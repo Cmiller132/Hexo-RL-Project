@@ -1,0 +1,44 @@
+[self_play]
+mcts_sims = 1024
+c_puct = 1.5
+temperature = 1.0
+games_per_epoch = 150
+max_game_moves = 500
+near_radius = 8
+dirichlet_alpha = 0.03
+noise_fraction = 0.2
+root_exploration_mode = "dirichlet"
+use_threat_constraints = true
+subtree_reuse = true
+
+[training]
+lr = 0.02
+lr_min = 0.0001
+lr_schedule = "cosine"
+training_passes = 2
+augment = true
+recency_decay = 0.9
+replay_buffer_size = 200000
+
+[loss_weights]
+loss_value_weight = 1.5
+loss_policy_weight = 1.4
+loss_threat_weight = 1.0
+loss_opp_policy_weight = 0.15
+loss_regret_rank_weight = 0.1
+loss_regret_value_weight = 0.1
+entropy_weight = 0.01
+entropy_anneal_epochs = 50
+
+[rgsc]
+rgsc_lambda = 0.5
+rgsc_buffer_capacity = 100
+rgsc_buffer_temperature = 0.1
+rgsc_ema_alpha = 0.5
+rgsc_start_epoch = 5
+rgsc_max_staleness = 50
+rgsc_tree_min_visits = 1
+
+[pcr]
+pcr_low_sim_prob = 0.75
+pcr_low_sims = 192
