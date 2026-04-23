@@ -5,10 +5,9 @@
 //!   2. `expand_and_backprop(policies, values)` → updates tree
 //!   3. `get_results()` → (moves, visits, root_value)
 
-use rustc_hash::FxHashSet;
-use crate::core::{Hex, HEX_DIRECTIONS};
+use crate::core::Hex;
 use crate::board::HexGameState;
-use crate::encoder::{self, BOARD_SIZE, BOARD_AREA, NUM_CHANNELS, TENSOR_SIZE, HALF_BOARD};
+use crate::encoder::{self, BOARD_SIZE, BOARD_AREA, TENSOR_SIZE};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -369,6 +368,9 @@ impl MCTSEngine {
                 n.visit_count += VIRTUAL_LOSS_VISITS;
             }
 
+            // We replayed `search_path.len() - 1` moves (root is not a move).
+            let depth = search_path.len() as u32 - 1;
+
             if self.game.is_over() {
                 // ── Step 3a: Terminal leaf — determine winner ──
                 // From the leaf node's player perspective:
@@ -411,8 +413,6 @@ impl MCTSEngine {
             }
 
             // ── Step 4: Undo moves to restore root state ──
-            // We replayed `search_path.len() - 1` moves (root is not a move).
-            let depth = search_path.len() as u32 - 1;
             for _ in 0..depth {
                 self.game.unmake_move();
             }

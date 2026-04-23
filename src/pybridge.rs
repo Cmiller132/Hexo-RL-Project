@@ -6,7 +6,7 @@ use pyo3::types::PyBytes;
 
 use numpy::{PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1};
 
-use crate::core::{hex_distance, Hex};
+use crate::core::Hex;
 use crate::encoder;
 use crate::eval;
 use crate::game::HexGameState;
@@ -18,23 +18,6 @@ use std::time::{Duration, SystemTime};
 
 // Re-export encoder constants so shapes stay in sync with the canonical implementation.
 use encoder::{BOARD_SIZE, BOARD_AREA, NUM_CHANNELS, TENSOR_SIZE};
-
-/// Python-compatible "banker's rounding" (round half to even).
-fn bankers_round(v: f64) -> i32 {
-    let frac = v - v.floor();
-    if (frac - 0.5).abs() < 1e-9 {
-        // Exactly half: round to even
-        let lo = v.floor() as i32;
-        let hi = v.ceil() as i32;
-        if lo % 2 == 0 {
-            lo
-        } else {
-            hi
-        }
-    } else {
-        v.round() as i32
-    }
-}
 
 // -------------------------------------------------------------------------
 // XOR-shift RNG (thread-local, seeded from system time)
@@ -221,7 +204,7 @@ impl PyHexGame {
     /// (i.e. needs to be filled to complete the line).
     fn get_threat_windows(&self, player: u8) -> Vec<Vec<(i32, i32, bool)>> {
         use crate::core::HEX_DIRECTIONS;
-        use crate::game::WIN_LENGTH;
+        use crate::patterns::WIN_LENGTH;
         let game = &self.inner;
         let pi = player as usize;
         let mut result = Vec::new();
@@ -346,11 +329,6 @@ impl PyHexGame {
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
         Ok((arr, encoded.offset_q, encoded.offset_r, PyBytes::new(py, &legal_buf)))
-    }
-
-    /// Classical pattern-based evaluation from `player`'s perspective.
-    fn evaluate(&self, player: u8) -> i32 {
-        eval::evaluate(&self.inner, player)
     }
 
     /// Extract the 13-element feature vector (for classical NN).

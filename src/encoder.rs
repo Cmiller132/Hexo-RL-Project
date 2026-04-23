@@ -262,7 +262,7 @@ pub fn encode_board_into(
     //     (windows with 4+ opponent stones and 0 own stones).
     // Ch 10: empty cells that lie inside the current player's hot windows.
     {
-        use crate::game::WIN_LENGTH;
+        use crate::patterns::WIN_LENGTH;
         let opp = (1 - current) as usize;
         let own = current as usize;
 

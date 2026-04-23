@@ -48,5 +48,5 @@ mod pybridge;
 
 // Re-exports for convenient access
 pub use core::{hex_distance, Hex, HEX_DIRECTIONS};
-pub use eval::{evaluate, extract_features, FEATURE_COUNT};
+pub use eval::{extract_features, FEATURE_COUNT};
 pub use game::{GameError, HexGameState, MoveRecord, PLACEMENT_RADIUS, WIN_LENGTH};

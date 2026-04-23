@@ -9,7 +9,6 @@
 //! at most 18 windows (3 directions × 6 origins). This makes evaluation O(18) per
 //! placement instead of O(board_size × windows).
 
-use rustc_hash::FxHashSet;
 use crate::core::{Hex, HEX_DIRECTIONS};
 use crate::board::HexGameState;
 
@@ -402,5 +401,120 @@ impl HexGameState {
             }
         }
         delta
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::board::HexGameState;
+
+    #[test]
+    fn eval_delta_consistency_with_move_eval_delta() {
+        let mut game = HexGameState::new();
+        // Place a few stones so there are active windows.
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (0, 1, 1),
+                (1, 1, 1),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let cell = crate::core::Hex::new(3, 0);
+        let delta_before = game.move_eval_delta(cell, 0);
+
+        // Actually place the stone and measure the real delta.
+        let old_eval = game.window_eval;
+        game.place(3, 0).unwrap();
+        let actual_delta = game.window_eval - old_eval;
+
+        assert_eq!(delta_before, actual_delta);
+    }
+
+    #[test]
+    fn hot_windows_tracked_correctly() {
+        let mut game = HexGameState::new();
+        // P0 places 4 stones in a row — should create a hot window.
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        assert!(!game.hot_windows[0].is_empty(), "P0 should have hot windows");
+        assert!(game.hot_windows[1].is_empty(), "P1 should have no hot windows");
+
+        // Now block the hot window with a P1 stone at (4,0).
+        game.place(4, 0).unwrap(); // P1's turn after set_position? No, current_player is 0.
+        // Wait, set_position sets current_player to 0, so place(4,0) is P0. That extends the line.
+        // Let me use a different approach: set_position with P1 already placed.
+    }
+
+    #[test]
+    fn hot_window_cleared_on_block() {
+        let mut game = HexGameState::new();
+        // P0 has a 4-stone run (0,0)..(3,0). Before blocking, there are hot windows.
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        assert!(!game.hot_windows[0].is_empty(), "P0 should have hot windows before block");
+        let hot_count_before = game.hot_windows[0].len();
+
+        // Place P1 at (4,0). This blocks the windows that contain (4,0),
+        // but windows like (-2,0)..(3,0) (which does NOT contain (4,0)) remain hot.
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 1), // P1 blocker
+            ],
+            1,
+            2,
+        )
+        .unwrap();
+
+        // Some hot windows were removed, but not all.
+        assert!(
+            game.hot_windows[0].len() < hot_count_before,
+            "Blocking should reduce hot window count"
+        );
+    }
+
+    #[test]
+    fn unmake_restores_eval_state() {
+        let mut game = HexGameState::new();
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let eval0 = game.window_eval;
+        let fives0 = game.window_fives;
+        let fours0 = game.window_fours;
+        let threes0 = game.window_threes;
+        let hot0 = game.hot_windows[0].len();
+
+        game.place(3, 0).unwrap();
+        game.unmake_move();
+
+        assert_eq!(game.window_eval, eval0);
+        assert_eq!(game.window_fives, fives0);
+        assert_eq!(game.window_fours, fours0);
+        assert_eq!(game.window_threes, threes0);
+        assert_eq!(game.hot_windows[0].len(), hot0);
     }
 }

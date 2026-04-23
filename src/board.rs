@@ -14,7 +14,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
-use crate::patterns::{EvalDelta, win_grid_idx, win_grid_in_bounds, WIN_GRID_RADIUS, WIN_GRID_TOTAL, WIN_LENGTH, PLACEMENT_RADIUS, PATTERN_COUNTS};
+use crate::patterns::{EvalDelta, win_grid_idx, win_grid_in_bounds, WIN_GRID_TOTAL, WIN_LENGTH, PLACEMENT_RADIUS, PATTERN_COUNTS};
 
 // -------------------------------------------------------------------------
 // Zobrist hashing (infinite board — mixing function instead of table)
@@ -246,27 +246,11 @@ impl HexGameState {
         self.move_history.push(record);
         self.placements_remaining -= 1;
 
-        // Update candidate set: remove this cell, add neighbors.
+        // Update candidate set and incremental eval.
         self.candidate_rc.remove(&cell);
-        let r2 = self.candidate_radius;
-        for dq in -r2..=r2 {
-            for dr in -r2..=r2 {
-                let h = Hex::new(cell.q + dq, cell.r + dr);
-                if hex_distance(cell, h) <= r2 && !self.board.contains_key(&h) {
-                    *self.candidate_rc.entry(h).or_insert(0) += 1;
-                }
-            }
-        }
-
-        // Incremental eval update (piece is now in board).
+        self.incr_candidate_neighbors(cell);
         let delta = self.compute_eval_delta(cell, player);
-        self.window_eval += delta.score;
-        for i in 0..2 {
-            self.window_fives[i] += delta.five_delta[i];
-            self.window_fours[i] += delta.four_delta[i];
-            self.window_threes[i] += delta.three_delta[i];
-        }
-        self.eval_stack.push(delta);
+        self.push_eval_delta(delta);
 
         // Check win
         if let Some(line) = self.find_winning_line(cell, player) {
@@ -324,27 +308,19 @@ impl HexGameState {
             self.move_count += 1;
             self.move_history.push(record);
 
-            // Update candidate set: remove this cell, add neighbors.
+            // Update candidate set and incremental eval.
             self.candidate_rc.remove(&cell);
-            let r2 = self.candidate_radius;
-            for dq in -r2..=r2 {
-                for dr in -r2..=r2 {
-                    let h = Hex::new(cell.q + dq, cell.r + dr);
-                    if hex_distance(cell, h) <= r2 && !self.board.contains_key(&h) {
-                        *self.candidate_rc.entry(h).or_insert(0) += 1;
-                    }
+            self.incr_candidate_neighbors(cell);
+            let delta = self.compute_eval_delta(cell, player);
+            self.push_eval_delta(delta);
+
+            // Detect wins during bulk placement
+            if self.winner.is_none() {
+                if let Some(line) = self.find_winning_line(cell, player) {
+                    self.winner = Some(player);
+                    self.winning_line = Some(line);
                 }
             }
-
-            // Incremental eval update; also updates hot_windows and window_indices.
-            let delta = self.compute_eval_delta(cell, player);
-            self.window_eval += delta.score;
-            for i in 0..2 {
-                self.window_fives[i] += delta.five_delta[i];
-                self.window_fours[i] += delta.four_delta[i];
-                self.window_threes[i] += delta.three_delta[i];
-            }
-            self.eval_stack.push(delta);
 
             // Simulate turn progression
             sim_remaining -= 1;
@@ -357,6 +333,31 @@ impl HexGameState {
         self.current_player = current_player & 1;
         self.placements_remaining = placements_remaining.max(1);
         Ok(())
+    }
+
+    /// Increment candidate reference counts for empty cells within radius 2 of `cell`.
+    /// Must be called **after** the piece is inserted into `self.board`.
+    fn incr_candidate_neighbors(&mut self, cell: Hex) {
+        let r2 = self.candidate_radius;
+        for dq in -r2..=r2 {
+            for dr in -r2..=r2 {
+                let h = Hex::new(cell.q + dq, cell.r + dr);
+                if hex_distance(cell, h) <= r2 && !self.board.contains_key(&h) {
+                    *self.candidate_rc.entry(h).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// Apply an eval delta to the running totals and push it onto the eval stack.
+    fn push_eval_delta(&mut self, delta: EvalDelta) {
+        self.window_eval += delta.score;
+        for i in 0..2 {
+            self.window_fives[i] += delta.five_delta[i];
+            self.window_fours[i] += delta.four_delta[i];
+            self.window_threes[i] += delta.three_delta[i];
+        }
+        self.eval_stack.push(delta);
     }
 
     /// Reset to initial empty state.
@@ -556,11 +557,13 @@ impl HexGameState {
         if self.board.is_empty() {
             return vec![Hex::ORIGIN];
         }
-        if !self.candidate_rc.is_empty() {
-            return self.candidate_rc.keys().copied().collect();
-        }
-        // Fallback: generate from scratch
-        self.legal_moves_near(2)
+        let mut result = if !self.candidate_rc.is_empty() {
+            self.candidate_rc.keys().copied().collect()
+        } else {
+            self.legal_moves_near(2)
+        };
+        result.sort();
+        result
     }
 
     // -----------------------------------------------------------------
@@ -1077,6 +1080,95 @@ mod tests {
         // Should have terminated with a winner within a reasonable number of moves.
         // (Random games typically end in ~100-900 moves.)
         assert!(g.is_over());
+    }
+
+    // -- set_position -----------------------------------------------------
+
+    #[test]
+    fn set_position_basic() {
+        let mut g = HexGameState::new();
+        g.set_position(&[(1, 0, 0), (2, 0, 0), (0, 1, 1)], 0, 2).unwrap();
+        assert_eq!(g.board.len(), 3);
+        assert_eq!(g.board.get(&Hex::new(1, 0)), Some(&0));
+        assert_eq!(g.board.get(&Hex::new(2, 0)), Some(&0));
+        assert_eq!(g.board.get(&Hex::new(0, 1)), Some(&1));
+        assert_eq!(g.current_player, 0);
+        assert_eq!(g.placements_remaining, 2);
+    }
+
+    #[test]
+    fn set_position_detects_win() {
+        let mut g = HexGameState::new();
+        g.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (5, 0, 0),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+        assert_eq!(g.winner, Some(0));
+        assert!(g.is_over());
+    }
+
+    #[test]
+    fn set_position_rejects_duplicate_cell() {
+        let mut g = HexGameState::new();
+        let res = g.set_position(&[(1, 0, 0), (1, 0, 1)], 0, 2);
+        assert!(matches!(res, Err(GameError::CellOccupied(_))));
+    }
+
+    // -- candidates_near2 --------------------------------------------------
+
+    #[test]
+    fn candidates_near2_is_sorted() {
+        let mut g = HexGameState::new();
+        g.place(0, 0).unwrap();
+        g.place(1, 0).unwrap();
+        g.place(0, 1).unwrap();
+        let cands = g.candidates_near2();
+        assert!(!cands.is_empty());
+        for i in 1..cands.len() {
+            assert!(
+                cands[i - 1] < cands[i],
+                "candidates_near2 must be sorted: {:?} >= {:?}",
+                cands[i - 1],
+                cands[i]
+            );
+        }
+    }
+
+    // -- unmake_move eval round-trip ---------------------------------------
+
+    #[test]
+    fn unmake_restores_eval_counters() {
+        let mut g = HexGameState::new();
+        g.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let eval0 = g.window_eval;
+        let fives0 = g.window_fives;
+        let fours0 = g.window_fours;
+        let threes0 = g.window_threes;
+        let hot0 = g.hot_windows[0].len();
+
+        g.place(3, 0).unwrap();
+        g.unmake_move();
+
+        assert_eq!(g.window_eval, eval0);
+        assert_eq!(g.window_fives, fives0);
+        assert_eq!(g.window_fours, fours0);
+        assert_eq!(g.window_threes, threes0);
+        assert_eq!(g.hot_windows[0].len(), hot0);
     }
 
     // -- Helpers ----------------------------------------------------------

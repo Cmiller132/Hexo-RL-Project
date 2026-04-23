@@ -4,7 +4,7 @@
 //! `impl` block.  These methods are used by the alpha-beta search and MCTS
 //! engines to filter moves, detect instant wins, and prune losing lines.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use crate::board::HexGameState;
 use crate::core::{Hex, HEX_DIRECTIONS};
 use crate::patterns::WIN_LENGTH;
@@ -204,5 +204,249 @@ impl HexGameState {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::board::HexGameState;
+    use crate::core::Hex;
+
+    #[test]
+    fn collect_winning_threat_cells_five_window() {
+        let mut game = HexGameState::new();
+        // P0 has a 5-stone run along (1,0): (0,0)..(4,0).
+        // This creates multiple overlapping hot windows (5-windows and 4-windows).
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let cells = game.collect_winning_threat_cells(0);
+        // A bare 5-run produces 4 hot windows whose empty cells are:
+        // (-2,0), (-1,0), (5,0), (6,0)
+        assert_eq!(cells.len(), 4);
+        assert!(cells.contains(&Hex::new(-2, 0)));
+        assert!(cells.contains(&Hex::new(-1, 0)));
+        assert!(cells.contains(&Hex::new(5, 0)));
+        assert!(cells.contains(&Hex::new(6, 0)));
+    }
+
+    #[test]
+    fn collect_winning_threat_cells_four_window() {
+        let mut game = HexGameState::new();
+        // P0 has a 4-stone run along (1,0): (0,0)..(3,0).
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let cells = game.collect_winning_threat_cells(0);
+        // A bare 4-run produces 3 hot 4-windows whose empty cells are:
+        // (-2,0), (-1,0), (4,0), (5,0)
+        assert_eq!(cells.len(), 4);
+        assert!(cells.contains(&Hex::new(-2, 0)));
+        assert!(cells.contains(&Hex::new(-1, 0)));
+        assert!(cells.contains(&Hex::new(4, 0)));
+        assert!(cells.contains(&Hex::new(5, 0)));
+    }
+
+    #[test]
+    fn collect_blocking_threat_cells_single_placement() {
+        let mut game = HexGameState::new();
+        // P1 has a 4-stone run (0,0)..(3,0) and P0 has already blocked one end at (-2,0).
+        // After the block, the remaining hot windows are:
+        //   (-1,0)..(4,0) → empties {(-1,0), (4,0)}
+        //   (0,0)..(5,0)  → empties {(4,0), (5,0)}
+        // Both remaining windows contain (4,0), so a single placement there blocks all.
+        game.set_position(
+            &[
+                (-2, 0, 0), // P0 blocker
+                (0, 0, 1),
+                (1, 0, 1),
+                (2, 0, 1),
+                (3, 0, 1),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+
+        let cells = game.collect_blocking_threat_cells(1);
+        assert_eq!(cells.len(), 1);
+        assert!(cells.contains(&Hex::new(4, 0)));
+    }
+
+    #[test]
+    fn collect_blocking_threat_cells_two_placements() {
+        let mut game = HexGameState::new();
+        // P1 has a bare 4-stone run (0,0)..(3,0).
+        // Hot windows and their empty cells:
+        //   (-2,0)..(3,0) → {(-2,0), (-1,0)}
+        //   (-1,0)..(4,0) → {(-1,0), (4,0)}
+        //   (0,0)..(5,0)  → {(4,0), (5,0)}
+        // Every boundary cell participates in at least one covering pair,
+        // so all four are returned.
+        game.set_position(
+            &[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let cells = game.collect_blocking_threat_cells(1);
+        assert_eq!(cells.len(), 4);
+        assert!(cells.contains(&Hex::new(-2, 0)));
+        assert!(cells.contains(&Hex::new(-1, 0)));
+        assert!(cells.contains(&Hex::new(4, 0)));
+        assert!(cells.contains(&Hex::new(5, 0)));
+    }
+
+    #[test]
+    fn is_player_win_unblockable_single_cell_blocks_all() {
+        let mut game = HexGameState::new();
+        // P0 has a 4-run (0,0)..(3,0) with P1 already blocking one end at (-2,0).
+        // After the block, the remaining hot windows are:
+        //   (-1,0)..(4,0) → empties {(-1,0), (4,0)}
+        //   (0,0)..(5,0)  → empties {(4,0), (5,0)}
+        // Both contain (4,0), so a single placement there blocks all.
+        game.set_position(
+            &[
+                (-2, 0, 1), // P1 blocker
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+
+        assert!(!game.is_player_win_unblockable(0, 1));
+    }
+
+    #[test]
+    fn is_player_win_unblockable_disjoint_threats() {
+        let mut game = HexGameState::new();
+        // P0 has two disjoint 5-stone runs.
+        // A single 5-run is unblockable with 1 placement (multiple disjoint empty cells).
+        // Two disjoint 5-runs are also unblockable with 2 placements
+        // because each run needs its own pair of blockers.
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (10, 0, 0),
+                (11, 0, 0),
+                (12, 0, 0),
+                (13, 0, 0),
+                (14, 0, 0),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+
+        // Even with 2 placements, two disjoint 5-runs are unblockable.
+        assert!(game.is_player_win_unblockable(0, 2));
+    }
+
+    #[test]
+    fn is_opponent_win_unblockable_true() {
+        let mut game = HexGameState::new();
+        // P1 has two disjoint 5-windows, P0 has only 1 placement.
+        game.set_position(
+            &[
+                (0, 0, 1),
+                (1, 0, 1),
+                (2, 0, 1),
+                (3, 0, 1),
+                (4, 0, 1),
+                (10, 0, 1),
+                (11, 0, 1),
+                (12, 0, 1),
+                (13, 0, 1),
+                (14, 0, 1),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+
+        assert!(game.is_opponent_win_unblockable(1));
+    }
+
+    #[test]
+    fn threat_constrained_moves_own_win() {
+        let mut game = HexGameState::new();
+        // P0 has a 5-window and is to move with 2 placements.
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let legal = vec![Hex::new(5, 0), Hex::new(100, 0)];
+        let constrained = game.compute_threat_constrained_moves(&legal, true);
+        assert!(constrained.is_some());
+        let moves = constrained.unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0], Hex::new(5, 0));
+    }
+
+    #[test]
+    fn threat_constrained_moves_opponent_block() {
+        let mut game = HexGameState::new();
+        // P1 has a 5-window. P0 must block.
+        game.set_position(
+            &[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1), (4, 0, 1)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let legal = vec![Hex::new(5, 0), Hex::new(100, 0)];
+        let constrained = game.compute_threat_constrained_moves(&legal, true);
+        assert!(constrained.is_some());
+        let moves = constrained.unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0], Hex::new(5, 0));
+    }
+
+    #[test]
+    fn threat_constrained_moves_unblockable_returns_none() {
+        let mut game = HexGameState::new();
+        // P1 has two disjoint 5-windows. P0 cannot block both with 1 placement.
+        game.set_position(
+            &[
+                (0, 0, 1),
+                (1, 0, 1),
+                (2, 0, 1),
+                (3, 0, 1),
+                (4, 0, 1),
+                (10, 0, 1),
+                (11, 0, 1),
+                (12, 0, 1),
+                (13, 0, 1),
+                (14, 0, 1),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+
+        let legal = vec![Hex::new(5, 0), Hex::new(15, 0)];
+        let constrained = game.compute_threat_constrained_moves(&legal, true);
+        // When unblockable, all moves are losing so no hard constraint is returned.
+        assert!(constrained.is_none());
     }
 }

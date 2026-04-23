@@ -1,20 +1,12 @@
-//! Classical pattern-based evaluation for Infinity Hexagonal Tic-Tac-Toe.
+//! Classical pattern-based feature extraction for Infinity Hexagonal Tic-Tac-Toe.
 //!
-//! This module provides two complementary evaluation paths:
+//! This module provides the **neural feature extraction** path (`extract_features`)
+//! — it scans the entire board to build a 13-element feature vector counting live
+//! and dead runs of various lengths. It is used by the classical self-play pipeline
+//! in `pybridge.rs` to generate training data for the neural network.
 //!
-//! 1. **Classical evaluation** (`evaluate`) — an O(1) heuristic score derived
-//!    from pre-computed incremental state (`window_eval`, `window_fives`,
-//!    `window_fours`). Used by the alpha-beta search in `search.rs` to assign
-//!    leaf-node scores.
-//!
-//! 2. **Neural feature extraction** (`extract_features`) — scans the entire
-//!    board to build a 13-element feature vector counting live and dead runs
-//!    of various lengths. Used by the classical self-play pipeline in
-//!    `pybridge.rs` to generate training data for the neural network.
-//!
-//! The two systems are independent. `evaluate` does NOT call
-//! `extract_features`; it relies on incremental updates maintained during
-//! `place`/`unmake_move` in `board.rs` for speed.
+//! The alpha-beta search in `search.rs` uses its own minimal O(1) evaluator that
+//! reads `window_eval` directly; it does not call `extract_features`.
 
 use crate::board::HexGameState;
 use crate::core::{Hex, HEX_DIRECTIONS};
@@ -195,44 +187,132 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_board_eval_is_zero() {
+    fn empty_board_features() {
         let game = HexGameState::new();
-        // On an empty board, both players have the same features (nothing).
-        // Player 0 has the tempo, so they get the +15 bonus.
-        assert_eq!(evaluate(&game, 0), 15);
+        let feats = extract_features(&game);
+        // All counts are zero; tempo is +1.0 because P0 to move.
+        for i in 0..FEATURE_COUNT - 1 {
+            assert_eq!(feats[i], 0.0, "feature {} should be zero on empty board", i);
+        }
+        assert_eq!(feats[FEATURE_COUNT - 1], 1.0);
     }
 
     #[test]
-    fn winning_position_has_win_score() {
+    fn tempo_feature_flips_for_player_1() {
         let mut game = HexGameState::new();
-        // Build player 0 win: 6 in a row along (1,0)
-        game.place(0, 0).unwrap();
-        game.place(-1, -1).unwrap();
-        game.place(-2, -2).unwrap();
-        game.place(1, 0).unwrap();
-        game.place(2, 0).unwrap();
-        game.place(-3, -3).unwrap();
-        game.place(-4, -4).unwrap();
-        game.place(3, 0).unwrap();
-        game.place(4, 0).unwrap();
-        game.place(-5, -5).unwrap();
-        game.place(-6, -6).unwrap();
-        game.place(5, 0).unwrap();
-        assert_eq!(evaluate(&game, 0), WIN_SCORE);
-        assert_eq!(evaluate(&game, 1), -WIN_SCORE);
+        game.place(0, 0).unwrap(); // P0 opens
+        game.place(1, 0).unwrap(); // P1 first placement
+        game.place(0, 1).unwrap(); // P1 second placement, turn switches to P0
+        // After the opening, current player is P0 again (move_count=3)
+        // Let's get to P1's turn.
+        game.place(2, 0).unwrap(); // P0 first
+        game.place(3, 0).unwrap(); // P0 second, turn switches to P1
+        assert_eq!(game.current_player, 1);
+        let feats = extract_features(&game);
+        assert_eq!(feats[FEATURE_COUNT - 1], -1.0);
     }
 
     #[test]
-    fn player_with_longer_lines_scores_higher() {
+    fn live_five_is_counted() {
         let mut game = HexGameState::new();
-        game.place(0, 0).unwrap();
-        game.place(2, 1).unwrap();
-        game.place(-2, 1).unwrap();
-        // P0 has 1 tile at (0,0), P1 has 2 scattered tiles
-        // P0's turn, 2 placements remaining
-        let s0 = evaluate(&game, 0);
-        let s1 = evaluate(&game, 1);
-        // s0 should be higher than s1 because P0 has the tempo
-        assert!(s0 > s1);
+        // P0 live-5 along (1,0): (0,0)..(4,0), both ends open.
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+        let feats = extract_features(&game);
+        assert_eq!(feats[0], 1.0); // P0 live-5
+    }
+
+    #[test]
+    fn dead_five_is_counted() {
+        let mut game = HexGameState::new();
+        // P0 dead-5: blocked on both ends by P1 at (-1,0) and (5,0).
+        game.set_position(
+            &[
+                (-1, 0, 1), // P1 blocker left
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (5, 0, 1), // P1 blocker right
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+        let feats = extract_features(&game);
+        assert_eq!(feats[1], 1.0); // P0 dead-5
+    }
+
+    #[test]
+    fn six_in_a_row_bumps_live_five() {
+        let mut game = HexGameState::new();
+        // 6 in a row for P0 along (1,0).
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (5, 0, 0),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+        let feats = extract_features(&game);
+        // Terminal pattern adds 10 to live-5 bucket
+        assert!(feats[0] >= 10.0);
+    }
+
+    #[test]
+    fn live_four_is_counted() {
+        let mut game = HexGameState::new();
+        // P0 live-4: (0,0)..(3,0), both ends open.
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+        let feats = extract_features(&game);
+        assert_eq!(feats[2], 1.0); // P0 live-4
+    }
+
+    #[test]
+    fn live_three_and_live_two() {
+        let mut game = HexGameState::new();
+        // P0 live-3: (0,0),(1,0),(2,0).
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2).unwrap();
+        let feats = extract_features(&game);
+        assert_eq!(feats[4], 1.0); // P0 live-3
+        assert_eq!(feats[5], 0.0); // no live-2 yet
+    }
+
+    #[test]
+    fn opponent_features_are_separate() {
+        let mut game = HexGameState::new();
+        // P0 live-3 along (1,0), P1 live-3 along (0,1) — far apart so they don't interfere.
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0), // P0 live-3
+                (5, 0, 1),
+                (5, 1, 1),
+                (5, 2, 1), // P1 live-3
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+        let feats = extract_features(&game);
+        assert_eq!(feats[4], 1.0);  // P0 live-3
+        assert_eq!(feats[10], 1.0); // P1 live-3
     }
 }

@@ -19,9 +19,9 @@ use std::cmp::Reverse;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
-use crate::eval::{evaluate, WIN_SCORE};
+use crate::eval::WIN_SCORE;
 use crate::game::HexGameState;
-use crate::game::WIN_LENGTH;
+use crate::patterns::WIN_LENGTH;
 
 // -------------------------------------------------------------------------
 // Constants
@@ -50,6 +50,23 @@ const DELTA_WEIGHT: i32 = 15;
 
 /// TT entries cap before clearing.
 const TT_MAX_SIZE: usize = 2_000_000;
+
+// -------------------------------------------------------------------------
+// Evaluation helper (local to search — not part of public eval API)
+// -------------------------------------------------------------------------
+
+/// Minimal O(1) evaluation from `player`'s perspective using incremental state.
+#[inline]
+fn evaluate(game: &HexGameState, player: u8) -> i32 {
+    if let Some(w) = game.winner {
+        return if w == player { WIN_SCORE } else { -WIN_SCORE };
+    }
+    let mut score = if player == 0 { game.window_eval } else { -game.window_eval };
+    if game.current_player == player {
+        score += 15;
+    }
+    score
+}
 
 // -------------------------------------------------------------------------
 // Turn type

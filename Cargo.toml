@@ -1,0 +1,25 @@
+[package]
+name = "hexgame"
+version = "0.2.0"
+edition = "2021"
+description = "Infinity Hexagonal Tic-Tac-Toe — Rust game engine with Python ML pipeline"
+license = "MIT"
+
+[lib]
+name = "hexgame"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustc-hash = "2"
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
+numpy = { version = "0.24", optional = true }
+
+[features]
+default = []
+python = ["pyo3", "numpy"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
