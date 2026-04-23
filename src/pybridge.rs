@@ -4,7 +4,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use numpy::{PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1};
+
 use crate::core::{hex_distance, Hex};
+use crate::encoder;
 use crate::eval;
 use crate::game::HexGameState;
 use crate::mcts::MCTSEngine;
@@ -13,12 +16,8 @@ use crate::search;
 use std::cell::Cell;
 use std::time::{Duration, SystemTime};
 
-// ── Board encoding constants (must match Python features.py) ─────────
-const BOARD_SIZE: i32 = 33;
-const HALF_BOARD: i32 = BOARD_SIZE / 2; // 16
-const NUM_CHANNELS: usize = 13;
-const BOARD_AREA: usize = (BOARD_SIZE * BOARD_SIZE) as usize; // 1089
-const TENSOR_SIZE: usize = NUM_CHANNELS * BOARD_AREA; // 14157
+// Re-export encoder constants so shapes stay in sync with the canonical implementation.
+use encoder::{BOARD_SIZE, BOARD_AREA, NUM_CHANNELS, TENSOR_SIZE};
 
 /// Python-compatible "banker's rounding" (round half to even).
 fn bankers_round(v: f64) -> i32 {
@@ -98,7 +97,7 @@ fn epsilon_topk_sample(best: Hex, candidates: &[(Hex, i32)], noise_level: f32) -
 }
 
 // -------------------------------------------------------------------------
-// Python-facing wrapper
+// Python-facing wrapper for HexGameState
 // -------------------------------------------------------------------------
 
 /// Python-facing wrapper around `HexGameState`.
@@ -109,6 +108,7 @@ pub struct PyHexGame {
 
 #[pymethods]
 impl PyHexGame {
+    /// Create a new game in the initial empty state.
     #[new]
     fn new() -> Self {
         Self {
@@ -117,7 +117,9 @@ impl PyHexGame {
     }
 
     /// Place the current player's tile at (q, r).
-    /// Returns True when the turn ends, False when the player has another placement.
+    ///
+    /// Returns `True` when the turn ends, `False` when the player has another
+    /// placement remaining.
     fn place(&mut self, q: i32, r: i32) -> PyResult<bool> {
         self.inner
             .place(q, r)
@@ -135,7 +137,7 @@ impl PyHexGame {
         self.inner.is_over()
     }
 
-    /// The winning player (0 or 1), or None.
+    /// The winning player (0 or 1), or `None`.
     #[getter]
     fn winner(&self) -> Option<u8> {
         self.inner.winner
@@ -213,6 +215,7 @@ impl PyHexGame {
     }
 
     /// Return active threat windows (4+ stones, unblocked) for the given player.
+    ///
     /// Each window is a list of 6 `(q, r, occupied)` tuples where `occupied`
     /// is `true` if the player has a stone there, `false` if the cell is empty
     /// (i.e. needs to be filled to complete the line).
@@ -265,7 +268,8 @@ impl PyHexGame {
     }
 
     /// Threat-constrained legal placements when a forced tactical state exists.
-    /// Returns None when no threat-based hard constraint applies.
+    ///
+    /// Returns `None` when no threat-based hard constraint applies.
     fn threat_constrained_moves(&self, radius: i32) -> Option<Vec<(i32, i32)>> {
         let legal = self.inner.legal_moves_near(radius);
         self.inner
@@ -274,6 +278,7 @@ impl PyHexGame {
     }
 
     /// Legal moves as packed bytes: pairs of little-endian i32 (q, r).
+    ///
     /// Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 2)`` in Python.
     fn legal_moves_near_bytes<'py>(&self, py: Python<'py>, radius: i32) -> Bound<'py, PyBytes> {
         let moves = self.inner.legal_moves_near(radius);
@@ -286,6 +291,7 @@ impl PyHexGame {
     }
 
     /// Board pieces as packed bytes: triples of little-endian i32 (q, r, player).
+    ///
     /// Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 3)`` in Python.
     fn board_pieces_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let board = &self.inner.board;
@@ -299,6 +305,7 @@ impl PyHexGame {
     }
 
     /// Move history as packed bytes: triples of little-endian i32 (player, q, r).
+    ///
     /// Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 3)`` in Python.
     fn move_history_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let hist = &self.inner.move_history;
@@ -311,220 +318,34 @@ impl PyHexGame {
         PyBytes::new(py, &buf)
     }
 
-    /// Encode the board as a (13, 33, 33) float32 tensor in Rust.
+    /// Encode the board as a (13, 33, 33) float32 tensor and return legal moves.
     ///
-    /// Returns ``(board_bytes, offset_q, offset_r, legal_moves_bytes)`` where:
-    /// - ``board_bytes``: packed little-endian f32, shape (13, 33, 33).
-    ///   Use ``np.frombuffer(data, dtype=np.float32).reshape(13, 33, 33)``
+    /// Delegates to the canonical encoder in `encoder.rs`.
+    ///
+    /// Returns ``(tensor, offset_q, offset_r, legal_moves_bytes)`` where:
+    /// - ``tensor``: a `numpy.ndarray` of shape (13, 33, 33) and dtype float32.
     /// - ``legal_moves_bytes``: packed i32 pairs (q, r) — the legal moves
     ///   within ``near_radius`` (same ones used for channel 3).
     ///   Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 2)``
-    ///
-    /// This avoids two separate Rust→Python calls and all Python loops.
     #[pyo3(signature = (near_radius, constrain_threats=true))]
     fn encode_board_and_legal<'py>(
         &self,
         py: Python<'py>,
         near_radius: i32,
         constrain_threats: bool,
-    ) -> (Bound<'py, PyBytes>, i32, i32, Bound<'py, PyBytes>) {
-        let game = &self.inner;
-        let board = &game.board;
-
-        // ── Compute centroid and offsets ──
-        // Python's round() uses banker's rounding (round half to even).
-        let (offset_q, offset_r) = if board.is_empty() {
-            (-HALF_BOARD, -HALF_BOARD)
-        } else {
-            let n = board.len() as f64;
-            let (mut sq, mut sr) = (0i64, 0i64);
-            for &h in board.keys() {
-                sq += h.q as i64;
-                sr += h.r as i64;
-            }
-            let cq = bankers_round(sq as f64 / n);
-            let cr = bankers_round(sr as f64 / n);
-            (cq - HALF_BOARD, cr - HALF_BOARD)
-        };
-
-        let current = game.current_player;
-        let mc = game.move_count;
-        let pr = game.placements_remaining;
-        let is_phase_2 = pr == 1 && mc > 0;
-
-        // ── Allocate tensor (all zeros) ──
-        let mut tensor = vec![0.0f32; TENSOR_SIZE];
-
-        // Helper: index into flat tensor [ch, gi, gj]
-        #[inline(always)]
-        fn idx(ch: usize, gi: i32, gj: i32) -> usize {
-            ch * BOARD_AREA + (gi as usize) * (BOARD_SIZE as usize) + gj as usize
-        }
-
-        // ── Ch 0-1: player stones ──
-        for (&h, &player) in board.iter() {
-            let gi = h.q - offset_q;
-            let gj = h.r - offset_r;
-            if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                if player == current {
-                    tensor[idx(0, gi, gj)] = 1.0;
-                } else {
-                    tensor[idx(1, gi, gj)] = 1.0;
-                }
-            }
-        }
-
-        // ── Ch 7-8: stone recency 1/(1+plies_ago), split by player ──
-        for (ply_idx, rec) in game.move_history.iter().enumerate() {
-            let gi = rec.cell.q - offset_q;
-            let gj = rec.cell.r - offset_r;
-            if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                let plies_ago = mc - ply_idx as u32;
-                let recency = 1.0 / (1.0 + plies_ago as f32);
-                let ch = if rec.player == current { 7 } else { 8 };
-                tensor[idx(ch, gi, gj)] = recency;
-            }
-        }
-
-        // ── Ch 2: empty cells mask = 1 - ch0 - ch1 ──
-        let ch2_start = 2 * BOARD_AREA as usize;
-        let ch0_start = 0usize;
-        let ch1_start = BOARD_AREA as usize;
-        for i in 0..BOARD_AREA as usize {
-            tensor[ch2_start + i] = 1.0 - tensor[ch0_start + i] - tensor[ch1_start + i];
-        }
-
-        // ── Ch 3: legal moves + build legal_moves output ──
-        let mut legal = game.legal_moves_near(near_radius);
-        if let Some(constrained) = game.compute_threat_constrained_moves(&legal, constrain_threats)
-        {
-            legal = constrained;
-        }
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
-        for h in &legal {
+    ) -> PyResult<(Bound<'py, PyArray3<f32>>, i32, i32, Bound<'py, PyBytes>)> {
+        let encoded = encoder::encode_board(&self.inner, near_radius, constrain_threats);
+        let arr = PyArray3::from_shape_vec(
+            py,
+            (NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize),
+            encoded.tensor,
+        )?;
+        let mut legal_buf: Vec<u8> = Vec::with_capacity(encoded.legal_moves.len() * 8);
+        for h in &encoded.legal_moves {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
-            let gi = h.q - offset_q;
-            let gj = h.r - offset_r;
-            if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                tensor[idx(3, gi, gj)] = 1.0;
-            }
         }
-
-        // ── Ch 4: turn phase ──
-        if is_phase_2 {
-            let start = 4 * BOARD_AREA as usize;
-            tensor[start..start + BOARD_AREA as usize].fill(1.0);
-        }
-
-        // ── Ch 5: first stone of current turn (phase 2 only) ──
-        if is_phase_2 {
-            if let Some(last) = game.move_history.last() {
-                let gi = last.cell.q - offset_q;
-                let gj = last.cell.r - offset_r;
-                if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                    tensor[idx(5, gi, gj)] = 1.0;
-                }
-            }
-        }
-
-        // ── Ch 6: current player color ──
-        if current == 0 {
-            let start = 6 * BOARD_AREA as usize;
-            tensor[start..start + BOARD_AREA as usize].fill(1.0);
-        }
-
-        // ── Ch 11: distance from centroid ──
-        // hex_distance from each cell to the grid center, normalized by HALF_BOARD.
-        // D6-invariant since hex distance is preserved under rotations/reflections.
-        {
-            let center = Hex::new(offset_q + HALF_BOARD, offset_r + HALF_BOARD);
-            for gi in 0..BOARD_SIZE {
-                for gj in 0..BOARD_SIZE {
-                    let h = Hex::new(gi + offset_q, gj + offset_r);
-                    let dist = hex_distance(h, center) as f32 / HALF_BOARD as f32;
-                    tensor[idx(11, gi, gj)] = dist;
-                }
-            }
-        }
-
-        // ── Ch 12: opponent's most recent completed turn ──
-        for h in game.opponent_last_turn_cells() {
-            let gi = h.q - offset_q;
-            let gj = h.r - offset_r;
-            if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                tensor[idx(12, gi, gj)] = 1.0;
-            }
-        }
-
-        // ── Ch 9: opponent's hot cells (empty cells in opp's 4+ windows) ──
-        // ── Ch 10: own hot cells (empty cells in own's 4+ windows) ──
-        {
-            use crate::core::HEX_DIRECTIONS;
-            use crate::game::WIN_LENGTH;
-            let opp = (1 - current) as usize;
-            let own = current as usize;
-
-            for (ch, player_idx) in [(9usize, opp), (10usize, own)] {
-                for &(wq, wr, dir) in &game.hot_windows[player_idx] {
-                    let (dq, dr) = HEX_DIRECTIONS[dir as usize];
-                    for k in 0..WIN_LENGTH {
-                        let cq = wq + dq * k;
-                        let cr = wr + dr * k;
-                        let h = Hex::new(cq, cr);
-                        if !board.contains_key(&h) {
-                            let gi = cq - offset_q;
-                            let gj = cr - offset_r;
-                            if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                                tensor[idx(ch, gi, gj)] = 1.0;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Pack tensor as bytes (zero-copy on little-endian) ──
-        let tensor_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                tensor.as_ptr() as *const u8,
-                tensor.len() * std::mem::size_of::<f32>(),
-            )
-        };
-
-        (
-            PyBytes::new(py, &tensor_bytes),
-            offset_q,
-            offset_r,
-            PyBytes::new(py, &legal_buf),
-        )
-    }
-
-    /// Compute per-cell per-axis influence scores for the current board.
-    ///
-    /// Returns packed f32 bytes of shape (3, 33, 33) from the current player's
-    /// perspective. Values in [-1, 1].
-    fn axis_influence<'py>(
-        &self,
-        py: Python<'py>,
-        offset_q: i32,
-        offset_r: i32,
-    ) -> Bound<'py, PyBytes> {
-        let mut out = vec![0.0f32; 3 * BOARD_AREA];
-        self.inner.compute_axis_influence(
-            offset_q,
-            offset_r,
-            BOARD_SIZE,
-            self.inner.current_player,
-            &mut out,
-        );
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                out.as_ptr() as *const u8,
-                out.len() * std::mem::size_of::<f32>(),
-            )
-        };
-        PyBytes::new(py, bytes)
+        Ok((arr, encoded.offset_q, encoded.offset_r, PyBytes::new(py, &legal_buf)))
     }
 
     /// Classical pattern-based evaluation from `player`'s perspective.
@@ -535,11 +356,6 @@ impl PyHexGame {
     /// Extract the 13-element feature vector (for classical NN).
     fn extract_features(&self) -> Vec<f32> {
         eval::extract_features(&self.inner).to_vec()
-    }
-
-    /// Quick heuristic score for a single move (for move ordering).
-    fn score_move(&self, q: i32, r: i32) -> i32 {
-        eval::score_move(&self.inner, Hex::new(q, r), self.inner.current_player)
     }
 
     /// Run iterative-deepening alpha-beta search.
@@ -587,8 +403,8 @@ impl PyHexGame {
     /// Run turn-based search and return the full turn (1 or 2 moves).
     ///
     /// Returns a list of (q, r) tuples representing the full turn.
-    /// For the opening move this is [(0, 0)].
-    /// For all other turns this is [(q1, r1), (q2, r2)].
+    /// For the opening move this is `[(0, 0)]`.
+    /// For all other turns this is `[(q1, r1), (q2, r2)]`.
     #[pyo3(signature = (time_ms, max_depth, near_radius=2, noise_level=0.0))]
     fn classical_search_turn(
         &self,
@@ -675,15 +491,15 @@ impl PyHexGame {
 /// ```python
 /// engine = MCTSEngine(game, num_sims, c_puct=1.4, near_radius=8)
 /// # Get root board tensor for initial GPU eval
-/// tensor_bytes, oq, or_, legal_bytes = engine.init_root()
+/// tensor, oq, or_, legal_bytes = engine.init_root()
 /// # ... run GPU inference to get root_policy, root_value ...
-/// engine.expand_root(root_policy_bytes, root_value, oq, or_, legal_bytes)
+/// engine.expand_root(root_policy, root_value, oq, or_, legal_bytes)
 /// engine.add_dirichlet_noise(noise_array, noise_fraction)
 ///
 /// while not engine.done():
-///     tensor_bytes, count = engine.select_leaves(batch_size)
-///     # ... GPU inference → policy_bytes, value_bytes ...
-///     engine.expand_and_backprop(policy_bytes, value_bytes)
+///     tensor, count = engine.select_leaves(batch_size)
+///     # ... GPU inference → policies, values ...
+///     engine.expand_and_backprop(policies, values)
 ///
 /// moves_q, moves_r, visits, root_value = engine.get_results()
 /// ```
@@ -694,8 +510,18 @@ struct PyMCTSEngine {
 
 #[pymethods]
 impl PyMCTSEngine {
+    /// Create a new MCTS engine.
+    ///
+    /// Parameters:
+    /// - `game`: starting board position (`HexGame`)
+    /// - `num_simulations`: total MCTS rollouts to perform
+    /// - `c_puct`: base exploration constant (default 1.4)
+    /// - `near_radius`: legal-move generation radius (default 8)
+    /// - `c_puct_init`: dynamic c_puct scaling constant (default 19652.0)
+    /// - `constrain_threats`: enable threat-based move filtering at root (default True)
+    /// - `arena_sim_hint`: optional arena pre-allocation hint (defaults to `num_simulations`)
     #[new]
-    #[pyo3(signature = (game, num_simulations, c_puct=1.4, near_radius=8, c_puct_init=19652.0, constrain_threats=true, selector="puct", c1=1.4, c2=3.0, arena_sim_hint=None))]
+    #[pyo3(signature = (game, num_simulations, c_puct=1.4, near_radius=8, c_puct_init=19652.0, constrain_threats=true, arena_sim_hint=None))]
     fn new(
         game: &PyHexGame,
         num_simulations: u32,
@@ -703,9 +529,6 @@ impl PyMCTSEngine {
         near_radius: i32,
         c_puct_init: f32,
         constrain_threats: bool,
-        selector: &str,
-        c1: f32,
-        c2: f32,
         arena_sim_hint: Option<u32>,
     ) -> Self {
         let hint = arena_sim_hint.unwrap_or(num_simulations);
@@ -718,54 +541,49 @@ impl PyMCTSEngine {
             constrain_threats,
         );
         engine.c_puct_init = c_puct_init;
-        engine.set_selector(selector, c1, c2);
-        Self {
-            inner: engine,
-        }
+        Self { inner: engine }
     }
 
-    /// Initialize root: encode the board and return tensor bytes for GPU eval.
-    /// Returns (tensor_bytes, offset_q, offset_r, legal_moves_bytes) or None.
+    /// Initialize root: encode the board and return a numpy tensor for GPU eval.
+    ///
+    /// Returns `Some((tensor, offset_q, offset_r, legal_moves_bytes))` or `None`
+    /// if the game is already over.
+    ///
+    /// `tensor` is a `numpy.ndarray` of shape (13, 33, 33) and dtype float32.
+    /// `legal_moves_bytes` contains packed i32 pairs (q, r).
     fn init_root<'py>(
         &mut self,
         py: Python<'py>,
-    ) -> Option<(Bound<'py, PyBytes>, i32, i32, Bound<'py, PyBytes>)> {
-        let (tensor, oq, or_, legal) = self.inner.init_root()?;
-        let tensor_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                tensor.as_ptr() as *const u8,
-                tensor.len() * std::mem::size_of::<f32>(),
-            )
+    ) -> PyResult<Option<(Bound<'py, PyArray3<f32>>, i32, i32, Bound<'py, PyBytes>)>> {
+        let Some((tensor, oq, or_, legal)) = self.inner.init_root() else {
+            return Ok(None);
         };
+        let arr = PyArray3::from_shape_vec(
+            py,
+            (NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize),
+            tensor,
+        )?;
         let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
         for h in &legal {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
-        Some((
-            PyBytes::new(py, tensor_bytes),
-            oq,
-            or_,
-            PyBytes::new(py, &legal_buf),
-        ))
+        Ok(Some((arr, oq, or_, PyBytes::new(py, &legal_buf))))
     }
 
     /// Expand root node with GPU-provided policy and value.
-    /// policy_bytes: packed f32 (1089,), value: scalar, legal_bytes: packed i32 pairs.
-    fn expand_root(
+    ///
+    /// `policy` is a 1-D `numpy.ndarray` of length `BOARD_AREA` (1089) containing
+    /// the raw policy logits. `value` is a scalar. `legal_bytes` is packed i32 pairs.
+    fn expand_root<'py>(
         &mut self,
-        policy_bytes: &[u8],
+        policy: PyReadonlyArray1<'py, f32>,
         value: f32,
         offset_q: i32,
         offset_r: i32,
         legal_bytes: &[u8],
     ) {
-        let policy: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                policy_bytes.as_ptr() as *const f32,
-                policy_bytes.len() / std::mem::size_of::<f32>(),
-            )
-        };
+        let policy_slice = policy.as_slice();
         let legal_i32: &[i32] = unsafe {
             std::slice::from_raw_parts(
                 legal_bytes.as_ptr() as *const i32,
@@ -777,37 +595,21 @@ impl PyMCTSEngine {
             .map(|c| Hex::new(c[0], c[1]))
             .collect();
         self.inner
-            .expand_root(policy, value, offset_q, offset_r, &legal);
+            .expand_root(policy_slice, value, offset_q, offset_r, &legal);
     }
 
     /// Add Dirichlet noise to root priors.
-    #[pyo3(signature = (noise_bytes, noise_fraction))]
-    fn add_dirichlet_noise(
+    ///
+    /// `noise` is a 1-D `numpy.ndarray` of the same length as root children.
+    /// `noise_fraction` controls the blend (0.0 = no noise, 1.0 = pure noise).
+    #[pyo3(signature = (noise, noise_fraction))]
+    fn add_dirichlet_noise<'py>(
         &mut self,
-        noise_bytes: &[u8],
+        noise: PyReadonlyArray1<'py, f32>,
         noise_fraction: f32,
     ) {
-        let noise: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                noise_bytes.as_ptr() as *const f32,
-                noise_bytes.len() / std::mem::size_of::<f32>(),
-            )
-        };
-        self.inner
-            .add_dirichlet_noise(noise, noise_fraction);
-    }
-
-    /// Initialize Gumbel Sequential Halving mode.
-    ///
-    /// Replaces Dirichlet noise with Gumbel-based exploration. Call after
-    /// `expand_root`. The top `num_considered` actions (by Gumbel + log-prior)
-    /// are selected as SH candidates. Simulations are allocated in rounds,
-    /// halving the candidate set after each round based on Q-values.
-    ///
-    /// Do NOT also call `add_dirichlet_noise` when using Gumbel mode.
-    #[pyo3(signature = (num_considered=16))]
-    fn init_gumbel(&mut self, num_considered: u32) {
-        self.inner.init_gumbel(num_considered);
+        let noise_slice = noise.as_slice();
+        self.inner.add_dirichlet_noise(noise_slice, noise_fraction);
     }
 
     /// Whether we have done enough simulations.
@@ -816,77 +618,46 @@ impl PyMCTSEngine {
     }
 
     /// Select leaves and encode their boards.
-    /// Returns (tensor_bytes, non_terminal_count).
-    /// tensor_bytes is packed f32 of shape (non_terminal_count, 13, 33, 33).
+    ///
+    /// Returns `(tensor, non_terminal_count)` where `tensor` is a
+    /// `numpy.ndarray` of shape `(non_terminal_count, 13, 33, 33)`.
     fn select_leaves<'py>(
         &mut self,
         py: Python<'py>,
         batch_size: u32,
-    ) -> (Bound<'py, PyBytes>, u32) {
+    ) -> PyResult<(Bound<'py, PyArray4<f32>>, u32)> {
         let (tensors, count) = self.inner.select_leaves(batch_size);
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                tensors.as_ptr() as *const u8,
-                tensors.len() * std::mem::size_of::<f32>(),
-            )
-        };
-        (PyBytes::new(py, bytes), count)
+        let tensor_vec = tensors.to_vec();
+        let arr = PyArray4::from_shape_vec(
+            py,
+            (
+                count as usize,
+                NUM_CHANNELS,
+                BOARD_SIZE as usize,
+                BOARD_SIZE as usize,
+            ),
+            tensor_vec,
+        )?;
+        Ok((arr, count))
     }
 
     /// Expand and backpropagate using GPU results.
-    /// policies_bytes: packed f32 (N, 1089), values_bytes: packed f32 (N,).
-    fn expand_and_backprop(&mut self, policies_bytes: &[u8], values_bytes: &[u8]) {
-        let policies: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                policies_bytes.as_ptr() as *const f32,
-                policies_bytes.len() / std::mem::size_of::<f32>(),
-            )
-        };
-        let values: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                values_bytes.as_ptr() as *const f32,
-                values_bytes.len() / std::mem::size_of::<f32>(),
-            )
-        };
-        self.inner.expand_and_backprop(policies, values);
-    }
-
-    /// Pipeline variant of select_leaves: saves current pending → prev_pending
-    /// before selecting new leaves. This enables GPU/CPU overlap.
-    fn select_leaves_pipeline<'py>(
+    ///
+    /// `policies` is a 1-D `numpy.ndarray` of length `N * BOARD_AREA` containing
+    /// the flat policy logits for each leaf. `values` is a 1-D array of length `N`.
+    fn expand_and_backprop<'py>(
         &mut self,
-        py: Python<'py>,
-        batch_size: u32,
-    ) -> (Bound<'py, PyBytes>, u32) {
-        let (tensors, count) = self.inner.select_leaves_pipeline(batch_size);
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                tensors.as_ptr() as *const u8,
-                tensors.len() * std::mem::size_of::<f32>(),
-            )
-        };
-        (PyBytes::new(py, bytes), count)
+        policies: PyReadonlyArray1<'py, f32>,
+        values: PyReadonlyArray1<'py, f32>,
+    ) {
+        let policies_slice = policies.as_slice();
+        let values_slice = values.as_slice();
+        self.inner.expand_and_backprop(policies_slice, values_slice);
     }
 
-    /// Expand and backprop the PREVIOUS batch (stored in prev_pending).
-    /// Used for pipeline overlap: select N+1 → expand N → ...
-    fn expand_prev_and_backprop(&mut self, policies_bytes: &[u8], values_bytes: &[u8]) {
-        let policies: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                policies_bytes.as_ptr() as *const f32,
-                policies_bytes.len() / std::mem::size_of::<f32>(),
-            )
-        };
-        let values: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                values_bytes.as_ptr() as *const f32,
-                values_bytes.len() / std::mem::size_of::<f32>(),
-            )
-        };
-        self.inner.expand_prev_and_backprop(policies, values);
-    }
-
-    /// Get results: (moves_q, moves_r, visits, root_value).
+    /// Get results: `(moves_q, moves_r, visits, root_value)`.
+    ///
+    /// Returns parallel vectors for all root children.
     fn get_results(&self) -> (Vec<i32>, Vec<i32>, Vec<u32>, f32) {
         self.inner.get_results()
     }
@@ -907,19 +678,28 @@ impl PyMCTSEngine {
     }
 
     /// Extract encoded board states and move histories for tree nodes.
+    ///
+    /// Returns `(tensor, histories, count)` where:
+    /// - `tensor` is a `numpy.ndarray` of shape `(count, 13, 33, 33)`
+    /// - `histories` is a parallel vector of move histories as `(player, q, r)` tuples
+    /// - `count` is the number of valid candidates extracted
     #[pyo3(signature = (min_visits=1))]
     fn extract_tree_node_states<'py>(
         &mut self,
         py: Python<'py>,
         min_visits: u32,
-    ) -> (Bound<'py, PyBytes>, Vec<Vec<(i32, i32, i32)>>, usize) {
+    ) -> PyResult<(Bound<'py, PyArray4<f32>>, Vec<Vec<(i32, i32, i32)>>, usize)> {
         let (packed, histories, count) = self.inner.extract_tree_node_states(min_visits);
-        let tensor_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                packed.as_ptr() as *const u8,
-                packed.len() * std::mem::size_of::<f32>(),
-            )
-        };
+        let arr = PyArray4::from_shape_vec(
+            py,
+            (
+                count,
+                NUM_CHANNELS,
+                BOARD_SIZE as usize,
+                BOARD_SIZE as usize,
+            ),
+            packed,
+        )?;
         let py_histories: Vec<Vec<(i32, i32, i32)>> = histories
             .into_iter()
             .map(|history| {
@@ -929,7 +709,7 @@ impl PyMCTSEngine {
                     .collect()
             })
             .collect();
-        (PyBytes::new(py, tensor_bytes), py_histories, count)
+        Ok((arr, py_histories, count))
     }
 
     /// Re-root the tree at the child matching action (q, r) for subtree reuse.
@@ -941,7 +721,7 @@ impl PyMCTSEngine {
     /// The pipeline must be fully flushed before calling (no pending leaves).
     /// After re-root, call `init_root` + `expand_root` if the new root is not
     /// yet expanded (`root_child_count() == 0`), or go straight to
-    /// `add_dirichlet_noise` / `init_gumbel` + search loop if it is.
+    /// `add_dirichlet_noise` + search loop if it is.
     #[pyo3(signature = (q, r, new_num_simulations))]
     fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) {
         self.inner.re_root(q as i16, r as i16, new_num_simulations);
@@ -949,20 +729,13 @@ impl PyMCTSEngine {
 }
 
 // -------------------------------------------------------------------------
-// Python-facing Multi MCTS engine wrapper
-// -------------------------------------------------------------------------
-
-/// Manages N MCTSEngines in Rust, merging leaf batches for one GPU call per iteration.
-///
-/// Usage from Python:
-/// ```python
-// -------------------------------------------------------------------------
 // Bulk classical self-play (for bootstrap training data)
 // -------------------------------------------------------------------------
 
 /// Generate self-play data using classical search.
-/// Returns a list of (features, outcome) tuples from completed games.
-/// This is fast because it uses the Rust alpha-beta engine.
+///
+/// Returns a list of `(features, outcome, board_snap)` tuples from completed
+/// games. This is fast because it uses the Rust alpha-beta engine.
 #[pyfunction]
 fn classical_self_play(
     num_games: u32,

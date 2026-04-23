@@ -1,24 +1,46 @@
-//! Pattern-based position evaluation for Hex Tic-Tac-Toe.
+//! Classical pattern-based evaluation for Infinity Hexagonal Tic-Tac-Toe.
 //!
-//! Scans all occupied cells along the 3 hex axes and classifies line patterns
-//! (live-5, live-4, dead-4, live-3, etc.) to produce a heuristic score.
-//! Also extracts a feature vector for use by the neural network.
+//! This module provides two complementary evaluation paths:
+//!
+//! 1. **Classical evaluation** (`evaluate`) — an O(1) heuristic score derived
+//!    from pre-computed incremental state (`window_eval`, `window_fives`,
+//!    `window_fours`). Used by the alpha-beta search in `search.rs` to assign
+//!    leaf-node scores.
+//!
+//! 2. **Neural feature extraction** (`extract_features`) — scans the entire
+//!    board to build a 13-element feature vector counting live and dead runs
+//!    of various lengths. Used by the classical self-play pipeline in
+//!    `pybridge.rs` to generate training data for the neural network.
+//!
+//! The two systems are independent. `evaluate` does NOT call
+//! `extract_features`; it relies on incremental updates maintained during
+//! `place`/`unmake_move` in `board.rs` for speed.
 
+use crate::board::HexGameState;
 use crate::core::{Hex, HEX_DIRECTIONS};
-use crate::game::{HexGameState, WIN_LENGTH};
+use crate::patterns::WIN_LENGTH;
 
 // -------------------------------------------------------------------------
-// Feature indices (for NN input)
+// Constants
 // -------------------------------------------------------------------------
 
-/// Number of features extracted per player (×2 players = total feature vec).
-pub const FEATURES_PER_PLAYER: usize = 6;
-/// Total feature vector length: per-player features × 2 + 1 (tempo).
-pub const FEATURE_COUNT: usize = FEATURES_PER_PLAYER * 2 + 1;
+/// Total length of the feature vector extracted by [`extract_features`].
+///
+/// Six features per player (live-5, dead-5, live-4, dead-4, live-3, live-2)
+/// plus one tempo feature = 13.
+pub const FEATURE_COUNT: usize = 13;
 
-/// Feature indices within a player's slice:
-/// 0 = live-5 count, 1 = dead-5 count, 2 = live-4, 3 = dead-4,
-/// 4 = live-3, 5 = live-2
+/// A large value representing a winning position (but not infinity).
+///
+/// Scores are offset slightly below this constant (`WIN_SCORE - 10`,
+/// `WIN_SCORE - 15`) to preserve ordering information for positions that
+/// are "essentially won" but not yet terminal.
+pub const WIN_SCORE: i32 = 1_000_000;
+
+/// Number of features extracted per player.
+const FEATURES_PER_PLAYER: usize = 6;
+
+/// Feature indices within a player's slice.
 const LIVE5: usize = 0;
 const DEAD5: usize = 1;
 const LIVE4: usize = 2;
@@ -26,16 +48,18 @@ const DEAD4: usize = 3;
 const LIVE3: usize = 4;
 const LIVE2: usize = 5;
 
-/// A large value representing a winning position (but not infinity).
-pub const WIN_SCORE: i32 = 1_000_000;
-
 // -------------------------------------------------------------------------
 // Run counting
 // -------------------------------------------------------------------------
 
 /// Count consecutive same-player tiles extending from `start` in direction
-/// (dq, dr). Returns (count, open_end) where open_end is true if the run
-/// terminates at an empty cell (false = blocked by opponent or board edge).
+/// `(dq, dr)`, **not including `start` itself**.
+///
+/// Returns `(count, open_end)` where:
+/// - `count` is the number of contiguous same-player cells.
+/// - `open_end` is `true` if the run terminates at an empty cell,
+///   `false` if it is blocked by an opponent piece or the board edge
+///   (represented by `None` from the hash map lookup).
 #[inline]
 fn count_run(game: &HexGameState, start: Hex, dq: i32, dr: i32, player: u8) -> (i32, bool) {
     let mut count = 0;
@@ -46,7 +70,7 @@ fn count_run(game: &HexGameState, start: Hex, dq: i32, dr: i32, player: u8) -> (
         match game.board.get(&h) {
             Some(&p) if p == player => count += 1,
             Some(_) => return (count, false), // blocked by opponent
-            None => return (count, true),     // open end
+            None => return (count, true),     // open end (empty or off-board)
         }
         q += dq;
         r += dr;
@@ -57,44 +81,77 @@ fn count_run(game: &HexGameState, start: Hex, dq: i32, dr: i32, player: u8) -> (
 // Feature extraction
 // -------------------------------------------------------------------------
 
-/// Extract pattern features for both players.
+/// Extract a 13-element feature vector from the current board state.
 ///
-/// Returns `[f32; FEATURE_COUNT]`:
-/// - `[0..6]`  = player 0 features (live5, dead5, live4, dead4, live3, live2)
-/// - `[6..12]` = player 1 features
-/// - `[12]`    = tempo (1.0 if player 0 to move, -1.0 if player 1)
+/// Features (indices 0-5 for player 0, 6-11 for player 1):
+/// - 0,6: live-5 (5+ in a row with at least 1 open end)
+/// - 1,7: dead-5 (5 in a row, blocked on one end)
+/// - 2,8: live-4 (4 in a row, both ends open)
+/// - 3,9: dead-4 (4 in a row, one end open)
+/// - 4,10: live-3 (3 in a row, both ends open)
+/// - 5,11: live-2 (2 in a row, both ends open)
+/// - 12: tempo (1.0 if P0 to move, -1.0 otherwise)
+///
+/// This scans the board by iterating over occupied cells and counting
+/// consecutive runs along each of the 6 hex directions. A run is only
+/// counted from its starting cell (the cell whose predecessor is not the
+/// same player) to avoid double-counting.
 pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
     let mut feats = [0.0f32; FEATURE_COUNT];
     let mut counts = [[0i32; FEATURES_PER_PLAYER]; 2];
 
-    // We iterate over all occupied cells but only count each run once.
-    // A run is counted from the cell that is the "start" of the run
-    // (the cell in the negative direction is NOT the same player).
+    // Step 1: Iterate over every occupied cell on the board.
+    // For each cell, we examine all 6 hex directions.
     for (&cell, &player) in &game.board {
         let p = player as usize;
         for &(dq, dr) in &HEX_DIRECTIONS {
-            // Only count from the start of a run: check that the cell
-            // before us (in the negative direction) is not the same player.
+            // Step 2: Only count runs from their starting cell.
+            //
+            // A "start" is defined as a cell whose predecessor in the
+            // negative direction `( -dq, -dr )` is NOT occupied by the same
+            // player. If the predecessor is also ours, this cell is in the
+            // middle of a longer run that was already counted from its true
+            // start, so we skip it. This guarantees each run is counted
+            // exactly once.
             let prev = Hex::new(cell.q - dq, cell.r - dr);
             if game.board.get(&prev) == Some(&player) {
                 continue; // not the start of this run
             }
 
-            // Count forward from this cell (including this cell).
+            // Step 3: Count forward from this cell.
+            //
+            // `count_run` returns how many same-player cells follow `cell`
+            // in direction `(dq, dr)` and whether that forward side is open.
+            // The run length includes `cell` itself, so we add 1.
             let (fwd, fwd_open) = count_run(game, cell, dq, dr, player);
-            let run_len = 1 + fwd; // includes this cell
+            let run_len = 1 + fwd;
 
-            // Check backward end (the cell before `cell` in -direction).
+            // Step 4: Determine the backward open end.
+            //
+            // We already know `prev` is not the same player (Step 2).
+            // If `prev` is empty (`None`), the backward end is open.
+            // If `prev` is occupied by the opponent (`Some(_)`), it is blocked.
             let bwd_open = match game.board.get(&prev) {
                 None => true,
-                Some(_) => false, // opponent piece (we already excluded same-player above)
+                Some(_) => false, // opponent piece
             };
 
+            // Step 5: Total open ends.
+            //
+            // A run can have 0, 1, or 2 open ends. Runs with 0 open ends
+            // are fully blocked and cannot be extended, so they contribute
+            // no feature value.
             let open_ends = (bwd_open as i32) + (fwd_open as i32);
 
-            // Classify the run.
+            // Step 6: Classify the run into a feature bucket.
+            //
+            // Live runs have open ends and represent active threats.
+            // Dead runs are blocked on one side and are less threatening.
+            // We only count runs of lengths 2-5 (plus the special case of
+            // 6+ which is already a win).
             if run_len >= WIN_LENGTH {
-                // Already won — shouldn't happen during eval normally, but handle it.
+                // Already won — shouldn't happen during normal eval, but
+                // we bump live-5 heavily to signal a terminal pattern.
                 counts[p][LIVE5] += 10;
             } else if run_len == 5 {
                 if open_ends >= 1 {
@@ -120,176 +177,18 @@ pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
         }
     }
 
+    // Step 7: Flatten per-player counts into the output feature vector.
     for p in 0..2 {
         for i in 0..FEATURES_PER_PLAYER {
             feats[p * FEATURES_PER_PLAYER + i] = counts[p][i] as f32;
         }
     }
+
+    // Step 8: Append the tempo feature.
     feats[FEATURE_COUNT - 1] = if game.current_player == 0 { 1.0 } else { -1.0 };
     feats
 }
 
-// -------------------------------------------------------------------------
-// Classical evaluation
-// -------------------------------------------------------------------------
-
-/// Evaluate the position from the perspective of `player`.
-///
-/// Reads pre-computed incremental window evaluation from the game state.
-/// O(1) per call — all window scanning is done incrementally during place/unmake.
-pub fn evaluate(game: &HexGameState, player: u8) -> i32 {
-    if let Some(w) = game.winner {
-        return if w == player { WIN_SCORE } else { -WIN_SCORE };
-    }
-
-    let our_turn = game.current_player == player;
-    let placements = game.placements_remaining as i32;
-
-    // Base score from pattern table (stored from player-0 perspective).
-    let mut score = if player == 0 {
-        game.window_eval
-    } else {
-        -game.window_eval
-    };
-
-    let my_fives = game.window_fives[player as usize];
-    let opp_fives = game.window_fives[1 - player as usize];
-    let my_fours = game.window_fours[player as usize];
-    let opp_fours = game.window_fours[1 - player as usize];
-
-    // ── Threat analysis ──────────────────────────────────────────────
-
-    // Near-win (5-in-a-row in window): essentially won/lost.
-    if my_fives > 0 {
-        if our_turn {
-            return WIN_SCORE - 10;
-        }
-        if my_fives > 1 {
-            return WIN_SCORE - 15;
-        }
-        score += 50_000;
-    }
-
-    if opp_fives > 0 {
-        if !our_turn {
-            return -(WIN_SCORE - 10);
-        }
-        if opp_fives > placements {
-            return -(WIN_SCORE - 15);
-        }
-        score -= 50_000 * opp_fives;
-    }
-
-    // Opponent four-threats: dangerous regardless of turn.
-    if opp_fours >= 2 {
-        if !our_turn {
-            score -= 35_000;
-        } else {
-            score -= 20_000;
-        }
-    }
-    if opp_fours >= 1 {
-        if !our_turn {
-            score -= 15_000;
-        } else {
-            score -= 6_000;
-        }
-    }
-
-    // Our four-threats: only valuable if we can act.
-    if my_fours >= 2 && our_turn && placements >= 2 {
-        score += 30_000;
-    }
-    if my_fours >= 1 && our_turn && placements >= 2 {
-        score += 12_000;
-    }
-
-    if our_turn {
-        score += 15;
-    }
-
-    score
-}
-
-// -------------------------------------------------------------------------
-// Forcing move detection (for quiescence search)
-// -------------------------------------------------------------------------
-
-/// Returns true if placing at `cell` is a "forcing" move — one that creates
-/// or blocks a significant threat.
-///
-/// Specifically, returns true when the placement:
-/// - Wins the game immediately (creates a run of WIN_LENGTH)
-/// - Creates a live-5 (run of WIN_LENGTH-1, one placement from winning)
-/// - Creates a live-4 (run of WIN_LENGTH-2 with both ends open)
-/// - Blocks the opponent from completing a run of WIN_LENGTH
-/// - Blocks the opponent's live-5 threat (run of WIN_LENGTH-1)
-pub fn is_forcing_move(game: &HexGameState, cell: Hex, player: u8) -> bool {
-    let opp = 1 - player;
-    for &(dq, dr) in &HEX_DIRECTIONS {
-        let (fwd, fwd_open) = count_run(game, cell, dq, dr, player);
-        let (bwd, bwd_open) = count_run(game, cell, -dq, -dr, player);
-        let run = 1 + fwd + bwd;
-        let open_ends = (fwd_open as i32) + (bwd_open as i32);
-
-        if run >= WIN_LENGTH {
-            return true;
-        } // immediate win
-        if run >= WIN_LENGTH - 1 {
-            return true;
-        } // creates live-5
-        if run == WIN_LENGTH - 2 && open_ends == 2 {
-            return true;
-        } // creates live-4
-
-        let (ofwd, _) = count_run(game, cell, dq, dr, opp);
-        let (obwd, _) = count_run(game, cell, -dq, -dr, opp);
-        let opp_run = 1 + ofwd + obwd;
-
-        if opp_run >= WIN_LENGTH {
-            return true;
-        } // blocks opponent win
-        if opp_run >= WIN_LENGTH - 1 {
-            return true;
-        } // blocks opponent live-5
-    }
-    false
-}
-
-// -------------------------------------------------------------------------
-// Move scoring (for move ordering in search)
-// -------------------------------------------------------------------------
-
-/// Quick heuristic score for placing `player`'s tile at `cell`.
-///
-/// Used for move ordering — does NOT do a full eval. Higher is better.
-pub fn score_move(game: &HexGameState, cell: Hex, player: u8) -> i32 {
-    let mut score = 0i32;
-
-    for &(dq, dr) in &HEX_DIRECTIONS {
-        let (fwd, _fwd_open) = count_run(game, cell, dq, dr, player);
-        let (bwd, _bwd_open) = count_run(game, cell, -dq, -dr, player);
-        let run = 1 + fwd + bwd;
-
-        if run >= WIN_LENGTH {
-            return 1_000_000; // winning move
-        }
-        score += run * run * 10; // prefer extending longer lines
-
-        // Check opponent threat at this cell.
-        let opp = 1 - player;
-        let (ofwd, _) = count_run(game, cell, dq, dr, opp);
-        let (obwd, _) = count_run(game, cell, -dq, -dr, opp);
-        let opp_run = 1 + ofwd + obwd;
-        if opp_run >= WIN_LENGTH {
-            score += 500_000; // blocking opponent win
-        } else if opp_run >= 4 {
-            score += opp_run as i32 * 200; // blocking a threat
-        }
-    }
-
-    score
-}
 
 #[cfg(test)]
 mod tests {
@@ -299,7 +198,8 @@ mod tests {
     fn empty_board_eval_is_zero() {
         let game = HexGameState::new();
         // On an empty board, both players have the same features (nothing).
-        assert_eq!(evaluate(&game, 0), 15); // just tempo bonus
+        // Player 0 has the tempo, so they get the +15 bonus.
+        assert_eq!(evaluate(&game, 0), 15);
     }
 
     #[test]
@@ -334,25 +234,5 @@ mod tests {
         let s1 = evaluate(&game, 1);
         // s0 should be higher than s1 because P0 has the tempo
         assert!(s0 > s1);
-    }
-
-    #[test]
-    fn is_forcing_detects_win() {
-        let mut game = HexGameState::new();
-        // Build player 0 with 5-in-a-row (live-5): (0,0)..(4,0)
-        game.place(0, 0).unwrap();
-        game.place(0, 2).unwrap();
-        game.place(1, 2).unwrap(); // P1 filler
-        game.place(1, 0).unwrap();
-        game.place(2, 0).unwrap();
-        game.place(0, 3).unwrap();
-        game.place(1, 3).unwrap(); // P1 filler
-        game.place(3, 0).unwrap();
-        game.place(4, 0).unwrap();
-        // Now P0 has (0,0),(1,0),(2,0),(3,0),(4,0) = 5 in a row
-        // Placing at (5,0) would win
-        assert!(is_forcing_move(&game, Hex::new(5, 0), 0));
-        // Placing far away should not be forcing
-        assert!(!is_forcing_move(&game, Hex::new(0, 5), 0));
     }
 }
