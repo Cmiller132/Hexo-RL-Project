@@ -349,6 +349,9 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
 
 /// Check if the current player can win this turn (with remaining placements).
 /// Uses incrementally-maintained hot_windows for O(hot_set) performance.
+///
+/// A 5-window (1 empty) is an instant win regardless of whether 1 or 2
+/// placements remain — the game ends as soon as the 6th stone is placed.
 fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
     let p = player as usize;
     if game.window_fours[p] == 0 && game.window_fives[p] == 0 {
@@ -370,16 +373,10 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
         }
         match empties.len() {
             1 => {
-                if remaining == 1 {
-                    return Some(Turn::one(empties[0]));
-                }
-                // 2 placements: fill the win cell + any legal cell
-                let win_cell = empties[0];
-                for c in game.candidates_near2() {
-                    if c != win_cell {
-                        return Some(Turn::two(win_cell, c));
-                    }
-                }
+                // A single empty in a 5-window wins immediately.
+                // Even with 2 placements remaining, Turn::one wins because
+                // the game ends after the 6th stone is placed.
+                return Some(Turn::one(empties[0]));
             }
             2 if remaining >= 2 => {
                 return Some(Turn::two(empties[0], empties[1]));
