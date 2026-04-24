@@ -1,16 +1,19 @@
 //! Test-only modules for the Hexgame engine.
 //!
-//! This directory contains three complementary test suites:
+//! This directory contains ten complementary test modules:
 //!
-//! - **`patterns`** — Low-level consistency checks for the incremental
-//!   evaluation system: pattern table round-trips, hot-window recomputation,
-//!   and score restore after `unplace`.
-//! - **`threats`** — Property-based tests (`proptest`) that compare the fast
-//!   threat-analysis path against a brute-force oracle over hundreds of
-//!   randomly-generated board positions.
-//! - **`oracle`** — The brute-force reference implementation used by the
-//!   threat tests. Exhaustively enumerates all legal turns to classify winning
-//!   moves, blocking singles, and blocking pairs.
+//! | Module             | Purpose |
+//! |--------------------|---------|
+//! | `board`            | Board rules and win detection |
+//! | `core`             | Hex coordinates, turns, and window keys |
+//! | `encoder`          | Neural-network tensor encoding |
+//! | `eval_state`       | Incremental evaluation consistency |
+//! | `grid`             | Win-grid spatial indexing |
+//! | `hot`              | Hot-window cache correctness |
+//! | `oracle`           | Brute-force threat-analysis verifier |
+//! | `patterns`         | Pattern table integrity |
+//! | `threats`          | Property-based threat-analysis verification |
+//! | `threats_internal` | Low-level threat constraint logic |
 //!
 //! All tests are gated behind `#[cfg(test)]` and do not appear in release
 //! builds.

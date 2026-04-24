@@ -205,7 +205,7 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 1, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 500, ..ProptestConfig::default() })]
 
     /// Play a compact deterministic random game and verify `threat_status`
     /// against the brute-force oracle after every completed turn.
@@ -415,7 +415,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 1, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 500, ..ProptestConfig::default() })]
 
     #[test]
     #[ignore = "slow oracle: run with cargo test --release -- --ignored"]
@@ -533,6 +533,179 @@ proptest! {
         let mut game = HexGameState::new();
         let mut moves_played = 0;
         let max_moves = 1 + rng.range(40);
+
+        while moves_played < max_moves && !game.is_over() {
+            let legal = game.candidates_near2();
+            if legal.is_empty() {
+                break;
+            }
+            let idx = rng.range(legal.len());
+            let cell = legal[idx];
+            let turn_ended = game.place(cell.q, cell.r).unwrap();
+            if turn_ended {
+                moves_played += 1;
+                if !game.is_over() {
+                    let oracle = analyse(&mut game.clone());
+                    let me = game.current_player();
+                    let opp = 1 - me;
+
+                    let mut live_current = Vec::new();
+                    live_cells(&game, me, &mut live_current);
+
+                    let mut live_opp = Vec::new();
+                    live_cells(&game, opp, &mut live_opp);
+
+                    for turn in &oracle.winning {
+                        if let Some(second) = turn.second() {
+                            assert!(
+                                live_current.contains(&turn.first())
+                                    || live_current.contains(&second),
+                                "neither cell of winning turn {:?} is in live_current",
+                                turn
+                            );
+                        } else {
+                            assert!(
+                                live_current.contains(&turn.first()),
+                                "single winning cell {:?} not in live_current",
+                                turn.first()
+                            );
+                        }
+                    }
+
+                    for &cell in &oracle.blocking_single {
+                        assert!(
+                            live_opp.contains(&cell),
+                            "blocking cell {:?} not in live_opp",
+                            cell
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast smoke tests — NOT ignored, run in CI
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 10, ..ProptestConfig::default() })]
+
+    #[test]
+    fn threat_status_matches_oracle_smoke(seed in any::<u64>()) {
+        let mut rng = Prng::new(seed);
+        let mut game = HexGameState::new();
+        let mut moves_played = 0;
+        // Short games for CI speed: 1–5 completed turns.
+        let max_moves = 1 + rng.range(5);
+
+        while moves_played < max_moves && !game.is_over() {
+            let legal = game.candidates_near2();
+            if legal.is_empty() {
+                break;
+            }
+            let idx = rng.range(legal.len());
+            let cell = legal[idx];
+            let turn_ended = game.place(cell.q, cell.r).unwrap();
+            if turn_ended {
+                moves_played += 1;
+                if !game.is_over() {
+                    let fast = threat_status(&game);
+                    let oracle = analyse(&mut game.clone());
+                    assert_matches(&fast, &oracle, &game);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turn_satisfies_threats_matches_oracle_smoke(seed in any::<u64>()) {
+        let mut rng = Prng::new(seed);
+        let mut game = HexGameState::new();
+        let mut moves_played = 0;
+        let max_moves = 1 + rng.range(5);
+
+        while moves_played < max_moves && !game.is_over() {
+            let legal = game.candidates_near2();
+            if legal.is_empty() {
+                break;
+            }
+            let idx = rng.range(legal.len());
+            let cell = legal[idx];
+            let turn_ended = game.place(cell.q, cell.r).unwrap();
+            if turn_ended {
+                moves_played += 1;
+                if !game.is_over() {
+                    let fast = threat_status(&game);
+                    let oracle = analyse(&mut game.clone());
+
+                    let opp = 1 - game.current_player();
+                    let opp_counts = game.eval().counts(opp);
+                    let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+
+                    let mut must_play = std::collections::HashSet::new();
+                    for turn in &oracle.winning {
+                        must_play.insert(*turn);
+                    }
+                    if oracle.winning.is_empty() && opp_has_threats {
+                        for turn in &oracle.blocking_pairs {
+                            must_play.insert(*turn);
+                        }
+                        if game.placements_remaining() == 1 {
+                            for &cell in &oracle.blocking_single {
+                                must_play.insert(Turn::single(cell));
+                            }
+                        }
+                    }
+
+                    let status = threat_status(&game);
+                    for turn in &oracle.legal {
+                        let satisfies = turn_satisfies_status(&status, *turn);
+                        let is_must_play = must_play.contains(turn);
+
+                        if is_must_play {
+                            if let ThreatStatus::WinningTurn(w) = &fast {
+                                if oracle.winning.contains(turn) && turn != w {
+                                    continue;
+                                }
+                            }
+                            assert!(
+                                satisfies,
+                                "turn {:?} is must-play but turn_satisfies_status returned false",
+                                turn
+                            );
+                        } else {
+                            match &fast {
+                                ThreatStatus::Quiet | ThreatStatus::Unblockable => {
+                                    assert!(
+                                        satisfies,
+                                        "turn {:?} should satisfy when no constraint",
+                                        turn
+                                    );
+                                }
+                                ThreatStatus::WinningTurn(_) | ThreatStatus::MustBlock(_) => {
+                                    assert!(
+                                        !satisfies,
+                                        "turn {:?} should not satisfy under constraint {:?}",
+                                        turn,
+                                        fast
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_cells_contains_all_threat_cells_smoke(seed in any::<u64>()) {
+        let mut rng = Prng::new(seed);
+        let mut game = HexGameState::new();
+        let mut moves_played = 0;
+        let max_moves = 1 + rng.range(5);
 
         while moves_played < max_moves && !game.is_over() {
             let legal = game.candidates_near2();

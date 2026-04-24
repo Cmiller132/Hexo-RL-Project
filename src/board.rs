@@ -212,6 +212,12 @@ impl CandidateSet {
 // -------------------------------------------------------------------------
 
 /// Alias for the stone map: each occupied hex maps to the player who owns it.
+/// Alias for the stone storage type.
+///
+/// This is intentionally a transparent type alias rather than a newtype.
+/// `FxHashMap<Hex, u8>` is the definitive representation; if it ever changes,
+/// every internal caller will need updating anyway, so the alias adds clarity
+/// without pretending to hide implementation details.
 pub(crate) type Stones = FxHashMap<Hex, u8>;
 
 /// Complete mutable game state.
@@ -367,18 +373,6 @@ impl HexGameState {
     /// # Panics
     ///
     /// Panics if called on an empty game (no moves to undo).
-    ///
-    /// # Algorithm
-    ///
-    /// 1. Reverse the incremental evaluation (`eval.unplace`).
-    /// 2. Pop the [`MoveRecord`] for the move being undone.
-    /// 3. Remove the stone from `stones` and XOR its Zobrist contribution.
-    /// 4. Decrement reference counts for all empty neighbours within radius 2
-    ///    of the removed stone; remove any count that reaches zero.
-    /// 5. Re-add the removed cell to the candidate set if any stones are
-    ///    still within radius 2 of it.
-    /// 6. Restore `current_player`, `placements_remaining`, `winner`, and
-    ///    `winning_line` from the snapshot.
     pub fn unplace(&mut self) {
         self.eval.unplace();
 
@@ -427,7 +421,7 @@ impl HexGameState {
         if player > 1 {
             return Err(GameError::InvalidPlayer(player));
         }
-        if remaining < 1 || remaining > 2 {
+        if !(1..=2).contains(&remaining) {
             return Err(GameError::InvalidRemaining(remaining));
         }
 
@@ -666,14 +660,6 @@ impl HexGameState {
     /// The opponent's most recent completed turn as an ordered list of cells.
     ///
     /// Returns one cell for Player 0's opening turn, otherwise two cells.
-    ///
-    /// # Algorithm
-    ///
-    /// 1. Walk backward from the end of `move_history`, skipping any
-    ///    placements belonging to `current_player` (these are from an
-    ///    in-progress turn).
-    /// 2. Collect consecutive placements belonging to the opponent.
-    /// 3. Reverse so the cells are in chronological order.
     pub fn opponent_last_turn_cells(&self) -> Vec<Hex> {
         let mut idx = self.move_history.len();
 

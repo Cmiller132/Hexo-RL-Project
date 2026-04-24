@@ -255,7 +255,7 @@ fn opp_winning_turns_after_turn(game: &HexGameState, player: u8) -> Vec<Turn> {
         .map(|(&h, &p)| (h.q, h.r, p))
         .collect();
     let mut g = HexGameState::new();
-    g.set_position(&stones, player, 2).unwrap();
+    g.set_position(&stones, player, 2).expect("oracle: invalid test position");
     all_winning_turns_for(&mut g, player)
 }
 
@@ -292,44 +292,6 @@ fn all_winning_turns_for(game: &mut HexGameState, player: u8) -> Vec<Turn> {
         game.unplace();
     }
     winning
-}
-
-/// Check whether `player` has any winning turn from the current position.
-///
-/// This is a helper for the oracle. It examines cells in the player-specific
-/// radius-2 superset — a set that is independent of the fast-path `live_cells`
-/// function.  Any winning placement must be adjacent to an existing player
-/// stone, so this superset is guaranteed to contain every possible winning
-/// cell.
-#[allow(dead_code)]
-fn any_winning_turn_for(game: &mut HexGameState, player: u8) -> bool {
-    let candidates = player_candidates_near2(game, player);
-    // If there are no candidates the player cannot win this turn.
-    if candidates.is_empty() {
-        return false;
-    }
-    for &c1 in &candidates {
-        let had_one = game.placements_remaining() == 1;
-        game.place_unchecked(c1);
-        if game.winner() == Some(player) {
-            game.unplace();
-            return true;
-        }
-        if !had_one {
-            for &c2 in &candidates {
-                if c2 <= c1 { continue; }
-                game.place_unchecked(c2);
-                let wins = game.winner() == Some(player);
-                game.unplace();
-                if wins {
-                    game.unplace();
-                    return true;
-                }
-            }
-        }
-        game.unplace();
-    }
-    false
 }
 
 #[cfg(test)]

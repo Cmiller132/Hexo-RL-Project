@@ -179,42 +179,43 @@ struct PendingLeaf {
 ///
 /// Moves that fall outside the tensor window receive a default logit of -10.0.
 ///
-/// Returns `(moves, priors)` where `priors` sum to 1.0.
+/// The caller must supply reusable `raw` and `priors` buffers to avoid
+/// per-expansion heap allocation.
 fn gather_policy(
     moves: &[Hex],
     policy_logits: &[f32],
     offset_q: i32,
     offset_r: i32,
-) -> (Vec<Hex>, Vec<f32>) {
+    raw: &mut Vec<f64>,
+    priors: &mut Vec<f32>,
+) {
     let n = moves.len();
-    let mut raw = vec![-10.0f64; n];
+    raw.clear();
+    raw.resize(n, -10.0f64);
 
     for (i, h) in moves.iter().enumerate() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             let flat = (gi as usize) * (BOARD_SIZE as usize) + gj as usize;
             raw[i] = policy_logits[flat] as f64;
         }
     }
 
     // Softmax in f64 for numerical stability, then convert to f32 priors.
-    // Reusing `priors` across calls is impractical: `expand_node` needs both
-    // the priors slice and `&mut self.arena` simultaneously, which the borrow
-    // checker rejects when the buffer lives on `MCTSEngine`.
     let max_val = raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    for v in &mut raw {
+    for v in raw.iter_mut() {
         *v = (*v - max_val).exp();
     }
     let sum: f64 = raw.iter().sum();
-    let priors: Vec<f32> = if sum > 0.0 {
-        raw.iter().map(|&e| (e / sum) as f32).collect()
+
+    priors.clear();
+    if sum > 0.0 {
+        priors.extend(raw.iter().map(|&e| (e / sum) as f32));
     } else {
         // Uniform fallback if all logits are identical or invalid.
-        vec![1.0 / moves.len() as f32; moves.len()]
-    };
-
-    (moves.to_vec(), priors)
+        priors.extend(std::iter::repeat_n(1.0 / moves.len() as f32, moves.len()));
+    }
 }
 
 // ── MCTSEngine ─────────────────────────────────────────────────────────
@@ -258,7 +259,13 @@ pub struct MCTSEngine {
     /// Pending leaves from the most recent `select_leaves` call, consumed by
     /// the next `expand_and_backprop` call.
     pending: Vec<PendingLeaf>,
+    /// Reusable scratch buffer for `gather_policy` (raw logits before softmax).
+    scratch_raw: Vec<f64>,
+    /// Reusable scratch buffer for `gather_policy` (normalized priors).
+    scratch_priors: Vec<f32>,
 }
+
+type TreeNodeStates = (Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize);
 
 impl MCTSEngine {
     // ── Construction ───────────────────────────────────────────────────
@@ -316,6 +323,8 @@ impl MCTSEngine {
             num_simulations,
             batch_buf: Vec::new(),
             pending: Vec::new(),
+            scratch_raw: Vec::new(),
+            scratch_priors: Vec::new(),
         }
     }
 
@@ -377,9 +386,9 @@ impl MCTSEngine {
         let start = root.children_start as usize;
         let count = root.children_count as usize;
         let n = count.min(noise.len());
-        for i in 0..n {
+        for (i, &noise_val) in noise.iter().enumerate().take(n) {
             let child = &mut self.arena[start + i];
-            child.prior = (1.0 - noise_fraction) * child.prior + noise_fraction * noise[i];
+            child.prior = (1.0 - noise_fraction) * child.prior + noise_fraction * noise_val;
         }
     }
 
@@ -723,7 +732,7 @@ impl MCTSEngine {
     pub fn extract_tree_node_states(
         &mut self,
         min_visits: u32,
-    ) -> Result<(Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize), &'static str> {
+    ) -> Result<TreeNodeStates, &'static str> {
         let mut packed = Vec::new();
         let mut histories = Vec::new();
 
@@ -752,7 +761,7 @@ impl MCTSEngine {
             candidates.truncate(MAX_CANDIDATES);
         }
 
-        if let Err(_) = packed.try_reserve(candidates.len() * TENSOR_SIZE) {
+        if packed.try_reserve(candidates.len() * TENSOR_SIZE).is_err() {
             return Ok((Vec::new(), Vec::new(), 0));
         }
         histories.reserve(candidates.len());
@@ -765,9 +774,19 @@ impl MCTSEngine {
             Unplace,
         }
 
+        /// Depth of `node_idx` from the root (number of ancestors).
+        fn depth_from_root(node_idx: u32, arena: &[MCTSNode]) -> u32 {
+            let mut depth = 0;
+            let mut idx = node_idx;
+            while idx != NO_PARENT {
+                depth += 1;
+                idx = arena[idx as usize].parent;
+            }
+            depth
+        }
+
         let mut stack: Vec<Frame> = Vec::new();
         stack.push(Frame::Visit(self.root_idx));
-        let mut cur_depth = 0u32;
 
         while let Some(frame) = stack.pop() {
             match frame {
@@ -775,7 +794,8 @@ impl MCTSEngine {
                     if candidate_set.contains(&node_idx) && node_idx != self.root_idx {
                         if self.game.is_over() {
                             // Restore game state before returning the error.
-                            for _ in 0..cur_depth {
+                            let d = depth_from_root(node_idx, &self.arena);
+                            for _ in 0..d {
                                 self.game.unplace();
                             }
                             return Err("sampled node is terminal during extraction");
@@ -806,16 +826,16 @@ impl MCTSEngine {
                         let count = node.children_count as usize;
                         for i in (start..start + count).rev() {
                             let child = &self.arena[i];
-                            if let Err(_) = self.game.place(
+                            if self.game.place(
                                 child.action.0 as i32,
                                 child.action.1 as i32,
-                            ) {
-                                for _ in 0..cur_depth {
+                            ).is_err() {
+                                let d = depth_from_root(node_idx, &self.arena);
+                                for _ in 0..d {
                                     self.game.unplace();
                                 }
                                 return Err("illegal move during tree node extraction");
                             }
-                            cur_depth += 1;
                             stack.push(Frame::Visit(i as u32));
                         }
                     } else if node_idx != self.root_idx {
@@ -824,12 +844,9 @@ impl MCTSEngine {
                 }
                 Frame::Unplace => {
                     self.game.unplace();
-                    cur_depth -= 1;
                 }
             }
         }
-
-        debug_assert_eq!(cur_depth, 0, "game state not restored to root after extraction");
 
         let count = histories.len();
         Ok((packed, histories, count))
@@ -926,15 +943,21 @@ impl MCTSEngine {
             return;
         }
 
-        let (filtered_moves, priors) =
-            gather_policy(legal_moves, policy_logits, offset_q, offset_r);
+        gather_policy(
+            legal_moves,
+            policy_logits,
+            offset_q,
+            offset_r,
+            &mut self.scratch_raw,
+            &mut self.scratch_priors,
+        );
 
         // Allocate children contiguously in arena.
         let children_start = self.arena.len() as u32;
-        let children_count = filtered_moves.len() as u16;
+        let children_count = legal_moves.len() as u16;
 
-        for (i, h) in filtered_moves.iter().enumerate() {
-            let child = MCTSNode::new(node_idx, (h.q as i16, h.r as i16), priors[i]);
+        for (i, h) in legal_moves.iter().enumerate() {
+            let child = MCTSNode::new(node_idx, (h.q as i16, h.r as i16), self.scratch_priors[i]);
             self.arena.push(child);
         }
 

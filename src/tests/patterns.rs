@@ -23,14 +23,14 @@ fn recompute_score(stones: &FxHashMap<Hex, u8>) -> i32 {
             for dir in 0..3u8 {
                 let (dq, dr) = HEX_DIRECTIONS[dir as usize];
                 let mut idx = 0usize;
-                for off in 0..WIN_LENGTH as usize {
+                for (off, &pow) in POW3.iter().enumerate().take(WIN_LENGTH as usize) {
                     let h = Hex::new(q + dq * off as i32, r + dr * off as i32);
                     let val = match stones.get(&h) {
                         Some(&0) => 1,
                         Some(&1) => 2,
                         _ => 0,
                     };
-                    idx += val * POW3[off];
+                    idx += val * pow;
                 }
                 total += PATTERN_VALUES[idx];
             }
@@ -52,8 +52,7 @@ mod tests {
     /// - `2` = player 1 stone
     #[test]
     fn ternary_index_roundtrip() {
-        for idx in 0..729usize {
-            let (expected_p0, expected_p1) = PATTERN_COUNTS[idx];
+        for (idx, &(expected_p0, expected_p1)) in PATTERN_COUNTS.iter().enumerate() {
             let mut manual_p0 = 0u8;
             let mut manual_p1 = 0u8;
             let mut n = idx;
@@ -79,8 +78,8 @@ mod tests {
     #[test]
     fn pow3_values() {
         let mut pow = 1usize;
-        for i in 0..6 {
-            assert_eq!(POW3[i], pow, "POW3[{}] should be {}", i, pow);
+        for (i, &p) in POW3.iter().enumerate() {
+            assert_eq!(p, pow, "POW3[{}] should be {}", i, pow);
             pow *= 3;
         }
     }
@@ -192,14 +191,14 @@ mod tests {
                 for dir in 0..3u8 {
                     let (dq, dr) = HEX_DIRECTIONS[dir as usize];
                     let mut idx = 0usize;
-                    for off in 0..WIN_LENGTH as usize {
+                    for (off, &pow) in POW3.iter().enumerate().take(WIN_LENGTH as usize) {
                         let h = Hex::new(q + dq * off as i32, r + dr * off as i32);
                         let val = match stones.get(&h) {
                             Some(&0) => 1,
                             Some(&1) => 2,
                             _ => 0,
                         };
-                        idx += val * POW3[off];
+                        idx += val * pow;
                     }
                     let (p0, p1) = PATTERN_COUNTS[idx];
                     if p0 >= 4 && p1 == 0 {

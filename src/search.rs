@@ -403,8 +403,7 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
 /// placements remain — the game ends as soon as the 6th stone is placed.
 /// A 4-window (2 empties) is a win only if we have at least 2 placements.
 fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
-    let counts = game.eval().counts(player);
-    if counts.fours() == 0 && counts.fives() == 0 {
+    if !game.eval().has_threats(player) {
         return None;
     }
     let remaining = game.placements_remaining() as usize;
@@ -450,18 +449,8 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
 
 /// Generate root turns with colony candidate and optional noise.
 ///
-/// # Strategy
-/// 1. **Opening** — on the very first move, play a single stone at origin.
-/// 2. **Instant win** — if we have a 5- or 4-window, return only the win.
-/// 3. **Candidate scoring** — score all `candidates_near2()` cells, cap at
-///    `ROOT_CANDIDATE_CAP`.
-/// 4. **Colony candidate** — add a distant cell to encourage multi-front
-///    play.  Chosen deterministically from the centroid + max_radius + 3
-///    in a hex direction derived from the noise seed.
-/// 5. **Pair generation** — for 2-placement turns, generate pairs from the
-///    capped candidate list with the pair-sum constraint.
-/// 6. **Threat filter** — compute `threat_status` once and retain only
-///    turns that block opponent threats (or satisfy `Unblockable`).
+/// Opening moves, instant wins, candidate scoring, colony injection,
+/// pair generation, and threat filtering are applied in sequence.
 fn generate_root_turns(
     game: &HexGameState,
     history: &FxHashMap<Hex, i32>,
@@ -519,11 +508,9 @@ fn generate_root_turns(
                 .stones()
                 .keys()
                 .any(|&h| hex_distance(h, colony) <= crate::core::PLACEMENT_RADIUS)
-        {
-            if !cands.contains(&colony) {
+            && !cands.contains(&colony) {
                 cands.push(colony);
             }
-        }
     }
 
     // Handle single-placement turns.
@@ -582,7 +569,7 @@ fn generate_inner_turns(
 /// Candidates are already sorted by `score_candidate`, so pairs inherit
 /// good ordering.  This function simply moves the two most trusted moves
 /// to indices 0 and 1 without changing the relative order of the rest.
-fn promote_best_turns(turns: &mut Vec<Turn>, tt_best: Option<Turn>, killer: Option<Turn>) {
+fn promote_best_turns(turns: &mut [Turn], tt_best: Option<Turn>, killer: Option<Turn>) {
     let mut start = 0;
     if let Some(tt_t) = tt_best {
         if let Some(pos) = turns.iter().position(|t| *t == tt_t) {
@@ -656,7 +643,7 @@ fn quiesce(
         return Ok(0);
     }
     ss.nodes += 1;
-    if ss.nodes % 1024 == 0 && ss.timed_out() {
+    if ss.nodes.is_multiple_of(1024) && ss.timed_out() {
         ss.aborted = true;
         return Ok(0);
     }
@@ -687,13 +674,7 @@ fn quiesce(
     }
 
     // Only extend when threats exist on either side.
-    let counts_p = game.eval().counts(player);
-    let counts_o = game.eval().counts(1 - player);
-    if counts_p.fives() == 0
-        && counts_o.fives() == 0
-        && counts_p.fours() == 0
-        && counts_o.fours() == 0
-    {
+    if !game.eval().has_any_threats() {
         return Ok(alpha);
     }
 
@@ -725,7 +706,8 @@ fn quiesce(
         return Ok(-(WIN_SCORE - ply as i32 - 1));
     }
 
-    let turns = generate_threat_turns(game);
+    let mut turns = Vec::new();
+    generate_threat_turns(game, &mut turns);
     if turns.is_empty() {
         return Ok(alpha);
     }
@@ -783,7 +765,7 @@ fn alphabeta(
     if ss.aborted {
         return Ok(0);
     }
-    if ss.nodes % 1024 == 0 && ss.timed_out() {
+    if ss.nodes.is_multiple_of(1024) && ss.timed_out() {
         ss.aborted = true;
         return Ok(0);
     }
@@ -802,7 +784,7 @@ fn alphabeta(
 
     // Leaf: drop into quiescence search.
     if depth <= 0 {
-        return Ok(quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply)?);
+        return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply);
     }
 
     // Instant win check: if we can win right now, return immediately.
@@ -984,6 +966,8 @@ fn alphabeta(
 // Root search with full move info
 // -------------------------------------------------------------------------
 
+type RootSearchResult = (Turn, i32, Vec<(Turn, i32)>);
+
 /// Search all root turns and return the best one, its score, and per-turn scores.
 ///
 /// Uses PVS at the root: the first move gets a full window, subsequent moves
@@ -995,7 +979,7 @@ fn search_root(
     root_turns: &[Turn],
     init_alpha: i32,
     init_beta: i32,
-) -> Result<(Turn, i32, Vec<(Turn, i32)>), GameError> {
+) -> Result<RootSearchResult, GameError> {
     let player = game.current_player();
     let mut alpha = init_alpha;
     let beta = init_beta;

@@ -278,15 +278,8 @@ const fn sign_extend_15(raw: u32) -> i32 {
 
 /// Compute the hex distance between two axial coordinates.
 ///
-/// Hex distance is the minimum number of steps required to move from `a` to
-/// `b` on the grid, where each step travels to any of the six neighbours.
-///
-/// # Cube-distance formula
-///
-/// In cube coordinates `(x, y, z)` with `x + y + z = 0`, distance is simply
-/// `max(|dx|, |dy|, |dz|)`.  When working in axial `(q, r)` we recover the
-/// implicit third cube component as `s = -q - r`.  Substituting and
-/// simplifying yields the equivalent axial form:
+/// Returns the minimum number of steps required to move from `a` to `b`,
+/// using the axial form of the cube-distance formula:
 ///
 /// ```text
 /// distance = (|dq| + |dr| + |dq + dr|) / 2
@@ -303,22 +296,9 @@ const fn sign_extend_15(raw: u32) -> i32 {
 /// ```
 #[inline(always)]
 pub fn hex_distance(a: Hex, b: Hex) -> i32 {
-    // 1. Compute the delta in axial space.
-    let dq = a.q - b.q; // difference along the q (column) axis
-    let dr = a.r - b.r; // difference along the r (row) axis
-
-    // 2. Recover the implicit third cube component.
-    //    In cube coordinates (x, y, z) we have x = q, z = r, and y = -q - r.
-    //    The delta in y is therefore dy = -(dq) - (dr) = -(dq + dr).
-    //    Because we only need the absolute value, |dy| == |dq + dr|.
-    let ds = dq + dr; // this is the negative of the third cube delta
-
-    // 3. Apply the cube-distance formula adapted for axial coordinates.
-    //    In cube form distance = max(|dx|, |dy|, |dz|).
-    //    An equivalent expression that avoids the branch inside max() is:
-    //    (|dx| + |dy| + |dz|) / 2.
-    //    Substituting dx = dq, dz = dr, dy = -ds gives:
-    //    (|dq| + |dr| + |ds|) / 2.
+    let dq = a.q - b.q;
+    let dr = a.r - b.r;
+    let ds = dq + dr;
     (dq.abs() + dr.abs() + ds.abs()) / 2
 }
 

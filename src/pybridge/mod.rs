@@ -34,14 +34,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1};
+use numpy::{ndarray, PyArray3};
 
 use crate::core::Hex;
 use crate::threats::{threat_status, ThreatStatus};
 use crate::encoder;
 use crate::board::{GameError, HexGameState};
-use crate::mcts::MCTSEngine;
 use crate::search;
+
+pub mod mcts;
+use mcts::PyMCTSEngine;
 
 use std::cell::Cell;
 use std::time::{Duration, SystemTime};
@@ -335,28 +337,28 @@ impl PyHexGame {
     /// * **Winning turn** — only the 1 or 2 cells that complete a 6-line.
     /// * **Must-block** — only the cells that block the opponent's immediate win.
     fn threat_constrained_moves(&self, radius: i32) -> Option<Vec<(i32, i32)>> {
-        let legal = self.inner.legal_moves_near(radius);
-        let result: Vec<(i32, i32)> = match threat_status(&self.inner) {
-            ThreatStatus::Quiet | ThreatStatus::Unblockable => Vec::new(),
+        match threat_status(&self.inner) {
+            ThreatStatus::Quiet | ThreatStatus::Unblockable => None,
             ThreatStatus::WinningTurn(t) => {
                 let first = t.first();
                 let second = t.second();
-                legal.into_iter()
+                let legal = self.inner.legal_moves_near(radius);
+                let result: Vec<(i32, i32)> = legal
+                    .into_iter()
                     .filter(|h| *h == first || second == Some(*h))
                     .map(|h| (h.q, h.r))
-                    .collect()
+                    .collect();
+                if result.is_empty() { None } else { Some(result) }
             }
             ThreatStatus::MustBlock(b) => {
-                legal.into_iter()
+                let legal = self.inner.legal_moves_near(radius);
+                let result: Vec<(i32, i32)> = legal
+                    .into_iter()
                     .filter(|h| b.cells().contains(h))
                     .map(|h| (h.q, h.r))
-                    .collect()
+                    .collect();
+                if result.is_empty() { None } else { Some(result) }
             }
-        };
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
         }
     }
 
@@ -627,273 +629,7 @@ impl PyHexGame {
 ///     engine.expand_and_backprop(policies, values)
 ///
 /// # 4. Extract results
-/// moves_q, moves_r, visits, root_value = engine.get_results()
-/// ```
-#[pyclass(name = "MCTSEngine")]
-struct PyMCTSEngine {
-    inner: MCTSEngine,
-}
 
-#[pymethods]
-impl PyMCTSEngine {
-    /// Create a new MCTS engine rooted at the given game state.
-    ///
-    /// Parameters:
-    /// * `game` — starting board position (`HexGame`).
-    /// * `num_simulations` — total MCTS rollouts to perform.
-    /// * `c_puct` — base exploration constant (default `1.4`).
-    /// * `near_radius` — legal-move generation radius (default `8`).
-    /// * `c_puct_init` — dynamic `c_puct` scaling constant (default `19652.0`).
-    /// * `constrain_threats` — enable threat-based move filtering at the root
-    ///   (default `True`).
-    /// * `arena_sim_hint` — optional arena pre-allocation hint (defaults to
-    ///   `num_simulations`). Larger values reduce reallocation during search.
-    #[new]
-    #[pyo3(signature = (game, num_simulations, c_puct=1.4, near_radius=8, c_puct_init=19652.0, constrain_threats=true, arena_sim_hint=None))]
-    fn new(
-        game: &PyHexGame,
-        num_simulations: u32,
-        c_puct: f32,
-        near_radius: i32,
-        c_puct_init: f32,
-        constrain_threats: bool,
-        arena_sim_hint: Option<u32>,
-    ) -> Self {
-        let hint = arena_sim_hint.unwrap_or(num_simulations);
-        let mut engine = MCTSEngine::with_arena_sim_hint(
-            game.inner.clone(),
-            num_simulations,
-            hint,
-            c_puct,
-            near_radius,
-            constrain_threats,
-        );
-        engine.c_puct_init = c_puct_init;
-        Self { inner: engine }
-    }
-
-    /// Initialise the root node: encode the board and return a numpy tensor for GPU evaluation.
-    ///
-    /// Returns `Some((tensor, offset_q, offset_r, legal_moves_bytes))` or `None`
-    /// if the game is already over.
-    ///
-    /// * `tensor` — `numpy.ndarray` of shape `(13, 33, 33)` and dtype `float32`.
-    /// * `legal_moves_bytes` — packed `i32` pairs `(q, r)` for root legal moves.
-    ///   Decode with `np.frombuffer(data, dtype=np.int32).reshape(-1, 2)`.
-    fn init_root<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<Option<(Bound<'py, PyArray3<f32>>, i32, i32, Bound<'py, PyBytes>)>> {
-        let Some((tensor, oq, or_, legal)) = self.inner.init_root() else {
-            return Ok(None);
-        };
-        let arr = ndarray::Array3::from_shape_vec(
-            (NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize),
-            tensor,
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        let arr = PyArray3::from_owned_array(py, arr);
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
-        for h in &legal {
-            legal_buf.extend_from_slice(&h.q.to_le_bytes());
-            legal_buf.extend_from_slice(&h.r.to_le_bytes());
-        }
-        Ok(Some((arr, oq, or_, PyBytes::new(py, &legal_buf))))
-    }
-
-    /// Expand the root node with GPU-provided policy and value.
-    ///
-    /// * `policy` — 1-D `numpy.ndarray` of length `BOARD_AREA` (1089) containing
-    ///   the raw policy logits. Must be C-contiguous.
-    /// * `value` — scalar value estimate from the neural net.
-    /// * `offset_q`, `offset_r` — spatial offsets returned by `init_root`.
-    /// * `legal_bytes` — packed `i32` pairs `(q, r)` returned by `init_root`.
-    ///
-    /// Raises `ValueError` if `policy` is not a contiguous array.
-    fn expand_root<'py>(
-        &mut self,
-        policy: PyReadonlyArray1<'py, f32>,
-        value: f32,
-        offset_q: i32,
-        offset_r: i32,
-        legal_bytes: &[u8],
-    ) -> PyResult<()> {
-        let policy_slice = policy
-            .as_slice()
-            .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
-        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
-        let mut ints = legal_bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()));
-        while let (Some(q), Some(r)) = (ints.next(), ints.next()) {
-            legal.push(Hex::new(q, r));
-        }
-        self.inner
-            .expand_root(policy_slice, value, offset_q, offset_r, &legal);
-        Ok(())
-    }
-
-    /// Add Dirichlet noise to root prior probabilities.
-    ///
-    /// * `noise` — 1-D `numpy.ndarray` of the same length as root children.
-    ///   Must be C-contiguous.
-    /// * `noise_fraction` — blend factor (`0.0` = no noise, `1.0` = pure noise).
-    ///
-    /// Raises `ValueError` if `noise` is not a contiguous array.
-    #[pyo3(signature = (noise, noise_fraction))]
-    fn add_dirichlet_noise<'py>(
-        &mut self,
-        noise: PyReadonlyArray1<'py, f32>,
-        noise_fraction: f32,
-    ) -> PyResult<()> {
-        let noise_slice = noise
-            .as_slice()
-            .map_err(|_| PyErr::new::<PyValueError, _>("noise array must be contiguous"))?;
-        self.inner.add_dirichlet_noise(noise_slice, noise_fraction);
-        Ok(())
-    }
-
-    /// Whether the engine has performed the requested number of simulations.
-    fn done(&self) -> bool {
-        self.inner.done()
-    }
-
-    /// Select leaves for expansion and encode their boards.
-    ///
-    /// Returns `(tensor, non_terminal_count)` where `tensor` is a
-    /// `numpy.ndarray` of shape `(non_terminal_count, 13, 33, 33)`.
-    /// Only non-terminal leaves are returned (terminal leaves are back-propagated
-    /// immediately without GPU evaluation).
-    fn select_leaves<'py>(
-        &mut self,
-        py: Python<'py>,
-        batch_size: u32,
-    ) -> PyResult<(Bound<'py, PyArray4<f32>>, u32)> {
-        let (tensors, count) = self.inner.select_leaves(batch_size);
-        let tensor_vec = tensors.to_vec();
-        let arr = ndarray::Array4::from_shape_vec(
-            (
-                count as usize,
-                NUM_CHANNELS,
-                BOARD_SIZE as usize,
-                BOARD_SIZE as usize,
-            ),
-            tensor_vec,
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        let arr = PyArray4::from_owned_array(py, arr);
-        Ok((arr, count))
-    }
-
-    /// Expand selected leaves and back-propagate the results.
-    ///
-    /// * `policies` — 1-D `numpy.ndarray` of length `N * BOARD_AREA` containing
-    ///   the flat policy logits for each leaf. Must be C-contiguous.
-    /// * `values` — 1-D `numpy.ndarray` of length `N` containing value estimates.
-    ///   Must be C-contiguous.
-    ///
-    /// `N` is the `non_terminal_count` returned by the previous `select_leaves` call.
-    ///
-    /// Raises `ValueError` if either array is not contiguous.
-    fn expand_and_backprop<'py>(
-        &mut self,
-        policies: PyReadonlyArray1<'py, f32>,
-        values: PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<()> {
-        let policies_slice = policies
-            .as_slice()
-            .map_err(|_| PyErr::new::<PyValueError, _>("policies array must be contiguous"))?;
-        let values_slice = values
-            .as_slice()
-            .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
-        self.inner.expand_and_backprop(policies_slice, values_slice);
-        Ok(())
-    }
-
-    /// Get final search results: `(moves_q, moves_r, visits, root_value)`.
-    ///
-    /// The four returned vectors are parallel and contain one entry per root
-    /// child. `root_value` is the value estimate of the root node from the
-    /// root player's perspective.
-    fn get_results(&self) -> (Vec<i32>, Vec<i32>, Vec<u32>, f32) {
-        self.inner.get_results()
-    }
-
-    /// Number of root children (useful for sizing Dirichlet noise arrays).
-    fn root_child_count(&self) -> u16 {
-        self.inner.root_child_count()
-    }
-
-    /// Prior probabilities of root children (for shaped Dirichlet noise).
-    fn root_child_priors(&self) -> Vec<f32> {
-        self.inner.root_child_priors()
-    }
-
-    /// Q-values of root children from the root player's perspective.
-    fn root_child_q_values(&self) -> Vec<f32> {
-        self.inner.root_child_q_values()
-    }
-
-    /// Extract encoded board states and move histories for tree nodes.
-    ///
-    /// Returns `(tensor, histories, count)` where:
-    /// * `tensor` — `numpy.ndarray` of shape `(count, 13, 33, 33)`.
-    /// * `histories` — parallel vector of move histories as `(player, q, r)` tuples.
-    /// * `count` — number of valid candidates extracted.
-    ///
-    /// Only nodes with at least `min_visits` are included.
-    #[pyo3(signature = (min_visits=1))]
-    fn extract_tree_node_states<'py>(
-        &mut self,
-        py: Python<'py>,
-        min_visits: u32,
-    ) -> PyResult<(Bound<'py, PyArray4<f32>>, Vec<Vec<(i32, i32, i32)>>, usize)> {
-        let (packed, histories, count) = self.inner.extract_tree_node_states(min_visits)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        let arr = ndarray::Array4::from_shape_vec(
-            (
-                count,
-                NUM_CHANNELS,
-                BOARD_SIZE as usize,
-                BOARD_SIZE as usize,
-            ),
-            packed,
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        let arr = PyArray4::from_owned_array(py, arr);
-        let py_histories: Vec<Vec<(i32, i32, i32)>> = histories
-            .into_iter()
-            .map(|history| {
-                history
-                    .into_iter()
-                    .map(|(player, q, r)| (player as i32, q as i32, r as i32))
-                    .collect()
-            })
-            .collect();
-        Ok((arr, py_histories, count))
-    }
-
-    /// Re-root the tree at the child matching action `(q, r)` for subtree reuse.
-    ///
-    /// After placement 1 is selected, call this to advance the tree so that
-    /// placement 2's MCTS starts from the surviving subtree. The arena is not
-    /// compacted — dead sibling subtrees remain in memory until the next
-    /// full reset.
-    ///
-    /// The pipeline must be fully flushed before calling (no pending leaves).
-    /// After re-rooting, call `init_root` + `expand_root` if the new root is
-    /// not yet expanded (`root_child_count() == 0`), or proceed straight to
-    /// `add_dirichlet_noise` + the search loop if it is.
-    #[pyo3(signature = (q, r, new_num_simulations))]
-    fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> PyResult<()> {
-        let q = i16::try_from(q)
-            .map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
-        let r = i16::try_from(r)
-            .map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
-        self.inner.re_root(q, r, new_num_simulations);
-        Ok(())
-    }
-}
 
 // -------------------------------------------------------------------------
 // Bulk classical self-play (for bootstrap training data)

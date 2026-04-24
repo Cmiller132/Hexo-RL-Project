@@ -9,8 +9,8 @@ mod tests {
     fn empty_board_features() {
         let game = HexGameState::new();
         let feats = extract_features(&game);
-        for i in 0..FEATURE_COUNT - 1 {
-            assert_eq!(feats[i], 0.0, "feature {} should be zero on empty board", i);
+        for (i, &feat) in feats.iter().enumerate().take(FEATURE_COUNT - 1) {
+            assert_eq!(feat, 0.0, "feature {} should be zero on empty board", i);
         }
         assert_eq!(feats[FEATURE_COUNT - 1], 1.0);
     }

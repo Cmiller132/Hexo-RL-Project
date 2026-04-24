@@ -1,10 +1,10 @@
 //! Classical pattern-based feature extraction for Infinity Hexagonal Tic-Tac-Toe.
 //!
-//! This module provides two complementary evaluation mechanisms:
+//! This module provides one complementary evaluation mechanism:
 //!
-//! 1. **Incremental evaluation** ([`EvalState`]) — used during search.
-//!    Updates only the windows touched by a newly placed stone, making
-//!    `place` and `unplace` `O(1)`.
+//! * **Incremental evaluation** ([`EvalState`]) — used during search.
+//!   Updates only the windows touched by a newly placed stone, making
+//!   `place` and `unplace` `O(1)`.
 //!
 //! # Sub-modules
 //!

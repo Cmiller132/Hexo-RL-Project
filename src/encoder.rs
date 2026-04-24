@@ -172,7 +172,7 @@ pub fn encode_board_into(
     for (&h, &player) in board.iter() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             if player == current {
                 out[idx(0, gi, gj)] = 1.0;
             } else {
@@ -187,7 +187,7 @@ pub fn encode_board_into(
     for (ply_idx, rec) in game.move_history().iter().enumerate() {
         let gi = rec.cell.q - offset_q;
         let gj = rec.cell.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             let plies_ago = mc - ply_idx as u32;
             let recency = 1.0 / (1.0 + plies_ago as f32);
             let ch = if rec.player == current { 7 } else { 8 };
@@ -227,7 +227,7 @@ pub fn encode_board_into(
     for h in &legal {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             out[idx(3, gi, gj)] = 1.0;
         }
     }
@@ -246,7 +246,7 @@ pub fn encode_board_into(
         if let Some(last) = game.move_history().last() {
             let gi = last.cell.q - offset_q;
             let gj = last.cell.r - offset_r;
-            if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+            if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
                 out[idx(5, gi, gj)] = 1.0;
             }
         }
@@ -280,7 +280,7 @@ pub fn encode_board_into(
     for h in game.opponent_last_turn_cells() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             out[idx(12, gi, gj)] = 1.0;
         }
     }
@@ -302,7 +302,7 @@ pub fn encode_board_into(
     for h in &hot_buf {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             out[idx(10, gi, gj)] = 1.0;
         }
     }
@@ -313,7 +313,7 @@ pub fn encode_board_into(
     for h in &hot_buf {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
-        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+        if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             out[idx(9, gi, gj)] = 1.0;
         }
     }
@@ -433,10 +433,7 @@ pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
             let run_len = 1 + fwd; // include `cell` itself
 
             // Determine whether the cell just before `cell` is open.
-            let bwd_open = match game.stones().get(&prev) {
-                None => true,
-                Some(_) => false,
-            };
+            let bwd_open = game.stones().get(&prev).is_none();
 
             let open_ends = (bwd_open as i32) + (fwd_open as i32);
 
@@ -459,11 +456,10 @@ pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
                 if open_ends == 2 {
                     counts[p][LIVE3] += 1;
                 }
-            } else if run_len == 2 {
-                if open_ends == 2 {
+            } else if run_len == 2
+                && open_ends == 2 {
                     counts[p][LIVE2] += 1;
                 }
-            }
         }
     }
 

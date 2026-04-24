@@ -83,7 +83,7 @@ impl std::ops::Neg for ThreatCountsDelta {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EvalDelta {
     cell: Hex,
-    player: u8,
+    cell_val: u8,
     score: i32,
     counts: [ThreatCountsDelta; 2],
 }
@@ -109,26 +109,6 @@ pub(crate) struct EvalDelta {
 /// * `delta_stack` — stack of [`EvalDelta`]s supporting `unplace`.  One entry
 ///   per stone placed.
 ///
-/// # Incremental update strategy
-///
-/// When a stone is placed at `(q, r)` for `player`:
-/// 1. Determine the stone's ternary digit: `cell_val = player + 1` (1 for P0,
-///    2 for P1).
-/// 2. For each of the 3 principal directions:
-///    a. Walk backwards up to 5 steps to find every window origin that
-///       includes this stone.
-///    b. If the origin is inside the finite win grid, compute the new pattern
-///       index: `new_idx = old_idx + cell_val * POW3[offset]`.
-///    c. Look up the old and new stone counts via [`PATTERN_COUNTS`].
-///    d. Update `score` with the difference in [`PATTERN_VALUES`].
-///    e. Update `ThreatCounts` via `classify_delta`.
-///    f. Update `HotWindows` via `update_hot`.
-///    g. Write `new_idx` back into `indices`.
-/// 3. Push the aggregated delta onto `delta_stack`.
-///
-/// `unplace` performs the exact inverse: it pops the delta, subtracts the
-/// score, applies the negated counts, and walks the same 18 windows in
-/// reverse, restoring the old pattern indices and hot-window state.
 #[derive(Clone, Debug)]
 pub struct EvalState {
     score: i32,
@@ -193,8 +173,7 @@ fn update_hot(hot: &mut HotWindows, key: WindowKey, player: u8, old_own: u8, old
 /// in `place`, `unplace`, and `hypothetical_score_delta`.
 #[inline]
 fn visit_windows(cell: Hex, mut cb: impl FnMut(i32, i32, usize)) {
-    for dir in 0..3 {
-        let (dq, dr) = HEX_DIRECTIONS[dir];
+    for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
         for off in 0..WIN_LENGTH as usize {
             let sq = cell.q - dq * off as i32;
             let sr = cell.r - dr * off as i32;
@@ -229,33 +208,19 @@ impl EvalState {
     /// # Arguments
     /// * `cell`    — the coordinate where the stone is placed.
     /// * `player`  — `0` or `1`.
-    ///
-    /// # Algorithm
-    /// 1. `cell_val = player + 1` → the ternary digit contributed by this
-    ///    stone (`1` for P0, `2` for P1).
-    /// 2. For each of the 18 windows that include `cell`:
-    ///    a. Skip origins outside the finite win grid.
-    ///    b. Read the old pattern index, compute the new index by adding
-    ///       `cell_val * POW3[offset]`.
-    ///    c. Accumulate the score delta and threat-category changes.
-    ///    d. Synchronize the hot-window cache.
-    ///    e. Write the new pattern index back into `indices`.
-    /// 3. Apply the aggregated deltas to `self.score` and `self.counts`.
-    /// 4. Push the delta onto `delta_stack` for a future `unplace`.
     pub fn place(&mut self, cell: Hex, player: u8) {
-        let cell_val = (player + 1) as usize; // 1 or 2
+        let cell_val = player + 1; // 1 or 2
         let mut delta = EvalDelta {
             cell,
-            player,
+            cell_val,
             score: 0,
             counts: [ThreatCountsDelta::default(); 2],
         };
 
         visit_windows(cell, |sq, sr, dir_idx| {
-            // WIN_GRID_RADIUS (30) caps evaluation at ~3–4 moves from origin per axis.
-            // For stones near the grid boundary, some of the 18 windows extend outside
-            // the grid; those windows simply don't contribute to evaluation. This is a
-            // known approximation, not a bug.
+            // After ~4 moves along a single axis, window origins can exceed radius 30.
+            // Those windows are skipped; they do not contribute to evaluation.
+            // See `eval/grid.rs` for the geometric justification.
             if !win_grid_in_bounds(sq, sr) {
                 return;
             }
@@ -264,7 +229,7 @@ impl EvalState {
             let off = dir_idx % (WIN_LENGTH as usize);
             let gi = win_grid_idx(sq, sr, dir as u8);
             let old_idx = self.indices[gi] as usize;
-            let new_idx = old_idx + cell_val * POW3[off];
+            let new_idx = old_idx + (cell_val as usize) * POW3[off];
             debug_assert!(new_idx < 729);
 
             delta.score += PATTERN_VALUES[new_idx] - PATTERN_VALUES[old_idx];
@@ -294,15 +259,6 @@ impl EvalState {
     ///
     /// Panics if `unplace` is called when no stone has been placed (i.e. the
     /// delta stack is empty).
-    ///
-    /// # Algorithm
-    /// `unplace` is the exact inverse of `place`:
-    /// 1. Pop the delta recorded by the matching `place` call.
-    /// 2. Subtract `delta.score` from `self.score`.
-    /// 3. Apply the negated threat-count deltas.
-    /// 4. Walk the same 18 windows, compute the old index by subtraction,
-    ///    reverse the hot-window transitions, and write the old index back.
-    /// 5. In debug builds, run `assert_invariants` to verify consistency.
     pub fn unplace(&mut self) {
         let delta = self.delta_stack.pop().expect("unplace called with empty stack");
 
@@ -311,8 +267,7 @@ impl EvalState {
         self.counts[1].apply(&(-delta.counts[1]));
 
         let cell = delta.cell;
-        let player = delta.player;
-        let cell_val = (player + 1) as usize;
+        let cell_val = delta.cell_val as usize;
 
         visit_windows(cell, |sq, sr, dir_idx| {
             if !win_grid_in_bounds(sq, sr) {
@@ -336,6 +291,7 @@ impl EvalState {
             self.indices[gi] = old_idx as u16;
         });
 
+        #[cfg(debug_assertions)]
         self.assert_invariants();
     }
 
@@ -344,45 +300,43 @@ impl EvalState {
     /// Recomputes the hot-window sets from scratch by scanning the entire
     /// win grid and comparing with the incremental cache.  Expensive, but
     /// invaluable for catching incremental-update bugs.
+    #[cfg(debug_assertions)]
     fn assert_invariants(&self) {
-        #[cfg(debug_assertions)]
-        {
-            use crate::eval::grid::WIN_GRID_RADIUS;
+        use crate::eval::grid::WIN_GRID_RADIUS;
 
-            let mut expected = [
-                std::collections::HashSet::new(),
-                std::collections::HashSet::new(),
-            ];
-            for q in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
-                for r in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
-                    for dir in 0..3u8 {
-                        let gi = win_grid_idx(q, r, dir);
-                        let idx = self.indices[gi] as usize;
-                        let (p0, p1) = PATTERN_COUNTS[idx];
-                        if p0 >= 4 && p1 == 0 {
-                            expected[0].insert(WindowKey::new(q, r, dir));
-                        }
-                        if p1 >= 4 && p0 == 0 {
-                            expected[1].insert(WindowKey::new(q, r, dir));
-                        }
+        let mut expected = [
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        ];
+        for q in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
+            for r in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
+                for dir in 0..3u8 {
+                    let gi = win_grid_idx(q, r, dir);
+                    let idx = self.indices[gi] as usize;
+                    let (p0, p1) = PATTERN_COUNTS[idx];
+                    if p0 >= 4 && p1 == 0 {
+                        expected[0].insert(WindowKey::new(q, r, dir));
+                    }
+                    if p1 >= 4 && p0 == 0 {
+                        expected[1].insert(WindowKey::new(q, r, dir));
                     }
                 }
             }
+        }
 
-            // Compare recomputed with actual (order-independent because swap_remove
-            // may reorder the internal SmallVec).
-            for player in 0..2 {
-                let actual: std::collections::HashSet<_> = self.hot.iter(player).collect();
-                assert_eq!(
-                    actual.len(),
-                    expected[player as usize].len(),
-                    "hot window count mismatch for player {}", player
-                );
-                assert_eq!(
-                    actual, expected[player as usize],
-                    "hot window mismatch for player {}", player
-                );
-            }
+        // Compare recomputed with actual (order-independent because swap_remove
+        // may reorder the internal SmallVec).
+        for player in 0..2 {
+            let actual: std::collections::HashSet<_> = self.hot.iter(player).collect();
+            assert_eq!(
+                actual.len(),
+                expected[player as usize].len(),
+                "hot window count mismatch for player {}", player
+            );
+            assert_eq!(
+                actual, expected[player as usize],
+                "hot window mismatch for player {}", player
+            );
         }
     }
 
