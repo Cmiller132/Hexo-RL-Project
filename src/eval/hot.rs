@@ -18,7 +18,7 @@
 //! incrementally maintaining a small set of hot windows inside
 //! [`EvalState`](crate::eval::state::EvalState), the query becomes `O(1)`
 //! (just check whether the set is empty) and iteration is `O(k)` where `k` is
-//! the number of hot windows (typically < 20 in normal play).
+//! the number of hot windows (typically 0–10 in normal play, rarely above 20).
 //!
 //! # Zero-allocation design
 //!
@@ -55,22 +55,20 @@ impl HotWindows {
         }
     }
 
-    /// Insert `k` into the hot set for `player` if it is not already present.
+    /// Insert `k` into the hot set for `player`.
     ///
     /// # Arguments
     /// * `player` — `0` or `1`.
     /// * `k`      — the window key to mark as hot.
     ///
     /// # Complexity
-    /// `O(n)` in the number of hot windows for `player` because of the
-    /// `contains` guard.  Since `n` is tiny (≈ 0–10) this is cheaper than
-    /// using a hash table.
+    /// Amortised `O(1)` push onto the inline `SmallVec`.  Duplicate insertion
+    /// is a logic bug (caught by `debug_assert!` in debug builds).
     #[inline]
     pub fn insert(&mut self, player: u8, k: WindowKey) {
         let vec = &mut self.by_player[player as usize];
-        if !vec.contains(&k) {
-            vec.push(k);
-        }
+        debug_assert!(!vec.contains(&k), "duplicate hot-window insertion");
+        vec.push(k);
     }
 
     /// Remove `k` from the hot set for `player`, if present.
@@ -123,54 +121,4 @@ impl Default for HotWindows {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    fn k(q: i32, r: i32, dir: u8) -> WindowKey {
-        WindowKey::new(q, r, dir)
-    }
-
-    #[test]
-    fn new_is_empty() {
-        let hw = HotWindows::new();
-        assert!(hw.is_empty(0));
-        assert!(hw.is_empty(1));
-    }
-
-    #[test]
-    fn insert_and_len() {
-        let mut hw = HotWindows::new();
-        hw.insert(0, k(0, 0, 0));
-        assert_eq!(hw.len(0), 1);
-        assert_eq!(hw.len(1), 0);
-    }
-
-    #[test]
-    fn duplicate_insert_is_idempotent() {
-        let mut hw = HotWindows::new();
-        let key = k(1, 2, 0);
-        hw.insert(0, key);
-        hw.insert(0, key);
-        assert_eq!(hw.len(0), 1);
-    }
-
-    #[test]
-    fn remove_existing() {
-        let mut hw = HotWindows::new();
-        hw.insert(0, k(0, 0, 0));
-        hw.insert(0, k(1, 0, 0));
-        hw.remove(0, k(0, 0, 0));
-        assert_eq!(hw.len(0), 1);
-    }
-
-    #[test]
-    fn clear_resets_everything() {
-        let mut hw = HotWindows::new();
-        hw.insert(0, k(0, 0, 0));
-        hw.insert(1, k(1, 1, 1));
-        hw.clear();
-        assert!(hw.is_empty(0));
-        assert!(hw.is_empty(1));
-    }
-}

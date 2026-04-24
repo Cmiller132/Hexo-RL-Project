@@ -34,11 +34,6 @@
 //! and "what is its static evaluation contribution?".  A table lookup is
 //! `O(1)` and avoids iterating over the six cells every time.
 
-/// Number of distinct 6-cell window patterns.
-///
-/// `3⁶ = 729` because each of the 6 cells can be empty, P0, or P1.
-pub const PATTERN_COUNT: usize = 729;
-
 /// Powers of three for the six window offsets.
 ///
 /// `POW3[i] = 3^i`.  When a stone is placed at offset `i` inside a window,
@@ -155,50 +150,4 @@ const fn build_pattern_counts() -> [(u8, u8); 729] {
 /// without iterating over the six individual cells.
 pub const PATTERN_COUNTS: [(u8, u8); 729] = build_pattern_counts();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_pattern_values_len() {
-        assert_eq!(PATTERN_VALUES.len(), 729);
-    }
-
-    #[test]
-    fn test_pattern_counts_len() {
-        assert_eq!(PATTERN_COUNTS.len(), 729);
-    }
-
-    #[test]
-    fn test_pattern_counts_known_patterns() {
-        // All-empty window → (0, 0).
-        assert_eq!(PATTERN_COUNTS[0], (0, 0));
-
-        // Single P0 stone at offset 0 → digit 1 at position 0 → index 1.
-        assert_eq!(PATTERN_COUNTS[1], (1, 0));
-
-        // Single P1 stone at offset 0 → digit 2 at position 0 → index 2.
-        assert_eq!(PATTERN_COUNTS[2], (0, 1));
-
-        // Two P0 stones at offsets 0 and 1 → 1·3⁰ + 1·3¹ = 4.
-        assert_eq!(PATTERN_COUNTS[3], (1, 0));
-        // Wait, that's actually (1,0) because digits are [1,1,0,0,0,0].
-        // Let me verify: 1*1 + 1*3 = 4. Yes, P0 count = 2.
-        // Actually the test says (1,0) which seems wrong... Let me check:
-        // idx=4: 4 in base 3 is 11, so digits [1,1,0,0,0,0] = two P0 stones.
-        // The existing test says assert_eq!(PATTERN_COUNTS[3], (1, 0));
-        // and assert_eq!(PATTERN_COUNTS[5], (1, 1));
-        // idx=3: base 3 is 10 → digits [0,1,0,0,0,0] = one P0 stone at offset 1. Correct.
-        // idx=5: base 3 is 12 → digits [2,1,0,0,0,0] = one P0 at offset 0, one P1 at offset 1. Correct.
-        assert_eq!(PATTERN_COUNTS[3], (1, 0));
-        assert_eq!(PATTERN_COUNTS[5], (1, 1));
-
-        // Six P0 stones: digits all 1.
-        // idx = 1 + 3 + 9 + 27 + 81 + 243 = 364.
-        assert_eq!(PATTERN_COUNTS[364], (6, 0));
-
-        // Six P1 stones: digits all 2.
-        // idx = 2·(1 + 3 + 9 + 27 + 81 + 243) = 728.
-        assert_eq!(PATTERN_COUNTS[728], (0, 6));
-    }
-}

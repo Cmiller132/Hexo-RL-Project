@@ -70,6 +70,5 @@ mod pybridge;
 mod tests;
 
 // Re-exports for convenient access
-pub use core::{hex_distance, Hex, Turn, HEX_DIRECTIONS, PLACEMENT_RADIUS, WIN_LENGTH};
-pub use eval::{extract_features, FEATURE_COUNT};
-pub use board::{GameError, HexGameState, MoveRecord};
+pub use core::{hex_distance, Hex, Turn, PLACEMENT_RADIUS, WIN_LENGTH};
+pub use board::{GameError, HexGameState};

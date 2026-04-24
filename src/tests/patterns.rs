@@ -116,7 +116,7 @@ mod tests {
         ];
 
         for &(cell, player) in &placements {
-            eval.place(&stones, cell, player);
+            eval.place(cell, player);
             stones.insert(cell, player);
             let recomputed = recompute_score(&stones);
             assert_eq!(
@@ -143,7 +143,7 @@ mod tests {
         ];
 
         for &(cell, player) in &placements {
-            eval.place(&stones, cell, player);
+            eval.place(cell, player);
             stones.insert(cell, player);
         }
 
@@ -176,7 +176,7 @@ mod tests {
         ];
 
         for &(cell, player) in &placements {
-            eval.place(&stones, cell, player);
+            eval.place(cell, player);
             stones.insert(cell, player);
         }
 
@@ -222,5 +222,61 @@ mod tests {
                 player
             );
         }
+    }
+
+    // -- Pattern table integrity (moved from eval/patterns.rs) ------------
+
+    #[test]
+    fn test_pattern_values_len() {
+        assert_eq!(PATTERN_VALUES.len(), 729);
+    }
+
+    #[test]
+    fn test_pattern_counts_len() {
+        assert_eq!(PATTERN_COUNTS.len(), 729);
+    }
+
+    #[test]
+    fn test_pattern_counts_known_patterns() {
+        // All-empty window → (0, 0).
+        assert_eq!(PATTERN_COUNTS[0], (0, 0));
+
+        // Single P0 stone at offset 0 → digit 1 at position 0 → index 1.
+        assert_eq!(PATTERN_COUNTS[1], (1, 0));
+
+        // Single P1 stone at offset 0 → digit 2 at position 0 → index 2.
+        assert_eq!(PATTERN_COUNTS[2], (0, 1));
+
+        // idx=3: base-3 digits [0,1,0,0,0,0] → one P0 stone at offset 1.
+        assert_eq!(PATTERN_COUNTS[3], (1, 0));
+        // idx=5: base-3 digits [2,1,0,0,0,0] → one P0 at offset 0, one P1 at offset 1.
+        assert_eq!(PATTERN_COUNTS[5], (1, 1));
+
+        // Six P0 stones: digits all 1.
+        // idx = 1 + 3 + 9 + 27 + 81 + 243 = 364.
+        assert_eq!(PATTERN_COUNTS[364], (6, 0));
+
+        // Six P1 stones: digits all 2.
+        // idx = 2·(1 + 3 + 9 + 27 + 81 + 243) = 728.
+        assert_eq!(PATTERN_COUNTS[728], (0, 6));
+    }
+
+    /// Verify that `PATTERN_VALUES` has not been accidentally corrupted.
+    ///
+    /// Plan Invariant 1 requires the table to be bit-identical to the tuned
+    /// CMA-ES weights. This checksum catches silent corruption (editor
+    /// accidents, merge conflicts, etc.). If the weights are intentionally
+    /// retuned, update the expected digest.
+    #[test]
+    fn pattern_values_checksum() {
+        // FNV-1a 64-bit over the raw i32 values (stable across platforms).
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &v in PATTERN_VALUES.iter() {
+            hash ^= (v as u32) as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        // If this fails after an intentional retune, replace the literal.
+        assert_eq!(hash, 0x9f5d14a209044de4,
+            "PATTERN_VALUES checksum mismatch — table may be corrupted");
     }
 }

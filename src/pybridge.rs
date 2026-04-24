@@ -39,8 +39,7 @@ use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1};
 use crate::core::Hex;
 use crate::threats::{threat_status, ThreatStatus};
 use crate::encoder;
-use crate::eval;
-use crate::board::HexGameState;
+use crate::board::{GameError, HexGameState};
 use crate::mcts::MCTSEngine;
 use crate::search;
 
@@ -218,12 +217,10 @@ impl PyHexGame {
     /// cost — reads the incremental threat counters maintained by the evaluator.
     #[getter]
     fn threat_level(&self) -> u8 {
-        let me = self.inner.current_player() as usize;
+        let me = self.inner.current_player();
         let opp = 1 - me;
-        let own = (self.inner.eval().counts(me as u8).fives > 0
-                || self.inner.eval().counts(me as u8).fours > 0) as u8;
-        let opp_threat = (self.inner.eval().counts(opp as u8).fives > 0
-                       || self.inner.eval().counts(opp as u8).fours > 0) as u8;
+        let own = self.inner.eval().has_threats(me) as u8;
+        let opp_threat = self.inner.eval().has_threats(opp) as u8;
         own | (opp_threat << 1)
     }
 
@@ -231,7 +228,8 @@ impl PyHexGame {
     ///
     /// The very first turn (`move_count == 0`, player 0 to move) allows only
     /// one placement (the opening stone). All subsequent turns allow two.
-    fn placements_per_turn(&self, move_count: u32) -> u8 {
+    #[staticmethod]
+    fn placements_per_turn(move_count: u32) -> u8 {
         if move_count == 0 { 1 } else { 2 }
     }
 
@@ -251,19 +249,19 @@ impl PyHexGame {
     /// zero opponent stones. These are the tactical lines that matter for
     /// threat detection.
     fn window_fours(&self, player: u8) -> i32 {
-        self.inner.eval().counts(player).fours as i32
+        self.inner.eval().counts(player).fours() as i32
     }
 
     /// Number of hot windows containing 5+ stones for `player`.
     ///
     /// A 5-window is one empty cell away from an instant win.
     fn window_fives(&self, player: u8) -> i32 {
-        self.inner.eval().counts(player).fives as i32
+        self.inner.eval().counts(player).fives() as i32
     }
 
     /// Number of hot windows containing 3+ stones for `player`.
     fn window_threes(&self, player: u8) -> i32 {
-        self.inner.eval().counts(player).threes as i32
+        self.inner.eval().counts(player).threes() as i32
     }
 
     /// Return active threat windows for the given player.
@@ -338,23 +336,27 @@ impl PyHexGame {
     /// * **Must-block** — only the cells that block the opponent's immediate win.
     fn threat_constrained_moves(&self, radius: i32) -> Option<Vec<(i32, i32)>> {
         let legal = self.inner.legal_moves_near(radius);
-        let constrained: Vec<Hex> = match threat_status(&self.inner) {
+        let result: Vec<(i32, i32)> = match threat_status(&self.inner) {
             ThreatStatus::Quiet | ThreatStatus::Unblockable => Vec::new(),
             ThreatStatus::WinningTurn(t) => {
-                let mut allowed = vec![t.first()];
-                if let Some(s) = t.second() {
-                    allowed.push(s);
-                }
-                legal.into_iter().filter(|h| allowed.contains(h)).collect()
+                let first = t.first();
+                let second = t.second();
+                legal.into_iter()
+                    .filter(|h| *h == first || second == Some(*h))
+                    .map(|h| (h.q, h.r))
+                    .collect()
             }
             ThreatStatus::MustBlock(b) => {
-                legal.into_iter().filter(|h| b.cells.contains(h)).collect()
+                legal.into_iter()
+                    .filter(|h| b.cells().contains(h))
+                    .map(|h| (h.q, h.r))
+                    .collect()
             }
         };
-        if constrained.is_empty() {
+        if result.is_empty() {
             None
         } else {
-            Some(constrained.into_iter().map(|h| (h.q, h.r)).collect())
+            Some(result)
         }
     }
 
@@ -458,7 +460,7 @@ impl PyHexGame {
     /// This is a compact hand-crafted feature set used by the shallow
     /// evaluation function in classical alpha-beta search.
     fn extract_features(&self) -> Vec<f32> {
-        eval::extract_features(&self.inner).to_vec()
+        encoder::extract_features(&self.inner).to_vec()
     }
 
     /// Run iterative-deepening alpha-beta search and return the best single placement.
@@ -474,19 +476,24 @@ impl PyHexGame {
     #[pyo3(signature = (time_ms, max_depth, near_radius, noise_level=0.0))]
     fn classical_search(
         &self,
+        py: Python<'_>,
         time_ms: u64,
         max_depth: i32,
         near_radius: i32,
         noise_level: f32,
-    ) -> (i32, i32, i32, i32, u64) {
-        let result = search::iterative_deepening(
-            &self.inner,
-            Duration::from_millis(time_ms),
-            max_depth,
-            near_radius,
-            noise_level > 0.0,
-            noise_level,
-        );
+    ) -> PyResult<(i32, i32, i32, i32, u64)> {
+        let result = py
+            .allow_threads(|| {
+                search::iterative_deepening(
+                    &self.inner,
+                    Duration::from_millis(time_ms),
+                    max_depth,
+                    near_radius,
+                    noise_level > 0.0,
+                    noise_level,
+                )
+            })
+            .map_err(|e: GameError| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         let chosen = if noise_level > 0.0 {
             epsilon_topk_sample(result.best_move, &result.root_candidates, noise_level)
@@ -494,13 +501,13 @@ impl PyHexGame {
             result.best_move
         };
 
-        (
+        Ok((
             chosen.q,
             chosen.r,
             result.score,
             result.depth_reached,
             result.nodes,
-        )
+        ))
     }
 
     /// Run turn-based search and return the full turn (1 or 2 moves).
@@ -512,19 +519,24 @@ impl PyHexGame {
     #[pyo3(signature = (time_ms, max_depth, near_radius=2, noise_level=0.0))]
     fn classical_search_turn(
         &self,
+        py: Python<'_>,
         time_ms: u64,
         max_depth: i32,
         near_radius: i32,
         noise_level: f32,
-    ) -> (Vec<(i32, i32)>, i32, i32, u64) {
-        let result = search::iterative_deepening(
-            &self.inner,
-            Duration::from_millis(time_ms),
-            max_depth,
-            near_radius,
-            false,
-            noise_level,
-        );
+    ) -> PyResult<(Vec<(i32, i32)>, i32, i32, u64)> {
+        let result = py
+            .allow_threads(|| {
+                search::iterative_deepening(
+                    &self.inner,
+                    Duration::from_millis(time_ms),
+                    max_depth,
+                    near_radius,
+                    false,
+                    noise_level,
+                )
+            })
+            .map_err(|e: GameError| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         let turn = result.best_turn;
         let mut moves = vec![(turn.first().q, turn.first().r)];
@@ -532,7 +544,7 @@ impl PyHexGame {
             moves.push((m2.q, m2.r));
         }
 
-        (moves, result.score, result.depth_reached, result.nodes)
+        Ok((moves, result.score, result.depth_reached, result.nodes))
     }
 
     /// Deep copy of this game state.
@@ -709,16 +721,13 @@ impl PyMCTSEngine {
         let policy_slice = policy
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
-        let legal_i32: &[i32] = unsafe {
-            std::slice::from_raw_parts(
-                legal_bytes.as_ptr() as *const i32,
-                legal_bytes.len() / std::mem::size_of::<i32>(),
-            )
-        };
-        let legal: Vec<Hex> = legal_i32
-            .chunks_exact(2)
-            .map(|c| Hex::new(c[0], c[1]))
-            .collect();
+        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
+        let mut ints = legal_bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()));
+        while let (Some(q), Some(r)) = (ints.next(), ints.next()) {
+            legal.push(Hex::new(q, r));
+        }
         self.inner
             .expand_root(policy_slice, value, offset_q, offset_r, &legal);
         Ok(())
@@ -839,7 +848,8 @@ impl PyMCTSEngine {
         py: Python<'py>,
         min_visits: u32,
     ) -> PyResult<(Bound<'py, PyArray4<f32>>, Vec<Vec<(i32, i32, i32)>>, usize)> {
-        let (packed, histories, count) = self.inner.extract_tree_node_states(min_visits);
+        let (packed, histories, count) = self.inner.extract_tree_node_states(min_visits)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
         let arr = ndarray::Array4::from_shape_vec(
             (
                 count,
@@ -875,8 +885,13 @@ impl PyMCTSEngine {
     /// not yet expanded (`root_child_count() == 0`), or proceed straight to
     /// `add_dirichlet_noise` + the search loop if it is.
     #[pyo3(signature = (q, r, new_num_simulations))]
-    fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) {
-        self.inner.re_root(q as i16, r as i16, new_num_simulations);
+    fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> PyResult<()> {
+        let q = i16::try_from(q)
+            .map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
+        let r = i16::try_from(r)
+            .map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
+        self.inner.re_root(q, r, new_num_simulations);
+        Ok(())
     }
 }
 
@@ -897,58 +912,61 @@ impl PyMCTSEngine {
 ///   state at that point.
 #[pyfunction]
 fn classical_self_play(
+    py: Python<'_>,
     num_games: u32,
     time_ms: u64,
     max_depth: i32,
     near_radius: i32,
     max_moves: u32,
-) -> Vec<(Vec<f32>, f32, Vec<(i32, i32, u8)>)> {
-    let mut results = Vec::new();
+) -> PyResult<Vec<(Vec<f32>, f32, Vec<(i32, i32, u8)>)>> {
+    py.allow_threads(|| -> Result<Vec<(Vec<f32>, f32, Vec<(i32, i32, u8)>)>, GameError> {
+        let mut results = Vec::new();
 
-    for _ in 0..num_games {
-        let mut game = HexGameState::new();
-        let mut positions: Vec<(Vec<f32>, u8, Vec<(i32, i32, u8)>)> = Vec::new();
-        let mut move_num = 0u32;
+        for _ in 0..num_games {
+            let mut game = HexGameState::new();
+            let mut positions: Vec<(Vec<f32>, u8, Vec<(i32, i32, u8)>)> = Vec::new();
+            let mut move_num = 0u32;
 
-        while !game.is_over() && move_num < max_moves {
-            let feats = eval::extract_features(&game).to_vec();
-            let player = game.current_player();
-            let board_snap: Vec<(i32, i32, u8)> =
-                game.stones().iter().map(|(&h, &p)| (h.q, h.r, p)).collect();
-            positions.push((feats, player, board_snap));
+            while !game.is_over() && move_num < max_moves {
+                let feats = encoder::extract_features(&game).to_vec();
+                let player = game.current_player();
+                let board_snap: Vec<(i32, i32, u8)> =
+                    game.stones().iter().map(|(&h, &p)| (h.q, h.r, p)).collect();
+                positions.push((feats, player, board_snap));
 
-            // Use turn-based alpha-beta to pick a turn (1 or 2 moves).
-            let result = search::iterative_deepening(
-                &game,
-                Duration::from_millis(time_ms),
-                max_depth,
-                near_radius,
-                false,
-                0.0,
-            );
-            let turn = result.best_turn;
-            game.place(turn.first().q, turn.first().r).unwrap_or(true);
-            move_num += 1;
-            if !game.is_over() {
-                if let Some(m2) = turn.second() {
-                    game.place(m2.q, m2.r).unwrap_or(true);
-                    move_num += 1;
+                let result = search::iterative_deepening(
+                    &game,
+                    Duration::from_millis(time_ms),
+                    max_depth,
+                    near_radius,
+                    false,
+                    0.0,
+                )?;
+                let turn = result.best_turn;
+                game.place(turn.first().q, turn.first().r)?;
+                move_num += 1;
+                if !game.is_over() {
+                    if let Some(m2) = turn.second() {
+                        game.place(m2.q, m2.r)?;
+                        move_num += 1;
+                    }
                 }
+            }
+
+            let winner = game.winner();
+            for (feats, player, board_snap) in positions {
+                let outcome = match winner {
+                    Some(w) if w == player => 1.0f32,
+                    Some(_) => -1.0f32,
+                    None => 0.0f32,
+                };
+                results.push((feats, outcome, board_snap));
             }
         }
 
-        let winner = game.winner();
-        for (feats, player, board_snap) in positions {
-            let outcome = match winner {
-                Some(w) if w == player => 1.0f32,
-                Some(_) => -1.0f32,
-                None => 0.0f32,
-            };
-            results.push((feats, outcome, board_snap));
-        }
-    }
-
-    results
+        Ok(results)
+    })
+    .map_err(|e: GameError| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }
 
 // -------------------------------------------------------------------------
@@ -965,7 +983,7 @@ fn hexgame(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHexGame>()?;
     m.add_class::<PyMCTSEngine>()?;
     m.add_function(wrap_pyfunction!(classical_self_play, m)?)?;
-    m.add("FEATURE_COUNT", eval::FEATURE_COUNT)?;
+    m.add("FEATURE_COUNT", encoder::FEATURE_COUNT)?;
     m.add("WIN_LENGTH", crate::core::WIN_LENGTH)?;
     m.add("PLACEMENT_RADIUS", crate::core::PLACEMENT_RADIUS)?;
     Ok(())

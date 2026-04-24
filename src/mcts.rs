@@ -49,6 +49,7 @@
 use crate::core::Hex;
 use crate::board::HexGameState;
 use crate::encoder::{self, BOARD_SIZE, BOARD_AREA, TENSOR_SIZE};
+use smallvec::SmallVec;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -90,7 +91,7 @@ const CHILD_CAPACITY_HINT: usize = 64;
 ///
 /// Children of a given node are always stored contiguously, so a node's
 /// children span `children_start .. children_start + children_count`.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct MCTSNode {
     /// Arena index of the parent node. `NO_PARENT` for the root.
     parent: u32,
@@ -155,7 +156,7 @@ struct PendingLeaf {
     /// Sequence of arena indices from root to this leaf (inclusive).
     ///
     /// Used to apply / remove virtual loss and to backpropagate values.
-    search_path: Vec<u32>,
+    search_path: SmallVec<[u32; 32]>,
     /// Whether this leaf represents a terminal game position.
     is_terminal: bool,
     /// Game outcome from the leaf node's player perspective (+1 win, -1 loss).
@@ -197,24 +198,23 @@ fn gather_policy(
         }
     }
 
-    let gathered_moves = moves.to_vec();
-    let gathered_raw = raw;
-
     // Softmax in f64 for numerical stability, then convert to f32 priors.
-    let max_val = gathered_raw
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let exps: Vec<f64> = gathered_raw.iter().map(|&v| (v - max_val).exp()).collect();
-    let sum: f64 = exps.iter().sum();
+    // Reusing `priors` across calls is impractical: `expand_node` needs both
+    // the priors slice and `&mut self.arena` simultaneously, which the borrow
+    // checker rejects when the buffer lives on `MCTSEngine`.
+    let max_val = raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for v in &mut raw {
+        *v = (*v - max_val).exp();
+    }
+    let sum: f64 = raw.iter().sum();
     let priors: Vec<f32> = if sum > 0.0 {
-        exps.iter().map(|&e| (e / sum) as f32).collect()
+        raw.iter().map(|&e| (e / sum) as f32).collect()
     } else {
         // Uniform fallback if all logits are identical or invalid.
-        vec![1.0 / gathered_moves.len() as f32; gathered_moves.len()]
+        vec![1.0 / moves.len() as f32; moves.len()]
     };
 
-    (gathered_moves, priors)
+    (moves.to_vec(), priors)
 }
 
 // ── MCTSEngine ─────────────────────────────────────────────────────────
@@ -420,11 +420,10 @@ impl MCTSEngine {
 
         for _ in 0..actual_batch {
             let mut node_idx = self.root_idx;
-            let mut search_path = vec![self.root_idx];
+            let mut search_path = SmallVec::<[u32; 32]>::new();
+            search_path.push(self.root_idx);
 
-            // ── Step 1: Selection — traverse tree via PUCT ──
-            // Walk down from the root, following the child with the highest
-            // PUCT score, until we reach an unexpanded node or a terminal.
+            // Traverse via PUCT until an unexpanded node or terminal.
             while self.arena[node_idx as usize].is_expanded
                 && self.arena[node_idx as usize].children_count > 0
             {
@@ -441,9 +440,8 @@ impl MCTSEngine {
                 self.arena[node_idx as usize].player = self.game.current_player();
             }
 
-            // ── Step 2: Apply virtual loss to the search path ──
-            // This marks the path as "in flight" so parallel or subsequent
-            // batch slots avoid selecting the same branch.
+            // Virtual loss discourages other batch slots from exploring the
+            // same branch while this leaf is awaiting GPU evaluation.
             for &ni in &search_path {
                 let n = &mut self.arena[ni as usize];
                 n.visit_count += VIRTUAL_LOSS_VISITS;
@@ -453,9 +451,7 @@ impl MCTSEngine {
             let depth = search_path.len() as u32 - 1;
 
             if self.game.is_over() {
-                // ── Step 3a: Terminal leaf — determine winner ──
-                // From the leaf node's player perspective:
-                // +1.0 if they won, -1.0 if they lost.
+                // Terminal value is from the leaf player's perspective.
                 let node_player = self.arena[node_idx as usize].player;
                 let value = if self.game.winner() == Some(node_player) {
                     1.0
@@ -472,7 +468,6 @@ impl MCTSEngine {
                     legal_moves: Vec::new(),
                 });
             } else {
-                // ── Step 3b: Non-terminal leaf — encode board into batch_buf ──
                 let start = non_terminal_count as usize * TENSOR_SIZE;
                 self.batch_buf.resize(start + TENSOR_SIZE, 0.0);
                 let tensor_slice = &mut self.batch_buf[start..start + TENSOR_SIZE];
@@ -495,7 +490,7 @@ impl MCTSEngine {
                 });
             }
 
-            // ── Step 4: Undo moves to restore root state ──
+            // Restore root state for the next simulation.
             for _ in 0..depth {
                 self.game.unplace();
             }
@@ -530,18 +525,14 @@ impl MCTSEngine {
         let leaves = std::mem::take(&mut self.pending);
 
         for leaf in &leaves {
-            // ── Step 1: Remove virtual loss from search path ──
-            // Each node on the path had VIRTUAL_LOSS_VISITS added during
-            // select_leaves; we subtract them now before adding real visits.
+            // Remove virtual loss before recording real visits.
             for &ni in &leaf.search_path {
                 let n = &mut self.arena[ni as usize];
                 n.visit_count -= VIRTUAL_LOSS_VISITS;
             }
 
-            // ── Step 2: Determine leaf value ──
             let value;
             if leaf.is_terminal {
-                // Terminal positions already have a deterministic outcome.
                 value = leaf.terminal_value;
             } else {
                 // Extract this leaf's policy slice from the flat GPU output.
@@ -562,10 +553,8 @@ impl MCTSEngine {
                 eval_idx += 1;
             }
 
-            // ── Step 3: Backpropagate up the search path ──
-            // Values are stored from each node's own player perspective.
-            // When moving up to a node whose player differs from the leaf's
-            // player, we negate the value.
+            // Flip sign when the parent player differs from the leaf player
+            // so every node stores values from its own perspective.
             let leaf_player = self.arena[leaf.node_idx as usize].player;
             for &ni in leaf.search_path.iter().rev() {
                 let n = &mut self.arena[ni as usize];
@@ -627,61 +616,23 @@ impl MCTSEngine {
         self.arena[child_idx as usize].parent = NO_PARENT;
 
         // If the new root was already expanded during P1's tree traversal, its
-        // children were computed with constrain_threats=false (encode_board_into
-        // always passes false for internal nodes to avoid the O(n²) unblockable
-        // check).  When threat constraints are enabled and P2's position has active
-        // threats, those unconstrained children are wrong — clear them so that
-        // Python calls init_root again and gets the correct constrained legal set.
+        // children were computed with constrain_threats=false (internal nodes
+        // never run the O(n²) unblockable check).  When threat constraints are
+        // enabled and the new position has active threats, those unconstrained
+        // children are wrong — clear them so Python calls init_root again and
+        // gets the correct constrained legal set.
         //
-        // The descendant subtree must also be purged: extract_tree_node_states
-        // iterates the full arena and includes any node with is_expanded=true
-        // whose parent chain reaches self.root_idx.  Without purging, the
-        // grandchildren reached via threat-illegal paths would leak into RGSC
-        // candidates as spurious off-policy positions.
-        if self.constrain_threats {
-            let me = self.game.current_player() as usize;
-            let opp = 1 - me;
-            let has_threats = self.game.eval().counts(me as u8).fives > 0
-                || self.game.eval().counts(me as u8).fours > 0
-                || self.game.eval().counts(opp as u8).fives > 0
-                || self.game.eval().counts(opp as u8).fours > 0;
-            if has_threats && self.arena[child_idx as usize].is_expanded {
-                // Remember the old child range so we can BFS-invalidate descendants.
-                let (old_start, old_count) = {
-                    let node = &self.arena[child_idx as usize];
-                    (node.children_start as usize, node.children_count as usize)
-                };
-                // Mark new root as needing re-expansion.
-                {
-                    let node = &mut self.arena[child_idx as usize];
-                    node.is_expanded = false;
-                    node.children_count = 0;
-                }
-                // BFS-invalidate the orphaned subtree so extract_tree_node_states
-                // does not surface descendants reached via unconstrained paths.
-                let mut stack: Vec<u32> = (old_start..old_start + old_count)
-                    .map(|i| i as u32)
-                    .collect();
-                while let Some(idx) = stack.pop() {
-                    let (child_start, child_count, was_expanded) = {
-                        let node = &self.arena[idx as usize];
-                        (
-                            node.children_start as usize,
-                            node.children_count as usize,
-                            node.is_expanded,
-                        )
-                    };
-                    let node = &mut self.arena[idx as usize];
-                    node.is_expanded = false;
-                    node.children_count = 0;
-                    node.parent = NO_PARENT;
-                    if was_expanded {
-                        for i in child_start..child_start + child_count {
-                            stack.push(i as u32);
-                        }
-                    }
-                }
-            }
+        // Descendant parent-clearing is unnecessary: once the ancestor's
+        // children_count is zero, descendants are unreachable from the new root.
+        // extract_tree_node_states only follows expanded nodes, so orphaned
+        // subtrees are naturally excluded.
+        if self.constrain_threats
+            && self.arena[child_idx as usize].is_expanded
+            && self.game.eval().has_any_threats()
+        {
+            let node = &mut self.arena[child_idx as usize];
+            node.is_expanded = false;
+            node.children_count = 0;
         }
 
         // Reset simulation state for the new search.
@@ -772,7 +723,7 @@ impl MCTSEngine {
     pub fn extract_tree_node_states(
         &mut self,
         min_visits: u32,
-    ) -> (Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize) {
+    ) -> Result<(Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize), &'static str> {
         let mut packed = Vec::new();
         let mut histories = Vec::new();
 
@@ -785,7 +736,6 @@ impl MCTSEngine {
             .enumerate()
             .filter_map(|(idx, node)| {
                 let idx = idx as u32;
-                // Skip root and unexpanded / low-visit nodes.
                 if idx == self.root_idx || !node.is_expanded || node.visit_count < min_visits {
                     return None;
                 }
@@ -793,7 +743,6 @@ impl MCTSEngine {
             })
             .collect();
 
-        // Keep only the highest-visited candidates if over the cap.
         if candidates.len() > MAX_CANDIDATES {
             candidates.sort_unstable_by(|a, b| {
                 self.arena[*b as usize]
@@ -804,66 +753,86 @@ impl MCTSEngine {
         }
 
         if let Err(_) = packed.try_reserve(candidates.len() * TENSOR_SIZE) {
-            // Allocation would exceed available memory — return empty.
-            return (Vec::new(), Vec::new(), 0);
+            return Ok((Vec::new(), Vec::new(), 0));
         }
         histories.reserve(candidates.len());
 
-        for node_idx in candidates {
-            // Reconstruct the move sequence from this node back to root.
-            let mut actions: Vec<(i16, i16)> = Vec::new();
-            let mut cur = node_idx;
-            let mut valid = true;
-            while cur != self.root_idx {
-                let node = &self.arena[cur as usize];
-                if node.parent == NO_PARENT {
-                    valid = false;
-                    break; // safety: orphan node
+        let candidate_set: std::collections::HashSet<u32> = candidates.iter().copied().collect();
+
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Visit(u32),
+            Unplace,
+        }
+
+        let mut stack: Vec<Frame> = Vec::new();
+        stack.push(Frame::Visit(self.root_idx));
+        let mut cur_depth = 0u32;
+
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Visit(node_idx) => {
+                    if candidate_set.contains(&node_idx) && node_idx != self.root_idx {
+                        if self.game.is_over() {
+                            // Restore game state before returning the error.
+                            for _ in 0..cur_depth {
+                                self.game.unplace();
+                            }
+                            return Err("sampled node is terminal during extraction");
+                        }
+                        let start = packed.len();
+                        packed.resize(start + TENSOR_SIZE, 0.0);
+                        encoder::encode_board_into(
+                            &self.game,
+                            self.near_radius,
+                            false,
+                            &mut packed[start..start + TENSOR_SIZE],
+                        );
+                        let history: Vec<(u8, i16, i16)> = self
+                            .game
+                            .move_history()
+                            .iter()
+                            .map(|rec| (rec.player, rec.cell.q as i16, rec.cell.r as i16))
+                            .collect();
+                        histories.push(history);
+                    }
+
+                    let node = &self.arena[node_idx as usize];
+                    if node.is_expanded && node.children_count > 0 {
+                        if node_idx != self.root_idx {
+                            stack.push(Frame::Unplace);
+                        }
+                        let start = node.children_start as usize;
+                        let count = node.children_count as usize;
+                        for i in (start..start + count).rev() {
+                            let child = &self.arena[i];
+                            if let Err(_) = self.game.place(
+                                child.action.0 as i32,
+                                child.action.1 as i32,
+                            ) {
+                                for _ in 0..cur_depth {
+                                    self.game.unplace();
+                                }
+                                return Err("illegal move during tree node extraction");
+                            }
+                            cur_depth += 1;
+                            stack.push(Frame::Visit(i as u32));
+                        }
+                    } else if node_idx != self.root_idx {
+                        stack.push(Frame::Unplace);
+                    }
                 }
-                actions.push(node.action);
-                cur = node.parent;
-            }
-            actions.reverse();
-
-            // Replay the moves on the internal game state.
-            let mut placed = 0usize;
-            for &(q, r) in &actions {
-                if self.game.is_over() {
-                    valid = false;
-                    break;
+                Frame::Unplace => {
+                    self.game.unplace();
+                    cur_depth -= 1;
                 }
-                if self.game.place(q as i32, r as i32).is_err() {
-                    valid = false;
-                    break;
-                }
-                placed += 1;
-            }
-
-            if valid && !self.game.is_over() {
-                // Encode the board into the packed buffer.
-                let start = packed.len();
-                packed.resize(start + TENSOR_SIZE, 0.0);
-                let tensor_slice = &mut packed[start..start + TENSOR_SIZE];
-                encoder::encode_board_into(&self.game, self.near_radius, false, tensor_slice);
-
-                // Record the full move history for this position.
-                let history: Vec<(u8, i16, i16)> = self
-                    .game
-                    .move_history()
-                    .iter()
-                    .map(|rec| (rec.player, rec.cell.q as i16, rec.cell.r as i16))
-                    .collect();
-                histories.push(history);
-            }
-
-            // Undo the replayed moves.
-            for _ in 0..placed {
-                self.game.unplace();
             }
         }
 
+        debug_assert_eq!(cur_depth, 0, "game state not restored to root after extraction");
+
         let count = histories.len();
-        (packed, histories, count)
+        Ok((packed, histories, count))
     }
 
     // ── Internal helpers ───────────────────────────────────────────────

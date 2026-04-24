@@ -10,7 +10,7 @@
 //! eliminating the previous duplication between `pybridge.rs` and `mcts.rs`.
 
 use crate::board::HexGameState;
-use crate::core::{hex_distance, Hex};
+use crate::core::{hex_distance, Hex, HEX_DIRECTIONS, WIN_LENGTH};
 use crate::threats::{live_cells, threat_status, ThreatStatus};
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ pub struct EncodedBoard {
 /// function to match Python's built-in `round()` behaviour exactly. This
 /// guarantees that the Rust encoder and any Python data-preprocessing scripts
 /// produce bitwise-identical offsets.
-pub fn bankers_round(v: f64) -> i32 {
+pub(crate) fn bankers_round(v: f64) -> i32 {
     let frac = v - v.floor();
     if (frac - 0.5).abs() < 1e-9 {
         let lo = v.floor() as i32;
@@ -160,7 +160,6 @@ pub fn encode_board_into(
     let pr = game.placements_remaining();
     let is_phase_2 = pr == 1 && mc > 0;
 
-    // Zero the active region of the buffer.
     out[..TENSOR_SIZE].fill(0.0);
 
     // Helper: index into flat tensor [ch, gi, gj]
@@ -170,8 +169,6 @@ pub fn encode_board_into(
     }
 
     // ── Channels 0-1: player stones ──
-    // For every occupied cell, write 1.0 into channel 0 (current player) or
-    // channel 1 (opponent). Cells outside the 33×33 view are clipped.
     for (&h, &player) in board.iter() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
@@ -206,27 +203,25 @@ pub fn encode_board_into(
     }
 
     // ── Channel 3: legal moves mask ──
-    // Gather legal moves via `legal_moves_near`, optionally constrained by
-    // threat analysis. Each legal move gets a 1.0 in channel 3 if it falls
-    // inside the tensor window. The (possibly constrained) move list is
-    // returned so callers can map policy logits back to moves.
     let mut legal = game.legal_moves_near(near_radius);
     if constrain_threats {
-        let constrained: Vec<Hex> = match threat_status(game) {
-            ThreatStatus::Quiet | ThreatStatus::Unblockable => Vec::new(),
+        let maybe_constrained = match threat_status(game) {
+            ThreatStatus::Quiet | ThreatStatus::Unblockable => None,
             ThreatStatus::WinningTurn(t) => {
                 let mut allowed = vec![t.first()];
                 if let Some(s) = t.second() {
                     allowed.push(s);
                 }
-                legal.iter().copied().filter(|h| allowed.contains(h)).collect()
+                Some(legal.iter().copied().filter(|h| allowed.contains(h)).collect::<Vec<_>>())
             }
             ThreatStatus::MustBlock(b) => {
-                legal.iter().copied().filter(|h| b.cells.contains(h)).collect()
+                Some(legal.iter().copied().filter(|h| b.cells().contains(h)).collect::<Vec<_>>())
             }
         };
-        if !constrained.is_empty() {
-            legal = constrained;
+        if let Some(constrained) = maybe_constrained {
+            if !constrained.is_empty() {
+                legal = constrained;
+            }
         }
     }
     for h in &legal {
@@ -325,3 +320,163 @@ pub fn encode_board_into(
 
     (offset_q, offset_r, legal)
 }
+
+// -------------------------------------------------------------------------
+// Classical feature extraction (moved from eval/mod.rs to resolve layer
+// hierarchy violation — encoder may depend on board, eval must not).
+// -------------------------------------------------------------------------
+
+/// Total number of scalar features emitted by [`extract_features`].
+///
+/// The vector is structured as:
+/// ```text
+/// [P0_live5, P0_dead5, P0_live4, P0_dead4, P0_live3, P0_live2,
+///  P1_live5, P1_dead5, P1_live4, P1_dead4, P1_live3, P1_live2,
+///  tempo]
+/// ```
+/// where `tempo` is `+1.0` when P0 is to move and `-1.0` when P1 is to move.
+pub const FEATURE_COUNT: usize = 13;
+
+/// Static evaluation bonus for an immediate win.
+pub const WIN_SCORE: i32 = 1_000_000;
+
+const FEATURES_PER_PLAYER: usize = 6;
+const LIVE5: usize = 0;
+const DEAD5: usize = 1;
+const LIVE4: usize = 2;
+const DEAD4: usize = 3;
+const LIVE3: usize = 4;
+const LIVE2: usize = 5;
+
+// -------------------------------------------------------------------------
+// Run counting
+// -------------------------------------------------------------------------
+
+/// Count contiguous stones of `player` starting from `start` along `(dq, dr)`.
+///
+/// # Arguments
+/// * `game`   — the board state.
+/// * `start`  — the first cell of the run (already known to hold `player`).
+/// * `dq`     — q-step per cell along the line.
+/// * `dr`     — r-step per cell along the line.
+/// * `player` — the player whose stones we are counting.
+///
+/// # Returns
+/// A tuple `(count, open_end)` where:
+/// * `count`    — number of *additional* consecutive `player` stones after
+///   `start` (not counting `start` itself).
+/// * `open_end` — `true` if the run ended because the next cell is empty;
+///   `false` if it ended because the next cell holds an opponent stone.
+#[inline]
+fn count_run(game: &HexGameState, start: Hex, dq: i32, dr: i32, player: u8) -> (i32, bool) {
+    let mut count = 0;
+    let mut q = start.q + dq;
+    let mut r = start.r + dr;
+    loop {
+        let h = Hex::new(q, r);
+        match game.stones().get(&h) {
+            Some(&p) if p == player => count += 1,
+            Some(_) => return (count, false), // blocked by opponent
+            None => return (count, true),     // open end
+        }
+        q += dq;
+        r += dr;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Feature extraction
+// -------------------------------------------------------------------------
+
+/// Extract a 13-dimensional classical feature vector from the board.
+///
+/// The features count "runs" of contiguous stones for each player along all
+/// three principal hex directions.  A run is only counted if the cell
+/// immediately before its start is **not** the same player's stone; this
+/// prevents double-counting the same line segment.
+///
+/// # Feature semantics
+///
+/// | Index | Name    | Meaning                                           |
+/// |-------|---------|---------------------------------------------------|
+/// | 0     | P0 live5| P0 has ≥5 in a row with at least one open end     |
+/// | 1     | P0 dead5| P0 has exactly 5 in a row with zero open ends     |
+/// | 2     | P0 live4| P0 has exactly 4 in a row with **two** open ends  |
+/// | 3     | P0 dead4| P0 has exactly 4 in a row with **one** open end   |
+/// | 4     | P0 live3| P0 has exactly 3 in a row with two open ends      |
+/// | 5     | P0 live2| P0 has exactly 2 in a row with two open ends      |
+/// | 6–11  | P1 …    | Same six features mirrored for player 1           |
+/// | 12    | tempo   | `+1.0` if P0 to move, `-1.0` otherwise            |
+///
+/// "Open end" means the adjacent cell past the run is empty.  A run of 6
+/// or more stones is treated as a `live5` and multiplied by 10 to emphasise
+/// its decisiveness.
+pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
+    let mut feats = [0.0f32; FEATURE_COUNT];
+    // counts[p][i] accumulates the raw integer counts for player p, feature i.
+    let mut counts = [[0i32; FEATURES_PER_PLAYER]; 2];
+
+    // Iterate over every stone on the board.
+    for (&cell, &player) in game.stones() {
+        let p = player as usize;
+        for &(dq, dr) in &HEX_DIRECTIONS {
+            // Only start a run if the previous cell in this direction is
+            // NOT the same player's stone.  This guarantees each maximal
+            // contiguous run is counted exactly once.
+            let prev = Hex::new(cell.q - dq, cell.r - dr);
+            if game.stones().get(&prev) == Some(&player) {
+                continue;
+            }
+
+            // Count how far the run extends forward from `cell`.
+            let (fwd, fwd_open) = count_run(game, cell, dq, dr, player);
+            let run_len = 1 + fwd; // include `cell` itself
+
+            // Determine whether the cell just before `cell` is open.
+            let bwd_open = match game.stones().get(&prev) {
+                None => true,
+                Some(_) => false,
+            };
+
+            let open_ends = (bwd_open as i32) + (fwd_open as i32);
+
+            // Classify the run into one of the threat categories.
+            if run_len >= WIN_LENGTH {
+                counts[p][LIVE5] += 10;
+            } else if run_len == 5 {
+                if open_ends >= 1 {
+                    counts[p][LIVE5] += 1;
+                } else {
+                    counts[p][DEAD5] += 1;
+                }
+            } else if run_len == 4 {
+                if open_ends == 2 {
+                    counts[p][LIVE4] += 1;
+                } else if open_ends == 1 {
+                    counts[p][DEAD4] += 1;
+                }
+            } else if run_len == 3 {
+                if open_ends == 2 {
+                    counts[p][LIVE3] += 1;
+                }
+            } else if run_len == 2 {
+                if open_ends == 2 {
+                    counts[p][LIVE2] += 1;
+                }
+            }
+        }
+    }
+
+    // Copy the integer counts into the float feature vector.
+    for p in 0..2 {
+        for i in 0..FEATURES_PER_PLAYER {
+            feats[p * FEATURES_PER_PLAYER + i] = counts[p][i] as f32;
+        }
+    }
+
+    // Final feature: tempo (whose turn it is).
+    feats[FEATURE_COUNT - 1] = if game.current_player() == 0 { 1.0 } else { -1.0 };
+    feats
+}
+
+

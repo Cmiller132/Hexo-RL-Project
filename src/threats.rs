@@ -83,10 +83,7 @@ pub enum ThreatStatus {
 /// * **1 placement remaining** — only `cells` matters.  The single stone must
 ///   land in `cells` (the intersection of all threat windows).
 /// * **2 placements remaining** — the pair of stones must together cover every
-///   threat window.  Valid pairs are enumerated in `pairs`.  Additionally, a
-///   single-placement turn is accepted if its cell appears in `union_cells`
-///   (a pragmatic heuristic that keeps the search alive when the engine is
-///   forced to play only one stone).
+///   threat window.  Valid pairs are enumerated in `pairs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockConstraint {
     /// Single cells that block **every** threat window.
@@ -94,21 +91,26 @@ pub struct BlockConstraint {
     /// These are the cells in the intersection of all opponent hot windows.
     /// If a turn contains any of these cells, it is automatically valid
     /// regardless of the other placement(s).
-    pub cells: SmallVec<[Hex; 16]>,
+    cells: SmallVec<[Hex; 16]>,
 
     /// Valid pairs of **distinct** cells that together block every threat
     /// window (used when 2 placements remain).
     ///
     /// Pairs are stored in canonical order (`c1 < c2` by the internal
     /// ordering of [`Hex`]).  There are **no** self-pairs `(c, c)`.
-    pub pairs: SmallVec<[(Hex, Hex); 32]>,
+    pairs: SmallVec<[(Hex, Hex); 32]>,
+}
 
-    /// Cells that appear in at least one valid pair.
-    ///
-    /// This is used for the "single-placement-is-acceptable-when-two-remain"
-    /// heuristic: a `Turn::single(h)` is accepted if `h` is in `union_cells`,
-    /// even though a single stone cannot block all threats on its own.
-    pub union_cells: SmallVec<[Hex; 16]>,
+impl BlockConstraint {
+    /// Single cells that block every threat window.
+    pub fn cells(&self) -> &[Hex] {
+        &self.cells
+    }
+
+    /// Valid pairs that together block every threat window.
+    pub fn pairs(&self) -> &[(Hex, Hex)] {
+        &self.pairs
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -122,12 +124,16 @@ pub struct BlockConstraint {
 ///
 /// The return type is a stack-allocated `SmallVec` to avoid heap allocation
 /// in the common case where the opponent has fewer than 16 hot windows.
+///
+/// # Precondition
+/// Callers must handle an empty result (no opponent threats) gracefully;
+/// this function returns empty when the opponent has no fours or fives.
 fn opponent_threat_windows(game: &HexGameState) -> SmallVec<[SmallVec<[Hex; 2]>; 16]> {
     let opp = 1 - game.current_player();
     let counts = game.eval().counts(opp);
 
-    // Fast exit: no fours or fives means no immediate threats.
-    if counts.fours == 0 && counts.fives == 0 {
+    // No hot windows exist when the opponent has no fours or fives.
+    if counts.fours() == 0 && counts.fives() == 0 {
         return SmallVec::new();
     }
 
@@ -179,29 +185,26 @@ fn opponent_threat_windows(game: &HexGameState) -> SmallVec<[SmallVec<[Hex; 2]>;
 ///    - `cells` = intersection of all threat-window empties.
 ///    - `pairs` = all distinct pairs `(c1, c2)` that together intersect every
 ///      threat window.
-///    - `union_cells` = all cells that appear in at least one valid pair.
 /// 6. **Unblockable?** — if `cells` is empty and no valid pair exists, the
 ///    threats cannot be stopped.
 pub fn threat_status(game: &HexGameState) -> ThreatStatus {
-    // 1. Game over?
     if game.winner().is_some() {
         return ThreatStatus::Quiet;
     }
 
-    // 2. Fast exit: no fives or fours for either player.
     let current = game.current_player();
     let curr_counts = game.eval().counts(current);
     let opp = 1 - current;
     let opp_counts = game.eval().counts(opp);
-    if curr_counts.fives == 0
-        && curr_counts.fours == 0
-        && opp_counts.fives == 0
-        && opp_counts.fours == 0
+    if curr_counts.fives() == 0
+        && curr_counts.fours() == 0
+        && opp_counts.fives() == 0
+        && opp_counts.fours() == 0
     {
         return ThreatStatus::Quiet;
     }
 
-    // 3. Can the current player win immediately?
+    // Can the current player win immediately?
     //
     // We do two passes: first look for 5-windows (single empty) so we always
     // prefer a one-stone win over a two-stone win. Then look for 4-windows.
@@ -239,17 +242,16 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
         return ThreatStatus::WinningTurn(turn);
     }
 
-    // 4. Opponent threats?
     let must_hit = opponent_threat_windows(game);
     if must_hit.is_empty() {
         return ThreatStatus::Quiet;
     }
 
-    // 5. Build exact BlockConstraint.
+    // Build exact BlockConstraint.
     let placements = game.placements_remaining();
 
     // Collect all unique empty cells across threat windows.
-    let mut all_cells: Vec<Hex> =
+    let mut all_cells: SmallVec<[Hex; 32]> =
         must_hit.iter().flat_map(|w| w.iter().copied()).collect();
     all_cells.sort();
     all_cells.dedup();
@@ -271,8 +273,7 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
             return ThreatStatus::Unblockable;
         }
         let pairs = SmallVec::<[(Hex, Hex); 32]>::new();
-        let union_cells = SmallVec::<[Hex; 16]>::new();
-        return ThreatStatus::MustBlock(BlockConstraint { cells, pairs, union_cells });
+        return ThreatStatus::MustBlock(BlockConstraint { cells, pairs });
     }
 
     // placements >= 2: enumerate every distinct pair of candidate cells.
@@ -295,18 +296,7 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
         return ThreatStatus::Unblockable;
     }
 
-    // Union of all cells appearing in any valid pair.
-    let mut union_cells = SmallVec::<[Hex; 16]>::new();
-    for &(c1, c2) in &pairs {
-        if !union_cells.contains(&c1) {
-            union_cells.push(c1);
-        }
-        if !union_cells.contains(&c2) {
-            union_cells.push(c2);
-        }
-    }
-
-    ThreatStatus::MustBlock(BlockConstraint { cells, pairs, union_cells })
+    ThreatStatus::MustBlock(BlockConstraint { cells, pairs })
 }
 
 /// Check whether a single turn is legal under threat constraints,
@@ -324,10 +314,9 @@ pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
 
         ThreatStatus::MustBlock(bc) => {
             if turn.placements() == 1 {
-                // When 2 placements remain, a single placement is acceptable if
-                // it is part of at least one valid blocking pair (union_cells),
-                // or if it alone blocks every threat window (cells).
-                bc.cells.contains(&turn.first()) || bc.union_cells.contains(&turn.first())
+                // With only 1 placement, the single stone must block every
+                // threat window by itself.
+                bc.cells.contains(&turn.first())
             } else {
                 let second = turn.second().unwrap();
 
@@ -350,16 +339,83 @@ pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
     }
 }
 
-/// Check whether a single turn is legal under threat constraints.
+// -------------------------------------------------------------------------
+// Threat turn generation (for quiescence)
+// -------------------------------------------------------------------------
+
+/// Generate turns from hot-window cells only (for quiescence search).
 ///
-/// This is a convenience wrapper that computes `threat_status` internally.
-/// For search nodes that test many turns, prefer `turn_satisfies_status`
-/// with a cached `ThreatStatus` to avoid redundant work.
-pub fn turn_satisfies_threats(game: &HexGameState, turn: Turn) -> bool {
-    if game.winner().is_some() {
-        return true;
+/// Quiescence does not need the full candidate list — it only extends
+/// along tactically relevant cells (threats and blocks).  This keeps
+/// the quiescence tree narrow while resolving immediate tactical
+/// sequences.
+///
+/// # Strategy
+/// 1. Collect opponent live cells (blocking moves).
+/// 2. If none, collect our own live cells (threat completion).
+/// 3. For single-placement quiescence, return the top 6 cells.
+/// 4. For two-placement quiescence, generate pairs from the combined
+///    threat cell set, deduplicate, and cap at 16 turns.
+pub fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
+    let player = game.current_player();
+    let opp = 1 - player;
+
+    // Single-placement quiescence
+    if game.placements_remaining() == 1 {
+        let mut opp_threats = Vec::new();
+        live_cells(game, opp, &mut opp_threats);
+        let mut my_threats = Vec::new();
+        live_cells(game, player, &mut my_threats);
+
+        let cells = if !opp_threats.is_empty() {
+            opp_threats
+        } else {
+            my_threats
+        };
+        if cells.is_empty() {
+            return Vec::new();
+        }
+        return cells.into_iter().take(6).map(Turn::single).collect();
     }
-    turn_satisfies_status(&threat_status(game), turn)
+
+    // Two-placement quiescence: collect live cells from both sides.
+    let mut opp_threats = Vec::new();
+    live_cells(game, opp, &mut opp_threats);
+    let mut my_threats = Vec::new();
+    live_cells(game, player, &mut my_threats);
+
+    let primary = if !opp_threats.is_empty() {
+        &opp_threats
+    } else {
+        &my_threats
+    };
+    if primary.is_empty() {
+        return Vec::new();
+    }
+
+    // Combine all threat cells from both sides.
+    let mut all_threats: Vec<Hex> = opp_threats
+        .iter()
+        .chain(my_threats.iter())
+        .copied()
+        .collect();
+    all_threats.sort();
+    all_threats.dedup();
+
+    let mut turns = Vec::new();
+
+    // Generate pairs within the top threat cells (most important).
+    let n = all_threats.len().min(8);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            turns.push(Turn::pair(all_threats[i], all_threats[j]));
+        }
+    }
+
+    turns.sort_by(|a, b| a.first().cmp(&b.first()).then(a.second().cmp(&b.second())));
+    turns.dedup();
+    turns.truncate(16);
+    turns
 }
 
 // -------------------------------------------------------------------------
@@ -385,7 +441,7 @@ pub fn live_cells(game: &HexGameState, player: u8, out: &mut Vec<Hex>) {
     let counts = game.eval().counts(player);
 
     // Fast exit: no fours or fives means no live cells.
-    if counts.fives == 0 && counts.fours == 0 {
+    if counts.fives() == 0 && counts.fours() == 0 {
         return;
     }
 
@@ -401,439 +457,4 @@ pub fn live_cells(game: &HexGameState, player: u8, out: &mut Vec<Hex>) {
     }
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::board::HexGameState;
-    use crate::core::Hex;
-
-    // ── Winning threat cells (5-window and 4-window) ──────────────────────
-
-    #[test]
-    fn winning_turn_five_window() {
-        let mut game = HexGameState::new();
-        // P0 has a 5-stone run along (1,0): (0,0)..(4,0).
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        match threat_status(&game) {
-            ThreatStatus::WinningTurn(t) => {
-                // With remaining=2 the first hot window is the 5-window at
-                // origin (0,0) whose only empty is (5,0).
-                assert_eq!(t.placements(), 1);
-                assert_eq!(t.first(), Hex::new(5, 0));
-            }
-            other => panic!("expected WinningTurn, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn winning_turn_four_window_with_two_placements() {
-        let mut game = HexGameState::new();
-        // P0 has a 4-stone run along (1,0): (0,0)..(3,0).
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        match threat_status(&game) {
-            ThreatStatus::WinningTurn(t) => {
-                // The first hot window is at origin (0,0) with empties (4,0),(5,0).
-                assert_eq!(t.placements(), 2);
-                assert_eq!(t.first(), Hex::new(4, 0));
-                assert_eq!(t.second(), Some(Hex::new(5, 0)));
-            }
-            other => panic!("expected WinningTurn, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn no_winning_turn_with_one_placement_on_four_window() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            1,
-        )
-        .unwrap();
-        assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
-    }
-
-    // ── Blocking single placement ─────────────────────────────────────────
-
-    #[test]
-    fn block_constraint_single_placement_intersection() {
-        let mut game = HexGameState::new();
-        // P1 has a 4-stone run (0,0)..(3,0) and P0 already blocked one end at (-2,0).
-        game.set_position(
-            &[
-                (-2, 0, 0), // P0 blocker
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
-                (3, 0, 1),
-            ],
-            0,
-            1,
-        )
-        .unwrap();
-
-        match threat_status(&game) {
-            ThreatStatus::MustBlock(b) => {
-                assert_eq!(b.cells.len(), 1);
-                assert_eq!(b.cells[0], Hex::new(4, 0));
-                assert!(b.pairs.is_empty());
-            }
-            other => panic!("expected MustBlock, got {:?}", other),
-        }
-    }
-
-    // ── Blocking with two placements (exact pair enumeration) ─────────────
-
-    #[test]
-    fn block_constraint_two_placements_exact_pairs() {
-        let mut game = HexGameState::new();
-        // P1 bare 4-run (0,0)..(3,0). P0 has 2 placements.
-        game.set_position(
-            &[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        match threat_status(&game) {
-            ThreatStatus::MustBlock(b) => {
-                // Valid covering pairs for the three hot windows.
-                assert!(b.pairs.contains(&(Hex::new(-2, 0), Hex::new(4, 0))));
-                assert!(b.pairs.contains(&(Hex::new(-1, 0), Hex::new(4, 0))));
-                assert!(b.pairs.contains(&(Hex::new(-1, 0), Hex::new(5, 0))));
-
-                // Invalid pairs must not be present.
-                assert!(!b.pairs.contains(&(Hex::new(-2, 0), Hex::new(5, 0))));
-                assert!(!b.pairs.contains(&(Hex::new(4, 0), Hex::new(5, 0))));
-
-                // Union of all cells that appear in any valid pair.
-                assert_eq!(b.union_cells.len(), 4);
-                assert!(b.union_cells.contains(&Hex::new(-2, 0)));
-                assert!(b.union_cells.contains(&Hex::new(-1, 0)));
-                assert!(b.union_cells.contains(&Hex::new(4, 0)));
-                assert!(b.union_cells.contains(&Hex::new(5, 0)));
-            }
-            other => panic!("expected MustBlock, got {:?}", other),
-        }
-    }
-
-    // ── Unblockable detection ─────────────────────────────────────────────
-
-    #[test]
-    fn unblockable_single_placement_disjoint_threats() {
-        let mut game = HexGameState::new();
-        // P1 has two disjoint 5-stone runs. P0 has only 1 placement.
-        game.set_position(
-            &[
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
-                (3, 0, 1),
-                (4, 0, 1),
-                (10, 0, 1),
-                (11, 0, 1),
-                (12, 0, 1),
-                (13, 0, 1),
-                (14, 0, 1),
-            ],
-            0,
-            1,
-        )
-        .unwrap();
-
-        assert!(matches!(threat_status(&game), ThreatStatus::Unblockable));
-    }
-
-    #[test]
-    fn unblockable_two_placements_disjoint_five_windows() {
-        let mut game = HexGameState::new();
-        // P1 has two disjoint 5-runs. P0 has 2 placements.
-        game.set_position(
-            &[
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
-                (3, 0, 1),
-                (4, 0, 1),
-                (10, 0, 1),
-                (11, 0, 1),
-                (12, 0, 1),
-                (13, 0, 1),
-                (14, 0, 1),
-            ],
-            0,
-            2,
-        )
-        .unwrap();
-
-        assert!(matches!(threat_status(&game), ThreatStatus::Unblockable));
-    }
-
-    #[test]
-    fn not_unblockable_when_common_cell_exists() {
-        let mut game = HexGameState::new();
-        // P1 has a 4-run (0,0)..(3,0) and P0 (current player) already blocked one end at (-2,0).
-        game.set_position(
-            &[
-                (-2, 0, 0), // P0 blocker
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
-                (3, 0, 1),
-            ],
-            0,
-            1,
-        )
-        .unwrap();
-
-        match threat_status(&game) {
-            ThreatStatus::MustBlock(b) => {
-                assert!(b.cells.contains(&Hex::new(4, 0)));
-            }
-            other => panic!("expected MustBlock, got {:?}", other),
-        }
-    }
-
-    // ── turn_satisfies_threats ────────────────────────────────────────────
-
-    #[test]
-    fn turn_satisfies_threats_own_win() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        let status = threat_status(&game);
-        let winning = match status {
-            ThreatStatus::WinningTurn(t) => t,
-            _ => panic!("expected winning turn"),
-        };
-
-        assert!(turn_satisfies_threats(&game, winning));
-        assert!(!turn_satisfies_threats(&game, Turn::single(Hex::new(100, 0))));
-    }
-
-    #[test]
-    fn turn_satisfies_threats_must_block_single() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[
-                (-2, 0, 0), // P0 blocker
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
-                (3, 0, 1),
-            ],
-            0,
-            1,
-        )
-        .unwrap();
-
-        assert!(turn_satisfies_threats(&game, Turn::single(Hex::new(4, 0))));
-        assert!(!turn_satisfies_threats(&game, Turn::single(Hex::new(-1, 0))));
-    }
-
-    #[test]
-    fn turn_satisfies_threats_must_block_pair() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        // Valid blocking pairs
-        assert!(turn_satisfies_threats(
-            &game,
-            Turn::pair(Hex::new(-1, 0), Hex::new(4, 0))
-        ));
-        assert!(turn_satisfies_threats(
-            &game,
-            Turn::pair(Hex::new(-1, 0), Hex::new(5, 0))
-        ));
-        assert!(turn_satisfies_threats(
-            &game,
-            Turn::pair(Hex::new(-2, 0), Hex::new(4, 0))
-        ));
-
-        // Invalid pair
-        assert!(!turn_satisfies_threats(
-            &game,
-            Turn::pair(Hex::new(-2, 0), Hex::new(5, 0))
-        ));
-
-        // Single placement at a cell in the union is accepted (per API spec).
-        assert!(turn_satisfies_threats(&game, Turn::single(Hex::new(-1, 0))));
-        // Single placement outside the union is rejected.
-        assert!(!turn_satisfies_threats(&game, Turn::single(Hex::new(100, 0))));
-    }
-
-    #[test]
-    fn turn_satisfies_threats_unblockable_returns_true() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
-                (3, 0, 1),
-                (4, 0, 1),
-                (10, 0, 1),
-                (11, 0, 1),
-                (12, 0, 1),
-                (13, 0, 1),
-                (14, 0, 1),
-            ],
-            0,
-            1,
-        )
-        .unwrap();
-
-        // Unblockable means the threat filter does not constrain moves.
-        assert!(turn_satisfies_threats(&game, Turn::single(Hex::new(5, 0))));
-        assert!(turn_satisfies_threats(&game, Turn::single(Hex::new(100, 0))));
-    }
-
-    // ── live_cells ────────────────────────────────────────────────────────
-
-    #[test]
-    fn live_cells_five_window() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        let mut cells = Vec::new();
-        live_cells(&game, 0, &mut cells);
-        assert_eq!(cells.len(), 4);
-        assert!(cells.contains(&Hex::new(-2, 0)));
-        assert!(cells.contains(&Hex::new(-1, 0)));
-        assert!(cells.contains(&Hex::new(5, 0)));
-        assert!(cells.contains(&Hex::new(6, 0)));
-    }
-
-    #[test]
-    fn live_cells_four_window() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
-
-        let mut cells = Vec::new();
-        live_cells(&game, 0, &mut cells);
-        assert_eq!(cells.len(), 4);
-        assert!(cells.contains(&Hex::new(-2, 0)));
-        assert!(cells.contains(&Hex::new(-1, 0)));
-        assert!(cells.contains(&Hex::new(4, 0)));
-        assert!(cells.contains(&Hex::new(5, 0)));
-    }
-
-    #[test]
-    fn live_cells_empty_when_no_threats() {
-        let mut game = HexGameState::new();
-        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2).unwrap();
-
-        let mut cells = Vec::new();
-        live_cells(&game, 0, &mut cells);
-        assert!(cells.is_empty());
-    }
-
-    // ── Edge cases ────────────────────────────────────────────────────────
-
-    #[test]
-    fn blocked_window_is_not_hot() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[
-                (-1, 0, 0),
-                (0, 0, 0),
-                (2, 0, 1), // P1 blocker inside
-                (3, 0, 0),
-                (4, 0, 0),
-            ],
-            0,
-            2,
-        )
-        .unwrap();
-
-        let mut cells = Vec::new();
-        live_cells(&game, 0, &mut cells);
-        // No hot window should contain the opponent stone.
-        assert!(!cells.contains(&Hex::new(2, 0)));
-        // With the block there are no hot windows for P0.
-        assert!(cells.is_empty());
-    }
-
-    #[test]
-    fn three_window_is_not_hot() {
-        let mut game = HexGameState::new();
-        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2).unwrap();
-
-        assert!(game.eval().hot_is_empty(0));
-        assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
-    }
-
-    #[test]
-    fn game_over_is_quiet() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[
-                (0, 0, 0),
-                (1, 0, 0),
-                (2, 0, 0),
-                (3, 0, 0),
-                (4, 0, 0),
-                (5, 0, 0),
-            ],
-            0,
-            2,
-        )
-        .unwrap();
-
-        assert!(game.winner().is_some());
-        assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
-        assert!(turn_satisfies_threats(&game, Turn::single(Hex::new(0, 0))));
-    }
-
-    #[test]
-    fn overlapping_hot_windows_share_empties() {
-        let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
-            0,
-            1,
-        )
-        .unwrap();
-
-        let mut cells = Vec::new();
-        live_cells(&game, 0, &mut cells);
-        assert!(cells.contains(&Hex::new(-1, 0)));
-        assert!(cells.contains(&Hex::new(5, 0)));
-    }
-}

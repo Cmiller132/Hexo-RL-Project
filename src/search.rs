@@ -30,7 +30,7 @@
 //! # Move ordering
 //!
 //! Candidates are scored by:
-//! - Incremental evaluation delta (`move_eval_delta`).
+//! - Incremental evaluation delta (`hypothetical_score_delta`).
 //! - History heuristic (depth² bonus on cutoffs).
 //! - Tactical bonuses for cells in hot windows (+50k for blocking opponent,
 //!   +40k for completing our own threats).
@@ -52,11 +52,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
 use smallvec::SmallVec;
-use crate::eval::WIN_SCORE;
+use crate::encoder::WIN_SCORE;
 use crate::board::HexGameState;
 use crate::core::WIN_LENGTH;
 use crate::core::Turn;
-use crate::threats::{live_cells, threat_status, turn_satisfies_status, ThreatStatus};
+use crate::board::GameError;
+use crate::threats::{generate_threat_turns, threat_status, turn_satisfies_status, ThreatStatus};
 
 // -------------------------------------------------------------------------
 // Constants
@@ -91,6 +92,9 @@ const PAIR_SUM_CAP: usize = 12;
 /// Weight for eval delta in move ordering.
 const DELTA_WEIGHT: i32 = 15;
 
+/// Tempo bonus for the side to move.
+const TEMPO_BONUS: i32 = 15;
+
 /// TT entries cap before clearing to avoid unbounded memory growth.
 const TT_MAX_SIZE: usize = 2_000_000;
 
@@ -109,7 +113,7 @@ fn evaluate(game: &HexGameState, player: u8) -> i32 {
     }
     let mut score = if player == 0 { game.eval().score() } else { -game.eval().score() };
     if game.current_player() == player {
-        score += 15; // tempo bonus for having the move
+        score += TEMPO_BONUS;
     }
     score
 }
@@ -237,22 +241,22 @@ fn tt_hash(game: &HexGameState) -> u64 {
 
 /// Execute a full turn (1 or 2 placements). Returns `(game_over, placements_made)`.
 ///
-/// The caller must ensure the turn is legal; an illegal placement is
-/// treated as game-over (defensive fallback) so the search does not crash.
-fn make_turn(game: &mut HexGameState, t: Turn) -> (bool, u8) {
+/// Propagates `GameError` so that an illegal move from the move generator
+/// surfaces immediately instead of silently corrupting the undo stack.
+fn make_turn(game: &mut HexGameState, t: Turn) -> Result<(bool, u8), GameError> {
     let m1 = t.first();
-    game.place(m1.q, m1.r).unwrap_or(true);
+    game.place(m1.q, m1.r)?;
     if game.is_over() {
-        return (true, 1);
+        return Ok((true, 1));
     }
     if let Some(m2) = t.second() {
-        game.place(m2.q, m2.r).unwrap_or(true);
+        game.place(m2.q, m2.r)?;
         if game.is_over() {
-            return (true, 2);
+            return Ok((true, 2));
         }
-        return (false, 2);
+        return Ok((false, 2));
     }
-    (false, 1)
+    Ok((false, 1))
 }
 
 /// Undo a full turn. `placed` = number of placements that were actually made.
@@ -269,7 +273,7 @@ fn unmake_turn(game: &mut HexGameState, placed: u8) {
 /// Score a single candidate cell for sorting.
 ///
 /// The score has three components:
-/// 1. **Evaluation delta** — how much `move_eval_delta` changes the position.
+/// 1. **Evaluation delta** — how much `hypothetical_score_delta` changes the position.
 /// 2. **History bonus** — cells that caused cutoffs in sibling subtrees.
 /// 3. **Tactical bonus** — cells in hot windows get huge bonuses so they
 ///    bubble to the top (+50k for blocking opponent, +40k for completing
@@ -287,7 +291,7 @@ fn score_candidate(
     noise_level: f32,
     noise_seed: u64,
 ) -> i64 {
-    let delta = game.move_eval_delta(cell, game.current_player()) as i64;
+    let delta = game.eval().hypothetical_score_delta(cell, game.current_player()) as i64;
     let hist = history.get(&cell).copied().unwrap_or(0).min(500_000) as i64;
 
     // ── Tactical bonuses (deterministic, not affected by noise) ──
@@ -400,7 +404,7 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
 /// A 4-window (2 empties) is a win only if we have at least 2 placements.
 fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
     let counts = game.eval().counts(player);
-    if counts.fours == 0 && counts.fives == 0 {
+    if counts.fours() == 0 && counts.fives() == 0 {
         return None;
     }
     let remaining = game.placements_remaining() as usize;
@@ -418,9 +422,8 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
             }
         }
 
-        // Skip windows that require more empties than we have placements,
-        // or windows that are already full (should not happen in practice
-        // because the game would be over, but we guard defensively).
+        // A full window means the game is already over; skip it.
+        // A window needing more empties than placements is unreachable.
         if empties.is_empty() || empties.len() > remaining {
             continue;
         }
@@ -550,6 +553,7 @@ fn generate_inner_turns(
     game: &HexGameState,
     history: &FxHashMap<Hex, i32>,
     noise_seed: u64,
+    ts: &ThreatStatus,
 ) -> Vec<Turn> {
     if game.stones().is_empty() {
         return vec![Turn::single(Hex::ORIGIN)];
@@ -564,10 +568,8 @@ fn generate_inner_turns(
     let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
 
-    // ── Threat filter ──
-    // Compute threat_status ONCE and retain only legal turns.
-    let ts = threat_status(game);
-    turns.retain(|t| turn_satisfies_status(&ts, *t));
+    // Retain only turns that satisfy the pre-computed threat status.
+    turns.retain(|t| turn_satisfies_status(ts, *t));
     turns
 }
 
@@ -593,85 +595,6 @@ fn promote_best_turns(turns: &mut Vec<Turn>, tt_best: Option<Turn>, killer: Opti
             turns.swap(start, pos + start);
         }
     }
-}
-
-// -------------------------------------------------------------------------
-// Threat turn generation (for quiescence)
-// -------------------------------------------------------------------------
-
-/// Generate turns from hot-window cells only (for quiescence search).
-///
-/// Quiescence does not need the full candidate list — it only extends
-/// along tactically relevant cells (threats and blocks).  This keeps
-/// the quiescence tree narrow while resolving immediate tactical
-/// sequences.
-///
-/// # Strategy
-/// 1. Collect opponent live cells (blocking moves).
-/// 2. If none, collect our own live cells (threat completion).
-/// 3. For single-placement quiescence, return the top 6 cells.
-/// 4. For two-placement quiescence, generate pairs from the combined
-///    threat cell set, deduplicate, and cap at 16 turns.
-fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
-    let player = game.current_player();
-    let opp = 1 - player;
-
-    // Single-placement quiescence
-    if game.placements_remaining() == 1 {
-        let mut opp_threats = Vec::new();
-        live_cells(game, opp, &mut opp_threats);
-        let mut my_threats = Vec::new();
-        live_cells(game, player, &mut my_threats);
-
-        let cells = if !opp_threats.is_empty() {
-            opp_threats
-        } else {
-            my_threats
-        };
-        if cells.is_empty() {
-            return Vec::new();
-        }
-        return cells.into_iter().take(6).map(Turn::single).collect();
-    }
-
-    // Two-placement quiescence: collect live cells from both sides.
-    let mut opp_threats = Vec::new();
-    live_cells(game, opp, &mut opp_threats);
-    let mut my_threats = Vec::new();
-    live_cells(game, player, &mut my_threats);
-
-    let primary = if !opp_threats.is_empty() {
-        &opp_threats
-    } else {
-        &my_threats
-    };
-    if primary.is_empty() {
-        return Vec::new();
-    }
-
-    // Combine all threat cells from both sides.
-    let mut all_threats: Vec<Hex> = opp_threats
-        .iter()
-        .chain(my_threats.iter())
-        .copied()
-        .collect();
-    all_threats.sort();
-    all_threats.dedup();
-
-    let mut turns = Vec::new();
-
-    // Generate pairs within the top threat cells (most important).
-    let n = all_threats.len().min(8);
-    for i in 0..n {
-        for j in (i + 1)..n {
-            turns.push(Turn::pair(all_threats[i], all_threats[j]));
-        }
-    }
-
-    turns.sort_by(|a, b| a.first().cmp(&b.first()).then(a.second().cmp(&b.second())));
-    turns.dedup();
-    turns.truncate(16);
-    turns
 }
 
 // -------------------------------------------------------------------------
@@ -728,31 +651,31 @@ fn quiesce(
     beta: i32,
     qdepth: i32,
     ply: usize,
-) -> i32 {
+) -> Result<i32, GameError> {
     if ss.aborted {
-        return 0;
+        return Ok(0);
     }
     ss.nodes += 1;
     if ss.nodes % 1024 == 0 && ss.timed_out() {
         ss.aborted = true;
-        return 0;
+        return Ok(0);
     }
 
     let player = game.current_player();
 
     // Terminal position: return mate score from player's perspective.
     if game.is_over() {
-        return if game.winner() == Some(player) {
+        return Ok(if game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             -(WIN_SCORE - ply as i32)
-        };
+        });
     }
 
     // Stand-pat: the static evaluation is a lower bound on the score.
     let stand_pat = evaluate(game, player);
     if stand_pat >= beta {
-        return stand_pat;
+        return Ok(stand_pat);
     }
     if stand_pat > alpha {
         alpha = stand_pat;
@@ -760,57 +683,55 @@ fn quiesce(
 
     // Max quiescence depth reached.
     if qdepth <= 0 {
-        return alpha;
+        return Ok(alpha);
     }
 
     // Only extend when threats exist on either side.
     let counts_p = game.eval().counts(player);
     let counts_o = game.eval().counts(1 - player);
-    if counts_p.fives == 0
-        && counts_o.fives == 0
-        && counts_p.fours == 0
-        && counts_o.fours == 0
+    if counts_p.fives() == 0
+        && counts_o.fives() == 0
+        && counts_p.fours() == 0
+        && counts_o.fours() == 0
     {
-        return alpha;
+        return Ok(alpha);
     }
 
     // Instant win check.
     if let Some(win_turn) = find_instant_win(game, player) {
-        let (over, placed) = make_turn(game, win_turn);
+        let (over, placed) = make_turn(game, win_turn)?;
 
         let score = if over && game.winner() == Some(player) {
-            // Game ends immediately with a win.
             WIN_SCORE - ply as i32
-        } else if over {
-            // Unlikely: win turn did not win (should not happen).
-            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
         } else {
-            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
+            // If the game ended unexpectedly, the recursive quiesce call
+            // will immediately see game.is_over() and return the correct
+            // terminal score.
+            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)?
         };
 
         unmake_turn(game, placed);
 
-        // If the win turn ended the game, return the win score directly;
-        // otherwise propagate the subtree score.
-        return if over && game.winner() == Some(player) {
+        return Ok(if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             score
-        };
+        });
     }
 
     // Unblockable opponent win: we cannot stop all threats.
-    if matches!(threat_status(game), ThreatStatus::Unblockable) {
-        return -(WIN_SCORE - ply as i32 - 1);
+    let ts = threat_status(game);
+    if matches!(ts, ThreatStatus::Unblockable) {
+        return Ok(-(WIN_SCORE - ply as i32 - 1));
     }
 
     let turns = generate_threat_turns(game);
     if turns.is_empty() {
-        return alpha;
+        return Ok(alpha);
     }
 
     for t in &turns {
-        let (over, placed) = make_turn(game, *t);
+        let (over, placed) = make_turn(game, *t)?;
         let score = if over {
             if game.winner() == Some(player) {
                 WIN_SCORE - ply as i32
@@ -818,23 +739,23 @@ fn quiesce(
                 -(WIN_SCORE - ply as i32)
             }
         } else {
-            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
+            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)?
         };
         unmake_turn(game, placed);
 
         if ss.aborted {
-            return 0;
+            return Ok(0);
         }
 
         if score >= beta {
-            return score;
+            return Ok(score);
         }
         if score > alpha {
             alpha = score;
         }
     }
 
-    alpha
+    Ok(alpha)
 }
 
 // -------------------------------------------------------------------------
@@ -858,13 +779,13 @@ fn alphabeta(
     ply: usize,
     mut alpha: i32,
     beta: i32,
-) -> i32 {
+) -> Result<i32, GameError> {
     if ss.aborted {
-        return 0;
+        return Ok(0);
     }
     if ss.nodes % 1024 == 0 && ss.timed_out() {
         ss.aborted = true;
-        return 0;
+        return Ok(0);
     }
     ss.nodes += 1;
 
@@ -872,33 +793,36 @@ fn alphabeta(
 
     // Terminal check.
     if game.is_over() {
-        return if game.winner() == Some(player) {
+        return Ok(if game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             -(WIN_SCORE - ply as i32)
-        };
+        });
     }
 
     // Leaf: drop into quiescence search.
     if depth <= 0 {
-        return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply);
+        return Ok(quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply)?);
     }
 
     // Instant win check: if we can win right now, return immediately.
     if let Some(win_turn) = find_instant_win(game, player) {
-        let (over, placed) = make_turn(game, win_turn);
+        let (over, placed) = make_turn(game, win_turn)?;
         let score = if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
-            -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
+            -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)?
         };
         unmake_turn(game, placed);
-        return score;
+        return Ok(score);
     }
 
+    // Compute threat status once for both the unblockable check and move generation.
+    let ts = threat_status(game);
+
     // Unblockable opponent win check.
-    if matches!(threat_status(game), ThreatStatus::Unblockable) {
-        return -(WIN_SCORE - ply as i32 - 1);
+    if matches!(ts, ThreatStatus::Unblockable) {
+        return Ok(-(WIN_SCORE - ply as i32 - 1));
     }
 
     // Reverse futility pruning.
@@ -908,7 +832,7 @@ fn alphabeta(
         let margin = 2000 * depth;
         let static_eval = evaluate(game, player);
         if static_eval - margin >= beta {
-            return static_eval;
+            return Ok(static_eval);
         }
     }
 
@@ -920,10 +844,10 @@ fn alphabeta(
         if entry.depth >= depth {
             let adj_score = adjust_mate_load(entry.score, ply);
             match entry.flag {
-                TTFlag::Exact => return adj_score,
+                TTFlag::Exact => return Ok(adj_score),
                 TTFlag::LowerBound => {
                     if adj_score >= beta {
-                        return adj_score;
+                        return Ok(adj_score);
                     }
                     if adj_score > alpha {
                         alpha = adj_score;
@@ -931,7 +855,7 @@ fn alphabeta(
                 }
                 TTFlag::UpperBound => {
                     if adj_score <= alpha {
-                        return adj_score;
+                        return Ok(adj_score);
                     }
                 }
             }
@@ -940,9 +864,9 @@ fn alphabeta(
     }
 
     // Generate turns (inner nodes always deterministic).
-    let mut turns = generate_inner_turns(game, &ss.history, ss.noise_seed);
+    let mut turns = generate_inner_turns(game, &ss.history, ss.noise_seed, &ts);
     if turns.is_empty() {
-        return evaluate(game, player);
+        return Ok(evaluate(game, player));
     }
 
     let ply_idx = ply.min(MAX_PLY - 1);
@@ -953,7 +877,7 @@ fn alphabeta(
     let orig_alpha = alpha;
 
     for (move_idx, t) in turns.iter().enumerate() {
-        let (over, placed) = make_turn(game, *t);
+        let (over, placed) = make_turn(game, *t)?;
 
         let score = if over {
             if game.winner() == Some(player) {
@@ -978,7 +902,7 @@ fn alphabeta(
 
             if move_idx == 0 {
                 // Full-window search for the first (presumably best) move.
-                -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
+                -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)?
             } else if do_lmr {
                 // Reduced-depth null-window search.
                 let reduced = -alphabeta(
@@ -988,13 +912,13 @@ fn alphabeta(
                     ply + 1,
                     -(alpha + 1),
                     -alpha,
-                );
+                )?;
                 if reduced > alpha && !ss.aborted {
                     // Re-search with null window at full depth.
-                    let nw = -alphabeta(game, ss, depth - 1, ply + 1, -(alpha + 1), -alpha);
+                    let nw = -alphabeta(game, ss, depth - 1, ply + 1, -(alpha + 1), -alpha)?;
                     if nw > alpha && nw < beta && !ss.aborted {
                         // Full-window re-search.
-                        -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
+                        -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)?
                     } else {
                         nw
                     }
@@ -1003,9 +927,9 @@ fn alphabeta(
                 }
             } else {
                 // Null-window search without reduction.
-                let nw = -alphabeta(game, ss, depth - 1, ply + 1, -(alpha + 1), -alpha);
+                let nw = -alphabeta(game, ss, depth - 1, ply + 1, -(alpha + 1), -alpha)?;
                 if nw > alpha && nw < beta && !ss.aborted {
-                    -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
+                    -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)?
                 } else {
                     nw
                 }
@@ -1014,7 +938,7 @@ fn alphabeta(
 
         unmake_turn(game, placed);
         if ss.aborted {
-            return 0;
+            return Ok(0);
         }
 
         if score > best_score {
@@ -1053,7 +977,7 @@ fn alphabeta(
         },
     );
 
-    best_score
+    Ok(best_score)
 }
 
 // -------------------------------------------------------------------------
@@ -1071,7 +995,7 @@ fn search_root(
     root_turns: &[Turn],
     init_alpha: i32,
     init_beta: i32,
-) -> (Turn, i32, Vec<(Turn, i32)>) {
+) -> Result<(Turn, i32, Vec<(Turn, i32)>), GameError> {
     let player = game.current_player();
     let mut alpha = init_alpha;
     let beta = init_beta;
@@ -1080,7 +1004,7 @@ fn search_root(
     let mut scores: Vec<(Turn, i32)> = Vec::with_capacity(root_turns.len());
 
     for (move_idx, t) in root_turns.iter().enumerate() {
-        let (over, placed) = make_turn(game, *t);
+        let (over, placed) = make_turn(game, *t)?;
 
         let score = if over {
             if game.winner() == Some(player) {
@@ -1091,11 +1015,11 @@ fn search_root(
         } else {
             // PVS at root.
             if move_idx == 0 {
-                -alphabeta(game, ss, depth - 1, 1, -beta, -alpha)
+                -alphabeta(game, ss, depth - 1, 1, -beta, -alpha)?
             } else {
-                let nw = -alphabeta(game, ss, depth - 1, 1, -(alpha + 1), -alpha);
+                let nw = -alphabeta(game, ss, depth - 1, 1, -(alpha + 1), -alpha)?;
                 if nw > alpha && nw < beta && !ss.aborted {
-                    -alphabeta(game, ss, depth - 1, 1, -beta, -alpha)
+                    -alphabeta(game, ss, depth - 1, 1, -beta, -alpha)?
                 } else {
                     nw
                 }
@@ -1118,7 +1042,7 @@ fn search_root(
         }
     }
 
-    (best_turn, best_score, scores)
+    Ok((best_turn, best_score, scores))
 }
 
 // -------------------------------------------------------------------------
@@ -1157,21 +1081,21 @@ pub fn iterative_deepening(
     _near_radius: i32, // kept for API compat, always uses radius-2 internally
     collect_candidates: bool,
     noise_level: f32,
-) -> SearchResult {
+) -> Result<SearchResult, GameError> {
     let mut ss = SearchState::new(noise_level);
     ss.deadline = Some(Instant::now() + time_limit);
     ss.maybe_clear_tt();
 
     // Handle opening move.
     if game.stones().is_empty() {
-        return SearchResult {
+        return Ok(SearchResult {
             best_turn: Turn::single(Hex::ORIGIN),
             best_move: Hex::ORIGIN,
             score: 0,
             depth_reached: 0,
             nodes: 0,
             root_candidates: vec![(Hex::ORIGIN, 0)],
-        };
+        });
     }
 
     // Generate root turns (using immutable game).
@@ -1183,14 +1107,14 @@ pub fn iterative_deepening(
         } else if !c.is_empty() {
             root_turns.push(Turn::single(c[0]));
         } else {
-            return SearchResult {
+            return Ok(SearchResult {
                 best_turn: Turn::single(Hex::ORIGIN),
                 best_move: Hex::ORIGIN,
                 score: 0,
                 depth_reached: 0,
                 nodes: 0,
                 root_candidates: vec![],
-            };
+            });
         }
     }
 
@@ -1210,7 +1134,7 @@ pub fn iterative_deepening(
             let hi = best_score + ASPIRATION_WINDOW;
 
             let (bt, s, scores) =
-                search_root(&mut search_game, &mut ss, depth, &root_turns, lo, hi);
+                search_root(&mut search_game, &mut ss, depth, &root_turns, lo, hi)?;
             if ss.aborted {
                 break;
             }
@@ -1225,7 +1149,7 @@ pub fn iterative_deepening(
                     &root_turns,
                     i32::MIN + 1,
                     i32::MAX - 1,
-                )
+                )?
             } else {
                 (bt, s, scores)
             }
@@ -1237,7 +1161,7 @@ pub fn iterative_deepening(
                 &root_turns,
                 i32::MIN + 1,
                 i32::MAX - 1,
-            )
+            )?
         };
 
         if ss.aborted {
@@ -1249,12 +1173,15 @@ pub fn iterative_deepening(
         depth_reached = depth;
 
         // Re-sort root turns for next iteration (best-first for PVS).
+        // Linear scan is cheaper than a HashMap for the small root move set.
         if !scores.is_empty() {
-            let score_map: FxHashMap<Turn, i32> = scores.into_iter().collect();
-            root_turns.sort_by(|a, b| {
-                let sa = score_map.get(a).copied().unwrap_or(i32::MIN);
-                let sb = score_map.get(b).copied().unwrap_or(i32::MIN);
-                sb.cmp(&sa)
+            root_turns.sort_by_key(|t| {
+                Reverse(
+                    scores
+                        .iter()
+                        .find_map(|(turn, s)| if turn == t { Some(*s) } else { None })
+                        .unwrap_or(i32::MIN),
+                )
             });
         }
 
@@ -1271,7 +1198,7 @@ pub fn iterative_deepening(
             .iter()
             .map(|&m| {
                 let sign = if game.current_player() == 0 { 1 } else { -1 };
-                let score = game.move_eval_delta(m, game.current_player()) * sign;
+                let score = game.eval().hypothetical_score_delta(m, game.current_player()) * sign;
                 (m, score)
             })
             .collect()
@@ -1279,12 +1206,12 @@ pub fn iterative_deepening(
         vec![]
     };
 
-    SearchResult {
+    Ok(SearchResult {
         best_turn,
         best_move: best_turn.first(),
         score: best_score,
         depth_reached,
         nodes: ss.nodes,
         root_candidates,
-    }
+    })
 }

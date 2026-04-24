@@ -16,8 +16,22 @@
 //! builds.
 
 #[cfg(test)]
+pub mod board;
+#[cfg(test)]
+pub mod core;
+#[cfg(test)]
+pub mod encoder;
+#[cfg(test)]
+pub mod eval_state;
+#[cfg(test)]
+pub mod grid;
+#[cfg(test)]
+pub mod hot;
+#[cfg(test)]
 pub mod oracle;
+#[cfg(test)]
+pub mod patterns;
 #[cfg(test)]
 pub mod threats;
 #[cfg(test)]
-pub mod patterns;
+pub mod threats_internal;

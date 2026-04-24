@@ -76,8 +76,12 @@ impl fmt::Display for Hex {
 }
 
 impl PartialOrd for Hex {
-    /// Delegates to [`Ord::cmp`] so that `Hex` has a total ordering compatible
-    /// with `Ord`.  This makes `Hex` usable in `BTreeMap` / `BTreeSet`.
+    /// A total order is required so that [`Turn::pair`] can canonicalise
+    /// two cells (smaller first).  A deterministic lexicographic order on
+    /// [`Hex`] guarantees that the same physical move always hashes to the
+    /// same key, which keeps transposition tables and `HashSet`s consistent
+    /// regardless of argument order.  It also makes `Hex` usable in
+    /// `BTreeMap` / `BTreeSet`.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -86,8 +90,10 @@ impl PartialOrd for Hex {
 impl Ord for Hex {
     /// Lexicographic ordering: first by `q`, then by `r`.
     ///
-    /// A deterministic order is important when the engine stores move lists
-    /// in sorted containers or when reproducibility across runs is required.
+    /// This order is the foundation of canonical pair storage in
+    /// [`Turn::pair`].  Without a deterministic total order, swapping the
+    /// arguments to `pair` would produce distinct values, breaking equality
+    /// and hashing invariants used by transposition tables and `HashSet`s.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.q.cmp(&other.q).then(self.r.cmp(&other.r))
     }
@@ -132,6 +138,9 @@ impl Turn {
     /// arguments produces an identical `Turn`.
     #[inline]
     pub fn pair(a: Hex, b: Hex) -> Self {
+        // A turn must place two distinct stones; self-pairs are a logic error
+        // in every caller and would corrupt transposition-table keys.
+        debug_assert_ne!(a, b, "Turn::pair requires two distinct cells");
         // Canonicalize: smaller Hex first.  This makes Turn equality and
         // hashing independent of argument order.
         if a <= b {
@@ -142,18 +151,27 @@ impl Turn {
     }
 
     /// The first (or only) placement of this turn.
+    ///
+    /// For a two-stone turn this is the lexicographically smaller cell,
+    /// which callers rely on when applying or undoing moves.
     #[inline]
     pub const fn first(self) -> Hex {
         self.first
     }
 
     /// The second placement, if this is a two-stone turn.
+    ///
+    /// When present, `first() <= second()` is guaranteed so that search
+    /// and encoding layers can treat moves as canonical values.
     #[inline]
     pub const fn second(self) -> Option<Hex> {
         self.second
     }
 
     /// How many individual placements this turn contains (1 or 2).
+    ///
+    /// Search and encoding layers need this count to know how many stones
+    /// to commit or undo in a single turn.
     #[inline]
     pub const fn placements(self) -> u8 {
         if self.second.is_some() { 2 } else { 1 }
@@ -199,7 +217,7 @@ impl WindowKey {
     /// # Panics
     ///
     /// Panics in debug builds if `q` or `r` are outside the range
-    /// `-16384..=16383` or if `dir` is larger than `3`.
+    /// `-16384..=16383` or if `dir` is not a valid `HEX_DIRECTIONS` index (0..3).
     #[inline(always)]
     pub const fn new(q: i32, r: i32, dir: u8) -> Self {
         debug_assert!(
@@ -210,7 +228,7 @@ impl WindowKey {
             r >= -16384 && r <= 16383,
             "r coordinate out of 15-bit signed range"
         );
-        debug_assert!(dir < 4, "dir must fit in 2 bits (0..3)");
+        debug_assert!(dir < 3, "dir must be a valid HEX_DIRECTIONS index (0..3)");
 
         let q_bits = (q as u32) & 0x7FFF;
         let r_bits = (r as u32) & 0x7FFF;
@@ -304,224 +322,4 @@ pub fn hex_distance(a: Hex, b: Hex) -> i32 {
     (dq.abs() + dr.abs() + ds.abs()) / 2
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn distance_same_cell() {
-        assert_eq!(hex_distance(Hex::ORIGIN, Hex::ORIGIN), 0);
-    }
-
-    #[test]
-    fn distance_adjacent_along_each_direction() {
-        for &(dq, dr) in &HEX_DIRECTIONS {
-            assert_eq!(hex_distance(Hex::ORIGIN, Hex::new(dq, dr)), 1);
-        }
-    }
-
-    #[test]
-    fn distance_is_symmetric() {
-        let a = Hex::new(3, -1);
-        let b = Hex::new(-2, 4);
-        assert_eq!(hex_distance(a, b), hex_distance(b, a));
-    }
-
-    #[test]
-    fn distance_known_values() {
-        assert_eq!(hex_distance(Hex::ORIGIN, Hex::new(3, 0)), 3);
-        assert_eq!(hex_distance(Hex::ORIGIN, Hex::new(0, 5)), 5);
-        assert_eq!(hex_distance(Hex::ORIGIN, Hex::new(2, -2)), 2);
-        assert_eq!(hex_distance(Hex::new(1, 1), Hex::new(-1, -1)), 4);
-    }
-
-    #[test]
-    fn distance_negative_coordinates() {
-        assert_eq!(hex_distance(Hex::new(-3, -2), Hex::new(-3, -2)), 0);
-        assert_eq!(hex_distance(Hex::new(-1, 0), Hex::new(1, 0)), 2);
-    }
-
-    #[test]
-    fn hex_display() {
-        assert_eq!(format!("{}", Hex::new(3, -1)), "(3, -1)");
-        assert_eq!(format!("{}", Hex::ORIGIN), "(0, 0)");
-    }
-
-    #[test]
-    fn hex_ordering() {
-        let mut hexes = vec![Hex::new(1, 0), Hex::new(0, 1), Hex::new(0, 0)];
-        hexes.sort();
-        assert_eq!(hexes, vec![Hex::new(0, 0), Hex::new(0, 1), Hex::new(1, 0)]);
-    }
-
-    #[test]
-    fn hex_equality_and_hashing() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(Hex::new(0, 0));
-        set.insert(Hex::new(1, 0));
-        set.insert(Hex::new(0, 0)); // duplicate
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn directions_count() {
-        assert_eq!(HEX_DIRECTIONS.len(), 3);
-    }
-
-    // ------------------------------------------------------------------
-    // WindowKey round-trip and behaviour tests
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn windowkey_roundtrip_positive() {
-        let key = WindowKey::new(42, 100, 2);
-        assert_eq!(key.q(), 42);
-        assert_eq!(key.r(), 100);
-        assert_eq!(key.dir(), 2);
-    }
-
-    #[test]
-    fn windowkey_roundtrip_negative() {
-        let key = WindowKey::new(-100, -42, 1);
-        assert_eq!(key.q(), -100);
-        assert_eq!(key.r(), -42);
-        assert_eq!(key.dir(), 1);
-    }
-
-    #[test]
-    fn windowkey_roundtrip_mixed() {
-        let key = WindowKey::new(-16384, 16383, 3);
-        assert_eq!(key.q(), -16384);
-        assert_eq!(key.r(), 16383);
-        assert_eq!(key.dir(), 3);
-    }
-
-    #[test]
-    fn windowkey_roundtrip_zero() {
-        let key = WindowKey::new(0, 0, 0);
-        assert_eq!(key.q(), 0);
-        assert_eq!(key.r(), 0);
-        assert_eq!(key.dir(), 0);
-    }
-
-    #[test]
-    fn windowkey_max_positive_coords() {
-        let key = WindowKey::new(16383, 16383, 0);
-        assert_eq!(key.q(), 16383);
-        assert_eq!(key.r(), 16383);
-    }
-
-    #[test]
-    fn windowkey_equality_and_hashing() {
-        use std::collections::HashSet;
-        let a = WindowKey::new(1, 2, 0);
-        let b = WindowKey::new(1, 2, 0);
-        let c = WindowKey::new(1, 2, 1);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-
-        let mut set = HashSet::new();
-        set.insert(a);
-        set.insert(b); // duplicate
-        set.insert(c);
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn windowkey_copy_trait() {
-        let a = WindowKey::new(5, -5, 2);
-        let b = a;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn windowkey_cell_at_along_axis_a() {
-        // Direction 0 is (1, 0).
-        let key = WindowKey::new(0, 0, 0);
-        assert_eq!(key.cell_at(0), Hex::new(0, 0));
-        assert_eq!(key.cell_at(1), Hex::new(1, 0));
-        assert_eq!(key.cell_at(5), Hex::new(5, 0));
-        assert_eq!(key.cell_at(-1), Hex::new(-1, 0));
-    }
-
-    #[test]
-    fn windowkey_cell_at_along_axis_b() {
-        // Direction 1 is (0, 1).
-        let key = WindowKey::new(3, -2, 1);
-        assert_eq!(key.cell_at(0), Hex::new(3, -2));
-        assert_eq!(key.cell_at(2), Hex::new(3, 0));
-        assert_eq!(key.cell_at(-2), Hex::new(3, -4));
-    }
-
-    #[test]
-    fn windowkey_cell_at_along_axis_c() {
-        // Direction 2 is (1, -1).
-        let key = WindowKey::new(1, 1, 2);
-        assert_eq!(key.cell_at(0), Hex::new(1, 1));
-        assert_eq!(key.cell_at(1), Hex::new(2, 0));
-        assert_eq!(key.cell_at(-1), Hex::new(0, 2));
-    }
-
-    #[test]
-    fn windowkey_size_is_u32() {
-        assert_eq!(std::mem::size_of::<WindowKey>(), 4);
-    }
-
-    // ------------------------------------------------------------------
-    // Turn tests
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn turn_single() {
-        let t = Turn::single(Hex::new(1, 2));
-        assert_eq!(t.first(), Hex::new(1, 2));
-        assert_eq!(t.second(), None);
-        assert_eq!(t.placements(), 1);
-    }
-
-    #[test]
-    fn turn_pair_ordered() {
-        let t = Turn::pair(Hex::new(1, 2), Hex::new(3, 4));
-        assert_eq!(t.first(), Hex::new(1, 2));
-        assert_eq!(t.second(), Some(Hex::new(3, 4)));
-        assert_eq!(t.placements(), 2);
-    }
-
-    #[test]
-    fn turn_pair_canonical_ordering() {
-        // When passed in reverse order, pair should canonicalize (smaller first).
-        let t = Turn::pair(Hex::new(3, 4), Hex::new(1, 2));
-        assert_eq!(t.first(), Hex::new(1, 2));
-        assert_eq!(t.second(), Some(Hex::new(3, 4)));
-        assert_eq!(t.placements(), 2);
-    }
-
-    #[test]
-    fn turn_pair_equal_hexes() {
-        let t = Turn::pair(Hex::new(2, 2), Hex::new(2, 2));
-        assert_eq!(t.first(), Hex::new(2, 2));
-        assert_eq!(t.second(), Some(Hex::new(2, 2)));
-        assert_eq!(t.placements(), 2);
-    }
-
-    #[test]
-    fn turn_copy_trait() {
-        let a = Turn::single(Hex::new(0, 0));
-        let b = a;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn turn_equality_and_hashing() {
-        use std::collections::HashSet;
-        let a = Turn::pair(Hex::new(1, 0), Hex::new(0, 1));
-        let b = Turn::pair(Hex::new(0, 1), Hex::new(1, 0));
-        assert_eq!(a, b);
-
-        let mut set = HashSet::new();
-        set.insert(a);
-        set.insert(b); // duplicate after canonicalization
-        assert_eq!(set.len(), 1);
-    }
-}
