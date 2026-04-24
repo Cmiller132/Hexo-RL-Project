@@ -168,10 +168,12 @@ pub struct SearchState {
     /// Affects candidate ordering to produce varied games for training.
     /// Threat blocking and instant-win detection remain deterministic.
     noise_level: f32,
+    /// Reusable buffer for inner-turn generation (avoids per-node allocations).
+    scratch_inner: Vec<Turn>,
     /// Reusable buffers for quiescence search (avoids per-node allocations).
-    pub(crate) scratch_turns: Vec<Turn>,
-    pub(crate) scratch_opp: Vec<Hex>,
-    pub(crate) scratch_my: Vec<Hex>,
+    scratch_turns: Vec<Turn>,
+    scratch_opp: Vec<Hex>,
+    scratch_my: Vec<Hex>,
 }
 
 impl SearchState {
@@ -188,6 +190,7 @@ impl SearchState {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(42),
             noise_level,
+            scratch_inner: Vec::new(),
             scratch_turns: Vec::new(),
             scratch_opp: Vec::new(),
             scratch_my: Vec::new(),
@@ -559,15 +562,19 @@ fn generate_inner_turns(
     history: &FxHashMap<Hex, i32>,
     noise_seed: u64,
     ts: &ThreatStatus,
-) -> Vec<Turn> {
+    out: &mut Vec<Turn>,
+) {
+    out.clear();
     if game.stones().is_empty() {
-        return vec![Turn::single(Hex::ORIGIN)];
+        out.push(Turn::single(Hex::ORIGIN));
+        return;
     }
 
     // Single-placement turn: no pairs to generate.
     if game.placements_remaining() == 1 {
         let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
-        return cands.into_iter().map(Turn::single).collect();
+        out.extend(cands.into_iter().map(Turn::single));
+        return;
     }
 
     let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
@@ -575,7 +582,7 @@ fn generate_inner_turns(
 
     // Retain only turns that satisfy the pre-computed threat status.
     turns.retain(|t| turn_satisfies_status(ts, *t));
-    turns
+    out.extend(turns);
 }
 
 // -------------------------------------------------------------------------
@@ -745,7 +752,7 @@ fn quiesce(
                 -(WIN_SCORE - ply as i32)
             }
         } else {
-            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1, Some(&ts))?
+            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1, None)?
         };
         unmake_turn(game, placed);
 
@@ -806,9 +813,12 @@ fn alphabeta(
         });
     }
 
+    // Compute threat status once for quiescence, unblockable check, and move generation.
+    let ts = threat_status(game);
+
     // Leaf: drop into quiescence search.
     if depth <= 0 {
-        return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply, None);
+        return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply, Some(&ts));
     }
 
     // Instant win check: if we can win right now, return immediately.
@@ -822,9 +832,6 @@ fn alphabeta(
         unmake_turn(game, placed);
         return Ok(score);
     }
-
-    // Compute threat status once for both the unblockable check and move generation.
-    let ts = threat_status(game);
 
     // Unblockable opponent win check.
     if matches!(ts, ThreatStatus::Unblockable) {
@@ -870,7 +877,8 @@ fn alphabeta(
     }
 
     // Generate turns (inner nodes always deterministic).
-    let mut turns = generate_inner_turns(game, &ss.history, ss.noise_seed, &ts);
+    generate_inner_turns(game, &ss.history, ss.noise_seed, &ts, &mut ss.scratch_inner);
+    let mut turns = std::mem::take(&mut ss.scratch_inner);
     if turns.is_empty() {
         return Ok(evaluate(game, player));
     }
@@ -982,6 +990,9 @@ fn alphabeta(
             best_turn: Some(best_turn),
         },
     );
+
+    ss.scratch_inner = turns;
+    ss.scratch_inner.clear();
 
     Ok(best_score)
 }

@@ -18,8 +18,8 @@
 //!    MustBlock / Unblockable).
 //! 2. `turn_satisfies_status(&status, turn)` — test a candidate turn against
 //!    the pre-computed status.
-//! 3. `generate_threat_turns(game, out)` — produce candidate turns for
-//!    quiescence search from live cells (crate-internal).
+//! 3. `generate_threat_turns(game, out, opp_buf, my_buf)` — produce candidate
+//!    turns for quiescence search from live cells (crate-internal).
 //! 4. `live_cells(game, player, out)` — enumerate empty cells that appear in
 //!    at least one of the player's hot windows (useful for quiescence search
 //!    and neural-network feature planes).

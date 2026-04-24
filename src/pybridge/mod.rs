@@ -461,8 +461,8 @@ impl PyHexGame {
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray3::from_owned_array(py, arr);
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(encoded.legal_moves.len() * 8);
-        for h in &encoded.legal_moves {
+        let mut legal_buf: Vec<u8> = Vec::with_capacity(encoded.legal_moves().len() * 8);
+        for h in encoded.legal_moves() {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }

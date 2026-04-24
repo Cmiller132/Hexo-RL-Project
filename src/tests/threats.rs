@@ -414,6 +414,8 @@ proptest! {
             }
         }
     }
+
+
 }
 
 // ---------------------------------------------------------------------------
@@ -853,4 +855,84 @@ proptest! {
             }
         }
     }
-}
+
+    #[test]
+    fn turn_satisfies_status_matches_oracle_medium(seed in any::<u64>()) {
+        let mut rng = Prng::new(seed);
+        let mut game = HexGameState::new();
+        let mut moves_played = 0;
+        let max_moves = 1 + rng.range(8);
+
+        while moves_played < max_moves && !game.is_over() {
+            let legal = game.candidates_near2();
+            if legal.is_empty() {
+                break;
+            }
+            let idx = rng.range(legal.len());
+            let cell = legal[idx];
+            let turn_ended = game.place(cell.q, cell.r).unwrap();
+            if turn_ended {
+                moves_played += 1;
+                if !game.is_over() {
+                    let fast = threat_status(&game);
+                    let oracle = analyse(&mut game.clone());
+
+                    let opp = 1 - game.current_player();
+                    let opp_counts = game.eval().counts(opp);
+                    let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+
+                    let mut must_play = std::collections::HashSet::new();
+                    for turn in &oracle.winning {
+                        must_play.insert(*turn);
+                    }
+                    if oracle.winning.is_empty() && opp_has_threats {
+                        for turn in &oracle.blocking_pairs {
+                            must_play.insert(*turn);
+                        }
+                        if game.placements_remaining() == 1 {
+                            for &cell in &oracle.blocking_single {
+                                must_play.insert(Turn::single(cell));
+                            }
+                        }
+                    }
+
+                    let status = threat_status(&game);
+                    for turn in &oracle.legal {
+                        let satisfies = turn_satisfies_status(&status, *turn);
+                        let is_must_play = must_play.contains(turn);
+
+                        if is_must_play {
+                            if let ThreatStatus::WinningTurn(w) = &fast {
+                                if oracle.winning.contains(turn) && turn != w {
+                                    continue;
+                                }
+                            }
+                            assert!(
+                                satisfies,
+                                "turn {:?} is must-play but turn_satisfies_status returned false",
+                                turn
+                            );
+                        } else {
+                            match &fast {
+                                ThreatStatus::Quiet | ThreatStatus::Unblockable => {
+                                    assert!(
+                                        satisfies,
+                                        "turn {:?} should satisfy when no constraint",
+                                        turn
+                                    );
+                                }
+                                ThreatStatus::WinningTurn(_) | ThreatStatus::MustBlock(_) => {
+                                    assert!(
+                                        !satisfies,
+                                        "turn {:?} should not satisfy under constraint {:?}",
+                                        turn,
+                                        fast
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }}

@@ -203,9 +203,9 @@ fn update_hot(
 
 /// Iterate the 18 windows that touch `cell`.
 ///
-/// `dir_idx` is a flat index `0..17` where `dir = dir_idx / 6` and
-/// `off = dir_idx % 6`.  This avoids duplicating the triple-nested loop
-/// in `place`, `unplace`, and `hypothetical_score_delta`.
+/// Passes `dir` and `off` directly to the callback to avoid re-deriving
+/// them from a flat index inside `place`, `unplace`, and
+/// `hypothetical_score_delta`.
 #[inline]
 fn visit_windows(cell: Hex, mut cb: impl FnMut(i32, i32, u8, u8)) {
     for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {

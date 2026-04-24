@@ -48,7 +48,14 @@ pub struct EncodedBoard {
     pub offset_q: i32,
     pub offset_r: i32,
     /// Legal moves used for channel 3 (same set that the NN policy head should predict).
-    pub legal_moves: Vec<Hex>,
+    legal_moves: Vec<Hex>,
+}
+
+impl EncodedBoard {
+    /// Legal moves at the encoded position.
+    pub fn legal_moves(&self) -> &[Hex] {
+        &self.legal_moves
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -110,7 +117,10 @@ pub fn encode_board(
 /// Encode into a pre-allocated buffer. Returns `(offset_q, offset_r, legal_moves)`.
 ///
 /// The buffer must be at least [`TENSOR_SIZE`] elements. This variant is used
-/// by MCTS to avoid repeated allocations during tree search.
+/// by MCTS to avoid repeated tensor allocations during tree search.
+/// The returned `legal_moves` vector is freshly allocated per call; callers
+/// that need zero-allocation on the MCTS hot path should reuse the vector
+/// themselves (e.g. by taking ownership and clearing it on the next call).
 ///
 /// # Channel layout (13 channels)
 ///
