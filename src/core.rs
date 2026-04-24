@@ -95,23 +95,45 @@ impl Ord for Hex {
 
 /// A turn consists of 1 or 2 placements.
 ///
-/// `Turn::single` creates a one-placement turn.
-/// `Turn::pair` creates a two-placement turn with canonical ordering
-/// (smaller `Hex` first) for TT consistency.
+/// In Infinity Hexagonal Tic-Tac-Toe the opening turn has exactly one
+/// placement; every subsequent turn has two.  [`Turn`] captures either case
+/// in a single compact value.
+///
+/// # Canonical ordering invariant
+///
+/// When a turn contains two placements they are stored in **sorted order**
+/// (`first <= second`).  This guarantees that `Turn::pair(a, b) ==
+/// Turn::pair(b, a)`, which is essential for transposition-table consistency
+/// — the same physical move must always hash to the same key regardless of
+/// the order in which the two cells were supplied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Turn {
+    /// The first (or only) cell of this turn.  For a two-placement turn this
+    /// is the lexicographically smaller cell.
     first: Hex,
+    /// The second cell, if any.  When present, `first <= second` is guaranteed.
     second: Option<Hex>,
 }
 
 impl Turn {
+    /// Create a single-placement turn.
+    ///
+    /// Used for the opening move (Player 0 places exactly one stone at the
+    /// origin) and for one-stone test positions.
     #[inline]
     pub const fn single(h: Hex) -> Self {
         Turn { first: h, second: None }
     }
 
+    /// Create a two-placement turn with canonical ordering.
+    ///
+    /// The two cells are reordered so that the smaller [`Hex`] is stored in
+    /// `first`.  This ensures hash and equality consistency: swapping the
+    /// arguments produces an identical `Turn`.
     #[inline]
     pub fn pair(a: Hex, b: Hex) -> Self {
+        // Canonicalize: smaller Hex first.  This makes Turn equality and
+        // hashing independent of argument order.
         if a <= b {
             Turn { first: a, second: Some(b) }
         } else {
@@ -119,16 +141,19 @@ impl Turn {
         }
     }
 
+    /// The first (or only) placement of this turn.
     #[inline]
     pub const fn first(self) -> Hex {
         self.first
     }
 
+    /// The second placement, if this is a two-stone turn.
     #[inline]
     pub const fn second(self) -> Option<Hex> {
         self.second
     }
 
+    /// How many individual placements this turn contains (1 or 2).
     #[inline]
     pub const fn placements(self) -> u8 {
         if self.second.is_some() { 2 } else { 1 }

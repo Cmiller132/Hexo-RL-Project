@@ -1,9 +1,21 @@
+//! Consistency tests for incremental pattern evaluation.
+//!
+//! The engine's evaluation is incremental: instead of re-scanning the whole
+//! board after every stone, [`EvalState`](crate::eval::state::EvalState) updates
+//! only the windows that touch the changed cell. This module verifies that the
+//! incremental result matches a full brute-force recompute on every test
+//! position.
+
 use crate::core::{Hex, HEX_DIRECTIONS, WIN_LENGTH};
 use crate::eval::grid::{WIN_GRID_RADIUS, win_grid_in_bounds};
 use crate::eval::patterns::{PATTERN_COUNTS, PATTERN_VALUES, POW3};
 use crate::eval::state::{EvalState, ThreatCounts};
 use rustc_hash::FxHashMap;
 
+/// Recompute the total pattern score from scratch by scanning every window
+/// in a fixed radius and summing `PATTERN_VALUES`.
+///
+/// This is `O(N²)` and only used as a reference in tests.
 fn recompute_score(stones: &FxHashMap<Hex, u8>) -> i32 {
     let mut total = 0i32;
     for q in -10..=10 {
@@ -31,6 +43,13 @@ fn recompute_score(stones: &FxHashMap<Hex, u8>) -> i32 {
 mod tests {
     use super::*;
 
+    /// Verify that `PATTERN_COUNTS` (precomputed stone counts per pattern)
+    /// matches a manual base-3 decomposition.
+    ///
+    /// Every pattern index is a 6-digit base-3 number where:
+    /// - `0` = empty
+    /// - `1` = player 0 stone
+    /// - `2` = player 1 stone
     #[test]
     fn ternary_index_roundtrip() {
         for idx in 0..729usize {
@@ -56,6 +75,7 @@ mod tests {
         }
     }
 
+    /// Sanity-check that `POW3` is actually the powers of three.
     #[test]
     fn pow3_values() {
         let mut pow = 1usize;
@@ -65,6 +85,9 @@ mod tests {
         }
     }
 
+    /// Ensure the pattern-value table is non-trivial.
+    ///
+    /// A table full of zeros would pass many other tests while being useless.
     #[test]
     fn pattern_values_not_all_zero() {
         let mut all_zero = true;
@@ -77,6 +100,8 @@ mod tests {
         assert!(!all_zero, "PATTERN_VALUES should not all be zero");
     }
 
+    /// After each incremental `place`, the score must equal the brute-force
+    /// recomputed score for the same stone set.
     #[test]
     fn incremental_place_consistency() {
         let mut eval = EvalState::new();
@@ -102,6 +127,9 @@ mod tests {
         }
     }
 
+    /// After placing several stones and then unplacing all of them, the
+    /// `EvalState` must return to its pristine default (score 0, no threats,
+    /// no hot windows).
     #[test]
     fn incremental_unplace_restores_score() {
         let mut eval = EvalState::new();
@@ -130,6 +158,9 @@ mod tests {
         assert_eq!(eval.hot_windows(1).count(), 0);
     }
 
+    /// The set of hot windows reported by `EvalState` must exactly match the
+    /// set obtained by brute-force scanning the win grid and recomputing
+    /// pattern indices from the stone map.
     #[test]
     fn hot_windows_recomputed_match() {
         let mut eval = EvalState::new();

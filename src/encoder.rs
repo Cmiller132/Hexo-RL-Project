@@ -1,9 +1,13 @@
-//! Unified neural network board encoder for a hexagonal tic-tac-toe engine.
+//! Unified neural-network board encoder for Infinity Hex.
 //!
-//! This module provides the single canonical implementation for encoding a
-//! [`HexGameState`] into a 13-channel 33×33 float32 tensor. Both the MCTS
-//! search and the Python training pipeline call into here, eliminating the
-//! previous duplication between `pybridge.rs` and `mcts.rs`.
+//! Infinity Hex is a variant of Hex played on an infinite hexagonal grid where
+//! the win condition is six stones in a straight line. Each turn (except the
+//! opening move) consists of **two** stone placements. This module converts a
+//! [`HexGameState`] into a fixed-size 13-channel 33×33 float32 tensor that
+//! feeds the neural-network policy and value heads.
+//!
+//! Both the MCTS search tree and the Python training pipeline call into here,
+//! eliminating the previous duplication between `pybridge.rs` and `mcts.rs`.
 
 use crate::board::HexGameState;
 use crate::core::{hex_distance, Hex};
@@ -12,9 +16,13 @@ use crate::threats::{live_cells, threat_status, ThreatStatus};
 // ── Constants ───────────────────────────────────────────────────────────
 
 /// Width and height of the square tensor used for NN input.
+///
+/// The infinite board is cropped to a 33×33 window centered on the board's
+/// centroid (banker's-rounded mean of all occupied cells). Stones or legal
+/// moves that fall outside this window are clipped.
 pub const BOARD_SIZE: i32 = 33;
 
-/// Half of [`BOARD_SIZE`], i.e. the center coordinate of the tensor.
+/// Half of [`BOARD_SIZE`], i.e. the centre coordinate of the tensor.
 pub const HALF_BOARD: i32 = 16; // BOARD_SIZE / 2
 
 /// Number of feature channels in the encoded tensor.
@@ -28,16 +36,18 @@ pub const TENSOR_SIZE: usize = NUM_CHANNELS * BOARD_AREA; // 14157
 
 // ── Types ───────────────────────────────────────────────────────────────
 
-/// Result of encoding a board for neural network input.
+/// Result of encoding a board for neural-network input.
 pub struct EncodedBoard {
     /// Flat f32 tensor of shape (NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE).
     /// Layout: [ch0_plane, ch1_plane, ..., ch12_plane] where each plane is row-major.
     pub tensor: Vec<f32>,
     /// Spatial offset: the board coordinate that maps to tensor index (0, 0).
-    /// To convert board (q, r) to tensor (gi, gj): gi = q - offset_q, gj = r - offset_r.
+    ///
+    /// To convert board `(q, r)` to tensor `(gi, gj)`:
+    /// `gi = q - offset_q`, `gj = r - offset_r`.
     pub offset_q: i32,
     pub offset_r: i32,
-    /// Legal moves used for channel 3 (same as what the NN policy head should predict).
+    /// Legal moves used for channel 3 (same set that the NN policy head should predict).
     pub legal_moves: Vec<Hex>,
 }
 
@@ -45,8 +55,10 @@ pub struct EncodedBoard {
 
 /// Python-compatible "banker's rounding" (round half to even).
 ///
-/// The centroid of all occupied cells is computed, then rounded with this function
-/// to match Python's `round()` behavior exactly.
+/// The centroid of all occupied cells is computed, then rounded with this
+/// function to match Python's built-in `round()` behaviour exactly. This
+/// guarantees that the Rust encoder and any Python data-preprocessing scripts
+/// produce bitwise-identical offsets.
 pub fn bankers_round(v: f64) -> i32 {
     let frac = v - v.floor();
     if (frac - 0.5).abs() < 1e-9 {
@@ -68,9 +80,9 @@ pub fn bankers_round(v: f64) -> i32 {
 ///
 /// # Steps
 /// 1. Compute board centroid (mean of all occupied cells), banker's-rounded.
-/// 2. Compute spatial offset so centroid lands at tensor center `(16, 16)`.
+/// 2. Compute spatial offset so the centroid lands at tensor centre `(16, 16)`.
 /// 3. Gather legal moves (with optional threat constraint).
-/// 4. Fill 13 channels (see [`encode_board_into`] for channel details).
+/// 4. Fill 13 channels (see [`encode_board_into`] for a detailed breakdown).
 ///
 /// Returns [`EncodedBoard`] with tensor, offsets, and legal moves.
 pub fn encode_board(game: &HexGameState, near_radius: i32, constrain_threats: bool) -> EncodedBoard {
@@ -88,25 +100,30 @@ pub fn encode_board(game: &HexGameState, near_radius: i32, constrain_threats: bo
 /// Encode into a pre-allocated buffer. Returns `(offset_q, offset_r, legal_moves)`.
 ///
 /// The buffer must be at least [`TENSOR_SIZE`] elements. This variant is used
-/// by MCTS to avoid repeated allocations during search.
+/// by MCTS to avoid repeated allocations during tree search.
 ///
-/// # Channel layout
+/// # Channel layout (13 channels)
 ///
-/// | Ch | Content |
-/// |---|---|
-/// | 0 | Current player's stones |
-/// | 1 | Opponent's stones |
-/// | 2 | Empty cell mask (= 1.0 - ch0 - ch1) |
-/// | 3 | Legal moves mask (constrained if `constrain_threats=true`) |
-/// | 4 | Turn phase: all 1.0 if `placements_remaining == 1 && move_count > 0` |
-/// | 5 | First stone of current turn (phase 2 only): marks last move in history |
-/// | 6 | Current player color: all 1.0 if player 0 |
-/// | 7 | Own stone recency: `1/(1 + plies_ago)` |
-/// | 8 | Opponent stone recency |
-/// | 9 | Opponent "hot cells" (empty cells in opponent's 4+ windows) |
-/// | 10 | Own "hot cells" |
-/// | 11 | Distance from centroid: `hex_dist(cell, center) / HALF_BOARD` |
-/// | 12 | Opponent's most recent completed turn cells |
+/// | Ch | Name | Description |
+/// |---|---|---|
+/// | 0 | **Own stones** | `1.0` on every cell occupied by the current player. |
+/// | 1 | **Opponent stones** | `1.0` on every cell occupied by the opponent. |
+/// | 2 | **Empty mask** | `1.0 - ch0 - ch1`. Marks every unoccupied cell. |
+/// | 3 | **Legal moves** | `1.0` on each legal move inside the 33×33 window. When `constrain_threats` is `true`, only threat-constrained moves are marked (e.g. must-block cells or winning-turn cells). |
+/// | 4 | **Turn phase** | All `1.0` when the current turn is on its **second** placement (`placements_remaining == 1 && move_count > 0`), otherwise all `0.0`. Tells the net whether one or two stones remain to be placed this turn. |
+/// | 5 | **First stone of turn** | `1.0` on the cell of the most recent move in history (the first placement of the current turn). Only active during phase 2 (see ch 4). |
+/// | 6 | **Player colour** | All `1.0` if the current player is player 0, all `0.0` if player 1. |
+/// | 7 | **Own recency** | `1 / (1 + plies_ago)` for each own stone, decaying from most-recent to oldest. |
+/// | 8 | **Opponent recency** | Same as ch 7 but for opponent stones. |
+/// | 9 | **Opponent hot cells** | Empty cells that lie inside the opponent's "hot windows" (windows with 4+ opponent stones and 0 own stones). These are the cells the opponent could use to extend a threat. Computed via [`live_cells`] to share logic with the tactical engine. |
+/// | 10 | **Own hot cells** | Empty cells inside the current player's hot windows. Same semantics as ch 9 but from the current player's perspective. |
+/// | 11 | **Distance from centre** | Normalised hex distance from the board centroid: `hex_dist(cell, centre) / HALF_BOARD`. Values are in `[0, 1]`. |
+/// | 12 | **Opponent's last turn** | Marks the cells placed by the opponent during their most recently completed turn (1 or 2 cells). |
+///
+/// Channels 9 and 10 are populated by calling [`live_cells`] with a single
+/// reusable buffer (`hot_buf`). This keeps the encoding zero-allocation per
+/// channel and guarantees that the tactical engine and the NN encoder always
+/// agree on which cells are "live".
 pub fn encode_board_into(
     game: &HexGameState,
     near_radius: i32,
@@ -240,7 +257,7 @@ pub fn encode_board_into(
         }
     }
 
-    // ── Channel 6: current player color ──
+    // ── Channel 6: current player colour ──
     // All 1.0 if the current player is player 0, all 0.0 if player 1.
     if current == 0 {
         let start = 6 * BOARD_AREA;
@@ -250,7 +267,7 @@ pub fn encode_board_into(
     // ── Channel 11: distance from centroid ──
     // For every tensor cell, compute the hex distance to the board centroid
     // (which maps to tensor coordinate (HALF_BOARD, HALF_BOARD)), then
-    // normalize by HALF_BOARD so values are in [0, 1].
+    // normalise by HALF_BOARD so values are in [0, 1].
     {
         let center = Hex::new(offset_q + HALF_BOARD, offset_r + HALF_BOARD);
         for gi in 0..BOARD_SIZE {
@@ -274,9 +291,15 @@ pub fn encode_board_into(
     }
 
     // ── Channels 9-10: hot cells ──
+    //
     // Ch 9: empty cells that lie inside the opponent's "hot windows"
     //     (windows with 4+ opponent stones and 0 own stones).
     // Ch 10: empty cells that lie inside the current player's hot windows.
+    //
+    // Both channels are filled by calling [`live_cells`] with a single
+    // reusable buffer (`hot_buf`). This avoids per-channel allocations and
+    // guarantees that the encoder and the tactical threat engine use the
+    // exact same definition of "live" cells.
     let mut hot_buf = Vec::new();
 
     // Channel 10 (own live cells)

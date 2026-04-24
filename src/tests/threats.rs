@@ -1,3 +1,30 @@
+//! Property-based threat-analysis tests.
+//!
+//! This module uses [`proptest`](https://docs.rs/proptest) to generate
+//! hundreds of random board positions and compares the engine's fast
+//! incremental threat path against the brute-force oracle.
+//!
+//! ## What is tested
+//!
+//! 1. **`threat_status_matches_oracle`** — For every random position, the
+//!    [`ThreatStatus`](crate::threats::ThreatStatus) returned by the fast path
+//!    must agree with the oracle on winning turns, blocking singles/pairs, and
+//!    unblockable positions.
+//! 2. **`turn_satisfies_threats_matches_oracle`** — Every legal turn must be
+//!    classified consistently by `turn_satisfies_threats` relative to the
+//!    oracle's must-play set.
+//! 3. **`live_cells_contains_all_threat_cells`** — Every cell that appears in
+//!    an oracle-winning turn or blocking single must be returned by
+//!    [`live_cells`](crate::threats::live_cells).
+//!
+//! ## Random game generation
+//!
+//! Each test receives a `u64` seed from proptest. A deterministic LCG
+//! uses that seed to play a random game of 1–40 moves, choosing legal
+//! cells from `candidates_near2()`. After every *completed* turn (when
+//! `placements_remaining` resets), the position is snapshotted and checked.
+//! This yields hundreds of distinct board states per test run.
+
 use crate::board::HexGameState;
 use crate::core::Turn;
 use crate::tests::oracle::{analyse, TurnAnalysis};
@@ -8,6 +35,11 @@ use proptest::prelude::*;
 // Deterministic PRNG
 // ---------------------------------------------------------------------------
 
+/// Simple 64-bit LCG used for reproducible random games inside proptest.
+///
+/// The multiplier and increment are the Numerical Recipes parameters,
+/// which give a full-period generator. Using a hand-rolled PRNG avoids
+/// depending on `rand` in dev-dependencies just for tests.
 struct Prng(u64);
 
 impl Prng {
@@ -23,6 +55,7 @@ impl Prng {
         self.0
     }
 
+    /// Uniform value in `[0, max)`.
     fn range(&mut self, max: usize) -> usize {
         if max == 0 {
             return 0;
@@ -35,6 +68,23 @@ impl Prng {
 // Comparison helper: fast path vs oracle
 // ---------------------------------------------------------------------------
 
+/// Assert that a [`ThreatStatus`](crate::threats::ThreatStatus) from the fast
+/// path matches a [`TurnAnalysis`] from the brute-force oracle.
+///
+/// # Bidirectional checks
+///
+/// The oracle is treated as ground truth. For every category the helper
+/// checks **both** directions:
+///
+/// - **Winning turns:** if the fast path says the position is a
+///   `WinningTurn`, that exact turn must be in the oracle's winning set;
+///   conversely, if the oracle finds any winning turn, the fast path must
+///   report `WinningTurn`.
+/// - **Blocking singles** (one placement remaining): the fast path's
+///   `MustBlock.cells` set must equal the oracle's `blocking_single` set.
+/// - **Blocking pairs** (two placements remaining): every oracle blocking
+///   pair must satisfy the fast-path constraint, and every fast-path pair
+///   must appear in the oracle.
 fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameState) {
     let remaining = game.placements_remaining();
     let opp = 1 - game.current_player();
@@ -153,19 +203,24 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 10, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 200, ..ProptestConfig::default() })]
 
-    /// Play a compact deterministic random game and verify threat_status against
-    /// the brute-force oracle after every completed turn.
+    /// Play a compact deterministic random game and verify `threat_status`
+    /// against the brute-force oracle after every completed turn.
+    ///
+    /// A random game of 1–40 moves is generated from the proptest seed.
+    /// After each full turn (when the player switches), the fast path and
+    /// the oracle are run and compared with [`assert_matches`].
     #[test]
     #[ignore = "slow oracle: run with cargo test --release -- --ignored"]
     fn threat_status_matches_oracle_random_positions(seed in any::<u64>()) {
         let mut rng = Prng::new(seed);
         let mut game = HexGameState::new();
         let mut moves_played = 0;
-        const MAX_MOVES: usize = 6;
+        // Random game length: 1 to 40 completed turns.
+        let max_moves = 1 + rng.range(40);
 
-        while moves_played < MAX_MOVES && !game.is_over() {
+        while moves_played < max_moves && !game.is_over() {
             let legal = game.candidates_near2();
             if legal.is_empty() {
                 break;
@@ -184,17 +239,23 @@ proptest! {
         }
     }
 
-    /// For each position reached, verify that every legal turn from the oracle
-    /// either satisfies or doesn't satisfy turn_satisfies_threats consistently.
+    /// For each random position, verify that every legal turn is classified
+    /// consistently by `turn_satisfies_threats` relative to the oracle.
+    ///
+    /// The oracle computes a `must_play` set: winning turns plus blocking
+    /// moves (when the opponent actually has threats). Every legal turn must
+    /// satisfy `turn_satisfies_threats` exactly when it is in `must_play`,
+    /// except that the fast path may expose only the first winning turn when
+    /// several exist.
     #[test]
     #[ignore = "slow oracle: run with cargo test --release -- --ignored"]
     fn turn_satisfies_threats_matches_oracle(seed in any::<u64>()) {
         let mut rng = Prng::new(seed);
         let mut game = HexGameState::new();
         let mut moves_played = 0;
-        const MAX_MOVES: usize = 6;
+        let max_moves = 1 + rng.range(40);
 
-        while moves_played < MAX_MOVES && !game.is_over() {
+        while moves_played < max_moves && !game.is_over() {
             let legal = game.candidates_near2();
             if legal.is_empty() {
                 break;
@@ -220,7 +281,9 @@ proptest! {
                     for turn in &oracle.winning {
                         must_play.insert(*turn);
                     }
-                    if opp_has_threats {
+                    // Blocking moves are irrelevant when a winning turn exists;
+                    // the current player should always take the win.
+                    if oracle.winning.is_empty() && opp_has_threats {
                         for turn in &oracle.blocking_pairs {
                             must_play.insert(*turn);
                         }
@@ -273,17 +336,21 @@ proptest! {
         }
     }
 
-    /// Verify that live_cells contains all cells from oracle winning turns and
-    /// blocking singles.
+    /// Verify that `live_cells` contains every cell that participates in an
+    /// oracle-winning turn or blocking single.
+    ///
+    /// `live_cells` is used by search and encoding to restrict attention to
+    /// cells that can actually matter. If it ever dropped a winning or
+    /// blocking cell, the engine would miss critical moves.
     #[test]
     #[ignore = "slow oracle: run with cargo test --release -- --ignored"]
     fn live_cells_contains_all_threat_cells(seed in any::<u64>()) {
         let mut rng = Prng::new(seed);
         let mut game = HexGameState::new();
         let mut moves_played = 0;
-        const MAX_MOVES: usize = 6;
+        let max_moves = 1 + rng.range(40);
 
-        while moves_played < MAX_MOVES && !game.is_over() {
+        while moves_played < max_moves && !game.is_over() {
             let legal = game.candidates_near2();
             if legal.is_empty() {
                 break;

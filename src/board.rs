@@ -22,7 +22,9 @@ use crate::core::{PLACEMENT_RADIUS, WIN_LENGTH};
 // -------------------------------------------------------------------------
 
 /// Deterministic hash for a (player, cell) pair using bit mixing.
-/// XOR this into the board hash on place and unplace for incremental updates.
+///
+/// XOR this value into the board hash on place and again on unplace for
+/// incremental updates.
 ///
 /// # Why a mixing function instead of a precomputed table?
 ///
@@ -39,7 +41,7 @@ pub fn zobrist_piece(player: u8, cell: Hex) -> u64 {
     h = h.wrapping_mul(0x100_0000_01b3);
     h ^= cell.r as u64;
     h = h.wrapping_mul(0x100_0000_01b3);
-    // Final avalanche
+    // Final avalanche: spread high-bit information into low bits.
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
@@ -94,8 +96,14 @@ impl std::error::Error for GameError {}
 /// A single placement in the move history.
 ///
 /// Snapshots the turn state **before** the move was made so that
-/// `unplace` can restore exactly without fragile `move_count`-based
-/// derivation.
+/// [`HexGameState::unplace`] can restore exactly without fragile
+/// `move_count`-based derivation.
+///
+/// # Invariant
+///
+/// Every field reflects the state *before* this placement occurred.  After
+/// `place` / `unplace` round-trips the game state must be bit-identical to
+/// what it was before the placement, including `winning_line`.
 #[derive(Debug, Clone)]
 pub struct MoveRecord {
     /// The hex coordinate where the tile was placed.
@@ -109,6 +117,9 @@ pub struct MoveRecord {
     /// Whether there was a winner BEFORE this move was made.
     pub winner_before: Option<u8>,
     /// The winning line BEFORE this move was made.
+    ///
+    /// Snapshotted so that `unplace` can restore a won position exactly
+    /// rather than unconditionally clearing the line.
     pub winning_line_before: Option<Vec<Hex>>,
 }
 
@@ -117,9 +128,22 @@ pub struct MoveRecord {
 // -------------------------------------------------------------------------
 
 /// Incremental reference-counted candidate set for fast move generation.
+///
+/// Instead of scanning the entire board on every move query, the engine
+/// maintains a set of empty cells that are within `radius` hexes of at least
+/// one occupied cell.  Each candidate stores a reference count equal to the
+/// number of occupied cells within `radius` of it.
+///
+/// # Invariants
+///
+/// * Every key in `rc` is an empty hex (not in `HexGameState::stones`).
+/// * `rc[h] > 0` for every stored key.
+/// * A hex is present iff at least one stone lies within `radius` of it.
 #[derive(Debug, Clone)]
 pub struct CandidateSet {
+    /// Reference counts: how many stones are within `radius` of this empty hex.
     rc: FxHashMap<Hex, u32>,
+    /// The neighbour radius used when incrementing / decrementing counts.
     radius: i32,
 }
 
@@ -133,6 +157,9 @@ impl CandidateSet {
     }
 
     /// Remove a cell from the candidate set.
+    ///
+    /// Called when a stone is placed on this cell; it is no longer empty and
+    /// therefore cannot be a legal move.
     pub fn remove(&mut self, cell: Hex) {
         self.rc.remove(&cell);
     }
@@ -147,6 +174,7 @@ impl CandidateSet {
 // Game state
 // -------------------------------------------------------------------------
 
+/// Alias for the stone map: each occupied hex maps to the player who owns it.
 pub type Stones = FxHashMap<Hex, u8>;
 
 /// Complete mutable game state.
@@ -168,15 +196,29 @@ pub type Stones = FxHashMap<Hex, u8>;
 /// ```
 #[derive(Debug, Clone)]
 pub struct HexGameState {
+    /// Map of all occupied cells → owning player (0 or 1).
     stones: Stones,
+    /// Player to move (0 or 1).
     current_player: u8,
+    /// How many stones the current player may still place this turn.
+    ///
+    /// * Opening: 1 for Player 0.
+    /// * Normal turns: 2.
+    /// * Immediately after a win: 0 (game over).
     placements_remaining: u8,
+    /// `Some(winner)` when the game has ended; `None` while ongoing.
     winner: Option<u8>,
+    /// The exact 6-in-a-row that produced the win, if any.
     winning_line: Option<Vec<Hex>>,
+    /// Total number of individual stone placements so far.
     move_count: u32,
+    /// Stack of snapshots for undo.  One entry per placement (not per turn).
     move_history: Vec<MoveRecord>,
+    /// Incremental Zobrist hash.  XORed with `zobrist_piece` on every place/unplace.
     zobrist: u64,
+    /// Incremental evaluation state (threat counts, hot windows, etc.).
     eval: EvalState,
+    /// Reference-counted empty cells near stones (radius 2).
     candidates: CandidateSet,
 }
 
@@ -265,13 +307,25 @@ impl HexGameState {
     /// Returns `Ok(true)` when this placement ends the current turn,
     /// `Ok(false)` when the player has another placement remaining.
     /// Returns `Err(GameError)` if the move is illegal.
+    ///
+    /// # Side effects
+    ///
+    /// * Inserts the stone into `self.stones`.
+    /// * Updates the incremental Zobrist hash.
+    /// * Pushes a [`MoveRecord`] onto `move_history`.
+    /// * Decrements `placements_remaining`.
+    /// * Updates the candidate set and incremental evaluation.
+    /// * Checks for a win; if found, sets `winner`, `winning_line`, and
+    ///   `placements_remaining = 0`.
+    /// * If the turn is complete and no win occurred, switches player and
+    ///   resets `placements_remaining` to 2.
     pub fn place(&mut self, q: i32, r: i32) -> Result<bool, GameError> {
         let cell = Hex::new(q, r);
         self.validate_move(cell)?;
 
         let player = self.current_player;
 
-        // Snapshot state BEFORE mutating.
+        // Snapshot state BEFORE mutating so unplace can restore exactly.
         let record = MoveRecord {
             cell,
             player,
@@ -281,19 +335,19 @@ impl HexGameState {
             winning_line_before: self.winning_line.clone(),
         };
 
-        // Place tile
+        // Commit the stone to the board.
         self.stones.insert(cell, player);
         self.zobrist ^= zobrist_piece(player, cell);
         self.move_count += 1;
         self.move_history.push(record);
         self.placements_remaining -= 1;
 
-        // Update candidate set and incremental eval.
+        // Update incremental structures: candidate set and eval state.
         self.candidates.remove(cell);
         self.incr_candidate_neighbors(cell);
         self.eval.place(&self.stones, cell, player);
 
-        // Check win
+        // Check whether this placement completed a winning line.
         if let Some(line) = self.find_winning_line(cell, player) {
             self.winner = Some(player);
             self.winning_line = Some(line);
@@ -301,12 +355,12 @@ impl HexGameState {
             return Ok(true);
         }
 
-        // Still has placements?
+        // If the player still has placements left, the turn continues.
         if self.placements_remaining > 0 {
             return Ok(false);
         }
 
-        // Advance turn
+        // Turn complete — swap player and reset to two placements.
         self.current_player = 1 - self.current_player;
         self.placements_remaining = 2;
         Ok(true)
@@ -314,19 +368,39 @@ impl HexGameState {
 
     /// Undo the last placement. Restores board, turn state, and hash.
     ///
+    /// # Panics
+    ///
     /// Panics if called on an empty game (no moves to undo).
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Reverse the incremental evaluation (`eval.unplace`).
+    /// 2. Pop the [`MoveRecord`] for the move being undone.
+    /// 3. Remove the stone from `stones` and XOR its Zobrist contribution.
+    /// 4. Decrement reference counts for all empty neighbours within radius 2
+    ///    of the removed stone; remove any count that reaches zero.
+    /// 5. Re-add the removed cell to the candidate set if any stones are
+    ///    still within radius 2 of it.
+    /// 6. Restore `current_player`, `placements_remaining`, `winner`, and
+    ///    `winning_line` from the snapshot.
     pub fn unplace(&mut self) {
-        // Reverse incremental eval before removing the piece.
+        // Reverse incremental eval BEFORE we know which move is undone.
+        // EvalState maintains its own parallel stack, so the order is safe.
         self.eval.unplace();
 
         let rec = self.move_history.pop().expect("no move to undo");
 
+        // Remove the stone from the board.
         self.stones.remove(&rec.cell);
         self.zobrist ^= zobrist_piece(rec.player, rec.cell);
         self.move_count -= 1;
 
-        // Reverse candidate set: decrement neighbors, add removed cell back.
+        // ---- Restore candidate set --------------------------------------
         let r2 = self.candidates.radius;
+
+        // 4a. Decrement reference counts for every empty cell within radius 2
+        //     of the removed stone.  If a count drops to zero, the cell is no
+        //     longer adjacent to any stone and is removed from candidates.
         for dq in -r2..=r2 {
             for dr in -r2..=r2 {
                 let h = Hex::new(rec.cell.q + dq, rec.cell.r + dr);
@@ -340,6 +414,10 @@ impl HexGameState {
                 }
             }
         }
+
+        // 4b. Re-insert the removed cell into the candidate set if there are
+        //     still stones within radius 2 of it.  The new count is exactly
+        //     the number of such stones.
         let mut rc = 0u32;
         for dq in -r2..=r2 {
             for dr in -r2..=r2 {
@@ -353,20 +431,35 @@ impl HexGameState {
             self.candidates.rc.insert(rec.cell, rc);
         }
 
-        // Restore turn state from the snapshot.
+        // ---- Restore turn state from snapshot ---------------------------
         self.current_player = rec.current_player_before;
         self.placements_remaining = rec.placements_remaining_before;
         self.winner = rec.winner_before;
         self.winning_line = rec.winning_line_before;
     }
 
-
-
     /// Set the board to a custom position, bypassing normal turn rules.
     ///
-    /// All pieces in `pieces` are placed directly regardless of who is "current player".
-    /// The resulting `current_player` and `placements_remaining` are set explicitly.
-    /// Any pre-existing game state is discarded (equivalent to `reset()` first).
+    /// All pieces in `stones` are placed directly regardless of who is
+    /// "current player".  The resulting `current_player` and
+    /// `placements_remaining` are set explicitly.  Any pre-existing game
+    /// state is discarded (equivalent to [`reset()`](Self::reset) first).
+    ///
+    /// # Use cases
+    ///
+    /// * Loading positions from test fixtures or databases.
+    /// * Setting up synthetic board states for oracle / property tests.
+    ///
+    /// # Arguments
+    ///
+    /// * `stones` — slice of `(q, r, player)` tuples to place.
+    /// * `player` — who is to move after setup.
+    /// * `remaining` — how many placements that player has left this turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GameError::CellOccupied`] if any two entries in `stones`
+    /// refer to the same hex.
     pub fn set_position(
         &mut self,
         stones: &[(i32, i32, u8)],
@@ -386,6 +479,7 @@ impl HexGameState {
                 return Err(GameError::CellOccupied(cell));
             }
 
+            // Snapshot the pre-placement state.
             let record = MoveRecord {
                 cell,
                 player,
@@ -395,17 +489,18 @@ impl HexGameState {
                 winning_line_before: self.winning_line.clone(),
             };
 
+            // Place the stone.
             self.stones.insert(cell, player);
             self.zobrist ^= zobrist_piece(player, cell);
             self.move_count += 1;
             self.move_history.push(record);
 
-            // Update candidate set and incremental eval.
+            // Update incremental structures.
             self.candidates.remove(cell);
             self.incr_candidate_neighbors(cell);
             self.eval.place(&self.stones, cell, player);
 
-            // Detect wins during bulk placement
+            // Detect wins during bulk placement.
             if self.winner.is_none() {
                 if let Some(line) = self.find_winning_line(cell, player) {
                     self.winner = Some(player);
@@ -413,7 +508,7 @@ impl HexGameState {
                 }
             }
 
-            // Simulate turn progression
+            // Advance the simulated turn counter.
             sim_remaining -= 1;
             if sim_remaining == 0 {
                 sim_player = 1 - sim_player;
@@ -441,9 +536,16 @@ impl HexGameState {
     }
 
     /// Places without validation, used by test oracle and internal modules.
+    ///
+    /// # Safety
+    ///
+    /// Callers must guarantee that `cell` is empty and legal.  Violating this
+    /// may corrupt `EvalState`, the candidate set, or the Zobrist hash.
     #[allow(dead_code)]
     pub(crate) fn place_unchecked(&mut self, cell: Hex) {
         let player = self.current_player;
+
+        // Snapshot state before mutation.
         let record = MoveRecord {
             cell,
             player,
@@ -452,16 +554,20 @@ impl HexGameState {
             winner_before: self.winner,
             winning_line_before: self.winning_line.clone(),
         };
+
+        // Commit the stone.
         self.stones.insert(cell, player);
         self.zobrist ^= zobrist_piece(player, cell);
         self.move_count += 1;
         self.move_history.push(record);
         self.placements_remaining -= 1;
 
+        // Update incremental structures.
         self.candidates.remove(cell);
         self.incr_candidate_neighbors(cell);
         self.eval.place(&self.stones, cell, player);
 
+        // Check for win.
         if let Some(line) = self.find_winning_line(cell, player) {
             self.winner = Some(player);
             self.winning_line = Some(line);
@@ -469,6 +575,7 @@ impl HexGameState {
             return;
         }
 
+        // Advance turn if completed.
         if self.placements_remaining == 0 {
             self.current_player = 1 - self.current_player;
             self.placements_remaining = 2;
@@ -477,6 +584,10 @@ impl HexGameState {
 
     // ── Validation ──────────────────────────────────────────────────────
 
+    /// Validate whether `cell` is a legal placement in the current position.
+    ///
+    /// Returns `Ok(())` if the move is legal, otherwise the specific error
+    /// that would occur.
     pub fn validate_move(&self, cell: Hex) -> Result<(), GameError> {
         if self.is_over() {
             return Err(GameError::GameOver);
@@ -487,9 +598,12 @@ impl HexGameState {
         if self.stones.contains_key(&cell) {
             return Err(GameError::CellOccupied(cell));
         }
+        // Opening invariant: the very first stone must be at the origin.
         if self.stones.is_empty() && cell != Hex::ORIGIN {
             return Err(GameError::MustPlaceAtOrigin);
         }
+        // Radius invariant: every non-opening stone must be within
+        // PLACEMENT_RADIUS of at least one existing stone.
         if !self.stones.is_empty()
             && !self
                 .stones
@@ -506,7 +620,7 @@ impl HexGameState {
     /// Return all legal placements (exhaustive radius-8 scan — expensive).
     ///
     /// Returns an empty vec if the game is over.  On an empty board returns
-    /// only `[Hex::ORIGIN]`.
+    /// only [`Hex::ORIGIN`].
     pub fn legal_moves(&self) -> Vec<Hex> {
         if self.is_over() {
             return Vec::new();
@@ -574,7 +688,10 @@ impl HexGameState {
     }
 
     /// Return the incremental radius-2 candidate set as a Vec.
-    /// This is the fast path for the turn-based search which always uses radius 2.
+    ///
+    /// This is the fast path for the turn-based search which always uses
+    /// radius 2.  Falls back to [`legal_moves_near(2)`](Self::legal_moves_near)
+    /// if the incremental set is empty (e.g. after a reset).
     pub fn candidates_near2(&self) -> Vec<Hex> {
         if self.is_over() {
             return Vec::new();
@@ -594,13 +711,23 @@ impl HexGameState {
     /// The opponent's most recent completed turn as an ordered list of cells.
     ///
     /// Returns one cell for Player 0's opening turn, otherwise two cells.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Walk backward from the end of `move_history`, skipping any
+    ///    placements belonging to `current_player` (these are from an
+    ///    in-progress turn).
+    /// 2. Collect consecutive placements belonging to the opponent.
+    /// 3. Reverse so the cells are in chronological order.
     pub fn opponent_last_turn_cells(&self) -> Vec<Hex> {
         let mut idx = self.move_history.len();
 
+        // Skip the current player's partial turn, if any.
         while idx > 0 && self.move_history[idx - 1].player == self.current_player {
             idx -= 1;
         }
 
+        // Collect the opponent's last completed turn.
         let mut cells = Vec::with_capacity(2);
         while idx > 0 && self.move_history[idx - 1].player != self.current_player {
             cells.push(self.move_history[idx - 1].cell);
@@ -612,17 +739,30 @@ impl HexGameState {
 
     // ── Win detection ───────────────────────────────────────────────────
 
+    /// Check whether `last` (just placed by `player`) completed a winning line.
+    ///
+    /// Scans in all three principal directions.  For each direction it collects
+    /// the contiguous run of `player` stones that includes `last`, then checks
+    /// whether the run is at least [`WIN_LENGTH`] long.
+    ///
+    /// # Returns
+    ///
+    /// `Some(winning_line)` — a vector of exactly 6 [`Hex`] cells forming the
+    /// winning segment, preferring one centered on `last` if possible.
     pub fn find_winning_line(&self, last: Hex, player: u8) -> Option<Vec<Hex>> {
         for &(dq, dr) in &HEX_DIRECTIONS {
+            // Collect the contiguous run on both sides of `last` along this axis.
             let mut backward = self.collect_run(last, -dq, -dr, player);
             backward.reverse();
             let forward = self.collect_run(last, dq, dr, player);
 
+            // Assemble the full run with `last` in the middle.
             let pivot = backward.len();
             let mut line = backward;
             line.push(last);
             line.extend_from_slice(&forward);
 
+            // If the run is long enough, extract the best 6-stone segment.
             if line.len() >= WIN_LENGTH as usize {
                 return Some(Self::select_segment(&line, pivot));
             }
@@ -630,11 +770,16 @@ impl HexGameState {
         None
     }
 
+    /// Collect consecutive stones belonging to `player` starting from the
+    /// neighbour of `origin` in direction `(dq, dr)`.
+    ///
+    /// Does NOT include `origin` itself; the caller appends it separately.
     #[inline]
     fn collect_run(&self, origin: Hex, dq: i32, dr: i32, player: u8) -> Vec<Hex> {
         let mut tiles = Vec::new();
         let mut q = origin.q + dq;
         let mut r = origin.r + dr;
+        // Step outward one cell at a time while each cell belongs to `player`.
         while self.stones.get(&Hex::new(q, r)) == Some(&player) {
             tiles.push(Hex::new(q, r));
             q += dq;
@@ -643,11 +788,26 @@ impl HexGameState {
         tiles
     }
 
+    /// Extract a [`WIN_LENGTH`]-long segment from a longer contiguous run.
+    ///
+    /// `pivot` is the index of the most recently placed stone within `line`.
+    /// The algorithm prefers a segment centred on `pivot`, but clamps the
+    /// start so the window stays entirely inside the run.
+    ///
+    /// # Example
+    ///
+    /// If `line` has 8 stones and `pivot` is 3, the preferred segment starts
+    /// at `3 - 2 = 1` (zero-based), giving indices 1..7 — a 6-stone window
+    /// centred roughly on the pivot.
     fn select_segment(line: &[Hex], pivot: usize) -> Vec<Hex> {
         let wl = WIN_LENGTH as usize;
+        // Earliest start that still includes the pivot in the 6-window.
         let lo = pivot.saturating_sub(wl - 1);
+        // Latest start such that the window fits inside the line.
         let hi = pivot.min(line.len() - wl);
+        // Ideal start: centre the window on the pivot.
         let preferred = pivot.saturating_sub((wl - 1) / 2);
+        // Clamp preferred start to the valid [lo, hi] range.
         let start = hi.min(lo.max(preferred));
         line[start..start + wl].to_vec()
     }
@@ -662,12 +822,16 @@ impl HexGameState {
     // ── Candidate helpers ───────────────────────────────────────────────
 
     /// Increment candidate reference counts for empty cells within radius 2 of `cell`.
-    /// Must be called **after** the piece is inserted into `self.stones`.
+    ///
+    /// Must be called **after** the piece is inserted into `self.stones`,
+    /// otherwise the newly occupied cell would incorrectly be counted as a
+    /// candidate.
     fn incr_candidate_neighbors(&mut self, cell: Hex) {
         let r2 = self.candidates.radius;
         for dq in -r2..=r2 {
             for dr in -r2..=r2 {
                 let h = Hex::new(cell.q + dq, cell.r + dr);
+                // Only count empty cells within the circular radius.
                 if hex_distance(cell, h) <= r2 && !self.stones.contains_key(&h) {
                     *self.candidates.rc.entry(h).or_insert(0) += 1;
                 }

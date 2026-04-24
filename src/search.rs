@@ -3,16 +3,48 @@
 //! Key design: the search unit is a **Turn** (pair of moves), not individual
 //! placements. This doubles effective depth vs placement-based search.
 //!
-//! Features inspired by SealBot's architecture:
-//! - Turn-based search (2-move atomic unit)
-//! - Instant-win detection + unblockable-win pruning at every node
-//! - Threat-filtered move generation (prune moves that don't block threats)
-//! - Deep quiescence search (depth 16) on threat moves only
-//! - PVS + LMR + killer/history heuristics (advantage over SealBot)
-//! - Aspiration windows in iterative deepening
-//! - Pair-sum constraint for focused branching
-//! - Mate-distance TT scoring
-//! - Root candidates returned for temperature-based sampling in self-play
+//! # Pruning strategy
+//!
+//! The engine uses a multi-layered pruning stack:
+//!
+//! 1. **Instant-win detection** — at every node, check if the current player
+//!    can win immediately (`find_instant_win`). If yes, return the winning
+//!    score without expanding children.
+//! 2. **Unblockable-loss pruning** — if `threat_status` reports `Unblockable`,
+//!    the opponent has disjoint threats we cannot stop; return a large
+//!    negative score immediately.
+//! 3. **Threat-filtered move generation** — `generate_root_turns` and
+//!    `generate_inner_turns` compute `threat_status` **once per node**, then
+//!    retain only turns that satisfy the blocking constraint.  This often
+//!    reduces the branching factor from hundreds to a handful.
+//! 4. **Reverse futility pruning** — at shallow depth (`depth <= 2`), if the
+//!    static evaluation is so far above beta that even a generous margin
+//!    cannot save it, return the static score early.
+//! 5. **Late-move pruning** — at low depth, skip moves late in the ordering
+//!    when the position is not in danger of mate.
+//! 6. **PVS + LMR** — Principal Variation Search with Late Move Reduction.
+//!    The first move is searched with a full window; subsequent moves use a
+//!    null window.  Moves indexed ≥2 are reduced by 1 or 2 plies; if they
+//!    beat alpha, a re-search at full depth is performed.
+//!
+//! # Move ordering
+//!
+//! Candidates are scored by:
+//! - Incremental evaluation delta (`move_eval_delta`).
+//! - History heuristic (depth² bonus on cutoffs).
+//! - Tactical bonuses for cells in hot windows (+50k for blocking opponent,
+//!   +40k for completing our own threats).
+//! - Optional noise for training data variety (applied only to the non-tactical
+//!   portion of the score so blocking remains deterministic).
+//!
+//! At each ply the TT best move and killer move are promoted to the front.
+//!
+//! # Transposition table
+//!
+//! A simple FxHashMap stores exact, lower-bound, and upper-bound entries
+//! keyed by Zobrist hash XOR side-to-move XOR phase.  Mate scores are
+//! adjusted by ply distance so that "mate in 3" and "mate in 5" are
+//! distinguished correctly.
 
 use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
@@ -33,10 +65,14 @@ use crate::threats::{live_cells, threat_status, turn_satisfies_status, ThreatSta
 /// Maximum ply depth tracked for killer moves.
 const MAX_PLY: usize = 64;
 
-/// Initial aspiration window.
+/// Initial aspiration window around the previous iteration's score.
 const ASPIRATION_WINDOW: i32 = 500;
 
 /// Maximum quiescence search depth (in turns).
+///
+/// Quiescence only searches threat moves, so a depth of 6 turns is
+/// deep enough to resolve most tactical sequences without exploding
+/// the node count.
 const QUIESCE_DEPTH: i32 = 6;
 
 /// Maximum candidate cells per node (non-root).
@@ -46,12 +82,16 @@ const CANDIDATE_CAP: usize = 12;
 const ROOT_CANDIDATE_CAP: usize = 14;
 
 /// Pair-sum cap: only generate pairs (i,j) where i+j <= this value.
+///
+/// Because candidates are sorted by quality, indices 0..N represent the
+/// best cells.  The pair-sum constraint limits pair generation to cells
+/// that are both high-quality, dramatically reducing branching factor.
 const PAIR_SUM_CAP: usize = 12;
 
 /// Weight for eval delta in move ordering.
 const DELTA_WEIGHT: i32 = 15;
 
-/// TT entries cap before clearing.
+/// TT entries cap before clearing to avoid unbounded memory growth.
 const TT_MAX_SIZE: usize = 2_000_000;
 
 // -------------------------------------------------------------------------
@@ -59,6 +99,9 @@ const TT_MAX_SIZE: usize = 2_000_000;
 // -------------------------------------------------------------------------
 
 /// Minimal O(1) evaluation from `player`'s perspective using incremental state.
+///
+/// Returns `WIN_SCORE` if `player` has won, `-WIN_SCORE` if they have lost,
+/// otherwise the signed incremental score plus a small tempo bonus.
 #[inline]
 fn evaluate(game: &HexGameState, player: u8) -> i32 {
     if let Some(w) = game.winner() {
@@ -66,7 +109,7 @@ fn evaluate(game: &HexGameState, player: u8) -> i32 {
     }
     let mut score = if player == 0 { game.eval().score() } else { -game.eval().score() };
     if game.current_player() == player {
-        score += 15;
+        score += 15; // tempo bonus for having the move
     }
     score
 }
@@ -100,12 +143,20 @@ pub struct SearchState {
     pub deadline: Option<Instant>,
     pub aborted: bool,
     /// Killer turns per ply.
+    ///
+    /// A "killer" is a non-capturing move that caused a beta cutoff at this
+    /// ply in a sibling subtree.  It is a cheap but effective proxy for
+    /// move quality and is promoted to the front of the move list.
     killers: [Option<Turn>; MAX_PLY],
     /// History heuristic: per-cell score (depth² on cutoff).
+    ///
+    /// Cells that frequently cause cutoffs accumulate history score, which
+    /// boosts their candidate ranking in later nodes.
     history: FxHashMap<Hex, i32>,
     /// Random seed for tiebreaking and non-deterministic play.
     noise_seed: u64,
     /// Noise level for non-deterministic play (0.0 = deterministic).
+    ///
     /// Affects candidate ordering to produce varied games for training.
     /// Threat blocking and instant-win detection remain deterministic.
     noise_level: f32,
@@ -162,6 +213,9 @@ impl SearchState {
 // -------------------------------------------------------------------------
 
 /// TT hash: board + side-to-move + placements remaining.
+///
+/// Uses fixed magic constants so that flipping side or phase always
+/// changes the hash, preventing collisions across different game states.
 #[inline]
 fn tt_hash(game: &HexGameState) -> u64 {
     let side = if game.current_player() == 0 {
@@ -181,7 +235,10 @@ fn tt_hash(game: &HexGameState) -> u64 {
 // Make/unmake turns
 // -------------------------------------------------------------------------
 
-/// Execute a full turn (1 or 2 placements). Returns (game_over, placements_made).
+/// Execute a full turn (1 or 2 placements). Returns `(game_over, placements_made)`.
+///
+/// The caller must ensure the turn is legal; an illegal placement is
+/// treated as game-over (defensive fallback) so the search does not crash.
 fn make_turn(game: &mut HexGameState, t: Turn) -> (bool, u8) {
     let m1 = t.first();
     game.place(m1.q, m1.r).unwrap_or(true);
@@ -210,9 +267,17 @@ fn unmake_turn(game: &mut HexGameState, placed: u8) {
 // -------------------------------------------------------------------------
 
 /// Score a single candidate cell for sorting.
-/// Includes hot-window bonuses for threat blocking/completing.
-/// When `noise_level > 0`, adds randomization for training data variety.
-/// Threat-related bonuses remain unaffected by noise (deterministic blocking).
+///
+/// The score has three components:
+/// 1. **Evaluation delta** — how much `move_eval_delta` changes the position.
+/// 2. **History bonus** — cells that caused cutoffs in sibling subtrees.
+/// 3. **Tactical bonus** — cells in hot windows get huge bonuses so they
+///    bubble to the top (+50k for blocking opponent, +40k for completing
+///    our own threat).
+///
+/// When `noise_level > 0`, pseudo-random noise is injected into the
+/// non-tactical portion.  This shuffles candidate ordering for varied
+/// training games while preserving deterministic threat handling.
 #[inline]
 fn score_candidate(
     game: &HexGameState,
@@ -225,10 +290,11 @@ fn score_candidate(
     let delta = game.move_eval_delta(cell, game.current_player()) as i64;
     let hist = history.get(&cell).copied().unwrap_or(0).min(500_000) as i64;
 
-    // Hot-window bonus: cells in opponent's hot windows (blocking threats)
-    // These bonuses are NOT affected by noise — blocking must remain deterministic.
+    // ── Tactical bonuses (deterministic, not affected by noise) ──
     let opp = (1 - game.current_player()) as usize;
     let mut tactical = 0i64;
+
+    // Blocking opponent threats: cell lies in an opponent hot window.
     for key in game.eval().hot_windows(opp as u8) {
         let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
         for k in 0..WIN_LENGTH {
@@ -238,9 +304,10 @@ fn score_candidate(
             }
         }
     }
-    // Cells in our own hot windows (completing threats)
-    let p = game.current_player() as usize;
-    for key in game.eval().hot_windows(p as u8) {
+
+    // Completing our own threats: cell lies in our hot window.
+    let curr = game.current_player() as usize;
+    for key in game.eval().hot_windows(curr as u8) {
         let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
         for k in 0..WIN_LENGTH {
             if cell.q == key.q() + dq * k && cell.r == key.r() + dr * k {
@@ -252,17 +319,15 @@ fn score_candidate(
 
     let base = delta * sign as i64 * DELTA_WEIGHT as i64 + hist;
 
-    // Inject noise into the non-tactical portion of the score.
-    // This shuffles candidate ordering for varied training games while
-    // preserving deterministic threat handling.
+    // ── Noise injection (training variety) ──
     let noisy_base = if noise_level > 0.0 {
-        // Deterministic-per-cell pseudo-random noise from cell coords + seed
+        // Deterministic-per-cell pseudo-random noise from cell coords + seed.
         let cell_hash = (cell.q as u64).wrapping_mul(2654435761)
             ^ (cell.r as u64).wrapping_mul(40503)
             ^ noise_seed;
-        // Map to [-1.0, 1.0] range
+        // Map to [-1.0, 1.0] range.
         let rand_frac = ((cell_hash % 10000) as f64 / 5000.0) - 1.0;
-        // Scale noise relative to the base score magnitude
+        // Scale noise relative to the base score magnitude.
         let noise_mag =
             (base.abs() as f64 * noise_level as f64 * 0.5 + 500.0 * noise_level as f64) * rand_frac;
         base + noise_mag as i64
@@ -273,7 +338,10 @@ fn score_candidate(
     noisy_base + tactical
 }
 
-/// Generate candidate cells sorted by score, capped.
+/// Generate candidate cells sorted by score, then cap to `cap`.
+///
+/// Uses `candidates_near2()` as the seed set, scores each cell, sorts
+/// descending, and truncates.  The cap keeps branching factor manageable.
 fn generate_sorted_candidates(
     game: &HexGameState,
     history: &FxHashMap<Hex, i32>,
@@ -286,11 +354,7 @@ fn generate_sorted_candidates(
         return cands;
     }
 
-    let sign = if game.current_player() == 0 {
-        1i32
-    } else {
-        -1i32
-    };
+    let sign = if game.current_player() == 0 { 1i32 } else { -1i32 };
     cands.sort_by_cached_key(|&m| {
         Reverse(score_candidate(
             game,
@@ -306,6 +370,11 @@ fn generate_sorted_candidates(
 }
 
 /// Generate turn pairs from sorted candidates with pair-sum constraint.
+///
+/// `cands` is assumed to be sorted from best to worst.  Only pairs whose
+/// indices satisfy `i + j <= max_pair_sum` are generated.  Because the
+/// best cells cluster at low indices, this heuristic keeps the pair set
+/// small and high-quality without evaluating every combination.
 fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
     let n = cands.len();
     let mut turns = Vec::with_capacity(n * (n - 1) / 2);
@@ -324,10 +393,11 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
 // -------------------------------------------------------------------------
 
 /// Check if the current player can win this turn (with remaining placements).
-/// Uses incrementally-maintained hot_windows for O(hot_set) performance.
 ///
+/// Uses incrementally-maintained hot_windows for O(hot_set) performance.
 /// A 5-window (1 empty) is an instant win regardless of whether 1 or 2
 /// placements remain — the game ends as soon as the 6th stone is placed.
+/// A 4-window (2 empties) is a win only if we have at least 2 placements.
 fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
     let counts = game.eval().counts(player);
     if counts.fours == 0 && counts.fives == 0 {
@@ -337,20 +407,28 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
 
     for key in game.eval().hot_windows(player) {
         let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
+        // Stack-allocated buffer: a length-6 window can have at most 2 empties
+        // when fours or fives are present.
         let mut empties: SmallVec<[Hex; 2]> = SmallVec::new();
+
         for k in 0..WIN_LENGTH {
             let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
             if !game.stones().contains_key(&h) {
                 empties.push(h);
             }
         }
+
+        // Skip windows that require more empties than we have placements,
+        // or windows that are already full (should not happen in practice
+        // because the game would be over, but we guard defensively).
         if empties.is_empty() || empties.len() > remaining {
             continue;
         }
+
         match empties.len() {
             1 => {
                 // A single empty in a 5-window wins immediately.
-                // Even with 2 placements remaining, Turn::one wins because
+                // Even with 2 placements remaining, Turn::single wins because
                 // the game ends after the 6th stone is placed.
                 return Some(Turn::single(empties[0]));
             }
@@ -364,30 +442,40 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
 }
 
 // -------------------------------------------------------------------------
-// Threat analysis
-// -------------------------------------------------------------------------
-
-// -------------------------------------------------------------------------
 // Turn generation
 // -------------------------------------------------------------------------
 
-/// Generate root turns with colony candidate.
+/// Generate root turns with colony candidate and optional noise.
+///
+/// # Strategy
+/// 1. **Opening** — on the very first move, play a single stone at origin.
+/// 2. **Instant win** — if we have a 5- or 4-window, return only the win.
+/// 3. **Candidate scoring** — score all `candidates_near2()` cells, cap at
+///    `ROOT_CANDIDATE_CAP`.
+/// 4. **Colony candidate** — add a distant cell to encourage multi-front
+///    play.  Chosen deterministically from the centroid + max_radius + 3
+///    in a hex direction derived from the noise seed.
+/// 5. **Pair generation** — for 2-placement turns, generate pairs from the
+///    capped candidate list with the pair-sum constraint.
+/// 6. **Threat filter** — compute `threat_status` once and retain only
+///    turns that block opponent threats (or satisfy `Unblockable`).
 fn generate_root_turns(
     game: &HexGameState,
     history: &FxHashMap<Hex, i32>,
     noise_level: f32,
     noise_seed: u64,
 ) -> Vec<Turn> {
+    // Opening: empty board.
     if game.stones().is_empty() {
         return vec![Turn::single(Hex::ORIGIN)];
     }
 
-    // Opening: player 0 only places 1 stone
+    // Opening: player 0 only places 1 stone on move 0.
     if game.placements_remaining() == 1 && game.move_count() == 0 {
         return vec![Turn::single(Hex::ORIGIN)];
     }
 
-    // Check for instant wins (always deterministic)
+    // Check for instant wins (always deterministic, highest priority).
     if let Some(win_turn) = find_instant_win(game, game.current_player()) {
         return vec![win_turn];
     }
@@ -395,7 +483,9 @@ fn generate_root_turns(
     let mut cands =
         generate_sorted_candidates(game, history, ROOT_CANDIDATE_CAP, noise_level, noise_seed);
 
-    // Add colony candidate: far from centroid
+    // ── Colony candidate ──
+    // Add a cell far from the stone centroid to encourage multi-front play.
+    // This prevents the engine from always clustering stones in one region.
     if cands.len() >= 2 && !game.stones().is_empty() {
         let (sq, sr, n) = game
             .stones()
@@ -419,6 +509,8 @@ fn generate_root_turns(
         let (dq, dr) = dirs[dir_idx];
         let colony = Hex::new(cq + dq * colony_dist, cr + dr * colony_dist);
 
+        // Only add the colony if it is empty and within placement radius
+        // of at least one existing stone (otherwise it would be illegal).
         if !game.stones().contains_key(&colony)
             && game
                 .stones()
@@ -431,22 +523,29 @@ fn generate_root_turns(
         }
     }
 
-    // Handle single-placement turns
+    // Handle single-placement turns.
     if game.placements_remaining() == 1 {
         return cands.into_iter().map(Turn::single).collect();
     }
 
-    // Generate pairs with pair-sum constraint at root too
+    // Generate pairs with pair-sum constraint at root too.
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
 
+    // ── Threat filter ──
+    // Compute threat_status ONCE and retain only legal turns.
     let ts = threat_status(game);
     turns.retain(|t| turn_satisfies_status(&ts, *t));
     turns
 }
 
 /// Generate inner (non-root) turns.
-/// Inner nodes always use deterministic ordering (noise_level=0) to preserve
-/// search quality. Noise is only injected at the root to vary game openings.
+///
+/// Inner nodes always use deterministic ordering (`noise_level = 0`) to
+/// preserve search quality.  Noise is only injected at the root to vary
+/// game openings.
+///
+/// The instant-win check is skipped here because the caller (`alphabeta`)
+/// already performs it before move generation, avoiding redundant work.
 fn generate_inner_turns(
     game: &HexGameState,
     history: &FxHashMap<Hex, i32>,
@@ -456,18 +555,17 @@ fn generate_inner_turns(
         return vec![Turn::single(Hex::ORIGIN)];
     }
 
-    // Single-placement turn
+    // Single-placement turn: no pairs to generate.
     if game.placements_remaining() == 1 {
         let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
         return cands.into_iter().map(Turn::single).collect();
     }
 
-    // Note: instant-win check is done by the caller (alphabeta) before
-    // calling this function, so we skip it here to avoid redundant work.
-
     let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
 
+    // ── Threat filter ──
+    // Compute threat_status ONCE and retain only legal turns.
     let ts = threat_status(game);
     turns.retain(|t| turn_satisfies_status(&ts, *t));
     turns
@@ -477,8 +575,11 @@ fn generate_inner_turns(
 // Turn ordering
 // -------------------------------------------------------------------------
 
-/// Promote TT best and killer to front. Candidates are already sorted by
-/// eval delta from generate_sorted_candidates, so pairs inherit good ordering.
+/// Promote TT best and killer moves to the front of the turn list.
+///
+/// Candidates are already sorted by `score_candidate`, so pairs inherit
+/// good ordering.  This function simply moves the two most trusted moves
+/// to indices 0 and 1 without changing the relative order of the rest.
 fn promote_best_turns(turns: &mut Vec<Turn>, tt_best: Option<Turn>, killer: Option<Turn>) {
     let mut start = 0;
     if let Some(tt_t) = tt_best {
@@ -498,7 +599,19 @@ fn promote_best_turns(turns: &mut Vec<Turn>, tt_best: Option<Turn>, killer: Opti
 // Threat turn generation (for quiescence)
 // -------------------------------------------------------------------------
 
-/// Generate turns from hot window cells only (for quiescence search).
+/// Generate turns from hot-window cells only (for quiescence search).
+///
+/// Quiescence does not need the full candidate list — it only extends
+/// along tactically relevant cells (threats and blocks).  This keeps
+/// the quiescence tree narrow while resolving immediate tactical
+/// sequences.
+///
+/// # Strategy
+/// 1. Collect opponent live cells (blocking moves).
+/// 2. If none, collect our own live cells (threat completion).
+/// 3. For single-placement quiescence, return the top 6 cells.
+/// 4. For two-placement quiescence, generate pairs from the combined
+///    threat cell set, deduplicate, and cap at 16 turns.
 fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
     let player = game.current_player();
     let opp = 1 - player;
@@ -509,6 +622,7 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
         live_cells(game, opp, &mut opp_threats);
         let mut my_threats = Vec::new();
         live_cells(game, player, &mut my_threats);
+
         let cells = if !opp_threats.is_empty() {
             opp_threats
         } else {
@@ -520,10 +634,12 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
         return cells.into_iter().take(6).map(Turn::single).collect();
     }
 
+    // Two-placement quiescence: collect live cells from both sides.
     let mut opp_threats = Vec::new();
     live_cells(game, opp, &mut opp_threats);
     let mut my_threats = Vec::new();
     live_cells(game, player, &mut my_threats);
+
     let primary = if !opp_threats.is_empty() {
         &opp_threats
     } else {
@@ -533,7 +649,7 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
         return Vec::new();
     }
 
-    // Combine all threat cells from both sides
+    // Combine all threat cells from both sides.
     let mut all_threats: Vec<Hex> = opp_threats
         .iter()
         .chain(my_threats.iter())
@@ -544,7 +660,7 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
 
     let mut turns = Vec::new();
 
-    // Pairs within threat cells (most important)
+    // Generate pairs within the top threat cells (most important).
     let n = all_threats.len().min(8);
     for i in 0..n {
         for j in (i + 1)..n {
@@ -562,6 +678,11 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
 // Mate-distance TT adjustments
 // -------------------------------------------------------------------------
 
+/// Adjust a mate score before storing it in the TT.
+///
+/// "Mate in N" scores are stored as `WIN_SCORE - ply` so that deeper
+/// nodes store larger (less negative) values.  When loaded back, the
+/// ply offset is subtracted to recover the original distance.
 #[inline]
 fn adjust_mate_store(score: i32, ply: usize) -> i32 {
     if score > WIN_SCORE - 200 {
@@ -573,6 +694,7 @@ fn adjust_mate_store(score: i32, ply: usize) -> i32 {
     }
 }
 
+/// Adjust a mate score after loading it from the TT.
 #[inline]
 fn adjust_mate_load(score: i32, ply: usize) -> i32 {
     if score > WIN_SCORE - 200 {
@@ -588,6 +710,17 @@ fn adjust_mate_load(score: i32, ply: usize) -> i32 {
 // Quiescence search (turn-based)
 // -------------------------------------------------------------------------
 
+/// Quiescence search: extend the evaluation along tactical lines only.
+///
+/// Quiescence resolves immediate threats (wins, blocks, and counter-threats)
+/// until the position is "quiet" (no fours or fives for either side).  It
+/// uses `generate_threat_turns` instead of the full move generator, keeping
+/// the node count tiny even at depth 6.
+///
+/// # Parameters
+/// * `alpha`, `beta` — standard alpha-beta bounds.
+/// * `qdepth` — remaining quiescence depth (in turns).  Stops at 0.
+/// * `ply` — distance from root, used for mate-distance scoring.
 fn quiesce(
     game: &mut HexGameState,
     ss: &mut SearchState,
@@ -607,6 +740,7 @@ fn quiesce(
 
     let player = game.current_player();
 
+    // Terminal position: return mate score from player's perspective.
     if game.is_over() {
         return if game.winner() == Some(player) {
             WIN_SCORE - ply as i32
@@ -615,7 +749,7 @@ fn quiesce(
         };
     }
 
-    // Stand-pat
+    // Stand-pat: the static evaluation is a lower bound on the score.
     let stand_pat = evaluate(game, player);
     if stand_pat >= beta {
         return stand_pat;
@@ -624,11 +758,12 @@ fn quiesce(
         alpha = stand_pat;
     }
 
+    // Max quiescence depth reached.
     if qdepth <= 0 {
         return alpha;
     }
 
-    // Only extend when threats exist
+    // Only extend when threats exist on either side.
     let counts_p = game.eval().counts(player);
     let counts_o = game.eval().counts(1 - player);
     if counts_p.fives == 0
@@ -639,18 +774,24 @@ fn quiesce(
         return alpha;
     }
 
-    // Check instant win
+    // Instant win check.
     if let Some(win_turn) = find_instant_win(game, player) {
         let (over, placed) = make_turn(game, win_turn);
+
         let score = if over && game.winner() == Some(player) {
+            // Game ends immediately with a win.
             WIN_SCORE - ply as i32
         } else if over {
-            let s = -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1);
-            s
+            // Unlikely: win turn did not win (should not happen).
+            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
         } else {
             -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
         };
+
         unmake_turn(game, placed);
+
+        // If the win turn ended the game, return the win score directly;
+        // otherwise propagate the subtree score.
         return if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
@@ -658,7 +799,7 @@ fn quiesce(
         };
     }
 
-    // Check unblockable opponent win
+    // Unblockable opponent win: we cannot stop all threats.
     if matches!(threat_status(game), ThreatStatus::Unblockable) {
         return -(WIN_SCORE - ply as i32 - 1);
     }
@@ -680,6 +821,7 @@ fn quiesce(
             -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
         };
         unmake_turn(game, placed);
+
         if ss.aborted {
             return 0;
         }
@@ -699,6 +841,16 @@ fn quiesce(
 // Main alpha-beta search (turn-based)
 // -------------------------------------------------------------------------
 
+/// Recursive alpha-beta search with PVS and LMR.
+///
+/// # Pruning inside this function
+/// - Instant-win return before move generation.
+/// - Unblockable-loss return before move generation.
+/// - Reverse futility pruning at shallow depth (`depth <= 2`).
+/// - Late-move pruning: skip moves indexed ≥20 at low depth.
+/// - PVS: full window for first move, null window for rest.
+/// - LMR: reduce depth by 1 or 2 for moves indexed ≥2; re-search if they
+///   beat alpha.
 fn alphabeta(
     game: &mut HexGameState,
     ss: &mut SearchState,
@@ -718,7 +870,7 @@ fn alphabeta(
 
     let player = game.current_player();
 
-    // Terminal check
+    // Terminal check.
     if game.is_over() {
         return if game.winner() == Some(player) {
             WIN_SCORE - ply as i32
@@ -727,12 +879,12 @@ fn alphabeta(
         };
     }
 
-    // Leaf: quiescence
+    // Leaf: drop into quiescence search.
     if depth <= 0 {
         return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply);
     }
 
-    // Instant win check
+    // Instant win check: if we can win right now, return immediately.
     if let Some(win_turn) = find_instant_win(game, player) {
         let (over, placed) = make_turn(game, win_turn);
         let score = if over && game.winner() == Some(player) {
@@ -744,12 +896,14 @@ fn alphabeta(
         return score;
     }
 
-    // Unblockable opponent win check
+    // Unblockable opponent win check.
     if matches!(threat_status(game), ThreatStatus::Unblockable) {
         return -(WIN_SCORE - ply as i32 - 1);
     }
 
-    // Reverse futility pruning
+    // Reverse futility pruning.
+    // If the static eval is so good that even a large margin cannot bring
+    // the opponent back to beta, return early.
     if depth <= 2 && ply > 0 {
         let margin = 2000 * depth;
         let static_eval = evaluate(game, player);
@@ -758,7 +912,7 @@ fn alphabeta(
         }
     }
 
-    // TT probe
+    // ── TT probe ──
     let hash = tt_hash(game);
     let tt_entry = ss.tt.get(&hash).copied();
     let mut tt_best_turn = None;
@@ -785,7 +939,7 @@ fn alphabeta(
         tt_best_turn = entry.best_turn;
     }
 
-    // Generate turns (inner nodes always deterministic)
+    // Generate turns (inner nodes always deterministic).
     let mut turns = generate_inner_turns(game, &ss.history, ss.noise_seed);
     if turns.is_empty() {
         return evaluate(game, player);
@@ -811,18 +965,22 @@ fn alphabeta(
             }
         } else {
             // Late move pruning: at low depth, skip moves late in order
+            // when the position is not in a forced-mate situation.
             if depth <= 2 && move_idx >= 20 && best_score > -(WIN_SCORE - 100) {
                 unmake_turn(game, placed);
                 continue;
             }
 
-            // PVS + LMR (aggressive: start reduction at move 2)
+            // ── PVS + LMR ──
+            // Aggressive reduction: start reducing at move index 2.
             let do_lmr = depth >= 2 && move_idx >= 2 && best_score > -(WIN_SCORE - 100);
             let lmr_reduction = if move_idx >= 10 { 2 } else { 1 };
 
             if move_idx == 0 {
+                // Full-window search for the first (presumably best) move.
                 -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
             } else if do_lmr {
+                // Reduced-depth null-window search.
                 let reduced = -alphabeta(
                     game,
                     ss,
@@ -832,8 +990,10 @@ fn alphabeta(
                     -alpha,
                 );
                 if reduced > alpha && !ss.aborted {
+                    // Re-search with null window at full depth.
                     let nw = -alphabeta(game, ss, depth - 1, ply + 1, -(alpha + 1), -alpha);
                     if nw > alpha && nw < beta && !ss.aborted {
+                        // Full-window re-search.
                         -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
                     } else {
                         nw
@@ -842,6 +1002,7 @@ fn alphabeta(
                     reduced
                 }
             } else {
+                // Null-window search without reduction.
                 let nw = -alphabeta(game, ss, depth - 1, ply + 1, -(alpha + 1), -alpha);
                 if nw > alpha && nw < beta && !ss.aborted {
                     -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
@@ -864,6 +1025,7 @@ fn alphabeta(
             alpha = score;
         }
         if alpha >= beta {
+            // Update killer and history on non-mate cutoffs.
             if best_score.abs() < WIN_SCORE - 100 {
                 ss.update_killers(ply_idx, *t);
                 ss.update_history(*t, depth);
@@ -872,7 +1034,7 @@ fn alphabeta(
         }
     }
 
-    // TT store with mate-distance adjustment
+    // ── TT store with mate-distance adjustment ──
     let flag = if best_score <= orig_alpha {
         TTFlag::UpperBound
     } else if best_score >= beta {
@@ -898,6 +1060,10 @@ fn alphabeta(
 // Root search with full move info
 // -------------------------------------------------------------------------
 
+/// Search all root turns and return the best one, its score, and per-turn scores.
+///
+/// Uses PVS at the root: the first move gets a full window, subsequent moves
+/// get a null window with re-search on failure.
 fn search_root(
     game: &mut HexGameState,
     ss: &mut SearchState,
@@ -923,7 +1089,7 @@ fn search_root(
                 -WIN_SCORE
             }
         } else {
-            // PVS at root
+            // PVS at root.
             if move_idx == 0 {
                 -alphabeta(game, ss, depth - 1, 1, -beta, -alpha)
             } else {
@@ -966,14 +1132,24 @@ pub struct SearchResult {
     pub score: i32,
     pub depth_reached: i32,
     pub nodes: u64,
+    /// Root candidates for temperature-based sampling in self-play.
+    /// Only populated when `collect_candidates` is true.
     pub root_candidates: Vec<(Hex, i32)>,
 }
 
 /// Run iterative-deepening turn-based alpha-beta search.
 ///
+/// `time_limit` caps the total search time.  The engine loops over depths
+/// 1..max_depth, reusing the TT between iterations.  After depth 3,
+/// aspiration windows (`best_score ± 500`) are used; if the score falls
+/// outside the window, a re-search with a full window is performed.
+///
 /// `noise_level`: 0.0 = deterministic (strongest play), >0.0 = inject noise
 /// into root candidate ordering for varied training data. Threat blocking
 /// and instant-win detection remain deterministic regardless of noise level.
+///
+/// `collect_candidates`: if true, populate `root_candidates` with the top
+/// 12 cells and their eval deltas for NN training compatibility.
 pub fn iterative_deepening(
     game: &HexGameState,
     time_limit: Duration,
@@ -986,7 +1162,7 @@ pub fn iterative_deepening(
     ss.deadline = Some(Instant::now() + time_limit);
     ss.maybe_clear_tt();
 
-    // Handle opening move
+    // Handle opening move.
     if game.stones().is_empty() {
         return SearchResult {
             best_turn: Turn::single(Hex::ORIGIN),
@@ -998,7 +1174,7 @@ pub fn iterative_deepening(
         };
     }
 
-    // Generate root turns (using immutable game)
+    // Generate root turns (using immutable game).
     let mut root_turns = generate_root_turns(game, &ss.history, ss.noise_level, ss.noise_seed);
     if root_turns.is_empty() {
         let c = game.candidates_near2();
@@ -1018,7 +1194,7 @@ pub fn iterative_deepening(
         }
     }
 
-    // Clone game ONCE for search (search_root uses make/unmake instead of cloning per move)
+    // Clone game ONCE for search (search_root uses make/unmake instead of cloning per move).
     let mut search_game = game.clone();
 
     let mut best_turn = root_turns[0];
@@ -1028,7 +1204,7 @@ pub fn iterative_deepening(
     for depth in 1..=max_depth {
         ss.aborted = false;
 
-        // Root search at this depth with aspiration windows
+        // Root search at this depth with aspiration windows.
         let (bt, score, scores) = if depth >= 3 && best_score.abs() < WIN_SCORE - 100 {
             let lo = best_score - ASPIRATION_WINDOW;
             let hi = best_score + ASPIRATION_WINDOW;
@@ -1040,7 +1216,7 @@ pub fn iterative_deepening(
             }
 
             if s <= lo || s >= hi {
-                // Re-search with full window
+                // Re-search with full window.
                 ss.aborted = false;
                 search_root(
                     &mut search_game,
@@ -1072,7 +1248,7 @@ pub fn iterative_deepening(
         best_score = score;
         depth_reached = depth;
 
-        // Re-sort root turns for next iteration
+        // Re-sort root turns for next iteration (best-first for PVS).
         if !scores.is_empty() {
             let score_map: FxHashMap<Turn, i32> = scores.into_iter().collect();
             root_turns.sort_by(|a, b| {
@@ -1082,13 +1258,13 @@ pub fn iterative_deepening(
             });
         }
 
-        // Early exit on forced win/loss
+        // Early exit on forced win/loss.
         if score.abs() >= WIN_SCORE - 100 {
             break;
         }
     }
 
-    // Build root_candidates for NN training compatibility (always deterministic)
+    // Build root_candidates for NN training compatibility (always deterministic).
     let root_candidates = if collect_candidates {
         let cands = generate_sorted_candidates(game, &ss.history, 12, 0.0, ss.noise_seed);
         cands

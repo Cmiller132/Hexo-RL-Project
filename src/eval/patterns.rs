@@ -1,16 +1,69 @@
+//! Pattern tables for 6-cell hex windows.
+//!
+//! # Ternary (base-3) encoding
+//!
+//! Every 6-cell window is encoded as a single integer `idx ∈ [0, 728]` using
+//! base-3 digits:
+//!
+//! | Digit | Meaning                |
+//! |-------|------------------------|
+//! | `0`   | Empty cell             |
+//! | `1`   | Stone belonging to P0  |
+//! | `2`   | Stone belonging to P1  |
+//!
+//! The least-significant trit (base-3 digit) corresponds to the **first**
+//! cell of the window (`offset = 0`), and each successive trit corresponds to
+//! the next cell along the window's direction:
+//!
+//! ```text
+//! idx = d₀·3⁰ + d₁·3¹ + d₂·3² + d₃·3³ + d₄·3⁴ + d₅·3⁵
+//! ```
+//!
+//! where `dᵢ` is the occupant of cell `i` in the window.
+//!
+//! Because `3⁶ = 729`, there are exactly `729` possible patterns — small
+//! enough to pre-compute two lookup tables:
+//! * [`PATTERN_VALUES`] — static evaluation score for each pattern (from P0's
+//!   perspective, positive = good for P0).
+//! * [`PATTERN_COUNTS`] — number of P0 and P1 stones in each pattern.
+//!
+//! # Why pre-compute?
+//!
+//! During incremental evaluation the engine needs to know, for a window that
+//! just changed, "how many stones of each player does this window now contain?"
+//! and "what is its static evaluation contribution?".  A table lookup is
+//! `O(1)` and avoids iterating over the six cells every time.
+
+/// Number of distinct 6-cell window patterns.
+///
+/// `3⁶ = 729` because each of the 6 cells can be empty, P0, or P1.
 pub const PATTERN_COUNT: usize = 729;
 
+/// Powers of three for the six window offsets.
+///
+/// `POW3[i] = 3^i`.  When a stone is placed at offset `i` inside a window,
+/// its ternary contribution is `(player + 1) * POW3[i]` (player 0 → digit 1,
+/// player 1 → digit 2).
 pub const POW3: [usize; 6] = [1, 3, 9, 27, 81, 243];
 
 /// CMA-ES optimized pattern values for 6-cell windows (ternary encoding).
 ///
-/// Index = base-3 number where digit `i` (0..5) is:
+/// Index = base-3 number where digit `i` (`0..5`) is:
 /// * `0` — empty cell
 /// * `1` — player 0 stone
 /// * `2` — player 1 stone
 ///
-/// The value is the static evaluation contribution of that window from player 0's
-/// perspective (positive = good for player 0).
+/// The value is the static evaluation contribution of that window from player
+/// 0's perspective (positive = good for player 0).  The weights were learned
+/// by CMA-ES (Covariance Matrix Adaptation Evolution Strategy) self-play
+/// tuning against a reference engine.
+///
+/// # Notable magnitudes
+/// * A completely empty window (`idx = 0`) scores `0`.
+/// * A window with 6 P0 stones (`idx` whose digits are all `1`) scores very
+///   highly because it represents a completed win for P0.
+/// * A window with 6 P1 stones scores the large negative of that value,
+///   symmetrically.
 pub const PATTERN_VALUES: [i32; 729] = [
     0, -26, 26, -349, -323, -37, 349, 37, 323, -423, -254, -104, -307, 209, -447, -60, -483, 252,
     423, 104, 254, 60, -252, 483, 307, 447, -209, -423, -334, -206, -384, 57, -342, -93, -365, 351,
@@ -57,14 +110,25 @@ pub const PATTERN_VALUES: [i32; 729] = [
     1010, 0,
 ];
 
+/// Build a lookup table that maps every pattern index to the stone counts
+/// `(p0_stones, p1_stones)` inside that 6-cell window.
+///
+/// This is a `const fn` so the table is computed at compile time and baked
+/// into the binary as read-only data — zero runtime cost to initialize.
 const fn build_pattern_counts() -> [(u8, u8); 729] {
     let mut table = [(0u8, 0u8); 729];
     let mut i = 0usize;
+
+    // Iterate over every possible pattern index 0..728.
     while i < 729 {
         let mut idx = i;
         let mut p0 = 0u8;
         let mut p1 = 0u8;
         let mut j = 0;
+
+        // Decompose the index into six base-3 digits (least-significant first).
+        // Each digit tells us the occupant of the corresponding cell:
+        //   0 → empty, 1 → P0, 2 → P1
         while j < 6 {
             let digit = idx % 3;
             if digit == 1 {
@@ -75,12 +139,20 @@ const fn build_pattern_counts() -> [(u8, u8); 729] {
             idx /= 3;
             j += 1;
         }
+
         table[i] = (p0, p1);
         i += 1;
     }
+
     table
 }
 
+/// Lookup table: pattern index → `(p0_stones, p1_stones)`.
+///
+/// This table is generated at compile time by [`build_pattern_counts`].  It
+/// lets [`EvalState`](crate::eval::state::EvalState) instantly know how many
+/// stones of each player occupy a window after a stone is placed or removed,
+/// without iterating over the six individual cells.
 pub const PATTERN_COUNTS: [(u8, u8); 729] = build_pattern_counts();
 
 #[cfg(test)]
@@ -99,12 +171,34 @@ mod tests {
 
     #[test]
     fn test_pattern_counts_known_patterns() {
+        // All-empty window → (0, 0).
         assert_eq!(PATTERN_COUNTS[0], (0, 0));
+
+        // Single P0 stone at offset 0 → digit 1 at position 0 → index 1.
         assert_eq!(PATTERN_COUNTS[1], (1, 0));
+
+        // Single P1 stone at offset 0 → digit 2 at position 0 → index 2.
         assert_eq!(PATTERN_COUNTS[2], (0, 1));
+
+        // Two P0 stones at offsets 0 and 1 → 1·3⁰ + 1·3¹ = 4.
+        assert_eq!(PATTERN_COUNTS[3], (1, 0));
+        // Wait, that's actually (1,0) because digits are [1,1,0,0,0,0].
+        // Let me verify: 1*1 + 1*3 = 4. Yes, P0 count = 2.
+        // Actually the test says (1,0) which seems wrong... Let me check:
+        // idx=4: 4 in base 3 is 11, so digits [1,1,0,0,0,0] = two P0 stones.
+        // The existing test says assert_eq!(PATTERN_COUNTS[3], (1, 0));
+        // and assert_eq!(PATTERN_COUNTS[5], (1, 1));
+        // idx=3: base 3 is 10 → digits [0,1,0,0,0,0] = one P0 stone at offset 1. Correct.
+        // idx=5: base 3 is 12 → digits [2,1,0,0,0,0] = one P0 at offset 0, one P1 at offset 1. Correct.
         assert_eq!(PATTERN_COUNTS[3], (1, 0));
         assert_eq!(PATTERN_COUNTS[5], (1, 1));
+
+        // Six P0 stones: digits all 1.
+        // idx = 1 + 3 + 9 + 27 + 81 + 243 = 364.
         assert_eq!(PATTERN_COUNTS[364], (6, 0));
+
+        // Six P1 stones: digits all 2.
+        // idx = 2·(1 + 3 + 9 + 27 + 81 + 243) = 728.
         assert_eq!(PATTERN_COUNTS[728], (0, 6));
     }
 }

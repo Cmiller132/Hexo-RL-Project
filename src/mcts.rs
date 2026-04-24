@@ -4,6 +4,47 @@
 //!   1. `select_leaves(batch_size)` → board tensors for GPU inference
 //!   2. `expand_and_backprop(policies, values)` → updates tree
 //!   3. `get_results()` → (moves, visits, root_value)
+//!
+//! # MCTS algorithm overview
+//!
+//! 1. **Selection** — starting from the root, repeatedly choose the child
+//!    with the highest PUCT score until an unexpanded node or terminal
+//!    position is reached.
+//! 2. **Expansion** — for a non-terminal leaf, create children for all
+//!    legal moves and attach neural-network policy priors.
+//! 3. **Evaluation** — terminal leaves use the game outcome; non-terminal
+//!    leaves use the neural-network value head.
+//! 4. **Backpropagation** — walk back up the search path, incrementing
+//!    visit counts and accumulating values.  Values are stored from each
+//!    node's own player perspective, so the sign flips at every ply.
+//!
+//! # UCB / PUCT formula
+//!
+//! The selection score for a child is:
+//!
+//! ```text
+//! score = Q + c_puct * prior * sqrt(parent_visits) / (1 + child_visits)
+//! ```
+//!
+//! Where:
+//! - `Q` is the average value of the child from the **parent player's**
+//!   perspective.  For unvisited children, `Q = parent_Q - FPU_REDUCTION`
+//!   (First-Play Urgency, encouraging exploration of high-prior moves).
+//! - `c_puct` is the exploration constant.  If `c_puct_init > 0`, it grows
+//!   logarithmically with parent visits (AlphaZero / KataGo formula):
+//!   ```text
+//!   effective_c = c_puct + ln((parent_visits + c_puct_init) / c_puct_init)
+//!   ```
+//! - `prior` is the neural-network policy probability for the move.
+//! - The denominator `(1 + child_visits)` shrinks the exploration bonus
+//!   as the child is visited more often.
+//!
+//! # Virtual loss
+//!
+//! During batch selection, every node on the search path receives a
+//! temporary `VIRTUAL_LOSS_VISITS`.  This discourages multiple batch slots
+//! (or parallel threads) from exploring the same branch simultaneously,
+//! improving diversity in the batch.
 
 use crate::core::Hex;
 use crate::board::HexGameState;
@@ -17,10 +58,12 @@ const NO_PARENT: u32 = u32::MAX;
 /// First-Play Urgency reduction for unvisited children.
 ///
 /// Unvisited children are assigned Q = parent_Q - FPU_REDUCTION.
+/// This makes the engine prefer exploring high-prior moves that have not
+/// yet been tried, rather than treating unvisited children as Q = 0.
 const FPU_REDUCTION: f32 = 0.2;
 
 /// Number of virtual visits added to each node on the search path during
-/// leaf selection. This discourages multiple threads (or sequential batch
+/// leaf selection.  This discourages multiple threads (or sequential batch
 /// slots) from exploring the same branch simultaneously.
 const VIRTUAL_LOSS_VISITS: u32 = 1;
 
@@ -28,7 +71,7 @@ const VIRTUAL_LOSS_VISITS: u32 = 1;
 ///
 /// Each leaf expansion pushes N children (N = filtered legal moves) into
 /// the arena, so realistic peak for a 1000-sim search is ~1000 × branching
-/// factor ≈ 50k nodes. A hint of 64 avoids mid-search Vec reallocation.
+/// factor ≈ 50k nodes.  A hint of 64 avoids mid-search Vec reallocation.
 const CHILD_CAPACITY_HINT: usize = 64;
 
 // ── MCTSNode ───────────────────────────────────────────────────────────
@@ -37,6 +80,16 @@ const CHILD_CAPACITY_HINT: usize = 64;
 ///
 /// Each node tracks its parent, the move that led to it, policy prior,
 /// visit count, total accumulated value, and child range within the arena.
+/// The arena layout is:
+///
+/// ```text
+/// arena[0]              = root node
+/// arena[1..N]           = root's children (contiguous)
+/// arena[N+1..]          = grandchildren, great-grandchildren, etc.
+/// ```
+///
+/// Children of a given node are always stored contiguously, so a node's
+/// children span `children_start .. children_start + children_count`.
 #[derive(Clone)]
 struct MCTSNode {
     /// Arena index of the parent node. `NO_PARENT` for the root.
@@ -50,6 +103,9 @@ struct MCTSNode {
     /// in-flight during batch selection).
     visit_count: u32,
     /// Sum of all backpropagated values from this node's perspective.
+    ///
+    /// Because values are stored from each node's own player perspective,
+    /// `total_value / visit_count` gives the node's Q-value directly.
     total_value: f32,
     /// Arena index where this node's children begin (if expanded).
     children_start: u32,
@@ -97,6 +153,8 @@ struct PendingLeaf {
     /// Arena index of the leaf node.
     node_idx: u32,
     /// Sequence of arena indices from root to this leaf (inclusive).
+    ///
+    /// Used to apply / remove virtual loss and to backpropagate values.
     search_path: Vec<u32>,
     /// Whether this leaf represents a terminal game position.
     is_terminal: bool,
@@ -117,6 +175,8 @@ struct PendingLeaf {
 /// For each legal move, looks up the corresponding logit in the flat
 /// `policy_logits` array (shape BOARD_AREA) using the board-to-tensor
 /// offset, then applies numerically-stable softmax in f64 space.
+///
+/// Moves that fall outside the tensor window receive a default logit of -10.0.
 ///
 /// Returns `(moves, priors)` where `priors` sum to 1.0.
 fn gather_policy(
@@ -150,6 +210,7 @@ fn gather_policy(
     let priors: Vec<f32> = if sum > 0.0 {
         exps.iter().map(|&e| (e / sum) as f32).collect()
     } else {
+        // Uniform fallback if all logits are identical or invalid.
         vec![1.0 / gathered_moves.len() as f32; gathered_moves.len()]
     };
 
@@ -159,19 +220,39 @@ fn gather_policy(
 // ── MCTSEngine ─────────────────────────────────────────────────────────
 
 pub struct MCTSEngine {
+    /// Contiguous storage for all MCTS nodes.
+    ///
+    /// Nodes are never deleted; `re_root` simply moves the root pointer.
     arena: Vec<MCTSNode>,
+    /// Internal game state used during tree traversal.
+    ///
+    /// Moves are applied during `select_leaves` and undone before the
+    /// function returns, so the game state is always valid for the root.
     game: HexGameState,
+    /// Arena index of the current root node.
     root_idx: u32,
+    /// Controls how far from existing stones legal moves are generated.
     near_radius: i32,
+    /// Enables threat-based move filtering at the root.
+    ///
+    /// When true, `init_root` calls the encoder with threat constraints.
+    /// Internal nodes never use threat constraints (too expensive).
     constrain_threats: bool,
+    /// Base exploration constant for PUCT.
     c_puct: f32,
     /// Dynamic c_puct scaling constant (AlphaZero/KataGo formula).
+    ///
+    /// ```text
     /// effective_c_puct = c_puct + ln((N_parent + c_puct_init) / c_puct_init)
+    /// ```
+    ///
     /// Set to 0.0 to disable (use static c_puct).
     pub c_puct_init: f32,
+    /// Number of simulations already completed.
     sims_done: u32,
+    /// Total number of simulations to perform.
     num_simulations: u32,
-    /// Pre-allocated output buffer for `select_leaves`. Holds packed tensors
+    /// Pre-allocated output buffer for `select_leaves`.  Holds packed tensors
     /// for all non-terminal leaves in the current batch.
     batch_buf: Vec<f32>,
     /// Pending leaves from the most recent `select_leaves` call, consumed by
@@ -209,7 +290,7 @@ impl MCTSEngine {
     /// Construct with an explicit arena simulation-count hint.
     ///
     /// Under subtree reuse, the same arena is shared across both placements of
-    /// a turn, so the p1 sim count underestimates the true node budget. Pass
+    /// a turn, so the p1 sim count underestimates the true node budget.  Pass
     /// `p1_sims + p2_sims` here to avoid mid-search Vec reallocation.
     pub fn with_arena_sim_hint(
         game: HexGameState,
@@ -244,7 +325,7 @@ impl MCTSEngine {
     ///
     /// # Returns
     /// `Some((tensor, offset_q, offset_r, legal_moves))` where `tensor` is a
-    /// flat `Vec<f32>` of length `TENSOR_SIZE` (13×33×33). Returns `None` if
+    /// flat `Vec<f32>` of length `TENSOR_SIZE` (13×33×33).  Returns `None` if
     /// the game is already over.
     pub fn init_root(&mut self) -> Option<(Vec<f32>, i32, i32, Vec<Hex>)> {
         if self.game.is_over() {
@@ -315,7 +396,7 @@ impl MCTSEngine {
     /// 1. Traverse from root using `select_child_puct` until an unexpanded
     ///    node or terminal position is reached.
     /// 2. Apply virtual loss to every node on the search path.
-    /// 3. If terminal, record the terminal value. If non-terminal, encode
+    /// 3. If terminal, record the terminal value.  If non-terminal, encode
     ///    the board into `batch_buf` using `encoder::encode_board_into`.
     /// 4. Undo all moves to restore the root game state.
     ///
@@ -395,11 +476,13 @@ impl MCTSEngine {
                 let start = non_terminal_count as usize * TENSOR_SIZE;
                 self.batch_buf.resize(start + TENSOR_SIZE, 0.0);
                 let tensor_slice = &mut self.batch_buf[start..start + TENSOR_SIZE];
+
                 // Only constrain threats at root (init_root), not internal
                 // nodes — the O(n²) unblockable check is too expensive to run
                 // on every leaf expansion during tree search.
                 let (oq, or_, legal) =
                     encoder::encode_board_into(&self.game, self.near_radius, false, tensor_slice);
+
                 non_terminal_count += 1;
                 self.pending.push(PendingLeaf {
                     node_idx,
@@ -507,7 +590,7 @@ impl MCTSEngine {
     /// completed expand_and_backprop cycle).
     ///
     /// The arena is not compacted — dead sibling subtrees remain in memory but
-    /// are never referenced. With typical tree sizes this wastes ~400KB, which
+    /// are never referenced.  With typical tree sizes this wastes ~400KB, which
     /// is acceptable since the arena is recreated per turn.
     pub fn re_root(&mut self, q: i16, r: i16, new_num_simulations: u32) {
         assert!(
@@ -546,13 +629,13 @@ impl MCTSEngine {
         // If the new root was already expanded during P1's tree traversal, its
         // children were computed with constrain_threats=false (encode_board_into
         // always passes false for internal nodes to avoid the O(n²) unblockable
-        // check). When threat constraints are enabled and P2's position has active
+        // check).  When threat constraints are enabled and P2's position has active
         // threats, those unconstrained children are wrong — clear them so that
         // Python calls init_root again and gets the correct constrained legal set.
         //
         // The descendant subtree must also be purged: extract_tree_node_states
         // iterates the full arena and includes any node with is_expanded=true
-        // whose parent chain reaches self.root_idx. Without purging, the
+        // whose parent chain reaches self.root_idx.  Without purging, the
         // grandchildren reached via threat-illegal paths would leak into RGSC
         // candidates as spurious off-policy positions.
         if self.constrain_threats {
@@ -610,7 +693,7 @@ impl MCTSEngine {
 
     /// Get search results: `(moves_q, moves_r, visit_counts, root_value)`.
     ///
-    /// Returns parallel vectors for all root children. `root_value` is the
+    /// Returns parallel vectors for all root children.  `root_value` is the
     /// average Q-value of the root node.
     pub fn get_results(&self) -> (Vec<i32>, Vec<i32>, Vec<u32>, f32) {
         let root = &self.arena[self.root_idx as usize];
@@ -663,6 +746,7 @@ impl MCTSEngine {
                 let child = &self.arena[i];
                 if child.visit_count > 0 {
                     let raw_q = child.q_value();
+                    // Flip sign if the child is from the opponent's perspective.
                     if root_player != 255 && child.player != 255 && child.player != root_player {
                         -raw_q
                     } else {
@@ -701,6 +785,7 @@ impl MCTSEngine {
             .enumerate()
             .filter_map(|(idx, node)| {
                 let idx = idx as u32;
+                // Skip root and unexpanded / low-visit nodes.
                 if idx == self.root_idx || !node.is_expanded || node.visit_count < min_visits {
                     return None;
                 }
@@ -783,13 +868,13 @@ impl MCTSEngine {
 
     // ── Internal helpers ───────────────────────────────────────────────
 
-    /// Select the best child using PUCT formula:
+    /// Select the best child using the PUCT formula.
     ///
     /// ```text
     /// score = Q + c_puct * prior * sqrt(parent_visits) / (1 + child_visits)
     /// ```
     ///
-    /// Where `Q` is the average value from the parent player's perspective.
+    /// Where `Q` is the average value from the **parent player's** perspective.
     /// For unvisited children, `Q = parent_Q - FPU_REDUCTION` (First-Play Urgency).
     ///
     /// Dynamic c_puct: if `c_puct_init > 0`, `c_puct` grows logarithmically:
@@ -831,6 +916,7 @@ impl MCTSEngine {
             let vc = child.visit_count;
 
             // Q-value from the parent player's perspective.
+            // If the child was reached by the opponent, flip the sign.
             let q = if vc > 0 {
                 let raw_q = child.total_value / vc as f32;
                 if parent_player != 255 && child.player != 255 && child.player != parent_player {
@@ -842,6 +928,7 @@ impl MCTSEngine {
                 fpu_value
             };
 
+            // PUCT exploration bonus.
             let score = q + effective_c_puct * child.prior * sqrt_parent / (1.0 + vc as f32);
             if score > best_score {
                 best_score = score;
@@ -855,7 +942,7 @@ impl MCTSEngine {
     /// Expand a node by creating children for all legal moves.
     ///
     /// Gathers policy priors for the legal moves, runs softmax, then appends
-    /// children contiguously to the arena. Sets the node's `children_start`,
+    /// children contiguously to the arena.  Sets the node's `children_start`,
     /// `children_count`, `player`, and `is_expanded`.
     fn expand_node(
         &mut self,

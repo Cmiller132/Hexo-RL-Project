@@ -4,6 +4,16 @@ use crate::eval::grid::{win_grid_idx, win_grid_in_bounds, WIN_GRID_TOTAL};
 use crate::eval::hot::HotWindows;
 use crate::eval::patterns::{PATTERN_VALUES, PATTERN_COUNTS, POW3};
 
+/// Aggregate threat statistics for a single player.
+///
+/// These counts are used by the search engine to quickly detect forcing
+/// lines (e.g. "does the opponent already have a five threat?").
+///
+/// # Invariants
+/// * All fields are monotonically non-decreasing across the lifetime of a
+///   game (they only decrease during `unplace`, which is the inverse of
+///   `place`).
+/// * `fives` > 0 implies an immediate win is available on the next turn.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ThreatCounts {
     pub fives: u32,
@@ -12,6 +22,13 @@ pub struct ThreatCounts {
 }
 
 impl ThreatCounts {
+    /// Apply a signed delta to the threat counts.
+    ///
+    /// # Panics (debug builds only)
+    ///
+    /// `debug_assert!` fires if any field would underflow.  Underflow is a
+    /// logic bug: it means `unplace` was called more times than `place`, or
+    /// the incremental update tables are inconsistent.
     pub fn apply(&mut self, delta: &ThreatCountsDelta) {
         debug_assert!((self.fives as i32 + delta.fives) >= 0,
             "fives underflow: {} + {}", self.fives, delta.fives);
@@ -25,6 +42,11 @@ impl ThreatCounts {
     }
 }
 
+/// Signed change in threat counts produced by a single stone placement.
+///
+/// A positive value means the corresponding threat category increased;
+/// negative means it decreased.  Used inside [`EvalDelta`] so that `unplace`
+/// can subtract the exact same delta back out.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ThreatCountsDelta {
     pub fives: i32,
@@ -32,6 +54,14 @@ pub struct ThreatCountsDelta {
     pub threes: i32,
 }
 
+/// Complete incremental delta for a single stone placement.
+///
+/// `EvalState::place` returns this struct so callers can see the immediate
+/// effect of a move, and `EvalState::unplace` consumes the mirrored delta
+/// from the internal stack to restore the previous state.
+///
+/// Because `EvalDelta` is `Copy`, it can be passed by value without
+/// allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct EvalDelta {
     pub cell: Hex,
@@ -40,6 +70,47 @@ pub struct EvalDelta {
     pub counts: [ThreatCountsDelta; 2],
 }
 
+/// Incremental evaluation state.
+///
+/// Instead of re-scanning the entire board after every move, `EvalState`
+/// maintains a dense win-grid of pattern indices and updates only the
+/// windows that touch the newly placed (or removed) stone.  This makes
+/// `place` and `unplace` `O(1)` — specifically they touch at most
+/// `3 directions × 6 offsets = 18` windows.
+///
+/// # Core data structures
+///
+/// * `score` — accumulated static evaluation from P0's perspective.
+/// * `counts` — per-player [`ThreatCounts`] (fives, fours, threes).
+/// * `hot` — a [`HotWindows`] cache of windows with ≥ 4 own stones and 0
+///   opponent stones.
+/// * `indices` — flattened win grid mapping every `(q, r, dir)` inside
+///   [`WIN_GRID_RADIUS`](crate::eval::grid::WIN_GRID_RADIUS) to a pattern
+///   index `0..728`.  Boxed so the large array lives on the heap but the
+///   `EvalState` struct itself remains small and cheap to move.
+/// * `delta_stack` — stack of [`EvalDelta`]s supporting `unplace`.  One entry
+///   per stone placed.
+///
+/// # Incremental update strategy
+///
+/// When a stone is placed at `(q, r)` for `player`:
+/// 1. Determine the stone's ternary digit: `cell_val = player + 1` (1 for P0,
+///    2 for P1).
+/// 2. For each of the 3 principal directions:
+///    a. Walk backwards up to 5 steps to find every window origin that
+///       includes this stone.
+///    b. If the origin is inside the finite win grid, compute the new pattern
+///       index: `new_idx = old_idx + cell_val * POW3[offset]`.
+///    c. Look up the old and new stone counts via [`PATTERN_COUNTS`].
+///    d. Update `score` with the difference in [`PATTERN_VALUES`].
+///    e. Update `ThreatCounts` via `classify_delta`.
+///    f. Update `HotWindows` via `update_hot`.
+///    g. Write `new_idx` back into `indices`.
+/// 3. Push the aggregated delta onto `delta_stack`.
+///
+/// `unplace` performs the exact inverse: it pops the delta, subtracts the
+/// score, applies the negated counts, and walks the same 18 windows in
+/// reverse, restoring the old pattern indices and hot-window state.
 #[derive(Clone, Debug)]
 pub struct EvalState {
     score: i32,
@@ -49,6 +120,23 @@ pub struct EvalState {
     delta_stack: Vec<EvalDelta>,
 }
 
+/// Update the threat-count delta for one player based on a window's old and
+/// new stone counts.
+///
+/// # Arguments
+/// * `delta`      — the accumulator to mutate.
+/// * `old_own`    — how many of the player's stones were in the window before.
+/// * `old_other`  — how many opponent stones were in the window before.
+/// * `new_own`    — how many of the player's stones are in the window now.
+/// * `new_other`  — how many opponent stones are in the window now.
+///
+/// # Logic
+/// A "five" threat is a window with ≥ 5 own stones and 0 opponent stones.
+/// A "four"  threat is a window with exactly 4 own stones and 0 opponent.
+/// A "three" threat is a window with exactly 3 own stones and 0 opponent.
+///
+/// The delta records `+1` when a window enters one of those categories and
+/// `-1` when it leaves.
 #[inline]
 fn classify_delta(delta: &mut ThreatCountsDelta, old_own: u8, old_other: u8, new_own: u8, new_other: u8) {
     let old_five = (old_own >= 5 && old_other == 0) as i32;
@@ -64,6 +152,11 @@ fn classify_delta(delta: &mut ThreatCountsDelta, old_own: u8, old_other: u8, new
     delta.threes += new_three - old_three;
 }
 
+/// Synchronously update the [`HotWindows`] cache for a single window.
+///
+/// A window becomes "hot" when it crosses the threshold
+/// `own >= 4 && other == 0`, and ceases to be hot when it drops below that
+/// threshold.  This helper ensures `hot` stays consistent with the win grid.
 #[inline]
 fn update_hot(hot: &mut HotWindows, key: WindowKey, player: u8, old_own: u8, old_other: u8, new_own: u8, new_other: u8) {
     let was_hot = old_own >= 4 && old_other == 0;
@@ -82,6 +175,10 @@ impl Default for EvalState {
 }
 
 impl EvalState {
+    /// Create a fresh evaluation state with an empty board.
+    ///
+    /// All pattern indices start at `0` (the "all empty" pattern), the score
+    /// is `0`, and there are no hot windows or threat counts.
     pub fn new() -> Self {
         Self {
             score: 0,
@@ -92,6 +189,36 @@ impl EvalState {
         }
     }
 
+    /// Incrementally evaluate a stone placement.
+    ///
+    /// # Arguments
+    /// * `_stones` — the board's stone map (reserved for future validation;
+    ///   currently unused to keep the hot path minimal).
+    /// * `cell`    — the coordinate where the stone is placed.
+    /// * `player`  — `0` or `1`.
+    ///
+    /// # Returns
+    /// An [`EvalDelta`] describing the exact change in score, threat counts,
+    /// and hot windows caused by this placement.
+    ///
+    /// # Algorithm (step-by-step)
+    /// 1. `cell_val = player + 1` → the ternary digit contributed by this
+    ///    stone (`1` for P0, `2` for P1).
+    /// 2. For each of the 3 principal hex directions:
+    ///    a. The stone at `cell` can belong to up to 6 windows along that
+    ///       direction (one for each offset `0..5`).  The window origin is
+    ///       `cell - direction * offset`.
+    ///    b. Skip origins that fall outside the finite win grid.
+    ///    c. Read the old pattern index from `indices`, compute the new index
+    ///       by adding `cell_val * POW3[offset]`.
+    ///    d. Update the aggregated `score` with the delta in pattern value.
+    ///    e. Use [`PATTERN_COUNTS`] to get old/new stone counts and feed them
+    ///       into `classify_delta` for both players.
+    ///    f. Feed the same counts into `update_hot` to keep the hot-window
+    ///       cache in sync.
+    ///    g. Write the new pattern index back into `indices`.
+    /// 3. Apply the aggregated deltas to `self.score` and `self.counts`.
+    /// 4. Push the delta onto `delta_stack` for a future `unplace`.
     pub fn place(&mut self, _stones: &FxHashMap<Hex, u8>, cell: Hex, player: u8) -> EvalDelta {
         let cell_val = (player + 1) as usize; // 1 or 2
         let mut delta = EvalDelta {
@@ -101,11 +228,15 @@ impl EvalState {
             counts: [ThreatCountsDelta::default(); 2],
         };
 
+        // A stone touches 3 directions × 6 offsets = 18 windows.
         for dir in 0..3 {
             let (dq, dr) = HEX_DIRECTIONS[dir];
             for off in 0..WIN_LENGTH as usize {
+                // The window origin is the cell such that `cell` is at
+                // position `off` inside the 6-cell window.
                 let sq = cell.q - dq * off as i32;
                 let sr = cell.r - dr * off as i32;
+
                 // WIN_GRID_RADIUS (30) caps evaluation at ~3–4 moves from origin per axis.
                 // For stones near the grid boundary, some of the 18 windows extend outside
                 // the grid; those windows simply don't contribute to evaluation. This is a
@@ -119,22 +250,28 @@ impl EvalState {
                 let new_idx = old_idx + cell_val * POW3[off];
                 debug_assert!(new_idx < 729);
 
+                // Pattern value delta: how much does this window's contribution change?
                 delta.score += PATTERN_VALUES[new_idx] - PATTERN_VALUES[old_idx];
 
+                // Look up stone counts before and after.
                 let (old_p0, old_p1) = PATTERN_COUNTS[old_idx];
                 let (new_p0, new_p1) = PATTERN_COUNTS[new_idx];
 
+                // Update threat-category counters for both players.
                 classify_delta(&mut delta.counts[0], old_p0, old_p1, new_p0, new_p1);
                 classify_delta(&mut delta.counts[1], old_p1, old_p0, new_p1, new_p0);
 
+                // Synchronize the hot-window cache.
                 let key = WindowKey::new(sq, sr, dir as u8);
                 update_hot(&mut self.hot, key, 0, old_p0, old_p1, new_p0, new_p1);
                 update_hot(&mut self.hot, key, 1, old_p1, old_p0, new_p1, new_p0);
 
+                // Commit the new pattern index.
                 self.indices[gi] = new_idx as u16;
             }
         }
 
+        // Apply the aggregated delta to the global state.
         self.score += delta.score;
         self.counts[0].apply(&delta.counts[0]);
         self.counts[1].apply(&delta.counts[1]);
@@ -142,9 +279,25 @@ impl EvalState {
         delta
     }
 
+    /// Undo the most recent stone placement, restoring the previous evaluation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `unplace` is called when no stone has been placed (i.e. the
+    /// delta stack is empty).
+    ///
+    /// # Algorithm
+    /// `unplace` is the exact inverse of `place`:
+    /// 1. Pop the delta recorded by the matching `place` call.
+    /// 2. Subtract `delta.score` from `self.score`.
+    /// 3. Apply the negated threat-count deltas.
+    /// 4. Walk the same 18 windows, compute the old index by subtraction,
+    ///    reverse the hot-window transitions, and write the old index back.
+    /// 5. In debug builds, run `assert_invariants` to verify consistency.
     pub fn unplace(&mut self) {
         let delta = self.delta_stack.pop().expect("unplace called with empty stack");
 
+        // Reverse the global score and threat counts.
         self.score -= delta.score;
         self.counts[0].apply(&ThreatCountsDelta {
             fives: -delta.counts[0].fives,
@@ -161,11 +314,13 @@ impl EvalState {
         let player = delta.player;
         let cell_val = (player + 1) as usize;
 
+        // Re-traverse the same 18 windows in the same order.
         for dir in 0..3 {
             let (dq, dr) = HEX_DIRECTIONS[dir];
             for off in 0..WIN_LENGTH as usize {
                 let sq = cell.q - dq * off as i32;
                 let sr = cell.r - dr * off as i32;
+
                 // WIN_GRID_RADIUS (30) caps evaluation at ~3–4 moves from origin per axis.
                 // For stones near the grid boundary, some of the 18 windows extend outside
                 // the grid; those windows simply don't contribute to evaluation. This is a
@@ -187,6 +342,7 @@ impl EvalState {
                 update_hot(&mut self.hot, key, 0, new_p0, new_p1, old_p0, old_p1);
                 update_hot(&mut self.hot, key, 1, new_p1, new_p0, old_p1, old_p0);
 
+                // Restore the old pattern index.
                 self.indices[gi] = old_idx as u16;
             }
         }
@@ -197,10 +353,16 @@ impl EvalState {
         }
     }
 
+    /// Debug-only consistency check.
+    ///
+    /// Recomputes the hot-window sets from scratch by scanning the entire
+    /// win grid and comparing with the incremental cache.  Expensive, but
+    /// invaluable for catching incremental-update bugs.
     #[cfg(debug_assertions)]
     fn assert_invariants(&self) {
         use crate::eval::grid::WIN_GRID_RADIUS;
-        // Recompute hot windows from scratch from indices + PATTERN_COUNTS
+
+        // Recompute hot windows from scratch from indices + PATTERN_COUNTS.
         let mut expected = [
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
@@ -237,26 +399,51 @@ impl EvalState {
         }
     }
 
+    /// Current static evaluation score from P0's perspective.
+    ///
+    /// Positive values favour P0; negative values favour P1.
+    #[inline]
     pub fn score(&self) -> i32 {
         self.score
     }
 
+    /// Threat counts for `player` (0 or 1).
+    #[inline]
     pub fn counts(&self, player: u8) -> ThreatCounts {
         self.counts[player as usize]
     }
 
+    /// Iterate over the hot windows for `player`.
+    ///
+    /// See [`HotWindows`](crate::eval::hot::HotWindows) for the definition of
+    /// "hot".
+    #[inline]
     pub fn hot_windows(&self, player: u8) -> impl Iterator<Item = WindowKey> + '_ {
         self.hot.iter(player)
     }
 
+    /// Returns `true` if `player` has no hot windows.
+    #[inline]
     pub fn hot_is_empty(&self, player: u8) -> bool {
         self.hot.is_empty(player)
     }
 
+    /// Number of hot windows currently tracked for `player`.
+    #[inline]
     pub fn hot_len(&self, player: u8) -> usize {
         self.hot.len(player)
     }
 
+    /// Compute the score delta that would result from placing a stone at
+    /// `cell` for `player`, **without mutating state**.
+    ///
+    /// This is useful for move ordering and quiescence search: the engine
+    /// can rank candidate moves by their immediate material impact before
+    /// committing to a full `place` / `unplace` pair.
+    ///
+    /// # Algorithm
+    /// Identical to the first half of `place`, but without writing back to
+    /// `indices`, updating `counts`, or touching `hot`.
     pub fn hypothetical_score_delta(&self, cell: Hex, player: u8) -> i32 {
         let cell_val = (player + 1) as usize;
         let mut delta = 0i32;
@@ -266,6 +453,7 @@ impl EvalState {
             for off in 0..WIN_LENGTH as usize {
                 let sq = cell.q - dq * off as i32;
                 let sr = cell.r - dr * off as i32;
+
                 // WIN_GRID_RADIUS (30) caps evaluation at ~3–4 moves from origin per axis.
                 // For stones near the grid boundary, some of the 18 windows extend outside
                 // the grid; those windows simply don't contribute to evaluation. This is a

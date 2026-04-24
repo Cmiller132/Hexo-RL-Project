@@ -1,4 +1,34 @@
-//! PyO3 bindings — exposes the Rust game engine to Python.
+//! PyO3 Python bindings — exposes the Rust Hex game engine to Python.
+//!
+//! This module defines two Python-facing classes:
+//!
+//! * `HexGame` — a thin wrapper around [`HexGameState`] that exposes board
+//!   manipulation, query methods, and neural-network encoding.
+//! * `MCTSEngine` — a wrapper around the Rust MCTS tree that handles root
+//!   expansion, leaf selection, Dirichlet noise, and back-propagation.
+//!
+//! # PyO3 / numpy patterns used throughout
+//!
+//! * **`Python<'py>` lifetime** — every method that allocates Python objects
+//!   (e.g. `numpy.ndarray`, `PyBytes`) takes a `Python<'py>` token so that
+//!   the returned `Bound<'py, T>` values are known to be valid for the
+//!   duration of the call.
+//! * **`Bound<'py, PyArray>` instead of `&PyArray`** — PyO3 0.22+ moved to the
+//!   `Bound` API for all object references. This is why init-methods return
+//!   `Bound<'py, PyArray3<f32>>` rather than `&PyArray3<f32>`.
+//! * **`ndarray::ArrayX::from_shape_vec` + `PyArrayX::from_owned_array`** —
+//!   `numpy` 0.24 removed the old `PyArrayX::from_shape_vec` constructor.
+//!   The new two-step pattern (build a Rust `ndarray::Array`, then transfer
+//!   ownership into Python) is used by `encode_board_and_legal`, `init_root`,
+//!   `select_leaves`, and `extract_tree_node_states`.
+//! * **Contiguous-slice validation** — `PyReadonlyArray1::as_slice()` returns
+//!   `Result<&[T], NotContiguousError>` because numpy arrays may be strided.
+//!   Fallible methods propagate this as a Python `ValueError` instead of
+//!   panicking so that the caller can catch it.
+//! * **Packed byte buffers** — methods ending in `_bytes` return `PyBytes`
+//!   containing little-endian `i32` values. This avoids the overhead of
+//!   constructing millions of tiny Python tuples when shipping move lists or
+//!   board states across the FFI boundary.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -17,7 +47,8 @@ use crate::search;
 use std::cell::Cell;
 use std::time::{Duration, SystemTime};
 
-// Re-export encoder constants so shapes stay in sync with the canonical implementation.
+// Re-export encoder constants so Python can query shapes that match the
+// canonical implementation in `encoder.rs`.
 use encoder::{BOARD_SIZE, NUM_CHANNELS};
 
 // -------------------------------------------------------------------------
@@ -38,7 +69,7 @@ thread_local! {
     });
 }
 
-/// Next 64-bit XOR-shift value.
+/// Next 64-bit XOR-shift value from the thread-local generator.
 fn rng_next() -> u64 {
     RNG_STATE.with(|s| {
         let mut v = s.get();
@@ -51,6 +82,10 @@ fn rng_next() -> u64 {
 }
 
 /// Epsilon top-k sampling around the deterministic best move.
+///
+/// With probability `noise_level` a candidate from the top `k` root moves is
+/// sampled uniformly, otherwise the best move is returned. Used by
+/// `classical_search` to inject variability into self-play games.
 fn epsilon_topk_sample(best: Hex, candidates: &[(Hex, i32)], noise_level: f32) -> Hex {
     if candidates.is_empty() {
         return best;
@@ -84,7 +119,10 @@ fn epsilon_topk_sample(best: Hex, candidates: &[(Hex, i32)], noise_level: f32) -
 // Python-facing wrapper for HexGameState
 // -------------------------------------------------------------------------
 
-/// Python-facing wrapper around `HexGameState`.
+/// Python-facing wrapper around [`HexGameState`].
+///
+/// Provides board manipulation, threat queries, legal-move generation, and
+/// neural-network encoding for a 6-in-a-row Hex variant on an infinite board.
 #[pyclass(name = "HexGame")]
 pub struct PyHexGame {
     inner: HexGameState,
@@ -93,6 +131,9 @@ pub struct PyHexGame {
 #[pymethods]
 impl PyHexGame {
     /// Create a new game in the initial empty state.
+    ///
+    /// Player 0 moves first with a single opening stone; all subsequent turns
+    /// consist of two stone placements.
     #[new]
     fn new() -> Self {
         Self {
@@ -100,10 +141,13 @@ impl PyHexGame {
         }
     }
 
-    /// Place the current player's tile at (q, r).
+    /// Place the current player's tile at `(q, r)`.
     ///
-    /// Returns `True` when the turn ends, `False` when the player has another
-    /// placement remaining.
+    /// Returns `True` when the turn ends (i.e. the second stone of a turn was
+    /// just placed, or the single opening stone), `False` when the player has
+    /// another placement remaining this turn.
+    ///
+    /// Raises `ValueError` if the placement is illegal.
     fn place(&mut self, q: i32, r: i32) -> PyResult<bool> {
         self.inner
             .place(q, r)
@@ -111,6 +155,9 @@ impl PyHexGame {
     }
 
     /// Undo the last placement.
+    ///
+    /// If the game is over this resets the winner as well. Safe to call even
+    /// when the history is empty (no-op).
     fn unplace(&mut self) {
         self.inner.unplace();
     }
@@ -121,19 +168,19 @@ impl PyHexGame {
         self.inner.is_over()
     }
 
-    /// The winning player (0 or 1), or `None`.
+    /// The winning player (`0` or `1`), or `None` if the game is still ongoing.
     #[getter]
     fn winner(&self) -> Option<u8> {
         self.inner.winner()
     }
 
-    /// Current player (0 or 1).
+    /// Current player (`0` or `1`).
     #[getter]
     fn current_player(&self) -> u8 {
         self.inner.current_player()
     }
 
-    /// Placements remaining in the current turn (1 or 2).
+    /// Placements remaining in the current turn (`1` or `2`).
     #[getter]
     fn placements_remaining(&self) -> u8 {
         self.inner.placements_remaining()
@@ -145,19 +192,30 @@ impl PyHexGame {
         self.inner.move_count()
     }
 
-    /// Incremental Zobrist hash of the board.
+    /// Incremental Zobrist hash of the board position.
+    ///
+    /// This hash is updated in O(1) on every placement and is suitable for
+    /// transposition tables.
     #[getter]
     fn zobrist_hash(&self) -> u64 {
         self.inner.zobrist()
     }
 
-    /// Whether a forced position exists (hot windows with 4+ own, 0 opponent).
+    /// Tactical threat summary for the current position.
     ///
-    /// With 2 placements per turn, both 4-windows (2 empty) and 5-windows
-    /// (1 empty) are single-turn wins. Returns a 2-bit value:
-    ///   0 = no threats, 1 = own threat only, 2 = opponent threat only, 3 = both.
-    /// Noise suppression only uses the opponent bit (must block).
-    /// Zero extra cost (reads incremental counters).
+    /// With two placements per turn, both 4-windows (2 empty cells) and
+    /// 5-windows (1 empty cell) are single-turn wins. This property returns a
+    /// 2-bit value:
+    ///
+    /// | Value | Meaning |
+    /// |---|---|
+    /// | `0` | No immediate threats for either side. |
+    /// | `1` | Current player has at least one 4-window or 5-window. |
+    /// | `2` | Opponent has at least one 4-window or 5-window. |
+    /// | `3` | Both sides have threats. |
+    ///
+    /// The opponent bit is used by noise suppression (must block). Zero extra
+    /// cost — reads the incremental threat counters maintained by the evaluator.
     #[getter]
     fn threat_level(&self) -> u8 {
         let me = self.inner.current_player() as usize;
@@ -169,44 +227,55 @@ impl PyHexGame {
         own | (opp_threat << 1)
     }
 
-    /// How many placements the current turn allows.
+    /// How many placements a turn allows given a move count.
     ///
-    /// The first turn (move_count == 0, i.e. the very first placement) allows
-    /// only 1 placement (P0's opening stone). All subsequent turns allow 2.
+    /// The very first turn (`move_count == 0`, player 0 to move) allows only
+    /// one placement (the opening stone). All subsequent turns allow two.
     fn placements_per_turn(&self, move_count: u32) -> u8 {
         if move_count == 0 { 1 } else { 2 }
     }
 
-    /// Raw window-based positional eval, from player-0's perspective.
-    /// Turn-independent: does NOT include threat bonuses or tempo.
+    /// Raw window-based positional evaluation from player 0's perspective.
+    ///
+    /// This is turn-independent: it does **not** include threat bonuses or
+    /// tempo adjustments. Positive values favour player 0; negative values
+    /// favour player 1.
     #[getter]
     fn window_eval(&self) -> i32 {
         self.inner.eval().score()
     }
 
-    /// Number of windows with 4+ pieces for the given player (0 or 1).
+    /// Number of hot windows containing exactly 4 stones for `player`.
+    ///
+    /// A "hot window" is a 6-cell line with 4+ stones of the given player and
+    /// zero opponent stones. These are the tactical lines that matter for
+    /// threat detection.
     fn window_fours(&self, player: u8) -> i32 {
         self.inner.eval().counts(player).fours as i32
     }
 
-    /// Number of windows with 5+ pieces (one-move wins) for the given player.
+    /// Number of hot windows containing 5+ stones for `player`.
+    ///
+    /// A 5-window is one empty cell away from an instant win.
     fn window_fives(&self, player: u8) -> i32 {
         self.inner.eval().counts(player).fives as i32
     }
 
-    /// Number of windows with 3+ pieces for the given player.
+    /// Number of hot windows containing 3+ stones for `player`.
     fn window_threes(&self, player: u8) -> i32 {
         self.inner.eval().counts(player).threes as i32
     }
 
-    /// Return active threat windows (4+ stones, unblocked) for the given player.
+    /// Return active threat windows for the given player.
     ///
     /// Each window is a list of 6 `(q, r, occupied)` tuples where `occupied`
-    /// is `true` if the player has a stone there, `false` if the cell is empty
-    /// (i.e. needs to be filled to complete the line).
+    /// is `True` if the player already has a stone on that cell and `False`
+    /// if the cell is empty (i.e. must be filled to complete the line).
+    ///
+    /// Only "hot" windows are returned — lines with 4+ player stones and no
+    /// blocking opponent stones.
     fn get_threat_windows(&self, player: u8) -> Vec<Vec<(i32, i32, bool)>> {
-        use crate::core::HEX_DIRECTIONS;
-        use crate::core::WIN_LENGTH;
+        use crate::core::{HEX_DIRECTIONS, WIN_LENGTH};
         let game = &self.inner;
         let mut result = Vec::new();
         for key in game.eval().hot_windows(player) {
@@ -225,7 +294,7 @@ impl PyHexGame {
         result
     }
 
-    /// Dict of {(q, r): player} for all occupied cells.
+    /// Dict-like list of all occupied cells: `[(q, r, player), ...]`.
     fn board_pieces(&self) -> Vec<(i32, i32, u8)> {
         self.inner
             .stones()
@@ -235,6 +304,9 @@ impl PyHexGame {
     }
 
     /// All legal placements (exhaustive radius-8 scan).
+    ///
+    /// This is slower but guarantees completeness. For most use-cases prefer
+    /// `legal_moves_near` with a small radius.
     fn legal_moves(&self) -> Vec<(i32, i32)> {
         self.inner
             .legal_moves()
@@ -243,7 +315,10 @@ impl PyHexGame {
             .collect()
     }
 
-    /// Legal placements within `radius` of any occupied cell (fast).
+    /// Legal placements within `radius` of any occupied cell (fast heuristic).
+    ///
+    /// The NN encoder uses `radius = 8` during self-play. For classical search
+    /// `radius = 2` is usually sufficient.
     fn legal_moves_near(&self, radius: i32) -> Vec<(i32, i32)> {
         self.inner
             .legal_moves_near(radius)
@@ -254,7 +329,13 @@ impl PyHexGame {
 
     /// Threat-constrained legal placements when a forced tactical state exists.
     ///
-    /// Returns `None` when no threat-based hard constraint applies.
+    /// Returns `None` when no threat-based hard constraint applies (the caller
+    /// should fall back to the full legal move set).
+    ///
+    /// When a constraint *does* apply the returned list is a subset of
+    /// `legal_moves_near(radius)`:
+    /// * **Winning turn** — only the 1 or 2 cells that complete a 6-line.
+    /// * **Must-block** — only the cells that block the opponent's immediate win.
     fn threat_constrained_moves(&self, radius: i32) -> Option<Vec<(i32, i32)>> {
         let legal = self.inner.legal_moves_near(radius);
         let constrained: Vec<Hex> = match threat_status(&self.inner) {
@@ -277,9 +358,11 @@ impl PyHexGame {
         }
     }
 
-    /// Legal moves as packed bytes: pairs of little-endian i32 (q, r).
+    /// Legal moves as packed bytes: pairs of little-endian `i32` `(q, r)`.
     ///
-    /// Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 2)`` in Python.
+    /// Use `np.frombuffer(data, dtype=np.int32).reshape(-1, 2)` in Python to
+    /// decode. This is much faster than returning a list of tuples when
+    /// shipping large move lists across the FFI boundary.
     fn legal_moves_near_bytes<'py>(&self, py: Python<'py>, radius: i32) -> Bound<'py, PyBytes> {
         let moves = self.inner.legal_moves_near(radius);
         let mut buf: Vec<u8> = Vec::with_capacity(moves.len() * 8);
@@ -290,9 +373,9 @@ impl PyHexGame {
         PyBytes::new(py, &buf)
     }
 
-    /// Board pieces as packed bytes: triples of little-endian i32 (q, r, player).
+    /// Board pieces as packed bytes: triples of little-endian `i32` `(q, r, player)`.
     ///
-    /// Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 3)`` in Python.
+    /// Use `np.frombuffer(data, dtype=np.int32).reshape(-1, 3)` in Python.
     fn board_pieces_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let board = self.inner.stones();
         let mut buf: Vec<u8> = Vec::with_capacity(board.len() * 12);
@@ -304,9 +387,9 @@ impl PyHexGame {
         PyBytes::new(py, &buf)
     }
 
-    /// Move history as packed bytes: triples of little-endian i32 (player, q, r).
+    /// Move history as packed bytes: triples of little-endian `i32` `(player, q, r)`.
     ///
-    /// Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 3)`` in Python.
+    /// Use `np.frombuffer(data, dtype=np.int32).reshape(-1, 3)` in Python.
     fn move_history_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let hist = self.inner.move_history();
         let mut buf: Vec<u8> = Vec::with_capacity(hist.len() * 12);
@@ -318,15 +401,36 @@ impl PyHexGame {
         PyBytes::new(py, &buf)
     }
 
-    /// Encode the board as a (13, 33, 33) float32 tensor and return legal moves.
+    /// Encode the board as a `(13, 33, 33)` float32 tensor and return legal moves.
     ///
     /// Delegates to the canonical encoder in `encoder.rs`.
     ///
-    /// Returns ``(tensor, offset_q, offset_r, legal_moves_bytes)`` where:
-    /// - ``tensor``: a `numpy.ndarray` of shape (13, 33, 33) and dtype float32.
-    /// - ``legal_moves_bytes``: packed i32 pairs (q, r) — the legal moves
-    ///   within ``near_radius`` (same ones used for channel 3).
-    ///   Use ``np.frombuffer(data, dtype=np.int32).reshape(-1, 2)``
+    /// Returns `(tensor, offset_q, offset_r, legal_moves_bytes)` where:
+    ///
+    /// * `tensor` — `numpy.ndarray` of shape `(13, 33, 33)` and dtype `float32`.
+    /// * `offset_q`, `offset_r` — board coordinates that map to tensor index `(0, 0)`.
+    ///   To recover board coords: `q = gi + offset_q`, `r = gj + offset_r`.
+    /// * `legal_moves_bytes` — packed `i32` pairs `(q, r)` for the legal moves
+    ///   inside `near_radius` (the same set used for channel 3).
+    ///   Decode with `np.frombuffer(data, dtype=np.int32).reshape(-1, 2)`.
+    ///
+    /// # Channel reference
+    ///
+    /// | Ch | Name | Description |
+    /// |---|---|---|
+    /// | 0 | Own stones | `1.0` on each cell occupied by the current player. |
+    /// | 1 | Opponent stones | `1.0` on each cell occupied by the opponent. |
+    /// | 2 | Empty mask | `1.0 - ch0 - ch1`. |
+    /// | 3 | Legal moves | `1.0` on each legal move (threat-constrained when `constrain_threats=True`). |
+    /// | 4 | Turn phase | All `1.0` during the second placement of a turn. |
+    /// | 5 | First stone | `1.0` on the first placement of the current turn (phase 2 only). |
+    /// | 6 | Player colour | All `1.0` if current player is 0, else all `0.0`. |
+    /// | 7 | Own recency | `1/(1+plies_ago)` for each own stone. |
+    /// | 8 | Opponent recency | `1/(1+plies_ago)` for each opponent stone. |
+    /// | 9 | Opponent hot cells | Empty cells in opponent's 4+ windows (must-block candidates). |
+    /// | 10 | Own hot cells | Empty cells in own 4+ windows (attacking candidates). |
+    /// | 11 | Distance from centre | Normalised hex distance to board centroid, in `[0, 1]`. |
+    /// | 12 | Opponent's last turn | Cells placed by opponent in their most recent completed turn. |
     #[pyo3(signature = (near_radius, constrain_threats=true))]
     fn encode_board_and_legal<'py>(
         &self,
@@ -349,21 +453,24 @@ impl PyHexGame {
         Ok((arr, encoded.offset_q, encoded.offset_r, PyBytes::new(py, &legal_buf)))
     }
 
-    /// Extract the 13-element feature vector (for classical NN).
+    /// Extract the 13-element classical feature vector.
+    ///
+    /// This is a compact hand-crafted feature set used by the shallow
+    /// evaluation function in classical alpha-beta search.
     fn extract_features(&self) -> Vec<f32> {
         eval::extract_features(&self.inner).to_vec()
     }
 
-    /// Run iterative-deepening alpha-beta search.
+    /// Run iterative-deepening alpha-beta search and return the best single placement.
     ///
     /// Parameters:
-    /// - `time_ms`:     search time budget in milliseconds
-    /// - `max_depth`:   hard cap on search depth (turns, not placements)
-    /// - `near_radius`: candidate generation radius (ignored, always uses 2)
-    /// - `noise_level`: 0.0 = deterministic (default); >0 = sample from top
-    ///                  candidates with softmax temperature for variability.
+    /// * `time_ms` — search time budget in milliseconds.
+    /// * `max_depth` — hard cap on search depth (measured in **turns**, not individual placements).
+    /// * `near_radius` — candidate-generation radius (currently ignored; always uses 2).
+    /// * `noise_level` — `0.0` = deterministic (default); `>0` = sample from the
+    ///   top candidates with epsilon-greedy noise for variety.
     ///
-    /// Returns (best_q, best_r, score, depth_reached, nodes).
+    /// Returns `(best_q, best_r, score, depth_reached, nodes)`.
     #[pyo3(signature = (time_ms, max_depth, near_radius, noise_level=0.0))]
     fn classical_search(
         &self,
@@ -398,9 +505,10 @@ impl PyHexGame {
 
     /// Run turn-based search and return the full turn (1 or 2 moves).
     ///
-    /// Returns a list of (q, r) tuples representing the full turn.
-    /// For the opening move this is `[(0, 0)]`.
-    /// For all other turns this is `[(q1, r1), (q2, r2)]`.
+    /// Returns `(moves, score, depth_reached, nodes)` where `moves` is a list
+    /// of `(q, r)` tuples:
+    /// * Opening move — `[(0, 0)]`
+    /// * Normal turn — `[(q1, r1), (q2, r2)]`
     #[pyo3(signature = (time_ms, max_depth, near_radius=2, noise_level=0.0))]
     fn classical_search_turn(
         &self,
@@ -435,15 +543,20 @@ impl PyHexGame {
     }
 
     /// Reset to the initial empty state.
+    ///
+    /// All stones, history, and derived evaluator state are cleared.
     fn reset(&mut self) {
         self.inner.reset();
     }
 
     /// Set a custom board position, bypassing normal turn rules.
     ///
-    /// `pieces` is a list of (q, r, player) tuples.
-    /// `current_player` (0 or 1) is whose turn it will be after setup.
-    /// `placements_remaining` defaults to 2 (or 1 for a fully empty board with P0 to move).
+    /// * `pieces` — list of `(q, r, player)` tuples.
+    /// * `current_player` — whose turn it will be after setup (`0` or `1`).
+    /// * `placements_remaining` — defaults to `2` (or `1` for a fully empty
+    ///   board with player 0 to move).
+    ///
+    /// Raises `ValueError` if the position is inconsistent (e.g. overlapping stones).
     #[pyo3(signature = (pieces, current_player, placements_remaining=None))]
     fn set_position(
         &mut self,
@@ -457,7 +570,7 @@ impl PyHexGame {
             .map_err(|e| PyValueError::new_err(format!("{}", e)))
     }
 
-    /// Move history as list of (player, q, r).
+    /// Move history as a list of `(player, q, r)` tuples.
     fn move_history(&self) -> Vec<(u8, i32, i32)> {
         self.inner
             .move_history()
@@ -481,22 +594,27 @@ impl PyHexGame {
 // Python-facing MCTS engine wrapper
 // -------------------------------------------------------------------------
 
-/// Python-facing MCTS engine that keeps the tree in Rust.
+/// Python-facing MCTS engine that keeps the entire tree in Rust memory.
 ///
-/// Usage from Python:
+/// Typical usage from Python:
+///
 /// ```python
 /// engine = MCTSEngine(game, num_sims, c_puct=1.4, near_radius=8)
-/// # Get root board tensor for initial GPU eval
+///
+/// # 1. Encode root board for GPU inference
 /// tensor, oq, or_, legal_bytes = engine.init_root()
-/// # ... run GPU inference to get root_policy, root_value ...
+///
+/// # 2. Run GPU inference → root_policy, root_value
 /// engine.expand_root(root_policy, root_value, oq, or_, legal_bytes)
 /// engine.add_dirichlet_noise(noise_array, noise_fraction)
 ///
+/// # 3. Search loop
 /// while not engine.done():
 ///     tensor, count = engine.select_leaves(batch_size)
 ///     # ... GPU inference → policies, values ...
 ///     engine.expand_and_backprop(policies, values)
 ///
+/// # 4. Extract results
 /// moves_q, moves_r, visits, root_value = engine.get_results()
 /// ```
 #[pyclass(name = "MCTSEngine")]
@@ -506,16 +624,18 @@ struct PyMCTSEngine {
 
 #[pymethods]
 impl PyMCTSEngine {
-    /// Create a new MCTS engine.
+    /// Create a new MCTS engine rooted at the given game state.
     ///
     /// Parameters:
-    /// - `game`: starting board position (`HexGame`)
-    /// - `num_simulations`: total MCTS rollouts to perform
-    /// - `c_puct`: base exploration constant (default 1.4)
-    /// - `near_radius`: legal-move generation radius (default 8)
-    /// - `c_puct_init`: dynamic c_puct scaling constant (default 19652.0)
-    /// - `constrain_threats`: enable threat-based move filtering at root (default True)
-    /// - `arena_sim_hint`: optional arena pre-allocation hint (defaults to `num_simulations`)
+    /// * `game` — starting board position (`HexGame`).
+    /// * `num_simulations` — total MCTS rollouts to perform.
+    /// * `c_puct` — base exploration constant (default `1.4`).
+    /// * `near_radius` — legal-move generation radius (default `8`).
+    /// * `c_puct_init` — dynamic `c_puct` scaling constant (default `19652.0`).
+    /// * `constrain_threats` — enable threat-based move filtering at the root
+    ///   (default `True`).
+    /// * `arena_sim_hint` — optional arena pre-allocation hint (defaults to
+    ///   `num_simulations`). Larger values reduce reallocation during search.
     #[new]
     #[pyo3(signature = (game, num_simulations, c_puct=1.4, near_radius=8, c_puct_init=19652.0, constrain_threats=true, arena_sim_hint=None))]
     fn new(
@@ -540,13 +660,14 @@ impl PyMCTSEngine {
         Self { inner: engine }
     }
 
-    /// Initialize root: encode the board and return a numpy tensor for GPU eval.
+    /// Initialise the root node: encode the board and return a numpy tensor for GPU evaluation.
     ///
     /// Returns `Some((tensor, offset_q, offset_r, legal_moves_bytes))` or `None`
     /// if the game is already over.
     ///
-    /// `tensor` is a `numpy.ndarray` of shape (13, 33, 33) and dtype float32.
-    /// `legal_moves_bytes` contains packed i32 pairs (q, r).
+    /// * `tensor` — `numpy.ndarray` of shape `(13, 33, 33)` and dtype `float32`.
+    /// * `legal_moves_bytes` — packed `i32` pairs `(q, r)` for root legal moves.
+    ///   Decode with `np.frombuffer(data, dtype=np.int32).reshape(-1, 2)`.
     fn init_root<'py>(
         &mut self,
         py: Python<'py>,
@@ -568,10 +689,15 @@ impl PyMCTSEngine {
         Ok(Some((arr, oq, or_, PyBytes::new(py, &legal_buf))))
     }
 
-    /// Expand root node with GPU-provided policy and value.
+    /// Expand the root node with GPU-provided policy and value.
     ///
-    /// `policy` is a 1-D `numpy.ndarray` of length `BOARD_AREA` (1089) containing
-    /// the raw policy logits. `value` is a scalar. `legal_bytes` is packed i32 pairs.
+    /// * `policy` — 1-D `numpy.ndarray` of length `BOARD_AREA` (1089) containing
+    ///   the raw policy logits. Must be C-contiguous.
+    /// * `value` — scalar value estimate from the neural net.
+    /// * `offset_q`, `offset_r` — spatial offsets returned by `init_root`.
+    /// * `legal_bytes` — packed `i32` pairs `(q, r)` returned by `init_root`.
+    ///
+    /// Raises `ValueError` if `policy` is not a contiguous array.
     fn expand_root<'py>(
         &mut self,
         policy: PyReadonlyArray1<'py, f32>,
@@ -579,8 +705,10 @@ impl PyMCTSEngine {
         offset_q: i32,
         offset_r: i32,
         legal_bytes: &[u8],
-    ) {
-        let policy_slice = policy.as_slice().expect("policy array must be contiguous");
+    ) -> PyResult<()> {
+        let policy_slice = policy
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
         let legal_i32: &[i32] = unsafe {
             std::slice::from_raw_parts(
                 legal_bytes.as_ptr() as *const i32,
@@ -593,31 +721,40 @@ impl PyMCTSEngine {
             .collect();
         self.inner
             .expand_root(policy_slice, value, offset_q, offset_r, &legal);
+        Ok(())
     }
 
-    /// Add Dirichlet noise to root priors.
+    /// Add Dirichlet noise to root prior probabilities.
     ///
-    /// `noise` is a 1-D `numpy.ndarray` of the same length as root children.
-    /// `noise_fraction` controls the blend (0.0 = no noise, 1.0 = pure noise).
+    /// * `noise` — 1-D `numpy.ndarray` of the same length as root children.
+    ///   Must be C-contiguous.
+    /// * `noise_fraction` — blend factor (`0.0` = no noise, `1.0` = pure noise).
+    ///
+    /// Raises `ValueError` if `noise` is not a contiguous array.
     #[pyo3(signature = (noise, noise_fraction))]
     fn add_dirichlet_noise<'py>(
         &mut self,
         noise: PyReadonlyArray1<'py, f32>,
         noise_fraction: f32,
-    ) {
-        let noise_slice = noise.as_slice().expect("noise array must be contiguous");
+    ) -> PyResult<()> {
+        let noise_slice = noise
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("noise array must be contiguous"))?;
         self.inner.add_dirichlet_noise(noise_slice, noise_fraction);
+        Ok(())
     }
 
-    /// Whether we have done enough simulations.
+    /// Whether the engine has performed the requested number of simulations.
     fn done(&self) -> bool {
         self.inner.done()
     }
 
-    /// Select leaves and encode their boards.
+    /// Select leaves for expansion and encode their boards.
     ///
     /// Returns `(tensor, non_terminal_count)` where `tensor` is a
     /// `numpy.ndarray` of shape `(non_terminal_count, 13, 33, 33)`.
+    /// Only non-terminal leaves are returned (terminal leaves are back-propagated
+    /// immediately without GPU evaluation).
     fn select_leaves<'py>(
         &mut self,
         py: Python<'py>,
@@ -639,38 +776,51 @@ impl PyMCTSEngine {
         Ok((arr, count))
     }
 
-    /// Expand and backpropagate using GPU results.
+    /// Expand selected leaves and back-propagate the results.
     ///
-    /// `policies` is a 1-D `numpy.ndarray` of length `N * BOARD_AREA` containing
-    /// the flat policy logits for each leaf. `values` is a 1-D array of length `N`.
+    /// * `policies` — 1-D `numpy.ndarray` of length `N * BOARD_AREA` containing
+    ///   the flat policy logits for each leaf. Must be C-contiguous.
+    /// * `values` — 1-D `numpy.ndarray` of length `N` containing value estimates.
+    ///   Must be C-contiguous.
+    ///
+    /// `N` is the `non_terminal_count` returned by the previous `select_leaves` call.
+    ///
+    /// Raises `ValueError` if either array is not contiguous.
     fn expand_and_backprop<'py>(
         &mut self,
         policies: PyReadonlyArray1<'py, f32>,
         values: PyReadonlyArray1<'py, f32>,
-    ) {
-        let policies_slice = policies.as_slice().expect("policies array must be contiguous");
-        let values_slice = values.as_slice().expect("values array must be contiguous");
+    ) -> PyResult<()> {
+        let policies_slice = policies
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("policies array must be contiguous"))?;
+        let values_slice = values
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
         self.inner.expand_and_backprop(policies_slice, values_slice);
+        Ok(())
     }
 
-    /// Get results: `(moves_q, moves_r, visits, root_value)`.
+    /// Get final search results: `(moves_q, moves_r, visits, root_value)`.
     ///
-    /// Returns parallel vectors for all root children.
+    /// The four returned vectors are parallel and contain one entry per root
+    /// child. `root_value` is the value estimate of the root node from the
+    /// root player's perspective.
     fn get_results(&self) -> (Vec<i32>, Vec<i32>, Vec<u32>, f32) {
         self.inner.get_results()
     }
 
-    /// Get number of root children (for noise array sizing).
+    /// Number of root children (useful for sizing Dirichlet noise arrays).
     fn root_child_count(&self) -> u16 {
         self.inner.root_child_count()
     }
 
-    /// Get prior probabilities of root children (for shaped Dirichlet noise).
+    /// Prior probabilities of root children (for shaped Dirichlet noise).
     fn root_child_priors(&self) -> Vec<f32> {
         self.inner.root_child_priors()
     }
 
-    /// Get Q-values of root children from root player's perspective.
+    /// Q-values of root children from the root player's perspective.
     fn root_child_q_values(&self) -> Vec<f32> {
         self.inner.root_child_q_values()
     }
@@ -678,9 +828,11 @@ impl PyMCTSEngine {
     /// Extract encoded board states and move histories for tree nodes.
     ///
     /// Returns `(tensor, histories, count)` where:
-    /// - `tensor` is a `numpy.ndarray` of shape `(count, 13, 33, 33)`
-    /// - `histories` is a parallel vector of move histories as `(player, q, r)` tuples
-    /// - `count` is the number of valid candidates extracted
+    /// * `tensor` — `numpy.ndarray` of shape `(count, 13, 33, 33)`.
+    /// * `histories` — parallel vector of move histories as `(player, q, r)` tuples.
+    /// * `count` — number of valid candidates extracted.
+    ///
+    /// Only nodes with at least `min_visits` are included.
     #[pyo3(signature = (min_visits=1))]
     fn extract_tree_node_states<'py>(
         &mut self,
@@ -711,16 +863,17 @@ impl PyMCTSEngine {
         Ok((arr, py_histories, count))
     }
 
-    /// Re-root the tree at the child matching action (q, r) for subtree reuse.
+    /// Re-root the tree at the child matching action `(q, r)` for subtree reuse.
     ///
     /// After placement 1 is selected, call this to advance the tree so that
     /// placement 2's MCTS starts from the surviving subtree. The arena is not
-    /// compacted — dead sibling subtrees remain in memory.
+    /// compacted — dead sibling subtrees remain in memory until the next
+    /// full reset.
     ///
     /// The pipeline must be fully flushed before calling (no pending leaves).
-    /// After re-root, call `init_root` + `expand_root` if the new root is not
-    /// yet expanded (`root_child_count() == 0`), or go straight to
-    /// `add_dirichlet_noise` + search loop if it is.
+    /// After re-rooting, call `init_root` + `expand_root` if the new root is
+    /// not yet expanded (`root_child_count() == 0`), or proceed straight to
+    /// `add_dirichlet_noise` + the search loop if it is.
     #[pyo3(signature = (q, r, new_num_simulations))]
     fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) {
         self.inner.re_root(q as i16, r as i16, new_num_simulations);
@@ -731,10 +884,17 @@ impl PyMCTSEngine {
 // Bulk classical self-play (for bootstrap training data)
 // -------------------------------------------------------------------------
 
-/// Generate self-play data using classical search.
+/// Generate self-play data using classical alpha-beta search.
 ///
 /// Returns a list of `(features, outcome, board_snap)` tuples from completed
-/// games. This is fast because it uses the Rust alpha-beta engine.
+/// games. This is fast because it uses the Rust alpha-beta engine rather than
+/// neural-net MCTS.
+///
+/// * `features` — 13-element classical feature vector at the position.
+/// * `outcome` — `1.0` if the player to move eventually won, `-1.0` if they
+///   lost, `0.0` for a draw.
+/// * `board_snap` — list of `(q, r, player)` tuples representing the board
+///   state at that point.
 #[pyfunction]
 fn classical_self_play(
     num_games: u32,
@@ -796,6 +956,9 @@ fn classical_self_play(
 // -------------------------------------------------------------------------
 
 /// The Python module definition.
+///
+/// When built with `maturin` the compiled shared object is named `_engine`
+/// and re-exported by the Python wrapper as `hexgame`.
 #[pymodule]
 #[pyo3(name = "_engine")]
 fn hexgame(m: &Bound<'_, PyModule>) -> PyResult<()> {
