@@ -128,7 +128,10 @@ impl Turn {
     /// origin) and for one-stone test positions.
     #[inline]
     pub const fn single(h: Hex) -> Self {
-        Turn { first: h, second: None }
+        Turn {
+            first: h,
+            second: None,
+        }
     }
 
     /// Create a two-placement turn with canonical ordering.
@@ -144,9 +147,15 @@ impl Turn {
         // Canonicalize: smaller Hex first.  This makes Turn equality and
         // hashing independent of argument order.
         if a <= b {
-            Turn { first: a, second: Some(b) }
+            Turn {
+                first: a,
+                second: Some(b),
+            }
         } else {
-            Turn { first: b, second: Some(a) }
+            Turn {
+                first: b,
+                second: Some(a),
+            }
         }
     }
 
@@ -174,7 +183,11 @@ impl Turn {
     /// to commit or undo in a single turn.
     #[inline]
     pub const fn placements(self) -> u8 {
-        if self.second.is_some() { 2 } else { 1 }
+        if self.second.is_some() {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -259,6 +272,7 @@ impl WindowKey {
     /// `offset` may be negative to step backward.  The direction vector is
     /// taken from [`HEX_DIRECTIONS`].
     #[inline(always)]
+    #[cfg(test)]
     pub fn cell_at(self, offset: i32) -> Hex {
         let (dq, dr) = HEX_DIRECTIONS[self.dir() as usize];
         Hex::new(self.q() + dq * offset, self.r() + dr * offset)
@@ -301,5 +315,3 @@ pub fn hex_distance(a: Hex, b: Hex) -> i32 {
     let ds = dq + dr;
     (dq.abs() + dr.abs() + ds.abs()) / 2
 }
-
-

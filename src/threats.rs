@@ -18,13 +18,15 @@
 //!    MustBlock / Unblockable).
 //! 2. `turn_satisfies_status(&status, turn)` — test a candidate turn against
 //!    the pre-computed status.
-//! 3. `live_cells(game, player, out)` — enumerate empty cells that appear in
+//! 3. `generate_threat_turns(game, out)` — produce candidate turns for
+//!    quiescence search from live cells (crate-internal).
+//! 4. `live_cells(game, player, out)` — enumerate empty cells that appear in
 //!    at least one of the player's hot windows (useful for quiescence search
 //!    and neural-network feature planes).
 
-use smallvec::SmallVec;
 use crate::board::HexGameState;
 use crate::core::{Hex, Turn, WindowKey, HEX_DIRECTIONS, WIN_LENGTH};
+use smallvec::SmallVec;
 
 // -------------------------------------------------------------------------
 // ThreatStatus
@@ -148,7 +150,10 @@ fn opponent_threat_windows(game: &HexGameState) -> SmallVec<[SmallVec<[Hex; 2]>;
 
     // Precondition: caller must only invoke this when the opponent has
     // fours or fives.  threat_status already gates on this.
-    debug_assert!(game.eval().has_threats(opp), "opponent_threat_windows called with no threats");
+    debug_assert!(
+        game.eval().has_threats(opp),
+        "opponent_threat_windows called with no threats"
+    );
 
     let mut result = SmallVec::new();
     let mut empties = SmallVec::<[Hex; 2]>::new();
@@ -310,18 +315,18 @@ pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
             if turn.placements() == 1 {
                 // With only 1 placement, the single stone must block every
                 // threat window by itself.
-                bc.cells.contains(&turn.first())
+                bc.cells().contains(&turn.first())
             } else {
                 let second = turn.second().unwrap();
 
                 // If either cell alone blocks every threat window, any pair
                 // containing it is valid.
-                if bc.cells.contains(&turn.first()) || bc.cells.contains(&second) {
+                if bc.cells().contains(&turn.first()) || bc.cells().contains(&second) {
                     return true;
                 }
 
                 // Otherwise the pair must exactly match a valid blocking pair.
-                bc.pairs.iter().any(|&(a, b_pair)| {
+                bc.pairs().iter().any(|&(a, b_pair)| {
                     (a == turn.first() && b_pair == second)
                         || (a == second && b_pair == turn.first())
                 })
@@ -344,24 +349,28 @@ pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
 /// the quiescence tree narrow while resolving immediate tactical
 /// sequences.
 ///
-/// The caller should supply a reusable `out` buffer (e.g. from a
-/// `Vec<Turn>` stored in the search stack) to avoid per-call heap
-/// allocation.
-pub fn generate_threat_turns(game: &HexGameState, out: &mut Vec<Turn>) {
+/// The caller should supply reusable `out`, `opp_buf`, and `my_buf` buffers
+/// (e.g. from `SearchState` scratch fields) to avoid per-call heap allocation.
+pub(crate) fn generate_threat_turns(
+    game: &HexGameState,
+    out: &mut Vec<Turn>,
+    opp_buf: &mut Vec<Hex>,
+    my_buf: &mut Vec<Hex>,
+) {
     out.clear();
     let player = game.current_player();
     let opp = 1 - player;
 
-    // Reusable scratch buffers — live_cells requires Vec, but we keep them
-    // small via the pre-allocated SmallVec-like sizing on the Vec itself.
-    let mut opp_buf = Vec::new();
-    live_cells(game, opp, &mut opp_buf);
-    let mut my_buf = Vec::new();
-    live_cells(game, player, &mut my_buf);
+    live_cells(game, opp, opp_buf);
+    live_cells(game, player, my_buf);
 
     // Single-placement quiescence
     if game.placements_remaining() == 1 {
-        let cells = if !opp_buf.is_empty() { &opp_buf[..] } else { &my_buf[..] };
+        let cells = if !opp_buf.is_empty() {
+            &opp_buf[..]
+        } else {
+            &my_buf[..]
+        };
         for &h in cells.iter().take(6) {
             out.push(Turn::single(h));
         }
@@ -369,7 +378,11 @@ pub fn generate_threat_turns(game: &HexGameState, out: &mut Vec<Turn>) {
     }
 
     // Two-placement quiescence: collect live cells from both sides.
-    let primary: &[Hex] = if !opp_buf.is_empty() { &opp_buf[..] } else { &my_buf[..] };
+    let primary: &[Hex] = if !opp_buf.is_empty() {
+        &opp_buf[..]
+    } else {
+        &my_buf[..]
+    };
     if primary.is_empty() {
         return;
     }
@@ -420,16 +433,14 @@ pub fn live_cells(game: &HexGameState, player: u8, out: &mut Vec<Hex>) {
         return;
     }
 
+    let mut empties = SmallVec::<[Hex; 2]>::new();
     for key in game.eval().hot_windows(player) {
-        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
-
-        for k in 0..WIN_LENGTH {
-            let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
-            if !game.stones().contains_key(&h) && !out.contains(&h) {
+        empties.clear();
+        window_empties(game, key, &mut empties);
+        for &h in &empties {
+            if !out.contains(&h) {
                 out.push(h);
             }
         }
     }
 }
-
-

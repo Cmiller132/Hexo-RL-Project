@@ -53,7 +53,10 @@ impl Prng {
     }
 
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(Self::MULTIPLIER).wrapping_add(Self::INCREMENT);
+        self.0 = self
+            .0
+            .wrapping_mul(Self::MULTIPLIER)
+            .wrapping_add(Self::INCREMENT);
         self.0
     }
 
@@ -195,7 +198,10 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
         // No opponent threats. Fast path should be Quiet.
         match fast {
             ThreatStatus::Quiet => {}
-            _ => panic!("expected Quiet when opponent has no threats, got {:?}", fast),
+            _ => panic!(
+                "expected Quiet when opponent has no threats, got {:?}",
+                fast
+            ),
         }
     }
 }
@@ -706,6 +712,97 @@ proptest! {
         let mut game = HexGameState::new();
         let mut moves_played = 0;
         let max_moves = 1 + rng.range(5);
+
+        while moves_played < max_moves && !game.is_over() {
+            let legal = game.candidates_near2();
+            if legal.is_empty() {
+                break;
+            }
+            let idx = rng.range(legal.len());
+            let cell = legal[idx];
+            let turn_ended = game.place(cell.q, cell.r).unwrap();
+            if turn_ended {
+                moves_played += 1;
+                if !game.is_over() {
+                    let oracle = analyse(&mut game.clone());
+                    let me = game.current_player();
+                    let opp = 1 - me;
+
+                    let mut live_current = Vec::new();
+                    live_cells(&game, me, &mut live_current);
+
+                    let mut live_opp = Vec::new();
+                    live_cells(&game, opp, &mut live_opp);
+
+                    for turn in &oracle.winning {
+                        if let Some(second) = turn.second() {
+                            assert!(
+                                live_current.contains(&turn.first())
+                                    || live_current.contains(&second),
+                                "neither cell of winning turn {:?} is in live_current",
+                                turn
+                            );
+                        } else {
+                            assert!(
+                                live_current.contains(&turn.first()),
+                                "single winning cell {:?} not in live_current",
+                                turn.first()
+                            );
+                        }
+                    }
+
+                    for &cell in &oracle.blocking_single {
+                        assert!(
+                            live_opp.contains(&cell),
+                            "blocking cell {:?} not in live_opp",
+                            cell
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Medium oracle tests — NOT ignored, run in CI (25 cases each)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 25, ..ProptestConfig::default() })]
+
+    #[test]
+    fn threat_status_matches_oracle_medium(seed in any::<u64>()) {
+        let mut rng = Prng::new(seed);
+        let mut game = HexGameState::new();
+        let mut moves_played = 0;
+        let max_moves = 1 + rng.range(8);
+
+        while moves_played < max_moves && !game.is_over() {
+            let legal = game.candidates_near2();
+            if legal.is_empty() {
+                break;
+            }
+            let idx = rng.range(legal.len());
+            let cell = legal[idx];
+            let turn_ended = game.place(cell.q, cell.r).unwrap();
+            if turn_ended {
+                moves_played += 1;
+                if !game.is_over() {
+                    let fast = threat_status(&game);
+                    let oracle = analyse(&mut game.clone());
+                    assert_matches(&fast, &oracle, &game);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_cells_matches_oracle_medium(seed in any::<u64>()) {
+        let mut rng = Prng::new(seed);
+        let mut game = HexGameState::new();
+        let mut moves_played = 0;
+        let max_moves = 1 + rng.range(8);
 
         while moves_played < max_moves && !game.is_over() {
             let legal = game.candidates_near2();

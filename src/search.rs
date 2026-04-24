@@ -50,14 +50,14 @@ use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
-use smallvec::SmallVec;
-use crate::encoder::WIN_SCORE;
-use crate::board::HexGameState;
-use crate::core::WIN_LENGTH;
-use crate::core::Turn;
 use crate::board::GameError;
+use crate::board::HexGameState;
+use crate::core::Turn;
+use crate::core::WIN_LENGTH;
+use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
+use crate::encoder::WIN_SCORE;
 use crate::threats::{generate_threat_turns, threat_status, turn_satisfies_status, ThreatStatus};
+use smallvec::SmallVec;
 
 // -------------------------------------------------------------------------
 // Constants
@@ -111,7 +111,11 @@ fn evaluate(game: &HexGameState, player: u8) -> i32 {
     if let Some(w) = game.winner() {
         return if w == player { WIN_SCORE } else { -WIN_SCORE };
     }
-    let mut score = if player == 0 { game.eval().score() } else { -game.eval().score() };
+    let mut score = if player == 0 {
+        game.eval().score()
+    } else {
+        -game.eval().score()
+    };
     if game.current_player() == player {
         score += TEMPO_BONUS;
     }
@@ -164,6 +168,10 @@ pub struct SearchState {
     /// Affects candidate ordering to produce varied games for training.
     /// Threat blocking and instant-win detection remain deterministic.
     noise_level: f32,
+    /// Reusable buffers for quiescence search (avoids per-node allocations).
+    pub(crate) scratch_turns: Vec<Turn>,
+    pub(crate) scratch_opp: Vec<Hex>,
+    pub(crate) scratch_my: Vec<Hex>,
 }
 
 impl SearchState {
@@ -180,6 +188,9 @@ impl SearchState {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(42),
             noise_level,
+            scratch_turns: Vec::new(),
+            scratch_opp: Vec::new(),
+            scratch_my: Vec::new(),
         }
     }
 
@@ -291,7 +302,9 @@ fn score_candidate(
     noise_level: f32,
     noise_seed: u64,
 ) -> i64 {
-    let delta = game.eval().hypothetical_score_delta(cell, game.current_player()) as i64;
+    let delta = game
+        .eval()
+        .hypothetical_score_delta(cell, game.current_player()) as i64;
     let hist = history.get(&cell).copied().unwrap_or(0).min(500_000) as i64;
 
     // ── Tactical bonuses (deterministic, not affected by noise) ──
@@ -358,7 +371,11 @@ fn generate_sorted_candidates(
         return cands;
     }
 
-    let sign = if game.current_player() == 0 { 1i32 } else { -1i32 };
+    let sign = if game.current_player() == 0 {
+        1i32
+    } else {
+        -1i32
+    };
     cands.sort_by_cached_key(|&m| {
         Reverse(score_candidate(
             game,
@@ -508,9 +525,10 @@ fn generate_root_turns(
                 .stones()
                 .keys()
                 .any(|&h| hex_distance(h, colony) <= crate::core::PLACEMENT_RADIUS)
-            && !cands.contains(&colony) {
-                cands.push(colony);
-            }
+            && !cands.contains(&colony)
+        {
+            cands.push(colony);
+        }
     }
 
     // Handle single-placement turns.
@@ -631,6 +649,8 @@ fn adjust_mate_load(score: i32, ply: usize) -> i32 {
 /// * `alpha`, `beta` — standard alpha-beta bounds.
 /// * `qdepth` — remaining quiescence depth (in turns).  Stops at 0.
 /// * `ply` — distance from root, used for mate-distance scoring.
+/// * `ts_opt` — pre-computed `ThreatStatus` from caller (avoids recomputation).
+///   Scratch buffers (`ss.scratch_turns/opp/my`) are reused via `SearchState`.
 fn quiesce(
     game: &mut HexGameState,
     ss: &mut SearchState,
@@ -638,6 +658,7 @@ fn quiesce(
     beta: i32,
     qdepth: i32,
     ply: usize,
+    ts_opt: Option<&ThreatStatus>,
 ) -> Result<i32, GameError> {
     if ss.aborted {
         return Ok(0);
@@ -688,32 +709,35 @@ fn quiesce(
             // If the game ended unexpectedly, the recursive quiesce call
             // will immediately see game.is_over() and return the correct
             // terminal score.
-            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)?
+            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1, None)?
         };
 
         unmake_turn(game, placed);
 
-        return Ok(if over && game.winner() == Some(player) {
-            WIN_SCORE - ply as i32
-        } else {
-            score
-        });
+        return Ok(score);
     }
 
     // Unblockable opponent win: we cannot stop all threats.
-    let ts = threat_status(game);
+    let ts = ts_opt.cloned().unwrap_or_else(|| threat_status(game));
     if matches!(ts, ThreatStatus::Unblockable) {
         return Ok(-(WIN_SCORE - ply as i32 - 1));
     }
 
-    let mut turns = Vec::new();
-    generate_threat_turns(game, &mut turns);
-    if turns.is_empty() {
+    ss.scratch_turns.clear();
+    generate_threat_turns(
+        game,
+        &mut ss.scratch_turns,
+        &mut ss.scratch_opp,
+        &mut ss.scratch_my,
+    );
+    if ss.scratch_turns.is_empty() {
         return Ok(alpha);
     }
 
-    for t in &turns {
-        let (over, placed) = make_turn(game, *t)?;
+    let turns: SmallVec<[Turn; 16]> = ss.scratch_turns.iter().copied().collect();
+
+    for &t in &turns {
+        let (over, placed) = make_turn(game, t)?;
         let score = if over {
             if game.winner() == Some(player) {
                 WIN_SCORE - ply as i32
@@ -721,7 +745,7 @@ fn quiesce(
                 -(WIN_SCORE - ply as i32)
             }
         } else {
-            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)?
+            -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1, Some(&ts))?
         };
         unmake_turn(game, placed);
 
@@ -784,7 +808,7 @@ fn alphabeta(
 
     // Leaf: drop into quiescence search.
     if depth <= 0 {
-        return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply);
+        return quiesce(game, ss, alpha, beta, QUIESCE_DEPTH, ply, None);
     }
 
     // Instant win check: if we can win right now, return immediately.
@@ -1182,7 +1206,10 @@ pub fn iterative_deepening(
             .iter()
             .map(|&m| {
                 let sign = if game.current_player() == 0 { 1 } else { -1 };
-                let score = game.eval().hypothetical_score_delta(m, game.current_player()) * sign;
+                let score = game
+                    .eval()
+                    .hypothetical_score_delta(m, game.current_player())
+                    * sign;
                 (m, score)
             })
             .collect()

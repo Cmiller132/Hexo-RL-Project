@@ -12,10 +12,10 @@
 //!    of their own tiles along any of the three hex axes wins.
 //! 7. The board is infinite — no draw-by-exhaustion.
 
-use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
-use crate::eval::state::EvalState;
 use crate::core::{PLACEMENT_RADIUS, WIN_LENGTH};
+use crate::eval::state::EvalState;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 // -------------------------------------------------------------------------
@@ -89,7 +89,9 @@ impl std::fmt::Display for GameError {
                 h.q, h.r, PLACEMENT_RADIUS
             ),
             GameError::InvalidPlayer(p) => write!(f, "Invalid player: {}. Must be 0 or 1.", p),
-            GameError::InvalidRemaining(r) => write!(f, "Invalid remaining: {}. Must be 1 or 2.", r),
+            GameError::InvalidRemaining(r) => {
+                write!(f, "Invalid remaining: {}. Must be 1 or 2.", r)
+            }
         }
     }
 }
@@ -123,17 +125,29 @@ pub struct MoveRecord {
 
 impl MoveRecord {
     /// The hex coordinate where the tile was placed.
-    pub fn cell(&self) -> Hex { self.cell }
+    pub fn cell(&self) -> Hex {
+        self.cell
+    }
     /// The player who placed this tile (0 or 1).
-    pub fn player(&self) -> u8 { self.player }
+    pub fn player(&self) -> u8 {
+        self.player
+    }
     /// The player whose turn it was BEFORE this move was made.
-    pub fn current_player_before(&self) -> u8 { self.current_player_before }
+    pub fn current_player_before(&self) -> u8 {
+        self.current_player_before
+    }
     /// How many placements_remaining BEFORE this move was made.
-    pub fn placements_remaining_before(&self) -> u8 { self.placements_remaining_before }
+    pub fn placements_remaining_before(&self) -> u8 {
+        self.placements_remaining_before
+    }
     /// Whether there was a winner BEFORE this move was made.
-    pub fn winner_before(&self) -> Option<u8> { self.winner_before }
+    pub fn winner_before(&self) -> Option<u8> {
+        self.winner_before
+    }
     /// The winning line BEFORE this move was made.
-    pub fn winning_line_before(&self) -> Option<&[Hex]> { self.winning_line_before.as_deref() }
+    pub fn winning_line_before(&self) -> Option<&[Hex]> {
+        self.winning_line_before.as_deref()
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -752,8 +766,6 @@ impl HexGameState {
         line[start..start + wl].to_vec()
     }
 
-    // ── Eval helpers ────────────────────────────────────────────────────
-
     // ── Candidate helpers ───────────────────────────────────────────────
 
     /// Increment candidate reference counts for empty cells within radius 2 of `cell`.
@@ -773,5 +785,3 @@ impl HexGameState {
         }
     }
 }
-
-

@@ -1,7 +1,7 @@
-use crate::core::{Hex, HEX_DIRECTIONS, WIN_LENGTH, WindowKey};
+use crate::core::{Hex, WindowKey, HEX_DIRECTIONS, WIN_LENGTH};
 use crate::eval::grid::{win_grid_idx, win_grid_in_bounds, WIN_GRID_TOTAL};
 use crate::eval::hot::HotWindows;
-use crate::eval::patterns::{PATTERN_VALUES, PATTERN_COUNTS, POW3};
+use crate::eval::patterns::{PATTERN_COUNTS, PATTERN_VALUES, POW3};
 
 /// Aggregate threat statistics for a single player.
 ///
@@ -29,12 +29,24 @@ impl ThreatCounts {
     /// logic bug: it means `unplace` was called more times than `place`, or
     /// the incremental update tables are inconsistent.
     pub(crate) fn apply(&mut self, delta: &ThreatCountsDelta) {
-        debug_assert!((self.fives as i32 + delta.fives) >= 0,
-            "fives underflow: {} + {}", self.fives, delta.fives);
-        debug_assert!((self.fours as i32 + delta.fours) >= 0,
-            "fours underflow: {} + {}", self.fours, delta.fours);
-        debug_assert!((self.threes as i32 + delta.threes) >= 0,
-            "threes underflow: {} + {}", self.threes, delta.threes);
+        debug_assert!(
+            (self.fives as i32 + delta.fives) >= 0,
+            "fives underflow: {} + {}",
+            self.fives,
+            delta.fives
+        );
+        debug_assert!(
+            (self.fours as i32 + delta.fours) >= 0,
+            "fours underflow: {} + {}",
+            self.fours,
+            delta.fours
+        );
+        debug_assert!(
+            (self.threes as i32 + delta.threes) >= 0,
+            "threes underflow: {} + {}",
+            self.threes,
+            delta.threes
+        );
         self.fives = (self.fives as i32 + delta.fives) as u32;
         self.fours = (self.fours as i32 + delta.fours) as u32;
         self.threes = (self.threes as i32 + delta.threes) as u32;
@@ -42,15 +54,21 @@ impl ThreatCounts {
 
     /// Number of immediate win threats (≥5 own stones, 0 opponent).
     #[inline]
-    pub fn fives(&self) -> u32 { self.fives }
+    pub fn fives(&self) -> u32 {
+        self.fives
+    }
 
     /// Number of one-away win threats (exactly 4 own stones, 0 opponent).
     #[inline]
-    pub fn fours(&self) -> u32 { self.fours }
+    pub fn fours(&self) -> u32 {
+        self.fours
+    }
 
     /// Number of two-away win threats (exactly 3 own stones, 0 opponent).
     #[inline]
-    pub fn threes(&self) -> u32 { self.threes }
+    pub fn threes(&self) -> u32 {
+        self.threes
+    }
 }
 
 /// Signed change in threat counts produced by a single stone placement.
@@ -109,6 +127,9 @@ pub(crate) struct EvalDelta {
 /// * `delta_stack` — stack of [`EvalDelta`]s supporting `unplace`.  One entry
 ///   per stone placed.
 ///
+/// NOTE: `Clone` copies the entire `Box<[u16; WIN_GRID_TOTAL]>` (~22 KB).
+/// Acceptable for search-invocation clones (once per `iterative_deepening`
+/// root) but would be costly inside MCTS node expansion.
 #[derive(Clone, Debug)]
 pub struct EvalState {
     score: i32,
@@ -136,7 +157,13 @@ pub struct EvalState {
 /// The delta records `+1` when a window enters one of those categories and
 /// `-1` when it leaves.
 #[inline]
-fn classify_delta(delta: &mut ThreatCountsDelta, old_own: u8, old_other: u8, new_own: u8, new_other: u8) {
+fn classify_delta(
+    delta: &mut ThreatCountsDelta,
+    old_own: u8,
+    old_other: u8,
+    new_own: u8,
+    new_other: u8,
+) {
     let old_five = (old_own >= 5 && old_other == 0) as i32;
     let new_five = (new_own >= 5 && new_other == 0) as i32;
     delta.fives += new_five - old_five;
@@ -156,7 +183,15 @@ fn classify_delta(delta: &mut ThreatCountsDelta, old_own: u8, old_other: u8, new
 /// `own >= 4 && other == 0`, and ceases to be hot when it drops below that
 /// threshold.  This helper ensures `hot` stays consistent with the win grid.
 #[inline]
-fn update_hot(hot: &mut HotWindows, key: WindowKey, player: u8, old_own: u8, old_other: u8, new_own: u8, new_other: u8) {
+fn update_hot(
+    hot: &mut HotWindows,
+    key: WindowKey,
+    player: u8,
+    old_own: u8,
+    old_other: u8,
+    new_own: u8,
+    new_other: u8,
+) {
     let was_hot = old_own >= 4 && old_other == 0;
     let is_hot = new_own >= 4 && new_other == 0;
     if was_hot && !is_hot {
@@ -172,12 +207,12 @@ fn update_hot(hot: &mut HotWindows, key: WindowKey, player: u8, old_own: u8, old
 /// `off = dir_idx % 6`.  This avoids duplicating the triple-nested loop
 /// in `place`, `unplace`, and `hypothetical_score_delta`.
 #[inline]
-fn visit_windows(cell: Hex, mut cb: impl FnMut(i32, i32, usize)) {
+fn visit_windows(cell: Hex, mut cb: impl FnMut(i32, i32, u8, u8)) {
     for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
         for off in 0..WIN_LENGTH as usize {
             let sq = cell.q - dq * off as i32;
             let sr = cell.r - dr * off as i32;
-            cb(sq, sr, dir * (WIN_LENGTH as usize) + off);
+            cb(sq, sr, dir as u8, off as u8);
         }
     }
 }
@@ -208,6 +243,7 @@ impl EvalState {
     /// # Arguments
     /// * `cell`    — the coordinate where the stone is placed.
     /// * `player`  — `0` or `1`.
+    #[inline]
     pub fn place(&mut self, cell: Hex, player: u8) {
         let cell_val = player + 1; // 1 or 2
         let mut delta = EvalDelta {
@@ -217,19 +253,14 @@ impl EvalState {
             counts: [ThreatCountsDelta::default(); 2],
         };
 
-        visit_windows(cell, |sq, sr, dir_idx| {
-            // After ~4 moves along a single axis, window origins can exceed radius 30.
-            // Those windows are skipped; they do not contribute to evaluation.
-            // See `eval/grid.rs` for the geometric justification.
+        visit_windows(cell, |sq, sr, dir, off| {
             if !win_grid_in_bounds(sq, sr) {
                 return;
             }
 
-            let dir = dir_idx / (WIN_LENGTH as usize);
-            let off = dir_idx % (WIN_LENGTH as usize);
-            let gi = win_grid_idx(sq, sr, dir as u8);
+            let gi = win_grid_idx(sq, sr, dir);
             let old_idx = self.indices[gi] as usize;
-            let new_idx = old_idx + (cell_val as usize) * POW3[off];
+            let new_idx = old_idx + (cell_val as usize) * POW3[off as usize];
             debug_assert!(new_idx < 729);
 
             delta.score += PATTERN_VALUES[new_idx] - PATTERN_VALUES[old_idx];
@@ -240,7 +271,7 @@ impl EvalState {
             classify_delta(&mut delta.counts[0], old_p0, old_p1, new_p0, new_p1);
             classify_delta(&mut delta.counts[1], old_p1, old_p0, new_p1, new_p0);
 
-            let key = WindowKey::new(sq, sr, dir as u8);
+            let key = WindowKey::new(sq, sr, dir);
             update_hot(&mut self.hot, key, 0, old_p0, old_p1, new_p0, new_p1);
             update_hot(&mut self.hot, key, 1, old_p1, old_p0, new_p1, new_p0);
 
@@ -259,8 +290,12 @@ impl EvalState {
     ///
     /// Panics if `unplace` is called when no stone has been placed (i.e. the
     /// delta stack is empty).
+    #[inline]
     pub fn unplace(&mut self) {
-        let delta = self.delta_stack.pop().expect("unplace called with empty stack");
+        let delta = self
+            .delta_stack
+            .pop()
+            .expect("unplace called with empty stack");
 
         self.score -= delta.score;
         self.counts[0].apply(&(-delta.counts[0]));
@@ -269,22 +304,24 @@ impl EvalState {
         let cell = delta.cell;
         let cell_val = delta.cell_val as usize;
 
-        visit_windows(cell, |sq, sr, dir_idx| {
+        visit_windows(cell, |sq, sr, dir, off| {
             if !win_grid_in_bounds(sq, sr) {
                 return;
             }
 
-            let dir = dir_idx / (WIN_LENGTH as usize);
-            let off = dir_idx % (WIN_LENGTH as usize);
-            let gi = win_grid_idx(sq, sr, dir as u8);
+            let gi = win_grid_idx(sq, sr, dir);
             let new_idx = self.indices[gi] as usize;
-            let old_idx = new_idx - cell_val * POW3[off];
+            debug_assert!(
+                new_idx >= cell_val * POW3[off as usize],
+                "unplace: index underflow at gi={gi}"
+            );
+            let old_idx = new_idx - cell_val * POW3[off as usize];
             debug_assert!(old_idx < 729);
 
             let (old_p0, old_p1) = PATTERN_COUNTS[old_idx];
             let (new_p0, new_p1) = PATTERN_COUNTS[new_idx];
 
-            let key = WindowKey::new(sq, sr, dir as u8);
+            let key = WindowKey::new(sq, sr, dir);
             update_hot(&mut self.hot, key, 0, new_p0, new_p1, old_p0, old_p1);
             update_hot(&mut self.hot, key, 1, new_p1, new_p0, old_p1, old_p0);
 
@@ -331,11 +368,13 @@ impl EvalState {
             assert_eq!(
                 actual.len(),
                 expected[player as usize].len(),
-                "hot window count mismatch for player {}", player
+                "hot window count mismatch for player {}",
+                player
             );
             assert_eq!(
                 actual, expected[player as usize],
-                "hot window mismatch for player {}", player
+                "hot window mismatch for player {}",
+                player
             );
         }
     }
@@ -402,16 +441,14 @@ impl EvalState {
         let cell_val = (player + 1) as usize;
         let mut delta = 0i32;
 
-        visit_windows(cell, |sq, sr, dir_idx| {
+        visit_windows(cell, |sq, sr, dir, off| {
             if !win_grid_in_bounds(sq, sr) {
                 return;
             }
 
-            let dir = dir_idx / (WIN_LENGTH as usize);
-            let off = dir_idx % (WIN_LENGTH as usize);
-            let gi = win_grid_idx(sq, sr, dir as u8);
+            let gi = win_grid_idx(sq, sr, dir);
             let old_idx = self.indices[gi] as usize;
-            let new_idx = old_idx + cell_val * POW3[off];
+            let new_idx = old_idx + cell_val * POW3[off as usize];
             debug_assert!(new_idx < 729);
 
             delta += PATTERN_VALUES[new_idx] - PATTERN_VALUES[old_idx];
@@ -420,5 +457,3 @@ impl EvalState {
         delta
     }
 }
-
-

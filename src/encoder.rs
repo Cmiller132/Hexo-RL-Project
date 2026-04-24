@@ -85,10 +85,20 @@ pub(crate) fn bankers_round(v: f64) -> i32 {
 /// 4. Fill 13 channels (see [`encode_board_into`] for a detailed breakdown).
 ///
 /// Returns [`EncodedBoard`] with tensor, offsets, and legal moves.
-pub fn encode_board(game: &HexGameState, near_radius: i32, constrain_threats: bool) -> EncodedBoard {
+pub fn encode_board(
+    game: &HexGameState,
+    near_radius: i32,
+    constrain_threats: bool,
+) -> EncodedBoard {
     let mut tensor = vec![0.0f32; TENSOR_SIZE];
-    let (offset_q, offset_r, legal_moves) =
-        encode_board_into(game, near_radius, constrain_threats, &mut tensor);
+    let mut hot_buf = Vec::new();
+    let (offset_q, offset_r, legal_moves) = encode_board_into(
+        game,
+        near_radius,
+        constrain_threats,
+        &mut tensor,
+        &mut hot_buf,
+    );
     EncodedBoard {
         tensor,
         offset_q,
@@ -121,14 +131,15 @@ pub fn encode_board(game: &HexGameState, near_radius: i32, constrain_threats: bo
 /// | 12 | **Opponent's last turn** | Marks the cells placed by the opponent during their most recently completed turn (1 or 2 cells). |
 ///
 /// Channels 9 and 10 are populated by calling [`live_cells`] with a single
-/// reusable buffer (`hot_buf`). This keeps the encoding zero-allocation per
-/// channel and guarantees that the tactical engine and the NN encoder always
-/// agree on which cells are "live".
+/// reusable buffer. The caller should own and reuse a `Vec<Hex>` to amortize
+/// allocations across encode calls. The legal-moves return vector is also
+/// caller-owned to avoid per-call allocation on the MCTS hot path.
 pub fn encode_board_into(
     game: &HexGameState,
     near_radius: i32,
     constrain_threats: bool,
     out: &mut [f32],
+    hot_buf: &mut Vec<Hex>,
 ) -> (i32, i32, Vec<Hex>) {
     debug_assert!(
         out.len() >= TENSOR_SIZE,
@@ -212,11 +223,21 @@ pub fn encode_board_into(
                 if let Some(s) = t.second() {
                     allowed.push(s);
                 }
-                Some(legal.iter().copied().filter(|h| allowed.contains(h)).collect::<Vec<_>>())
+                Some(
+                    legal
+                        .iter()
+                        .copied()
+                        .filter(|h| allowed.contains(h))
+                        .collect::<Vec<_>>(),
+                )
             }
-            ThreatStatus::MustBlock(b) => {
-                Some(legal.iter().copied().filter(|h| b.cells().contains(h)).collect::<Vec<_>>())
-            }
+            ThreatStatus::MustBlock(b) => Some(
+                legal
+                    .iter()
+                    .copied()
+                    .filter(|h| b.cells().contains(h))
+                    .collect::<Vec<_>>(),
+            ),
         };
         if let Some(constrained) = maybe_constrained {
             if !constrained.is_empty() {
@@ -291,15 +312,12 @@ pub fn encode_board_into(
     //     (windows with 4+ opponent stones and 0 own stones).
     // Ch 10: empty cells that lie inside the current player's hot windows.
     //
-    // Both channels are filled by calling [`live_cells`] with a single
-    // reusable buffer (`hot_buf`). This avoids per-channel allocations and
-    // guarantees that the encoder and the tactical threat engine use the
-    // exact same definition of "live" cells.
-    let mut hot_buf = Vec::new();
-
+    // Both channels are filled by calling [`live_cells`] with a caller-owned
+    // reusable buffer (`hot_buf`) to avoid per-call allocation.
     // Channel 10 (own live cells)
-    live_cells(game, current, &mut hot_buf);
-    for h in &hot_buf {
+    hot_buf.clear();
+    live_cells(game, current, hot_buf);
+    for h in hot_buf.iter() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
         if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
@@ -309,8 +327,9 @@ pub fn encode_board_into(
 
     // Channel 9 (opponent live cells)
     let opp = 1 - current;
-    live_cells(game, opp, &mut hot_buf);
-    for h in &hot_buf {
+    hot_buf.clear();
+    live_cells(game, opp, hot_buf);
+    for h in hot_buf.iter() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
         if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
@@ -456,10 +475,9 @@ pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
                 if open_ends == 2 {
                     counts[p][LIVE3] += 1;
                 }
-            } else if run_len == 2
-                && open_ends == 2 {
-                    counts[p][LIVE2] += 1;
-                }
+            } else if run_len == 2 && open_ends == 2 {
+                counts[p][LIVE2] += 1;
+            }
         }
     }
 
@@ -471,8 +489,10 @@ pub fn extract_features(game: &HexGameState) -> [f32; FEATURE_COUNT] {
     }
 
     // Final feature: tempo (whose turn it is).
-    feats[FEATURE_COUNT - 1] = if game.current_player() == 0 { 1.0 } else { -1.0 };
+    feats[FEATURE_COUNT - 1] = if game.current_player() == 0 {
+        1.0
+    } else {
+        -1.0
+    };
     feats
 }
-
-

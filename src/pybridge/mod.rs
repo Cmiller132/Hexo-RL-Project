@@ -36,11 +36,11 @@ use pyo3::types::PyBytes;
 
 use numpy::{ndarray, PyArray3};
 
-use crate::core::Hex;
-use crate::threats::{threat_status, ThreatStatus};
-use crate::encoder;
 use crate::board::{GameError, HexGameState};
+use crate::core::Hex;
+use crate::encoder;
 use crate::search;
+use crate::threats::{threat_status, ThreatStatus};
 
 pub mod mcts;
 use mcts::PyMCTSEngine;
@@ -232,7 +232,11 @@ impl PyHexGame {
     /// one placement (the opening stone). All subsequent turns allow two.
     #[staticmethod]
     fn placements_per_turn(move_count: u32) -> u8 {
-        if move_count == 0 { 1 } else { 2 }
+        if move_count == 0 {
+            1
+        } else {
+            2
+        }
     }
 
     /// Raw window-based positional evaluation from player 0's perspective.
@@ -348,7 +352,11 @@ impl PyHexGame {
                     .filter(|h| *h == first || second == Some(*h))
                     .map(|h| (h.q, h.r))
                     .collect();
-                if result.is_empty() { None } else { Some(result) }
+                if result.is_empty() {
+                    None
+                } else {
+                    Some(result)
+                }
             }
             ThreatStatus::MustBlock(b) => {
                 let legal = self.inner.legal_moves_near(radius);
@@ -357,7 +365,11 @@ impl PyHexGame {
                     .filter(|h| b.cells().contains(h))
                     .map(|h| (h.q, h.r))
                     .collect();
-                if result.is_empty() { None } else { Some(result) }
+                if result.is_empty() {
+                    None
+                } else {
+                    Some(result)
+                }
             }
         }
     }
@@ -454,7 +466,12 @@ impl PyHexGame {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
-        Ok((arr, encoded.offset_q, encoded.offset_r, PyBytes::new(py, &legal_buf)))
+        Ok((
+            arr,
+            encoded.offset_q,
+            encoded.offset_r,
+            PyBytes::new(py, &legal_buf),
+        ))
     }
 
     /// Extract the 13-element classical feature vector.
@@ -495,7 +512,9 @@ impl PyHexGame {
                     noise_level,
                 )
             })
-            .map_err(|e: GameError| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(|e: GameError| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+            })?;
 
         let chosen = if noise_level > 0.0 {
             epsilon_topk_sample(result.best_move, &result.root_candidates, noise_level)
@@ -538,7 +557,9 @@ impl PyHexGame {
                     noise_level,
                 )
             })
-            .map_err(|e: GameError| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(|e: GameError| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+            })?;
 
         let turn = result.best_turn;
         let mut moves = vec![(turn.first().q, turn.first().r)];
@@ -578,7 +599,13 @@ impl PyHexGame {
         current_player: u8,
         placements_remaining: Option<u8>,
     ) -> PyResult<()> {
-        let pr = placements_remaining.unwrap_or_else(|| if pieces.is_empty() && current_player == 0 { 1 } else { 2 });
+        let pr = placements_remaining.unwrap_or_else(|| {
+            if pieces.is_empty() && current_player == 0 {
+                1
+            } else {
+                2
+            }
+        });
         self.inner
             .set_position(&pieces, current_player, pr)
             .map_err(|e| PyValueError::new_err(format!("{}", e)))
@@ -629,7 +656,11 @@ impl PyHexGame {
 ///     engine.expand_and_backprop(policies, values)
 ///
 /// # 4. Extract results
-
+/// visits, q_values, priors = engine.root_child_stats()
+/// ```
+///
+/// The `classical_self_play` function generates bootstrap training data
+/// using the alpha-beta engine (no GPU required).
 
 // -------------------------------------------------------------------------
 // Bulk classical self-play (for bootstrap training data)
@@ -655,53 +686,55 @@ fn classical_self_play(
     near_radius: i32,
     max_moves: u32,
 ) -> PyResult<Vec<(Vec<f32>, f32, Vec<(i32, i32, u8)>)>> {
-    py.allow_threads(|| -> Result<Vec<(Vec<f32>, f32, Vec<(i32, i32, u8)>)>, GameError> {
-        let mut results = Vec::new();
+    py.allow_threads(
+        || -> Result<Vec<(Vec<f32>, f32, Vec<(i32, i32, u8)>)>, GameError> {
+            let mut results = Vec::new();
 
-        for _ in 0..num_games {
-            let mut game = HexGameState::new();
-            let mut positions: Vec<(Vec<f32>, u8, Vec<(i32, i32, u8)>)> = Vec::new();
-            let mut move_num = 0u32;
+            for _ in 0..num_games {
+                let mut game = HexGameState::new();
+                let mut positions: Vec<(Vec<f32>, u8, Vec<(i32, i32, u8)>)> = Vec::new();
+                let mut move_num = 0u32;
 
-            while !game.is_over() && move_num < max_moves {
-                let feats = encoder::extract_features(&game).to_vec();
-                let player = game.current_player();
-                let board_snap: Vec<(i32, i32, u8)> =
-                    game.stones().iter().map(|(&h, &p)| (h.q, h.r, p)).collect();
-                positions.push((feats, player, board_snap));
+                while !game.is_over() && move_num < max_moves {
+                    let feats = encoder::extract_features(&game).to_vec();
+                    let player = game.current_player();
+                    let board_snap: Vec<(i32, i32, u8)> =
+                        game.stones().iter().map(|(&h, &p)| (h.q, h.r, p)).collect();
+                    positions.push((feats, player, board_snap));
 
-                let result = search::iterative_deepening(
-                    &game,
-                    Duration::from_millis(time_ms),
-                    max_depth,
-                    near_radius,
-                    false,
-                    0.0,
-                )?;
-                let turn = result.best_turn;
-                game.place(turn.first().q, turn.first().r)?;
-                move_num += 1;
-                if !game.is_over() {
-                    if let Some(m2) = turn.second() {
-                        game.place(m2.q, m2.r)?;
-                        move_num += 1;
+                    let result = search::iterative_deepening(
+                        &game,
+                        Duration::from_millis(time_ms),
+                        max_depth,
+                        near_radius,
+                        false,
+                        0.0,
+                    )?;
+                    let turn = result.best_turn;
+                    game.place(turn.first().q, turn.first().r)?;
+                    move_num += 1;
+                    if !game.is_over() {
+                        if let Some(m2) = turn.second() {
+                            game.place(m2.q, m2.r)?;
+                            move_num += 1;
+                        }
                     }
+                }
+
+                let winner = game.winner();
+                for (feats, player, board_snap) in positions {
+                    let outcome = match winner {
+                        Some(w) if w == player => 1.0f32,
+                        Some(_) => -1.0f32,
+                        None => 0.0f32,
+                    };
+                    results.push((feats, outcome, board_snap));
                 }
             }
 
-            let winner = game.winner();
-            for (feats, player, board_snap) in positions {
-                let outcome = match winner {
-                    Some(w) if w == player => 1.0f32,
-                    Some(_) => -1.0f32,
-                    None => 0.0f32,
-                };
-                results.push((feats, outcome, board_snap));
-            }
-        }
-
-        Ok(results)
-    })
+            Ok(results)
+        },
+    )
     .map_err(|e: GameError| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }
 

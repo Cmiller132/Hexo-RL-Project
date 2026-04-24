@@ -46,9 +46,9 @@
 //! (or parallel threads) from exploring the same branch simultaneously,
 //! improving diversity in the batch.
 
-use crate::core::Hex;
 use crate::board::HexGameState;
-use crate::encoder::{self, BOARD_SIZE, BOARD_AREA, TENSOR_SIZE};
+use crate::core::Hex;
+use crate::encoder::{self, BOARD_AREA, BOARD_SIZE, TENSOR_SIZE};
 use smallvec::SmallVec;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -263,6 +263,8 @@ pub struct MCTSEngine {
     scratch_raw: Vec<f64>,
     /// Reusable scratch buffer for `gather_policy` (normalized priors).
     scratch_priors: Vec<f32>,
+    /// Reusable buffer for `encode_board_into` live-cells channels.
+    hot_buf: Vec<Hex>,
 }
 
 type TreeNodeStates = (Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize);
@@ -325,6 +327,7 @@ impl MCTSEngine {
             pending: Vec::new(),
             scratch_raw: Vec::new(),
             scratch_priors: Vec::new(),
+            hot_buf: Vec::new(),
         }
     }
 
@@ -343,8 +346,13 @@ impl MCTSEngine {
 
         // Allocate a local tensor buffer and encode directly into it.
         let mut tensor = vec![0.0f32; TENSOR_SIZE];
-        let (oq, or_, legal) =
-            encoder::encode_board_into(&self.game, self.near_radius, self.constrain_threats, &mut tensor);
+        let (oq, or_, legal) = encoder::encode_board_into(
+            &self.game,
+            self.near_radius,
+            self.constrain_threats,
+            &mut tensor,
+            &mut self.hot_buf,
+        );
 
         Some((tensor, oq, or_, legal))
     }
@@ -484,8 +492,13 @@ impl MCTSEngine {
                 // Only constrain threats at root (init_root), not internal
                 // nodes — the O(n²) unblockable check is too expensive to run
                 // on every leaf expansion during tree search.
-                let (oq, or_, legal) =
-                    encoder::encode_board_into(&self.game, self.near_radius, false, tensor_slice);
+                let (oq, or_, legal) = encoder::encode_board_into(
+                    &self.game,
+                    self.near_radius,
+                    false,
+                    tensor_slice,
+                    &mut self.hot_buf,
+                );
 
                 non_terminal_count += 1;
                 self.pending.push(PendingLeaf {
@@ -567,7 +580,11 @@ impl MCTSEngine {
             let leaf_player = self.arena[leaf.node_idx as usize].player;
             for &ni in leaf.search_path.iter().rev() {
                 let n = &mut self.arena[ni as usize];
-                let pv_value = if n.player == leaf_player { value } else { -value };
+                let pv_value = if n.player == leaf_player {
+                    value
+                } else {
+                    -value
+                };
                 n.visit_count += 1;
                 n.total_value += pv_value;
             }
@@ -771,6 +788,10 @@ impl MCTSEngine {
         #[derive(Clone, Copy)]
         enum Frame {
             Visit(u32),
+            VisitChild {
+                parent_idx: u32,
+                child_offset: usize,
+            },
             Unplace,
         }
 
@@ -785,6 +806,7 @@ impl MCTSEngine {
             depth
         }
 
+        let mut scratch_history: Vec<(u8, i16, i16)> = Vec::new();
         let mut stack: Vec<Frame> = Vec::new();
         stack.push(Frame::Visit(self.root_idx));
 
@@ -807,40 +829,51 @@ impl MCTSEngine {
                             self.near_radius,
                             false,
                             &mut packed[start..start + TENSOR_SIZE],
+                            &mut self.hot_buf,
                         );
-                        let history: Vec<(u8, i16, i16)> = self
-                            .game
-                            .move_history()
-                            .iter()
-                            .map(|rec| (rec.player, rec.cell.q as i16, rec.cell.r as i16))
-                            .collect();
-                        histories.push(history);
+                        scratch_history.clear();
+                        scratch_history.extend(
+                            self.game
+                                .move_history()
+                                .iter()
+                                .map(|rec| (rec.player, rec.cell.q as i16, rec.cell.r as i16)),
+                        );
+                        histories.push(scratch_history.clone());
                     }
 
                     let node = &self.arena[node_idx as usize];
                     if node.is_expanded && node.children_count > 0 {
-                        if node_idx != self.root_idx {
-                            stack.push(Frame::Unplace);
-                        }
-                        let start = node.children_start as usize;
                         let count = node.children_count as usize;
-                        for i in (start..start + count).rev() {
-                            let child = &self.arena[i];
-                            if self.game.place(
-                                child.action.0 as i32,
-                                child.action.1 as i32,
-                            ).is_err() {
-                                let d = depth_from_root(node_idx, &self.arena);
-                                for _ in 0..d {
-                                    self.game.unplace();
-                                }
-                                return Err("illegal move during tree node extraction");
-                            }
-                            stack.push(Frame::Visit(i as u32));
+                        // Schedule children for traversal.
+                        for offset in (0..count).rev() {
+                            stack.push(Frame::VisitChild {
+                                parent_idx: node_idx,
+                                child_offset: offset,
+                            });
                         }
-                    } else if node_idx != self.root_idx {
-                        stack.push(Frame::Unplace);
                     }
+                }
+                Frame::VisitChild {
+                    parent_idx,
+                    child_offset,
+                } => {
+                    let node = &self.arena[parent_idx as usize];
+                    let start = node.children_start as usize;
+                    let child = &self.arena[start + child_offset];
+                    if self
+                        .game
+                        .place(child.action.0 as i32, child.action.1 as i32)
+                        .is_err()
+                    {
+                        let d = depth_from_root(parent_idx, &self.arena);
+                        for _ in 0..d {
+                            self.game.unplace();
+                        }
+                        return Err("illegal move during tree node extraction");
+                    }
+                    // After the child's entire subtree is processed, unplace it.
+                    stack.push(Frame::Unplace);
+                    stack.push(Frame::Visit(start as u32 + child_offset as u32));
                 }
                 Frame::Unplace => {
                     self.game.unplace();
@@ -876,11 +909,7 @@ impl MCTSEngine {
         } else {
             1.0
         };
-        let parent_q = if parent_n > 0 {
-            node.q_value()
-        } else {
-            0.0
-        };
+        let parent_q = if parent_n > 0 { node.q_value() } else { 0.0 };
         let fpu_value = parent_q - FPU_REDUCTION;
 
         let start = node.children_start as usize;

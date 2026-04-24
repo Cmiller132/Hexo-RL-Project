@@ -166,7 +166,9 @@ impl PyMCTSEngine {
         py: Python<'py>,
         min_visits: u32,
     ) -> PyResult<(Bound<'py, PyArray4<f32>>, Vec<Vec<(i32, i32, i32)>>, usize)> {
-        let (packed, histories, count) = self.inner.extract_tree_node_states(min_visits)
+        let (packed, histories, count) = self
+            .inner
+            .extract_tree_node_states(min_visits)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
         let arr = ndarray::Array4::from_shape_vec(
             (
@@ -193,10 +195,10 @@ impl PyMCTSEngine {
 
     #[pyo3(signature = (q, r, new_num_simulations))]
     fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> PyResult<()> {
-        let q = i16::try_from(q)
-            .map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
-        let r = i16::try_from(r)
-            .map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
+        let q =
+            i16::try_from(q).map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
+        let r =
+            i16::try_from(r).map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
         self.inner.re_root(q, r, new_num_simulations);
         Ok(())
     }

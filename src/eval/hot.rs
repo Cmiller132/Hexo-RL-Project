@@ -28,8 +28,8 @@
 //! the heap transparently, but that path is effectively unreachable in real
 //! games.
 
-use smallvec::SmallVec;
 use crate::core::WindowKey;
+use smallvec::SmallVec;
 
 /// Compact set of "hot" win-window keys for both players.
 ///
@@ -109,6 +109,7 @@ impl HotWindows {
 
     /// Clear both players' hot sets, returning to an empty state.
     #[inline]
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.by_player[0].clear();
         self.by_player[1].clear();
@@ -120,5 +121,3 @@ impl Default for HotWindows {
         Self::new()
     }
 }
-
-
