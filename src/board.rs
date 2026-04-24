@@ -14,7 +14,8 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
-use crate::patterns::{EvalDelta, win_grid_idx, win_grid_in_bounds, WIN_GRID_TOTAL, WIN_LENGTH, PLACEMENT_RADIUS, PATTERN_COUNTS};
+use crate::eval::state::EvalState;
+use crate::core::{PLACEMENT_RADIUS, WIN_LENGTH};
 
 // -------------------------------------------------------------------------
 // Zobrist hashing (infinite board — mixing function instead of table)
@@ -46,14 +47,6 @@ pub fn zobrist_piece(player: u8, cell: Hex) -> u64 {
     h ^= h >> 33;
     h
 }
-
-// -------------------------------------------------------------------------
-// Constants
-// -------------------------------------------------------------------------
-
-/// Powers of 3 for ternary index computation.
-/// Used in `unmake_move` to reverse window index updates.
-const POW3: [usize; 6] = [1, 3, 9, 27, 81, 243];
 
 // -------------------------------------------------------------------------
 // Error type
@@ -101,9 +94,9 @@ impl std::error::Error for GameError {}
 /// A single placement in the move history.
 ///
 /// Snapshots the turn state **before** the move was made so that
-/// `unmake_move` can restore exactly without fragile `move_count`-based
+/// `unplace` can restore exactly without fragile `move_count`-based
 /// derivation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MoveRecord {
     /// The hex coordinate where the tile was placed.
     pub cell: Hex,
@@ -115,17 +108,52 @@ pub struct MoveRecord {
     pub placements_remaining_before: u8,
     /// Whether there was a winner BEFORE this move was made.
     pub winner_before: Option<u8>,
+    /// The winning line BEFORE this move was made.
+    pub winning_line_before: Option<Vec<Hex>>,
+}
+
+// -------------------------------------------------------------------------
+// Candidate set
+// -------------------------------------------------------------------------
+
+/// Incremental reference-counted candidate set for fast move generation.
+#[derive(Debug, Clone)]
+pub struct CandidateSet {
+    rc: FxHashMap<Hex, u32>,
+    radius: i32,
+}
+
+impl CandidateSet {
+    /// Create a new empty candidate set with the given radius.
+    pub fn new(radius: i32) -> Self {
+        Self {
+            rc: FxHashMap::default(),
+            radius,
+        }
+    }
+
+    /// Remove a cell from the candidate set.
+    pub fn remove(&mut self, cell: Hex) {
+        self.rc.remove(&cell);
+    }
+
+    /// Clear all candidates.
+    pub fn clear(&mut self) {
+        self.rc.clear();
+    }
 }
 
 // -------------------------------------------------------------------------
 // Game state
 // -------------------------------------------------------------------------
 
+pub type Stones = FxHashMap<Hex, u8>;
+
 /// Complete mutable game state.
 ///
 /// Create with [`HexGameState::new()`], then call [`place()`](HexGameState::place)
 /// to advance the game. Query [`is_over()`](HexGameState::is_over) and
-/// [`winner`] to check for a win.
+/// [`winner`](HexGameState::winner) to check for a win.
 ///
 /// # Example
 ///
@@ -136,32 +164,20 @@ pub struct MoveRecord {
 /// g.place(0, 0).unwrap();   // Player 0 opens
 /// g.place(1, 0).unwrap();   // Player 1, placement 1/2
 /// g.place(0, 1).unwrap();   // Player 1, placement 2/2
-/// assert_eq!(g.current_player, 0);
+/// assert_eq!(g.current_player(), 0);
 /// ```
 #[derive(Debug, Clone)]
 pub struct HexGameState {
-    // ── Rule state ──
-    pub board: FxHashMap<Hex, u8>,
-    pub current_player: u8,
-    pub placements_remaining: u8,
-    pub winner: Option<u8>,
-    pub winning_line: Option<Vec<Hex>>,
-    pub move_count: u32,
-    pub move_history: Vec<MoveRecord>,
-    pub zobrist_hash: u64,
-
-    // ── Incremental evaluation ──
-    pub window_eval: i32,
-    pub window_fives: [i32; 2],
-    pub window_fours: [i32; 2],
-    pub window_threes: [i32; 2],
-    pub hot_windows: [FxHashSet<(i32, i32, u8)>; 2],
-    pub window_indices: Vec<u16>,
-
-    // ── Internal (pub(crate) so patterns.rs and threats.rs can access) ──
-    pub(crate) eval_stack: Vec<EvalDelta>,
-    pub(crate) candidate_rc: FxHashMap<Hex, u32>,
-    pub(crate) candidate_radius: i32,
+    stones: Stones,
+    current_player: u8,
+    placements_remaining: u8,
+    winner: Option<u8>,
+    winning_line: Option<Vec<Hex>>,
+    move_count: u32,
+    move_history: Vec<MoveRecord>,
+    zobrist: u64,
+    eval: EvalState,
+    candidates: CandidateSet,
 }
 
 impl Default for HexGameState {
@@ -171,27 +187,51 @@ impl Default for HexGameState {
 }
 
 impl HexGameState {
-    /// Create a new game in the initial state (empty board, player 0's turn).
-    pub fn new() -> Self {
-        Self {
-            board: FxHashMap::default(),
-            current_player: 0,
-            placements_remaining: 1,
-            winner: None,
-            winning_line: None,
-            move_count: 0,
-            move_history: Vec::new(),
-            zobrist_hash: 0,
-            window_eval: 0,
-            window_fives: [0; 2],
-            window_fours: [0; 2],
-            window_threes: [0; 2],
-            eval_stack: Vec::new(),
-            window_indices: vec![0u16; WIN_GRID_TOTAL],
-            candidate_rc: FxHashMap::default(),
-            candidate_radius: 2,
-            hot_windows: [FxHashSet::default(), FxHashSet::default()],
-        }
+    // ── Public accessors ────────────────────────────────────────────────
+
+    /// The map of all placed stones.
+    pub fn stones(&self) -> &Stones {
+        &self.stones
+    }
+
+    /// The incremental evaluation state.
+    pub fn eval(&self) -> &EvalState {
+        &self.eval
+    }
+
+    /// The player whose turn it is (0 or 1).
+    pub fn current_player(&self) -> u8 {
+        self.current_player
+    }
+
+    /// How many placements the current player still has this turn.
+    pub fn placements_remaining(&self) -> u8 {
+        self.placements_remaining
+    }
+
+    /// The winner, if any.
+    pub fn winner(&self) -> Option<u8> {
+        self.winner
+    }
+
+    /// The winning line of 6 cells, if the game is over.
+    pub fn winning_line(&self) -> Option<&[Hex]> {
+        self.winning_line.as_deref()
+    }
+
+    /// Total number of individual tile placements so far.
+    pub fn move_count(&self) -> u32 {
+        self.move_count
+    }
+
+    /// The history of all placements made so far.
+    pub fn move_history(&self) -> &[MoveRecord] {
+        &self.move_history
+    }
+
+    /// The incremental Zobrist hash of the current position.
+    pub fn zobrist(&self) -> u64 {
+        self.zobrist
     }
 
     /// Whether the game has ended (a winner exists).
@@ -200,24 +240,25 @@ impl HexGameState {
         self.winner.is_some()
     }
 
-    /// The opponent's most recent completed turn as an ordered list of cells.
-    ///
-    /// Returns one cell for Player 0's opening turn, otherwise two cells.
-    pub fn opponent_last_turn_cells(&self) -> Vec<Hex> {
-        let mut idx = self.move_history.len();
+    // ── Construction ────────────────────────────────────────────────────
 
-        while idx > 0 && self.move_history[idx - 1].player == self.current_player {
-            idx -= 1;
+    /// Create a new game in the initial empty state.
+    pub fn new() -> Self {
+        Self {
+            stones: FxHashMap::default(),
+            current_player: 0,
+            placements_remaining: 1,
+            winner: None,
+            winning_line: None,
+            move_count: 0,
+            move_history: Vec::new(),
+            zobrist: 0,
+            eval: EvalState::new(),
+            candidates: CandidateSet::new(2),
         }
-
-        let mut cells = Vec::with_capacity(2);
-        while idx > 0 && self.move_history[idx - 1].player != self.current_player {
-            cells.push(self.move_history[idx - 1].cell);
-            idx -= 1;
-        }
-        cells.reverse();
-        cells
     }
+
+    // ── Placement ───────────────────────────────────────────────────────
 
     /// Place the current player's tile at `(q, r)`.
     ///
@@ -237,20 +278,20 @@ impl HexGameState {
             current_player_before: self.current_player,
             placements_remaining_before: self.placements_remaining,
             winner_before: self.winner,
+            winning_line_before: self.winning_line.clone(),
         };
 
         // Place tile
-        self.board.insert(cell, player);
-        self.zobrist_hash ^= zobrist_piece(player, cell);
+        self.stones.insert(cell, player);
+        self.zobrist ^= zobrist_piece(player, cell);
         self.move_count += 1;
         self.move_history.push(record);
         self.placements_remaining -= 1;
 
         // Update candidate set and incremental eval.
-        self.candidate_rc.remove(&cell);
+        self.candidates.remove(cell);
         self.incr_candidate_neighbors(cell);
-        let delta = self.compute_eval_delta(cell, player);
-        self.push_eval_delta(delta);
+        self.eval.place(&self.stones, cell, player);
 
         // Check win
         if let Some(line) = self.find_winning_line(cell, player) {
@@ -271,6 +312,56 @@ impl HexGameState {
         Ok(true)
     }
 
+    /// Undo the last placement. Restores board, turn state, and hash.
+    ///
+    /// Panics if called on an empty game (no moves to undo).
+    pub fn unplace(&mut self) {
+        // Reverse incremental eval before removing the piece.
+        self.eval.unplace();
+
+        let rec = self.move_history.pop().expect("no move to undo");
+
+        self.stones.remove(&rec.cell);
+        self.zobrist ^= zobrist_piece(rec.player, rec.cell);
+        self.move_count -= 1;
+
+        // Reverse candidate set: decrement neighbors, add removed cell back.
+        let r2 = self.candidates.radius;
+        for dq in -r2..=r2 {
+            for dr in -r2..=r2 {
+                let h = Hex::new(rec.cell.q + dq, rec.cell.r + dr);
+                if hex_distance(rec.cell, h) <= r2 && !self.stones.contains_key(&h) {
+                    if let Some(count) = self.candidates.rc.get_mut(&h) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.candidates.rc.remove(&h);
+                        }
+                    }
+                }
+            }
+        }
+        let mut rc = 0u32;
+        for dq in -r2..=r2 {
+            for dr in -r2..=r2 {
+                let h = Hex::new(rec.cell.q + dq, rec.cell.r + dr);
+                if hex_distance(rec.cell, h) <= r2 && self.stones.contains_key(&h) {
+                    rc += 1;
+                }
+            }
+        }
+        if rc > 0 {
+            self.candidates.rc.insert(rec.cell, rc);
+        }
+
+        // Restore turn state from the snapshot.
+        self.current_player = rec.current_player_before;
+        self.placements_remaining = rec.placements_remaining_before;
+        self.winner = rec.winner_before;
+        self.winning_line = rec.winning_line_before;
+    }
+
+
+
     /// Set the board to a custom position, bypassing normal turn rules.
     ///
     /// All pieces in `pieces` are placed directly regardless of who is "current player".
@@ -278,9 +369,9 @@ impl HexGameState {
     /// Any pre-existing game state is discarded (equivalent to `reset()` first).
     pub fn set_position(
         &mut self,
-        pieces: &[(i32, i32, u8)],
-        current_player: u8,
-        placements_remaining: u8,
+        stones: &[(i32, i32, u8)],
+        player: u8,
+        remaining: u8,
     ) -> Result<(), GameError> {
         self.reset();
 
@@ -289,9 +380,9 @@ impl HexGameState {
         let mut sim_player = self.current_player; // 0
         let mut sim_remaining = self.placements_remaining; // 1
 
-        for &(q, r, player) in pieces {
+        for &(q, r, player) in stones {
             let cell = Hex::new(q, r);
-            if self.board.contains_key(&cell) {
+            if self.stones.contains_key(&cell) {
                 return Err(GameError::CellOccupied(cell));
             }
 
@@ -301,18 +392,18 @@ impl HexGameState {
                 current_player_before: sim_player,
                 placements_remaining_before: sim_remaining,
                 winner_before: self.winner,
+                winning_line_before: self.winning_line.clone(),
             };
 
-            self.board.insert(cell, player);
-            self.zobrist_hash ^= zobrist_piece(player, cell);
+            self.stones.insert(cell, player);
+            self.zobrist ^= zobrist_piece(player, cell);
             self.move_count += 1;
             self.move_history.push(record);
 
             // Update candidate set and incremental eval.
-            self.candidate_rc.remove(&cell);
+            self.candidates.remove(cell);
             self.incr_candidate_neighbors(cell);
-            let delta = self.compute_eval_delta(cell, player);
-            self.push_eval_delta(delta);
+            self.eval.place(&self.stones, cell, player);
 
             // Detect wins during bulk placement
             if self.winner.is_none() {
@@ -330,153 +421,87 @@ impl HexGameState {
             }
         }
 
-        self.current_player = current_player & 1;
-        self.placements_remaining = placements_remaining.max(1);
+        self.current_player = player & 1;
+        self.placements_remaining = remaining.max(1);
         Ok(())
-    }
-
-    /// Increment candidate reference counts for empty cells within radius 2 of `cell`.
-    /// Must be called **after** the piece is inserted into `self.board`.
-    fn incr_candidate_neighbors(&mut self, cell: Hex) {
-        let r2 = self.candidate_radius;
-        for dq in -r2..=r2 {
-            for dr in -r2..=r2 {
-                let h = Hex::new(cell.q + dq, cell.r + dr);
-                if hex_distance(cell, h) <= r2 && !self.board.contains_key(&h) {
-                    *self.candidate_rc.entry(h).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-
-    /// Apply an eval delta to the running totals and push it onto the eval stack.
-    fn push_eval_delta(&mut self, delta: EvalDelta) {
-        self.window_eval += delta.score;
-        for i in 0..2 {
-            self.window_fives[i] += delta.five_delta[i];
-            self.window_fours[i] += delta.four_delta[i];
-            self.window_threes[i] += delta.three_delta[i];
-        }
-        self.eval_stack.push(delta);
     }
 
     /// Reset to initial empty state.
     pub fn reset(&mut self) {
-        self.board.clear();
+        self.stones.clear();
         self.current_player = 0;
         self.placements_remaining = 1;
         self.winner = None;
         self.winning_line = None;
         self.move_count = 0;
         self.move_history.clear();
-        self.zobrist_hash = 0;
-        self.window_eval = 0;
-        self.window_fives = [0; 2];
-        self.window_fours = [0; 2];
-        self.window_threes = [0; 2];
-        self.eval_stack.clear();
-        self.window_indices.fill(0);
-        self.candidate_rc.clear();
-        self.hot_windows[0].clear();
-        self.hot_windows[1].clear();
+        self.zobrist = 0;
+        self.eval = EvalState::new();
+        self.candidates = CandidateSet::new(2);
     }
 
-    /// Undo the last placement. Restores board, turn state, and hash.
-    ///
-    /// Panics if called on an empty game (no moves to undo).
-    pub fn unmake_move(&mut self) {
-        // Reverse incremental eval before removing the piece.
-        if let Some(delta) = self.eval_stack.pop() {
-            self.window_eval -= delta.score;
-            for i in 0..2 {
-                self.window_fives[i] -= delta.five_delta[i];
-                self.window_fours[i] -= delta.four_delta[i];
-                self.window_threes[i] -= delta.three_delta[i];
-            }
+    /// Places without validation, used by test oracle and internal modules.
+    #[allow(dead_code)]
+    pub(crate) fn place_unchecked(&mut self, cell: Hex) {
+        let player = self.current_player;
+        let record = MoveRecord {
+            cell,
+            player,
+            current_player_before: self.current_player,
+            placements_remaining_before: self.placements_remaining,
+            winner_before: self.winner,
+            winning_line_before: self.winning_line.clone(),
+        };
+        self.stones.insert(cell, player);
+        self.zobrist ^= zobrist_piece(player, cell);
+        self.move_count += 1;
+        self.move_history.push(record);
+        self.placements_remaining -= 1;
+
+        self.candidates.remove(cell);
+        self.incr_candidate_neighbors(cell);
+        self.eval.place(&self.stones, cell, player);
+
+        if let Some(line) = self.find_winning_line(cell, player) {
+            self.winner = Some(player);
+            self.winning_line = Some(line);
+            self.placements_remaining = 0;
+            return;
         }
 
-        let rec = self.move_history.pop().expect("no move to undo");
-
-        // Reverse window indices for the removed piece.
-        let cell_val = if rec.player == 0 { 1usize } else { 2usize };
-        for (dir_idx, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
-            for off in 0..WIN_LENGTH as usize {
-                let sq = rec.cell.q - dq * off as i32;
-                let sr = rec.cell.r - dr * off as i32;
-
-                if !win_grid_in_bounds(sq, sr) {
-                    continue;
-                }
-                let gi = win_grid_idx(sq, sr, dir_idx as u8);
-
-                let current_idx = self.window_indices[gi] as usize;
-                let old_idx = current_idx - cell_val * POW3[off];
-
-                // Update hot windows (reverse transition)
-                let (cur_p0, cur_p1) = PATTERN_COUNTS[current_idx];
-                let (old_p0, old_p1) = PATTERN_COUNTS[old_idx];
-                let wkey = (sq, sr, dir_idx as u8);
-                let was_hot_0 = cur_p0 >= 4 && cur_p1 == 0;
-                let is_hot_0 = old_p0 >= 4 && old_p1 == 0;
-                if was_hot_0 && !is_hot_0 {
-                    self.hot_windows[0].remove(&wkey);
-                }
-                if !was_hot_0 && is_hot_0 {
-                    self.hot_windows[0].insert(wkey);
-                }
-                let was_hot_1 = cur_p1 >= 4 && cur_p0 == 0;
-                let is_hot_1 = old_p1 >= 4 && old_p0 == 0;
-                if was_hot_1 && !is_hot_1 {
-                    self.hot_windows[1].remove(&wkey);
-                }
-                if !was_hot_1 && is_hot_1 {
-                    self.hot_windows[1].insert(wkey);
-                }
-
-                self.window_indices[gi] = old_idx as u16;
-            }
+        if self.placements_remaining == 0 {
+            self.current_player = 1 - self.current_player;
+            self.placements_remaining = 2;
         }
-
-        self.board.remove(&rec.cell);
-
-        // Reverse candidate set: add this cell back, decrement neighbors.
-        let r2 = self.candidate_radius;
-        for dq in -r2..=r2 {
-            for dr in -r2..=r2 {
-                let h = Hex::new(rec.cell.q + dq, rec.cell.r + dr);
-                if hex_distance(rec.cell, h) <= r2 && !self.board.contains_key(&h) {
-                    if let Some(count) = self.candidate_rc.get_mut(&h) {
-                        *count -= 1;
-                        if *count == 0 {
-                            self.candidate_rc.remove(&h);
-                        }
-                    }
-                }
-            }
-        }
-        // Add the removed cell back as candidate if it has neighbors
-        let mut rc = 0u32;
-        for dq in -r2..=r2 {
-            for dr in -r2..=r2 {
-                let h = Hex::new(rec.cell.q + dq, rec.cell.r + dr);
-                if hex_distance(rec.cell, h) <= r2 && self.board.contains_key(&h) {
-                    rc += 1;
-                }
-            }
-        }
-        if rc > 0 {
-            self.candidate_rc.insert(rec.cell, rc);
-        }
-
-        self.zobrist_hash ^= zobrist_piece(rec.player, rec.cell);
-        self.move_count -= 1;
-
-        // Restore turn state from the snapshot.
-        self.current_player = rec.current_player_before;
-        self.placements_remaining = rec.placements_remaining_before;
-        self.winner = rec.winner_before;
-        self.winning_line = None;
     }
+
+    // ── Validation ──────────────────────────────────────────────────────
+
+    pub fn validate_move(&self, cell: Hex) -> Result<(), GameError> {
+        if self.is_over() {
+            return Err(GameError::GameOver);
+        }
+        if self.placements_remaining == 0 {
+            return Err(GameError::NoPlacements);
+        }
+        if self.stones.contains_key(&cell) {
+            return Err(GameError::CellOccupied(cell));
+        }
+        if self.stones.is_empty() && cell != Hex::ORIGIN {
+            return Err(GameError::MustPlaceAtOrigin);
+        }
+        if !self.stones.is_empty()
+            && !self
+                .stones
+                .keys()
+                .any(|&existing| hex_distance(existing, cell) <= PLACEMENT_RADIUS)
+        {
+            return Err(GameError::OutOfRadius(cell));
+        }
+        Ok(())
+    }
+
+    // ── Legal moves ─────────────────────────────────────────────────────
 
     /// Return all legal placements (exhaustive radius-8 scan — expensive).
     ///
@@ -486,16 +511,16 @@ impl HexGameState {
         if self.is_over() {
             return Vec::new();
         }
-        if self.board.is_empty() {
+        if self.stones.is_empty() {
             return vec![Hex::ORIGIN];
         }
 
         let mut candidates = FxHashSet::default();
-        for &cell in self.board.keys() {
+        for &cell in self.stones.keys() {
             for dq in -PLACEMENT_RADIUS..=PLACEMENT_RADIUS {
                 for dr in -PLACEMENT_RADIUS..=PLACEMENT_RADIUS {
                     let cand = Hex::new(cell.q + dq, cell.r + dr);
-                    if !self.board.contains_key(&cand)
+                    if !self.stones.contains_key(&cand)
                         && hex_distance(cell, cand) <= PLACEMENT_RADIUS
                     {
                         candidates.insert(cand);
@@ -518,13 +543,13 @@ impl HexGameState {
         if self.is_over() {
             return Vec::new();
         }
-        if self.board.is_empty() {
+        if self.stones.is_empty() {
             return vec![Hex::ORIGIN];
         }
 
         // Use incremental candidate set if radius matches (fast path).
-        if radius == self.candidate_radius && !self.candidate_rc.is_empty() {
-            let mut result: Vec<Hex> = self.candidate_rc.keys().copied().collect();
+        if radius == self.candidates.radius && !self.candidates.rc.is_empty() {
+            let mut result: Vec<Hex> = self.candidates.rc.keys().copied().collect();
             result.sort();
             return result;
         }
@@ -532,11 +557,11 @@ impl HexGameState {
         // Fallback: full scan for different radius.
         let r = radius.min(PLACEMENT_RADIUS);
         let mut candidates = FxHashSet::default();
-        for &cell in self.board.keys() {
+        for &cell in self.stones.keys() {
             for dq in -r..=r {
                 for dr in -r..=r {
                     let cand = Hex::new(cell.q + dq, cell.r + dr);
-                    if !self.board.contains_key(&cand) && hex_distance(cell, cand) <= r {
+                    if !self.stones.contains_key(&cand) && hex_distance(cell, cand) <= r {
                         candidates.insert(cand);
                     }
                 }
@@ -554,11 +579,11 @@ impl HexGameState {
         if self.is_over() {
             return Vec::new();
         }
-        if self.board.is_empty() {
+        if self.stones.is_empty() {
             return vec![Hex::ORIGIN];
         }
-        let mut result = if !self.candidate_rc.is_empty() {
-            self.candidate_rc.keys().copied().collect()
+        let mut result = if !self.candidates.rc.is_empty() {
+            self.candidates.rc.keys().copied().collect()
         } else {
             self.legal_moves_near(2)
         };
@@ -566,37 +591,26 @@ impl HexGameState {
         result
     }
 
-    // -----------------------------------------------------------------
-    // Validation
-    // -----------------------------------------------------------------
+    /// The opponent's most recent completed turn as an ordered list of cells.
+    ///
+    /// Returns one cell for Player 0's opening turn, otherwise two cells.
+    pub fn opponent_last_turn_cells(&self) -> Vec<Hex> {
+        let mut idx = self.move_history.len();
 
-    pub fn validate_move(&self, cell: Hex) -> Result<(), GameError> {
-        if self.is_over() {
-            return Err(GameError::GameOver);
+        while idx > 0 && self.move_history[idx - 1].player == self.current_player {
+            idx -= 1;
         }
-        if self.placements_remaining == 0 {
-            return Err(GameError::NoPlacements);
+
+        let mut cells = Vec::with_capacity(2);
+        while idx > 0 && self.move_history[idx - 1].player != self.current_player {
+            cells.push(self.move_history[idx - 1].cell);
+            idx -= 1;
         }
-        if self.board.contains_key(&cell) {
-            return Err(GameError::CellOccupied(cell));
-        }
-        if self.board.is_empty() && cell != Hex::ORIGIN {
-            return Err(GameError::MustPlaceAtOrigin);
-        }
-        if !self.board.is_empty()
-            && !self
-                .board
-                .keys()
-                .any(|&existing| hex_distance(existing, cell) <= PLACEMENT_RADIUS)
-        {
-            return Err(GameError::OutOfRadius(cell));
-        }
-        Ok(())
+        cells.reverse();
+        cells
     }
 
-    // -----------------------------------------------------------------
-    // Win detection
-    // -----------------------------------------------------------------
+    // ── Win detection ───────────────────────────────────────────────────
 
     pub fn find_winning_line(&self, last: Hex, player: u8) -> Option<Vec<Hex>> {
         for &(dq, dr) in &HEX_DIRECTIONS {
@@ -621,7 +635,7 @@ impl HexGameState {
         let mut tiles = Vec::new();
         let mut q = origin.q + dq;
         let mut r = origin.r + dr;
-        while self.board.get(&Hex::new(q, r)) == Some(&player) {
+        while self.stones.get(&Hex::new(q, r)) == Some(&player) {
             tiles.push(Hex::new(q, r));
             q += dq;
             r += dr;
@@ -636,6 +650,29 @@ impl HexGameState {
         let preferred = pivot.saturating_sub((wl - 1) / 2);
         let start = hi.min(lo.max(preferred));
         line[start..start + wl].to_vec()
+    }
+
+    // ── Eval helpers ────────────────────────────────────────────────────
+
+    /// Compute the eval delta for a hypothetical placement without modifying state.
+    pub fn move_eval_delta(&self, cell: Hex, player: u8) -> i32 {
+        self.eval.hypothetical_score_delta(cell, player)
+    }
+
+    // ── Candidate helpers ───────────────────────────────────────────────
+
+    /// Increment candidate reference counts for empty cells within radius 2 of `cell`.
+    /// Must be called **after** the piece is inserted into `self.stones`.
+    fn incr_candidate_neighbors(&mut self, cell: Hex) {
+        let r2 = self.candidates.radius;
+        for dq in -r2..=r2 {
+            for dr in -r2..=r2 {
+                let h = Hex::new(cell.q + dq, cell.r + dr);
+                if hex_distance(cell, h) <= r2 && !self.stones.contains_key(&h) {
+                    *self.candidates.rc.entry(h).or_insert(0) += 1;
+                }
+            }
+        }
     }
 }
 
@@ -996,20 +1033,20 @@ mod tests {
         g.place(0, 0).unwrap();
         let mut c = g.clone();
         c.place(1, 0).unwrap();
-        assert!(!g.board.contains_key(&Hex::new(1, 0)));
+        assert!(!g.stones.contains_key(&Hex::new(1, 0)));
     }
 
     #[test]
     fn zobrist_restores_after_unmake() {
         let mut g = HexGameState::new();
-        let h0 = g.zobrist_hash;
+        let h0 = g.zobrist;
 
         g.place(0, 0).unwrap();
-        let h1 = g.zobrist_hash;
+        let h1 = g.zobrist;
         assert_ne!(h0, h1);
 
-        g.unmake_move();
-        assert_eq!(g.zobrist_hash, h0);
+        g.unplace();
+        assert_eq!(g.zobrist, h0);
     }
 
     #[test]
@@ -1019,7 +1056,7 @@ mod tests {
         g.place(1, 0).unwrap();
         g.reset();
         assert_eq!(g.move_count, 0);
-        assert!(g.board.is_empty());
+        assert!(g.stones.is_empty());
         assert!(g.move_history.is_empty());
         assert!(g.winner.is_none());
         assert!(g.winning_line.is_none());
@@ -1036,7 +1073,7 @@ mod tests {
         assert_eq!(a.current_player, b.current_player);
         assert_eq!(a.placements_remaining, b.placements_remaining);
         assert_eq!(a.move_count, b.move_count);
-        assert!(a.board.is_empty() && b.board.is_empty());
+        assert!(a.stones.is_empty() && b.stones.is_empty());
     }
 
     // -- Error display ---------------------------------------------------
@@ -1088,10 +1125,10 @@ mod tests {
     fn set_position_basic() {
         let mut g = HexGameState::new();
         g.set_position(&[(1, 0, 0), (2, 0, 0), (0, 1, 1)], 0, 2).unwrap();
-        assert_eq!(g.board.len(), 3);
-        assert_eq!(g.board.get(&Hex::new(1, 0)), Some(&0));
-        assert_eq!(g.board.get(&Hex::new(2, 0)), Some(&0));
-        assert_eq!(g.board.get(&Hex::new(0, 1)), Some(&1));
+        assert_eq!(g.stones.len(), 3);
+        assert_eq!(g.stones.get(&Hex::new(1, 0)), Some(&0));
+        assert_eq!(g.stones.get(&Hex::new(2, 0)), Some(&0));
+        assert_eq!(g.stones.get(&Hex::new(0, 1)), Some(&1));
         assert_eq!(g.current_player, 0);
         assert_eq!(g.placements_remaining, 2);
     }
@@ -1143,7 +1180,7 @@ mod tests {
         }
     }
 
-    // -- unmake_move eval round-trip ---------------------------------------
+    // -- unplace eval round-trip -------------------------------------------
 
     #[test]
     fn unmake_restores_eval_counters() {
@@ -1155,20 +1192,20 @@ mod tests {
         )
         .unwrap();
 
-        let eval0 = g.window_eval;
-        let fives0 = g.window_fives;
-        let fours0 = g.window_fours;
-        let threes0 = g.window_threes;
-        let hot0 = g.hot_windows[0].len();
+        let eval0 = g.eval.score();
+        let fives0 = [g.eval.counts(0).fives, g.eval.counts(1).fives];
+        let fours0 = [g.eval.counts(0).fours, g.eval.counts(1).fours];
+        let threes0 = [g.eval.counts(0).threes, g.eval.counts(1).threes];
+        let hot0 = g.eval.hot_len(0);
 
         g.place(3, 0).unwrap();
-        g.unmake_move();
+        g.unplace();
 
-        assert_eq!(g.window_eval, eval0);
-        assert_eq!(g.window_fives, fives0);
-        assert_eq!(g.window_fours, fours0);
-        assert_eq!(g.window_threes, threes0);
-        assert_eq!(g.hot_windows[0].len(), hot0);
+        assert_eq!(g.eval.score(), eval0);
+        assert_eq!([g.eval.counts(0).fives, g.eval.counts(1).fives], fives0);
+        assert_eq!([g.eval.counts(0).fours, g.eval.counts(1).fours], fours0);
+        assert_eq!([g.eval.counts(0).threes, g.eval.counts(1).threes], threes0);
+        assert_eq!(g.eval.hot_len(0), hot0);
     }
 
     // -- Helpers ----------------------------------------------------------

@@ -7,19 +7,22 @@
 //!
 //! | Module | Responsibility |
 //! |--------|---------------|
-//! | [`core`] | Hex coordinates, distances, directions |
+//! | [`core`] | Hex coordinates, distances, directions, `Turn`, `WindowKey` |
 //! | [`board`] | Game state, rules, placement/undo, win detection, legal moves |
-//! | [`patterns`] | Ternary 6-cell window encoding, incremental evaluation |
-//! | [`threats`] | Hot windows, threat detection, forced-move constraints |
+//! | [`eval`] | Pattern tables, incremental evaluation (`EvalState`), feature extraction |
+//! | [`threats`] | Threat detection, forced-move constraints (`ThreatStatus`) |
 //! | [`encoder`] | Unified 13-channel NN tensor encoder |
-//! | [`eval`] | Classical evaluation and feature extraction |
 //! | [`search`] | Turn-based alpha-beta search (classical engine) |
-//! | [`mcts`] | Neural MCTS with PUCT (kept minimal) |
+//! | [`mcts`] | Neural MCTS with PUCT |
 //! | [`pybridge`] | PyO3 bindings exposing engine to Python |
 //!
-//! The old `game` module is now a thin re-export for backward compatibility.
-//! Its contents have been split into [`board`] (state), [`patterns`] (evaluation),
-//! and [`threats`] (tactics).
+//! ## Layer dependency
+//!
+//! ```text
+//! core → eval → board → threats → {search, mcts, encoder} → py
+//!                              ↑
+//!                          tests/oracle  (test-only)
+//! ```
 //!
 //! ## Rules
 //!
@@ -37,16 +40,17 @@ pub mod board;
 pub mod core;
 pub mod encoder;
 pub mod eval;
-pub mod game;
 pub mod mcts;
-pub mod patterns;
 pub mod search;
 pub mod threats;
 
 #[cfg(feature = "python")]
 mod pybridge;
 
+#[cfg(test)]
+mod tests;
+
 // Re-exports for convenient access
-pub use core::{hex_distance, Hex, HEX_DIRECTIONS};
+pub use core::{hex_distance, Hex, Turn, HEX_DIRECTIONS, PLACEMENT_RADIUS, WIN_LENGTH};
 pub use eval::{extract_features, FEATURE_COUNT};
-pub use game::{GameError, HexGameState, MoveRecord, PLACEMENT_RADIUS, WIN_LENGTH};
+pub use board::{GameError, HexGameState, MoveRecord};

@@ -1,0 +1,195 @@
+use crate::core::{Hex, HEX_DIRECTIONS, WIN_LENGTH};
+use crate::eval::grid::{WIN_GRID_RADIUS, win_grid_in_bounds};
+use crate::eval::patterns::{PATTERN_COUNTS, PATTERN_VALUES, POW3};
+use crate::eval::state::{EvalState, ThreatCounts};
+use rustc_hash::FxHashMap;
+
+fn recompute_score(stones: &FxHashMap<Hex, u8>) -> i32 {
+    let mut total = 0i32;
+    for q in -10..=10 {
+        for r in -10..=10 {
+            for dir in 0..3u8 {
+                let (dq, dr) = HEX_DIRECTIONS[dir as usize];
+                let mut idx = 0usize;
+                for off in 0..WIN_LENGTH as usize {
+                    let h = Hex::new(q + dq * off as i32, r + dr * off as i32);
+                    let val = match stones.get(&h) {
+                        Some(&0) => 1,
+                        Some(&1) => 2,
+                        _ => 0,
+                    };
+                    idx += val * POW3[off];
+                }
+                total += PATTERN_VALUES[idx];
+            }
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ternary_index_roundtrip() {
+        for idx in 0..729usize {
+            let (expected_p0, expected_p1) = PATTERN_COUNTS[idx];
+            let mut manual_p0 = 0u8;
+            let mut manual_p1 = 0u8;
+            let mut n = idx;
+            for _ in 0..6 {
+                let digit = (n % 3) as u8;
+                if digit == 1 {
+                    manual_p0 += 1;
+                } else if digit == 2 {
+                    manual_p1 += 1;
+                }
+                n /= 3;
+            }
+            assert_eq!(
+                (manual_p0, manual_p1),
+                (expected_p0, expected_p1),
+                "PATTERN_COUNTS[{}] mismatch",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn pow3_values() {
+        let mut pow = 1usize;
+        for i in 0..6 {
+            assert_eq!(POW3[i], pow, "POW3[{}] should be {}", i, pow);
+            pow *= 3;
+        }
+    }
+
+    #[test]
+    fn pattern_values_not_all_zero() {
+        let mut all_zero = true;
+        for &v in PATTERN_VALUES.iter() {
+            if v != 0 {
+                all_zero = false;
+                break;
+            }
+        }
+        assert!(!all_zero, "PATTERN_VALUES should not all be zero");
+    }
+
+    #[test]
+    fn incremental_place_consistency() {
+        let mut eval = EvalState::new();
+        let mut stones = FxHashMap::default();
+
+        let placements = [
+            (Hex::new(0, 0), 0u8),
+            (Hex::new(1, 0), 1u8),
+            (Hex::new(2, 0), 0u8),
+            (Hex::new(0, 1), 1u8),
+            (Hex::new(-1, -1), 0u8),
+        ];
+
+        for &(cell, player) in &placements {
+            eval.place(&stones, cell, player);
+            stones.insert(cell, player);
+            let recomputed = recompute_score(&stones);
+            assert_eq!(
+                eval.score(), recomputed,
+                "score mismatch after placing at {:?} for player {}",
+                cell, player
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_unplace_restores_score() {
+        let mut eval = EvalState::new();
+        let mut stones = FxHashMap::default();
+
+        let placements = [
+            (Hex::new(0, 0), 0u8),
+            (Hex::new(1, 0), 1u8),
+            (Hex::new(2, 0), 0u8),
+            (Hex::new(0, 1), 1u8),
+        ];
+
+        for &(cell, player) in &placements {
+            eval.place(&stones, cell, player);
+            stones.insert(cell, player);
+        }
+
+        for _ in 0..placements.len() {
+            eval.unplace();
+        }
+
+        assert_eq!(eval.score(), 0, "score should be 0 after unplacing all");
+        assert_eq!(eval.counts(0), ThreatCounts::default());
+        assert_eq!(eval.counts(1), ThreatCounts::default());
+        assert_eq!(eval.hot_windows(0).count(), 0);
+        assert_eq!(eval.hot_windows(1).count(), 0);
+    }
+
+    #[test]
+    fn hot_windows_recomputed_match() {
+        let mut eval = EvalState::new();
+        let mut stones = FxHashMap::default();
+
+        let placements = [
+            (Hex::new(0, 0), 0u8),
+            (Hex::new(1, 0), 1u8),
+            (Hex::new(2, 0), 0u8),
+            (Hex::new(3, 0), 0u8),
+            (Hex::new(4, 0), 0u8),
+            (Hex::new(0, 1), 1u8),
+        ];
+
+        for &(cell, player) in &placements {
+            eval.place(&stones, cell, player);
+            stones.insert(cell, player);
+        }
+
+        // Recompute hot windows by scanning all board windows and computing indices from stones.
+        let mut recomputed_0 = Vec::new();
+        let mut recomputed_1 = Vec::new();
+
+        for q in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
+            for r in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
+                if !win_grid_in_bounds(q, r) {
+                    continue;
+                }
+                for dir in 0..3u8 {
+                    let (dq, dr) = HEX_DIRECTIONS[dir as usize];
+                    let mut idx = 0usize;
+                    for off in 0..WIN_LENGTH as usize {
+                        let h = Hex::new(q + dq * off as i32, r + dr * off as i32);
+                        let val = match stones.get(&h) {
+                            Some(&0) => 1,
+                            Some(&1) => 2,
+                            _ => 0,
+                        };
+                        idx += val * POW3[off];
+                    }
+                    let (p0, p1) = PATTERN_COUNTS[idx];
+                    if p0 >= 4 && p1 == 0 {
+                        recomputed_0.push(crate::core::WindowKey::new(q, r, dir));
+                    }
+                    if p1 >= 4 && p0 == 0 {
+                        recomputed_1.push(crate::core::WindowKey::new(q, r, dir));
+                    }
+                }
+            }
+        }
+
+        for (player, mut expected) in [(0u8, recomputed_0), (1u8, recomputed_1)] {
+            let mut actual: Vec<_> = eval.hot_windows(player).collect();
+            expected.sort_by_key(|k| (k.q(), k.r(), k.dir()));
+            actual.sort_by_key(|k| (k.q(), k.r(), k.dir()));
+            assert_eq!(
+                actual, expected,
+                "hot windows mismatch for player {}",
+                player
+            );
+        }
+    }
+}

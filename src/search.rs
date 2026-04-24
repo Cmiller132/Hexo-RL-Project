@@ -19,9 +19,12 @@ use std::cmp::Reverse;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
+use smallvec::SmallVec;
 use crate::eval::WIN_SCORE;
-use crate::game::HexGameState;
-use crate::patterns::WIN_LENGTH;
+use crate::board::HexGameState;
+use crate::core::WIN_LENGTH;
+use crate::core::Turn;
+use crate::threats::{live_cells, threat_status, turn_satisfies_status, ThreatStatus};
 
 // -------------------------------------------------------------------------
 // Constants
@@ -58,42 +61,14 @@ const TT_MAX_SIZE: usize = 2_000_000;
 /// Minimal O(1) evaluation from `player`'s perspective using incremental state.
 #[inline]
 fn evaluate(game: &HexGameState, player: u8) -> i32 {
-    if let Some(w) = game.winner {
+    if let Some(w) = game.winner() {
         return if w == player { WIN_SCORE } else { -WIN_SCORE };
     }
-    let mut score = if player == 0 { game.window_eval } else { -game.window_eval };
-    if game.current_player == player {
+    let mut score = if player == 0 { game.eval().score() } else { -game.eval().score() };
+    if game.current_player() == player {
         score += 15;
     }
     score
-}
-
-// -------------------------------------------------------------------------
-// Turn type
-// -------------------------------------------------------------------------
-
-/// A turn consists of 1 or 2 placements.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Turn {
-    pub m1: Hex,
-    pub m2: Option<Hex>,
-}
-
-impl Turn {
-    #[inline]
-    pub fn one(m: Hex) -> Self {
-        Turn { m1: m, m2: None }
-    }
-
-    #[inline]
-    pub fn two(a: Hex, b: Hex) -> Self {
-        // Canonical ordering for TT consistency
-        if a <= b {
-            Turn { m1: a, m2: Some(b) }
-        } else {
-            Turn { m1: b, m2: Some(a) }
-        }
-    }
 }
 
 // -------------------------------------------------------------------------
@@ -169,8 +144,8 @@ impl SearchState {
 
     fn update_history(&mut self, t: Turn, depth: i32) {
         let bonus = depth * depth;
-        *self.history.entry(t.m1).or_insert(0) += bonus;
-        if let Some(m2) = t.m2 {
+        *self.history.entry(t.first()).or_insert(0) += bonus;
+        if let Some(m2) = t.second() {
             *self.history.entry(m2).or_insert(0) += bonus;
         }
     }
@@ -189,17 +164,17 @@ impl SearchState {
 /// TT hash: board + side-to-move + placements remaining.
 #[inline]
 fn tt_hash(game: &HexGameState) -> u64 {
-    let side = if game.current_player == 0 {
+    let side = if game.current_player() == 0 {
         0x9e37_79b9_7f4a_7c15u64
     } else {
         0xc2b2_ae3d_27d4_eb4fu64
     };
-    let phase = match game.placements_remaining {
+    let phase = match game.placements_remaining() {
         0 => 0x1656_67b1_9e37_79f9u64,
         1 => 0x27d4_eb2f_1656_67c5u64,
         _ => 0x94d0_49bb_1331_11ebu64,
     };
-    game.zobrist_hash ^ side ^ phase
+    game.zobrist() ^ side ^ phase
 }
 
 // -------------------------------------------------------------------------
@@ -208,11 +183,12 @@ fn tt_hash(game: &HexGameState) -> u64 {
 
 /// Execute a full turn (1 or 2 placements). Returns (game_over, placements_made).
 fn make_turn(game: &mut HexGameState, t: Turn) -> (bool, u8) {
-    game.place(t.m1.q, t.m1.r).unwrap_or(true);
+    let m1 = t.first();
+    game.place(m1.q, m1.r).unwrap_or(true);
     if game.is_over() {
         return (true, 1);
     }
-    if let Some(m2) = t.m2 {
+    if let Some(m2) = t.second() {
         game.place(m2.q, m2.r).unwrap_or(true);
         if game.is_over() {
             return (true, 2);
@@ -225,7 +201,7 @@ fn make_turn(game: &mut HexGameState, t: Turn) -> (bool, u8) {
 /// Undo a full turn. `placed` = number of placements that were actually made.
 fn unmake_turn(game: &mut HexGameState, placed: u8) {
     for _ in 0..placed {
-        game.unmake_move();
+        game.unplace();
     }
 }
 
@@ -246,28 +222,28 @@ fn score_candidate(
     noise_level: f32,
     noise_seed: u64,
 ) -> i64 {
-    let delta = game.move_eval_delta(cell, game.current_player) as i64;
+    let delta = game.move_eval_delta(cell, game.current_player()) as i64;
     let hist = history.get(&cell).copied().unwrap_or(0).min(500_000) as i64;
 
     // Hot-window bonus: cells in opponent's hot windows (blocking threats)
     // These bonuses are NOT affected by noise — blocking must remain deterministic.
-    let opp = (1 - game.current_player) as usize;
+    let opp = (1 - game.current_player()) as usize;
     let mut tactical = 0i64;
-    for &(wq, wr, dir) in &game.hot_windows[opp] {
-        let (dq, dr) = HEX_DIRECTIONS[dir as usize];
+    for key in game.eval().hot_windows(opp as u8) {
+        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
         for k in 0..WIN_LENGTH {
-            if cell.q == wq + dq * k && cell.r == wr + dr * k {
+            if cell.q == key.q() + dq * k && cell.r == key.r() + dr * k {
                 tactical += 50_000;
                 break;
             }
         }
     }
     // Cells in our own hot windows (completing threats)
-    let p = game.current_player as usize;
-    for &(wq, wr, dir) in &game.hot_windows[p] {
-        let (dq, dr) = HEX_DIRECTIONS[dir as usize];
+    let p = game.current_player() as usize;
+    for key in game.eval().hot_windows(p as u8) {
+        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
         for k in 0..WIN_LENGTH {
-            if cell.q == wq + dq * k && cell.r == wr + dr * k {
+            if cell.q == key.q() + dq * k && cell.r == key.r() + dr * k {
                 tactical += 40_000;
                 break;
             }
@@ -310,7 +286,7 @@ fn generate_sorted_candidates(
         return cands;
     }
 
-    let sign = if game.current_player == 0 {
+    let sign = if game.current_player() == 0 {
         1i32
     } else {
         -1i32
@@ -336,7 +312,7 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
     for i in 0..n {
         for j in (i + 1)..n {
             if i + j <= max_pair_sum {
-                turns.push(Turn::two(cands[i], cands[j]));
+                turns.push(Turn::pair(cands[i], cands[j]));
             }
         }
     }
@@ -353,18 +329,18 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
 /// A 5-window (1 empty) is an instant win regardless of whether 1 or 2
 /// placements remain — the game ends as soon as the 6th stone is placed.
 fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
-    let p = player as usize;
-    if game.window_fours[p] == 0 && game.window_fives[p] == 0 {
+    let counts = game.eval().counts(player);
+    if counts.fours == 0 && counts.fives == 0 {
         return None;
     }
-    let remaining = game.placements_remaining as usize;
+    let remaining = game.placements_remaining() as usize;
 
-    for &(wq, wr, dir) in &game.hot_windows[p] {
-        let (dq, dr) = HEX_DIRECTIONS[dir as usize];
-        let mut empties = Vec::new();
+    for key in game.eval().hot_windows(player) {
+        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
+        let mut empties: SmallVec<[Hex; 2]> = SmallVec::new();
         for k in 0..WIN_LENGTH {
-            let h = Hex::new(wq + dq * k, wr + dr * k);
-            if !game.board.contains_key(&h) {
+            let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
+            if !game.stones().contains_key(&h) {
                 empties.push(h);
             }
         }
@@ -376,10 +352,10 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
                 // A single empty in a 5-window wins immediately.
                 // Even with 2 placements remaining, Turn::one wins because
                 // the game ends after the 6th stone is placed.
-                return Some(Turn::one(empties[0]));
+                return Some(Turn::single(empties[0]));
             }
             2 if remaining >= 2 => {
-                return Some(Turn::two(empties[0], empties[1]));
+                return Some(Turn::pair(empties[0], empties[1]));
             }
             _ => {}
         }
@@ -390,30 +366,6 @@ fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
 // -------------------------------------------------------------------------
 // Threat analysis
 // -------------------------------------------------------------------------
-
-/// Filter turns to only keep those that block all opponent threats.
-fn filter_turns_by_threats(game: &HexGameState, turns: &mut Vec<Turn>) {
-    let opp = 1 - game.current_player;
-    let must_hit = game.collect_threat_window_empties(opp);
-
-    if must_hit.is_empty() || turns.is_empty() {
-        return;
-    }
-
-    let filtered: Vec<Turn> = turns
-        .iter()
-        .copied()
-        .filter(|t| {
-            must_hit
-                .iter()
-                .all(|set| set.contains(&t.m1) || t.m2.map_or(false, |m2| set.contains(&m2)))
-        })
-        .collect();
-
-    if !filtered.is_empty() {
-        *turns = filtered;
-    }
-}
 
 // -------------------------------------------------------------------------
 // Turn generation
@@ -426,17 +378,17 @@ fn generate_root_turns(
     noise_level: f32,
     noise_seed: u64,
 ) -> Vec<Turn> {
-    if game.board.is_empty() {
-        return vec![Turn::one(Hex::ORIGIN)];
+    if game.stones().is_empty() {
+        return vec![Turn::single(Hex::ORIGIN)];
     }
 
     // Opening: player 0 only places 1 stone
-    if game.placements_remaining == 1 && game.move_count == 0 {
-        return vec![Turn::one(Hex::ORIGIN)];
+    if game.placements_remaining() == 1 && game.move_count() == 0 {
+        return vec![Turn::single(Hex::ORIGIN)];
     }
 
     // Check for instant wins (always deterministic)
-    if let Some(win_turn) = find_instant_win(game, game.current_player) {
+    if let Some(win_turn) = find_instant_win(game, game.current_player()) {
         return vec![win_turn];
     }
 
@@ -444,9 +396,9 @@ fn generate_root_turns(
         generate_sorted_candidates(game, history, ROOT_CANDIDATE_CAP, noise_level, noise_seed);
 
     // Add colony candidate: far from centroid
-    if cands.len() >= 2 && !game.board.is_empty() {
+    if cands.len() >= 2 && !game.stones().is_empty() {
         let (sq, sr, n) = game
-            .board
+            .stones()
             .keys()
             .fold((0i64, 0i64, 0u32), |(sq, sr, n), h| {
                 (sq + h.q as i64, sr + h.r as i64, n + 1)
@@ -455,7 +407,7 @@ fn generate_root_turns(
         let cr = (sr as f64 / n as f64).round() as i32;
 
         let max_r = game
-            .board
+            .stones()
             .keys()
             .map(|h| hex_distance(*h, Hex::new(cq, cr)))
             .max()
@@ -463,15 +415,15 @@ fn generate_root_turns(
 
         let colony_dist = max_r + 3;
         let dirs: [(i32, i32); 6] = [(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)];
-        let dir_idx = (noise_seed as usize ^ game.zobrist_hash as usize) % 6;
+        let dir_idx = (noise_seed as usize ^ game.zobrist() as usize) % 6;
         let (dq, dr) = dirs[dir_idx];
         let colony = Hex::new(cq + dq * colony_dist, cr + dr * colony_dist);
 
-        if !game.board.contains_key(&colony)
+        if !game.stones().contains_key(&colony)
             && game
-                .board
+                .stones()
                 .keys()
-                .any(|&h| hex_distance(h, colony) <= crate::game::PLACEMENT_RADIUS)
+                .any(|&h| hex_distance(h, colony) <= crate::core::PLACEMENT_RADIUS)
         {
             if !cands.contains(&colony) {
                 cands.push(colony);
@@ -480,14 +432,15 @@ fn generate_root_turns(
     }
 
     // Handle single-placement turns
-    if game.placements_remaining == 1 {
-        return cands.into_iter().map(Turn::one).collect();
+    if game.placements_remaining() == 1 {
+        return cands.into_iter().map(Turn::single).collect();
     }
 
     // Generate pairs with pair-sum constraint at root too
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
 
-    filter_turns_by_threats(game, &mut turns);
+    let ts = threat_status(game);
+    turns.retain(|t| turn_satisfies_status(&ts, *t));
     turns
 }
 
@@ -499,14 +452,14 @@ fn generate_inner_turns(
     history: &FxHashMap<Hex, i32>,
     noise_seed: u64,
 ) -> Vec<Turn> {
-    if game.board.is_empty() {
-        return vec![Turn::one(Hex::ORIGIN)];
+    if game.stones().is_empty() {
+        return vec![Turn::single(Hex::ORIGIN)];
     }
 
     // Single-placement turn
-    if game.placements_remaining == 1 {
+    if game.placements_remaining() == 1 {
         let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
-        return cands.into_iter().map(Turn::one).collect();
+        return cands.into_iter().map(Turn::single).collect();
     }
 
     // Note: instant-win check is done by the caller (alphabeta) before
@@ -515,7 +468,8 @@ fn generate_inner_turns(
     let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
 
-    filter_turns_by_threats(game, &mut turns);
+    let ts = threat_status(game);
+    turns.retain(|t| turn_satisfies_status(&ts, *t));
     turns
 }
 
@@ -546,13 +500,15 @@ fn promote_best_turns(turns: &mut Vec<Turn>, tt_best: Option<Turn>, killer: Opti
 
 /// Generate turns from hot window cells only (for quiescence search).
 fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
-    let player = game.current_player;
+    let player = game.current_player();
     let opp = 1 - player;
 
     // Single-placement quiescence
-    if game.placements_remaining == 1 {
-        let opp_threats = game.collect_threat_cells(opp);
-        let my_threats = game.collect_threat_cells(player);
+    if game.placements_remaining() == 1 {
+        let mut opp_threats = Vec::new();
+        live_cells(game, opp, &mut opp_threats);
+        let mut my_threats = Vec::new();
+        live_cells(game, player, &mut my_threats);
         let cells = if !opp_threats.is_empty() {
             opp_threats
         } else {
@@ -561,11 +517,13 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
         if cells.is_empty() {
             return Vec::new();
         }
-        return cells.into_iter().take(6).map(Turn::one).collect();
+        return cells.into_iter().take(6).map(Turn::single).collect();
     }
 
-    let opp_threats = game.collect_threat_cells(opp);
-    let my_threats = game.collect_threat_cells(player);
+    let mut opp_threats = Vec::new();
+    live_cells(game, opp, &mut opp_threats);
+    let mut my_threats = Vec::new();
+    live_cells(game, player, &mut my_threats);
     let primary = if !opp_threats.is_empty() {
         &opp_threats
     } else {
@@ -590,11 +548,11 @@ fn generate_threat_turns(game: &HexGameState) -> Vec<Turn> {
     let n = all_threats.len().min(8);
     for i in 0..n {
         for j in (i + 1)..n {
-            turns.push(Turn::two(all_threats[i], all_threats[j]));
+            turns.push(Turn::pair(all_threats[i], all_threats[j]));
         }
     }
 
-    turns.sort_by(|a, b| a.m1.cmp(&b.m1).then(a.m2.cmp(&b.m2)));
+    turns.sort_by(|a, b| a.first().cmp(&b.first()).then(a.second().cmp(&b.second())));
     turns.dedup();
     turns.truncate(16);
     turns
@@ -647,10 +605,10 @@ fn quiesce(
         return 0;
     }
 
-    let player = game.current_player;
+    let player = game.current_player();
 
     if game.is_over() {
-        return if game.winner == Some(player) {
+        return if game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             -(WIN_SCORE - ply as i32)
@@ -671,12 +629,12 @@ fn quiesce(
     }
 
     // Only extend when threats exist
-    let p = player as usize;
-    let o = 1 - p;
-    if game.window_fives[p] == 0
-        && game.window_fives[o] == 0
-        && game.window_fours[p] == 0
-        && game.window_fours[o] == 0
+    let counts_p = game.eval().counts(player);
+    let counts_o = game.eval().counts(1 - player);
+    if counts_p.fives == 0
+        && counts_o.fives == 0
+        && counts_p.fours == 0
+        && counts_o.fours == 0
     {
         return alpha;
     }
@@ -684,7 +642,7 @@ fn quiesce(
     // Check instant win
     if let Some(win_turn) = find_instant_win(game, player) {
         let (over, placed) = make_turn(game, win_turn);
-        let score = if over && game.winner == Some(player) {
+        let score = if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else if over {
             let s = -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1);
@@ -693,7 +651,7 @@ fn quiesce(
             -quiesce(game, ss, -beta, -alpha, qdepth - 1, ply + 1)
         };
         unmake_turn(game, placed);
-        return if over && game.winner == Some(player) {
+        return if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             score
@@ -701,7 +659,7 @@ fn quiesce(
     }
 
     // Check unblockable opponent win
-    if game.is_opponent_win_unblockable(game.placements_remaining) {
+    if matches!(threat_status(game), ThreatStatus::Unblockable) {
         return -(WIN_SCORE - ply as i32 - 1);
     }
 
@@ -713,7 +671,7 @@ fn quiesce(
     for t in &turns {
         let (over, placed) = make_turn(game, *t);
         let score = if over {
-            if game.winner == Some(player) {
+            if game.winner() == Some(player) {
                 WIN_SCORE - ply as i32
             } else {
                 -(WIN_SCORE - ply as i32)
@@ -758,11 +716,11 @@ fn alphabeta(
     }
     ss.nodes += 1;
 
-    let player = game.current_player;
+    let player = game.current_player();
 
     // Terminal check
     if game.is_over() {
-        return if game.winner == Some(player) {
+        return if game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             -(WIN_SCORE - ply as i32)
@@ -777,7 +735,7 @@ fn alphabeta(
     // Instant win check
     if let Some(win_turn) = find_instant_win(game, player) {
         let (over, placed) = make_turn(game, win_turn);
-        let score = if over && game.winner == Some(player) {
+        let score = if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
         } else {
             -alphabeta(game, ss, depth - 1, ply + 1, -beta, -alpha)
@@ -787,7 +745,7 @@ fn alphabeta(
     }
 
     // Unblockable opponent win check
-    if game.is_opponent_win_unblockable(game.placements_remaining) {
+    if matches!(threat_status(game), ThreatStatus::Unblockable) {
         return -(WIN_SCORE - ply as i32 - 1);
     }
 
@@ -844,9 +802,9 @@ fn alphabeta(
         let (over, placed) = make_turn(game, *t);
 
         let score = if over {
-            if game.winner == Some(player) {
+            if game.winner() == Some(player) {
                 WIN_SCORE - ply as i32
-            } else if game.winner == Some(1 - player) {
+            } else if game.winner() == Some(1 - player) {
                 -(WIN_SCORE - ply as i32)
             } else {
                 0
@@ -948,7 +906,7 @@ fn search_root(
     init_alpha: i32,
     init_beta: i32,
 ) -> (Turn, i32, Vec<(Turn, i32)>) {
-    let player = game.current_player;
+    let player = game.current_player();
     let mut alpha = init_alpha;
     let beta = init_beta;
     let mut best_turn = root_turns[0];
@@ -959,7 +917,7 @@ fn search_root(
         let (over, placed) = make_turn(game, *t);
 
         let score = if over {
-            if game.winner == Some(player) {
+            if game.winner() == Some(player) {
                 WIN_SCORE
             } else {
                 -WIN_SCORE
@@ -1029,9 +987,9 @@ pub fn iterative_deepening(
     ss.maybe_clear_tt();
 
     // Handle opening move
-    if game.board.is_empty() {
+    if game.stones().is_empty() {
         return SearchResult {
-            best_turn: Turn::one(Hex::ORIGIN),
+            best_turn: Turn::single(Hex::ORIGIN),
             best_move: Hex::ORIGIN,
             score: 0,
             depth_reached: 0,
@@ -1044,13 +1002,13 @@ pub fn iterative_deepening(
     let mut root_turns = generate_root_turns(game, &ss.history, ss.noise_level, ss.noise_seed);
     if root_turns.is_empty() {
         let c = game.candidates_near2();
-        if c.len() >= 2 && game.placements_remaining >= 2 {
-            root_turns.push(Turn::two(c[0], c[1]));
+        if c.len() >= 2 && game.placements_remaining() >= 2 {
+            root_turns.push(Turn::pair(c[0], c[1]));
         } else if !c.is_empty() {
-            root_turns.push(Turn::one(c[0]));
+            root_turns.push(Turn::single(c[0]));
         } else {
             return SearchResult {
-                best_turn: Turn::one(Hex::ORIGIN),
+                best_turn: Turn::single(Hex::ORIGIN),
                 best_move: Hex::ORIGIN,
                 score: 0,
                 depth_reached: 0,
@@ -1136,8 +1094,8 @@ pub fn iterative_deepening(
         cands
             .iter()
             .map(|&m| {
-                let sign = if game.current_player == 0 { 1 } else { -1 };
-                let score = game.move_eval_delta(m, game.current_player) * sign;
+                let sign = if game.current_player() == 0 { 1 } else { -1 };
+                let score = game.move_eval_delta(m, game.current_player()) * sign;
                 (m, score)
             })
             .collect()
@@ -1147,7 +1105,7 @@ pub fn iterative_deepening(
 
     SearchResult {
         best_turn,
-        best_move: best_turn.m1,
+        best_move: best_turn.first(),
         score: best_score,
         depth_reached,
         nodes: ss.nodes,

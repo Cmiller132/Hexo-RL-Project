@@ -274,7 +274,7 @@ impl MCTSEngine {
         offset_r: i32,
         legal: &[Hex],
     ) {
-        let player = self.game.current_player;
+        let player = self.game.current_player();
         self.expand_node(
             self.root_idx,
             legal,
@@ -357,7 +357,7 @@ impl MCTSEngine {
 
             // Set player if this is the first time we've reached this node.
             if self.arena[node_idx as usize].player == 255 {
-                self.arena[node_idx as usize].player = self.game.current_player;
+                self.arena[node_idx as usize].player = self.game.current_player();
             }
 
             // ── Step 2: Apply virtual loss to the search path ──
@@ -376,7 +376,7 @@ impl MCTSEngine {
                 // From the leaf node's player perspective:
                 // +1.0 if they won, -1.0 if they lost.
                 let node_player = self.arena[node_idx as usize].player;
-                let value = if self.game.winner == Some(node_player) {
+                let value = if self.game.winner() == Some(node_player) {
                     1.0
                 } else {
                     -1.0
@@ -414,7 +414,7 @@ impl MCTSEngine {
 
             // ── Step 4: Undo moves to restore root state ──
             for _ in 0..depth {
-                self.game.unmake_move();
+                self.game.unplace();
             }
         }
 
@@ -556,12 +556,12 @@ impl MCTSEngine {
         // grandchildren reached via threat-illegal paths would leak into RGSC
         // candidates as spurious off-policy positions.
         if self.constrain_threats {
-            let me = self.game.current_player as usize;
+            let me = self.game.current_player() as usize;
             let opp = 1 - me;
-            let has_threats = self.game.window_fives[me] > 0
-                || self.game.window_fours[me] > 0
-                || self.game.window_fives[opp] > 0
-                || self.game.window_fours[opp] > 0;
+            let has_threats = self.game.eval().counts(me as u8).fives > 0
+                || self.game.eval().counts(me as u8).fours > 0
+                || self.game.eval().counts(opp as u8).fives > 0
+                || self.game.eval().counts(opp as u8).fours > 0;
             if has_threats && self.arena[child_idx as usize].is_expanded {
                 // Remember the old child range so we can BFS-invalidate descendants.
                 let (old_start, old_count) = {
@@ -764,7 +764,7 @@ impl MCTSEngine {
                 // Record the full move history for this position.
                 let history: Vec<(u8, i16, i16)> = self
                     .game
-                    .move_history
+                    .move_history()
                     .iter()
                     .map(|rec| (rec.player, rec.cell.q as i16, rec.cell.r as i16))
                     .collect();
@@ -773,7 +773,7 @@ impl MCTSEngine {
 
             // Undo the replayed moves.
             for _ in 0..placed {
-                self.game.unmake_move();
+                self.game.unplace();
             }
         }
 

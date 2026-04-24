@@ -6,7 +6,8 @@
 //! previous duplication between `pybridge.rs` and `mcts.rs`.
 
 use crate::board::HexGameState;
-use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
+use crate::core::{hex_distance, Hex};
+use crate::threats::{live_cells, threat_status, ThreatStatus};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -119,7 +120,7 @@ pub fn encode_board_into(
         TENSOR_SIZE
     );
 
-    let board = &game.board;
+    let board = game.stones();
 
     // ── Compute centroid and offsets ──
     // Python's round() uses banker's rounding (round half to even).
@@ -137,9 +138,9 @@ pub fn encode_board_into(
         (cq - HALF_BOARD, cr - HALF_BOARD)
     };
 
-    let current = game.current_player;
-    let mc = game.move_count;
-    let pr = game.placements_remaining;
+    let current = game.current_player();
+    let mc = game.move_count();
+    let pr = game.placements_remaining();
     let is_phase_2 = pr == 1 && mc > 0;
 
     // Zero the active region of the buffer.
@@ -169,7 +170,7 @@ pub fn encode_board_into(
     // ── Channels 7-8: stone recency ──
     // `1/(1 + plies_ago)` for each stone in the move history, split by
     // whether the stone belongs to the current player (ch7) or opponent (ch8).
-    for (ply_idx, rec) in game.move_history.iter().enumerate() {
+    for (ply_idx, rec) in game.move_history().iter().enumerate() {
         let gi = rec.cell.q - offset_q;
         let gj = rec.cell.r - offset_r;
         if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
@@ -193,8 +194,23 @@ pub fn encode_board_into(
     // inside the tensor window. The (possibly constrained) move list is
     // returned so callers can map policy logits back to moves.
     let mut legal = game.legal_moves_near(near_radius);
-    if let Some(constrained) = game.compute_threat_constrained_moves(&legal, constrain_threats) {
-        legal = constrained;
+    if constrain_threats {
+        let constrained: Vec<Hex> = match threat_status(game) {
+            ThreatStatus::Quiet | ThreatStatus::Unblockable => Vec::new(),
+            ThreatStatus::WinningTurn(t) => {
+                let mut allowed = vec![t.first()];
+                if let Some(s) = t.second() {
+                    allowed.push(s);
+                }
+                legal.iter().copied().filter(|h| allowed.contains(h)).collect()
+            }
+            ThreatStatus::MustBlock(b) => {
+                legal.iter().copied().filter(|h| b.cells.contains(h)).collect()
+            }
+        };
+        if !constrained.is_empty() {
+            legal = constrained;
+        }
     }
     for h in &legal {
         let gi = h.q - offset_q;
@@ -215,7 +231,7 @@ pub fn encode_board_into(
     // Marks the cell of the most recent move in history, which is the first
     // placement of the current turn when `is_phase_2` is true.
     if is_phase_2 {
-        if let Some(last) = game.move_history.last() {
+        if let Some(last) = game.move_history().last() {
             let gi = last.cell.q - offset_q;
             let gj = last.cell.r - offset_r;
             if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
@@ -261,27 +277,26 @@ pub fn encode_board_into(
     // Ch 9: empty cells that lie inside the opponent's "hot windows"
     //     (windows with 4+ opponent stones and 0 own stones).
     // Ch 10: empty cells that lie inside the current player's hot windows.
-    {
-        use crate::patterns::WIN_LENGTH;
-        let opp = (1 - current) as usize;
-        let own = current as usize;
+    let mut hot_buf = Vec::new();
 
-        for (ch, player_idx) in [(9usize, opp), (10usize, own)] {
-            for &(wq, wr, dir) in &game.hot_windows[player_idx] {
-                let (dq, dr) = HEX_DIRECTIONS[dir as usize];
-                for k in 0..WIN_LENGTH {
-                    let cq = wq + dq * k;
-                    let cr = wr + dr * k;
-                    let h = Hex::new(cq, cr);
-                    if !board.contains_key(&h) {
-                        let gi = cq - offset_q;
-                        let gj = cr - offset_r;
-                        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
-                            out[idx(ch, gi, gj)] = 1.0;
-                        }
-                    }
-                }
-            }
+    // Channel 10 (own live cells)
+    live_cells(game, current, &mut hot_buf);
+    for h in &hot_buf {
+        let gi = h.q - offset_q;
+        let gj = h.r - offset_r;
+        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+            out[idx(10, gi, gj)] = 1.0;
+        }
+    }
+
+    // Channel 9 (opponent live cells)
+    let opp = 1 - current;
+    live_cells(game, opp, &mut hot_buf);
+    for h in &hot_buf {
+        let gi = h.q - offset_q;
+        let gj = h.r - offset_r;
+        if gi >= 0 && gi < BOARD_SIZE && gj >= 0 && gj < BOARD_SIZE {
+            out[idx(9, gi, gj)] = 1.0;
         }
     }
 

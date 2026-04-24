@@ -93,6 +93,48 @@ impl Ord for Hex {
     }
 }
 
+/// A turn consists of 1 or 2 placements.
+///
+/// `Turn::single` creates a one-placement turn.
+/// `Turn::pair` creates a two-placement turn with canonical ordering
+/// (smaller `Hex` first) for TT consistency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Turn {
+    first: Hex,
+    second: Option<Hex>,
+}
+
+impl Turn {
+    #[inline]
+    pub const fn single(h: Hex) -> Self {
+        Turn { first: h, second: None }
+    }
+
+    #[inline]
+    pub fn pair(a: Hex, b: Hex) -> Self {
+        if a <= b {
+            Turn { first: a, second: Some(b) }
+        } else {
+            Turn { first: b, second: Some(a) }
+        }
+    }
+
+    #[inline]
+    pub const fn first(self) -> Hex {
+        self.first
+    }
+
+    #[inline]
+    pub const fn second(self) -> Option<Hex> {
+        self.second
+    }
+
+    #[inline]
+    pub const fn placements(self) -> u8 {
+        if self.second.is_some() { 2 } else { 1 }
+    }
+}
+
 /// The three principal line-checking directions on a hex grid.
 ///
 /// Each tuple is a delta `(dq, dr)` that moves one step along a unique axis.
@@ -101,6 +143,95 @@ impl Ord for Hex {
 /// direction on the same line.  Together they form a complete basis for
 /// straight-line win detection on a hexagonal board.
 pub const HEX_DIRECTIONS: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
+
+/// Number of stones in a row required to win.
+pub const WIN_LENGTH: i32 = 6;
+
+/// Maximum distance from the origin at which a stone may be placed.
+pub const PLACEMENT_RADIUS: i32 = 8;
+
+/// A compact key representing a sliding "window" of cells along one of the
+/// three principal hex directions.
+///
+/// `WindowKey` replaces the old `(i32, i32, u8)` tuple for hot-window lookups.
+/// It packs `q`, `r` and `dir` into a single `u32` so that it can be used
+/// directly as a cheap `HashMap` / `HashSet` key without heap allocation.
+///
+/// # Bit layout
+///
+/// ```text
+/// [ dir:2 | r:15 (signed, -16384..16383) | q:15 (signed, -16384..16383) ]
+/// ```
+///
+/// Both coordinates are stored in two's-complement form and sign-extended on
+/// extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowKey(u32);
+
+impl WindowKey {
+    /// Create a new `WindowKey` from axial coordinates and a direction index.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `q` or `r` are outside the range
+    /// `-16384..=16383` or if `dir` is larger than `3`.
+    #[inline(always)]
+    pub const fn new(q: i32, r: i32, dir: u8) -> Self {
+        debug_assert!(
+            q >= -16384 && q <= 16383,
+            "q coordinate out of 15-bit signed range"
+        );
+        debug_assert!(
+            r >= -16384 && r <= 16383,
+            "r coordinate out of 15-bit signed range"
+        );
+        debug_assert!(dir < 4, "dir must fit in 2 bits (0..3)");
+
+        let q_bits = (q as u32) & 0x7FFF;
+        let r_bits = (r as u32) & 0x7FFF;
+        let dir_bits = (dir as u32) & 0x3;
+        Self((dir_bits << 30) | (r_bits << 15) | q_bits)
+    }
+
+    /// Extract the `q` coordinate (15-bit signed, sign-extended to `i32`).
+    #[inline(always)]
+    pub const fn q(self) -> i32 {
+        sign_extend_15(self.0 & 0x7FFF)
+    }
+
+    /// Extract the `r` coordinate (15-bit signed, sign-extended to `i32`).
+    #[inline(always)]
+    pub const fn r(self) -> i32 {
+        sign_extend_15((self.0 >> 15) & 0x7FFF)
+    }
+
+    /// Extract the direction index (`0..3`).
+    #[inline(always)]
+    pub const fn dir(self) -> u8 {
+        ((self.0 >> 30) & 0x3) as u8
+    }
+
+    /// Return the [`Hex`] at `offset` steps along this window's direction.
+    ///
+    /// `offset` may be negative to step backward.  The direction vector is
+    /// taken from [`HEX_DIRECTIONS`].
+    #[inline(always)]
+    pub fn cell_at(self, offset: i32) -> Hex {
+        let (dq, dr) = HEX_DIRECTIONS[self.dir() as usize];
+        Hex::new(self.q() + dq * offset, self.r() + dr * offset)
+    }
+}
+
+/// Sign-extend a 15-bit two's-complement value to a full `i32`.
+const fn sign_extend_15(raw: u32) -> i32 {
+    // The sign bit for a 15-bit value is bit 14 (0x4000).
+    if raw & 0x4000 != 0 {
+        // Set all upper bits to 1 so the i32 interpretation becomes negative.
+        (raw | 0xFFFF8000) as i32
+    } else {
+        raw as i32
+    }
+}
 
 /// Compute the hex distance between two axial coordinates.
 ///
@@ -211,5 +342,161 @@ mod tests {
     #[test]
     fn directions_count() {
         assert_eq!(HEX_DIRECTIONS.len(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // WindowKey round-trip and behaviour tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn windowkey_roundtrip_positive() {
+        let key = WindowKey::new(42, 100, 2);
+        assert_eq!(key.q(), 42);
+        assert_eq!(key.r(), 100);
+        assert_eq!(key.dir(), 2);
+    }
+
+    #[test]
+    fn windowkey_roundtrip_negative() {
+        let key = WindowKey::new(-100, -42, 1);
+        assert_eq!(key.q(), -100);
+        assert_eq!(key.r(), -42);
+        assert_eq!(key.dir(), 1);
+    }
+
+    #[test]
+    fn windowkey_roundtrip_mixed() {
+        let key = WindowKey::new(-16384, 16383, 3);
+        assert_eq!(key.q(), -16384);
+        assert_eq!(key.r(), 16383);
+        assert_eq!(key.dir(), 3);
+    }
+
+    #[test]
+    fn windowkey_roundtrip_zero() {
+        let key = WindowKey::new(0, 0, 0);
+        assert_eq!(key.q(), 0);
+        assert_eq!(key.r(), 0);
+        assert_eq!(key.dir(), 0);
+    }
+
+    #[test]
+    fn windowkey_max_positive_coords() {
+        let key = WindowKey::new(16383, 16383, 0);
+        assert_eq!(key.q(), 16383);
+        assert_eq!(key.r(), 16383);
+    }
+
+    #[test]
+    fn windowkey_equality_and_hashing() {
+        use std::collections::HashSet;
+        let a = WindowKey::new(1, 2, 0);
+        let b = WindowKey::new(1, 2, 0);
+        let c = WindowKey::new(1, 2, 1);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b); // duplicate
+        set.insert(c);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn windowkey_copy_trait() {
+        let a = WindowKey::new(5, -5, 2);
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn windowkey_cell_at_along_axis_a() {
+        // Direction 0 is (1, 0).
+        let key = WindowKey::new(0, 0, 0);
+        assert_eq!(key.cell_at(0), Hex::new(0, 0));
+        assert_eq!(key.cell_at(1), Hex::new(1, 0));
+        assert_eq!(key.cell_at(5), Hex::new(5, 0));
+        assert_eq!(key.cell_at(-1), Hex::new(-1, 0));
+    }
+
+    #[test]
+    fn windowkey_cell_at_along_axis_b() {
+        // Direction 1 is (0, 1).
+        let key = WindowKey::new(3, -2, 1);
+        assert_eq!(key.cell_at(0), Hex::new(3, -2));
+        assert_eq!(key.cell_at(2), Hex::new(3, 0));
+        assert_eq!(key.cell_at(-2), Hex::new(3, -4));
+    }
+
+    #[test]
+    fn windowkey_cell_at_along_axis_c() {
+        // Direction 2 is (1, -1).
+        let key = WindowKey::new(1, 1, 2);
+        assert_eq!(key.cell_at(0), Hex::new(1, 1));
+        assert_eq!(key.cell_at(1), Hex::new(2, 0));
+        assert_eq!(key.cell_at(-1), Hex::new(0, 2));
+    }
+
+    #[test]
+    fn windowkey_size_is_u32() {
+        assert_eq!(std::mem::size_of::<WindowKey>(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // Turn tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn turn_single() {
+        let t = Turn::single(Hex::new(1, 2));
+        assert_eq!(t.first(), Hex::new(1, 2));
+        assert_eq!(t.second(), None);
+        assert_eq!(t.placements(), 1);
+    }
+
+    #[test]
+    fn turn_pair_ordered() {
+        let t = Turn::pair(Hex::new(1, 2), Hex::new(3, 4));
+        assert_eq!(t.first(), Hex::new(1, 2));
+        assert_eq!(t.second(), Some(Hex::new(3, 4)));
+        assert_eq!(t.placements(), 2);
+    }
+
+    #[test]
+    fn turn_pair_canonical_ordering() {
+        // When passed in reverse order, pair should canonicalize (smaller first).
+        let t = Turn::pair(Hex::new(3, 4), Hex::new(1, 2));
+        assert_eq!(t.first(), Hex::new(1, 2));
+        assert_eq!(t.second(), Some(Hex::new(3, 4)));
+        assert_eq!(t.placements(), 2);
+    }
+
+    #[test]
+    fn turn_pair_equal_hexes() {
+        let t = Turn::pair(Hex::new(2, 2), Hex::new(2, 2));
+        assert_eq!(t.first(), Hex::new(2, 2));
+        assert_eq!(t.second(), Some(Hex::new(2, 2)));
+        assert_eq!(t.placements(), 2);
+    }
+
+    #[test]
+    fn turn_copy_trait() {
+        let a = Turn::single(Hex::new(0, 0));
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn turn_equality_and_hashing() {
+        use std::collections::HashSet;
+        let a = Turn::pair(Hex::new(1, 0), Hex::new(0, 1));
+        let b = Turn::pair(Hex::new(0, 1), Hex::new(1, 0));
+        assert_eq!(a, b);
+
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b); // duplicate after canonicalization
+        assert_eq!(set.len(), 1);
     }
 }
