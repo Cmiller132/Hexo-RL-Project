@@ -1,5 +1,5 @@
-use crate::board::*;
-use crate::core::{Hex, PLACEMENT_RADIUS, WIN_LENGTH};
+use hexgame::board::*;
+use hexgame::core::{Hex, PLACEMENT_RADIUS, WIN_LENGTH};
 
 #[cfg(test)]
 mod tests {
@@ -43,7 +43,7 @@ mod tests {
         let mut g = HexGameState::new();
         g.place(0, 0).unwrap();
 
-        assert_eq!(g.opponent_last_turn_cells(), vec![Hex::new(0, 0)]);
+        assert_eq!(g.opponent_last_turn_cells().as_slice(), &[Hex::new(0, 0)]);
     }
 
     #[test]
@@ -54,10 +54,8 @@ mod tests {
         g.place(1, 1).unwrap();
         g.place(0, 1).unwrap();
 
-        assert_eq!(
-            g.opponent_last_turn_cells(),
-            vec![Hex::new(1, 0), Hex::new(1, 1)]
-        );
+        let cells = g.opponent_last_turn_cells();
+        assert_eq!(cells.as_slice(), &[Hex::new(1, 0), Hex::new(1, 1)]);
     }
 
     // -- Placement validation --------------------------------------------
@@ -446,8 +444,9 @@ mod tests {
     #[test]
     fn set_position_basic() {
         let mut g = HexGameState::new();
-        g.set_position(&[(1, 0, 0), (2, 0, 0), (0, 1, 1)], 0, 2).unwrap();
-        assert_eq!(g.stones().len(), 3);
+        g.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 1)], 0, 2).unwrap();
+        assert_eq!(g.stones().len(), 4);
+        assert_eq!(g.stones().get(&Hex::new(0, 0)), Some(&0));
         assert_eq!(g.stones().get(&Hex::new(1, 0)), Some(&0));
         assert_eq!(g.stones().get(&Hex::new(2, 0)), Some(&0));
         assert_eq!(g.stones().get(&Hex::new(0, 1)), Some(&1));
@@ -478,7 +477,7 @@ mod tests {
     #[test]
     fn set_position_rejects_duplicate_cell() {
         let mut g = HexGameState::new();
-        let res = g.set_position(&[(1, 0, 0), (1, 0, 1)], 0, 2);
+        let res = g.set_position(&[(0, 0, 0), (1, 0, 0), (1, 0, 1)], 0, 2);
         assert!(matches!(res, Err(GameError::CellOccupied(_))));
     }
 
@@ -490,7 +489,7 @@ mod tests {
         g.place(0, 0).unwrap();
         g.place(1, 0).unwrap();
         g.place(0, 1).unwrap();
-        let cands = g.candidates_near2();
+        let cands = g.candidates_near2_sorted();
         assert!(!cands.is_empty());
         for i in 1..cands.len() {
             assert!(
@@ -528,6 +527,47 @@ mod tests {
         assert_eq!([g.eval().counts(0).fours(), g.eval().counts(1).fours()], fours0);
         assert_eq!([g.eval().counts(0).threes(), g.eval().counts(1).threes()], threes0);
         assert_eq!(g.eval().hot_len(0), hot0);
+    }
+
+    // -- Proptests ----------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..ProptestConfig::default() })]
+
+        #[test]
+        fn place_unplace_is_identity(
+            moves in prop::collection::vec((-8i32..=8, -8i32..=8), 1..15)
+        ) {
+            let mut game = HexGameState::new();
+            let _ = game.place(0, 0);
+            let mut placed = 0usize;
+            for (q, r) in moves {
+                if game.place(q, r).is_ok() {
+                    placed += 1;
+                }
+            }
+            let _hash_before = game.zobrist();
+            for _ in 0..placed + 1 {
+                game.unplace();
+            }
+            assert_eq!(game.zobrist(), 0, "zobrist after full unplace must be zero");
+            assert_eq!(game.move_count(), 0);
+        }
+
+        #[test]
+        fn zobrist_changes_on_every_valid_placement(
+            q in -8i32..=8,
+            r in -8i32..=8,
+        ) {
+            let mut game = HexGameState::new();
+            let _ = game.place(0, 0);
+            let before = game.zobrist();
+            if game.place(q, r).is_ok() {
+                assert_ne!(game.zobrist(), before, "zobrist must change on placement");
+            }
+        }
     }
 
     // -- Helpers ----------------------------------------------------------

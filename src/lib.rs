@@ -59,9 +59,9 @@ pub mod board;
 pub mod core;
 pub mod encoder;
 pub mod eval;
-pub mod mcts;
-pub mod search;
-pub mod threats;
+pub(crate) mod mcts;
+pub(crate) mod search;
+pub(crate) mod threats;
 
 #[cfg(feature = "python")]
 mod pybridge;

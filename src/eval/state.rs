@@ -238,6 +238,15 @@ impl EvalState {
         }
     }
 
+    /// Zero all state in place, avoiding reallocation.
+    pub fn clear(&mut self) {
+        self.indices.fill(0);
+        self.score = 0;
+        self.counts = [ThreatCounts::default(); 2];
+        self.hot = HotWindows::new();
+        self.delta_stack.clear();
+    }
+
     /// Incrementally evaluate a stone placement.
     ///
     /// # Arguments
@@ -261,7 +270,7 @@ impl EvalState {
             let gi = win_grid_idx(sq, sr, dir);
             let old_idx = self.indices[gi] as usize;
             let new_idx = old_idx + (cell_val as usize) * POW3[off as usize];
-            debug_assert!(new_idx < 729);
+            assert!(new_idx < 729, "pattern index out of range: {} (cell_val={}, off={})", new_idx, cell_val, off);
 
             delta.score += PATTERN_VALUES[new_idx] - PATTERN_VALUES[old_idx];
 
@@ -316,7 +325,7 @@ impl EvalState {
                 "unplace: index underflow at gi={gi}"
             );
             let old_idx = new_idx - cell_val * POW3[off as usize];
-            debug_assert!(old_idx < 729);
+            assert!(old_idx < 729, "pattern index out of range on unplace: {}", old_idx);
 
             let (old_p0, old_p1) = PATTERN_COUNTS[old_idx];
             let (new_p0, new_p1) = PATTERN_COUNTS[new_idx];
@@ -449,7 +458,7 @@ impl EvalState {
             let gi = win_grid_idx(sq, sr, dir);
             let old_idx = self.indices[gi] as usize;
             let new_idx = old_idx + cell_val * POW3[off as usize];
-            debug_assert!(new_idx < 729);
+            assert!(new_idx < 729, "pattern index out of range in score_delta: {}", new_idx);
 
             delta += PATTERN_VALUES[new_idx] - PATTERN_VALUES[old_idx];
         });

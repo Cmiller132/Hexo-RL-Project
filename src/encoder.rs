@@ -9,9 +9,30 @@
 //! Both the MCTS search tree and the Python training pipeline call into here,
 //! eliminating the previous duplication between `pybridge.rs` and `mcts.rs`.
 
+use std::sync::OnceLock;
+
 use crate::board::HexGameState;
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS, WIN_LENGTH};
 use crate::threats::{live_cells, threat_status, ThreatStatus};
+
+// ── Pre-computed channel ─────────────────────────────────────────────────
+
+static CENTROID_DIST_CHANNEL: OnceLock<[f32; BOARD_AREA]> = OnceLock::new();
+
+fn centroid_dist_channel() -> &'static [f32; BOARD_AREA] {
+    CENTROID_DIST_CHANNEL.get_or_init(|| {
+        let center = Hex::new(HALF_BOARD, HALF_BOARD);
+        let mut buf = [0.0f32; BOARD_AREA];
+        for gi in 0..BOARD_SIZE {
+            for gj in 0..BOARD_SIZE {
+                let h = Hex::new(gi, gj);
+                buf[(gi * BOARD_SIZE + gj) as usize] =
+                    hex_distance(h, center) as f32 / HALF_BOARD as f32;
+            }
+        }
+        buf
+    })
+}
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -99,12 +120,14 @@ pub fn encode_board(
 ) -> EncodedBoard {
     let mut tensor = vec![0.0f32; TENSOR_SIZE];
     let mut hot_buf = Vec::new();
-    let (offset_q, offset_r, legal_moves) = encode_board_into(
+    let mut legal_moves = Vec::new();
+    let (offset_q, offset_r) = encode_board_into(
         game,
         near_radius,
         constrain_threats,
         &mut tensor,
         &mut hot_buf,
+        &mut legal_moves,
     );
     EncodedBoard {
         tensor,
@@ -114,13 +137,12 @@ pub fn encode_board(
     }
 }
 
-/// Encode into a pre-allocated buffer. Returns `(offset_q, offset_r, legal_moves)`.
+/// Encode into a pre-allocated buffer. Returns `(offset_q, offset_r)`.
 ///
-/// The buffer must be at least [`TENSOR_SIZE`] elements. This variant is used
+/// The `out` buffer must be at least [`TENSOR_SIZE`] elements. This variant is used
 /// by MCTS to avoid repeated tensor allocations during tree search.
-/// The returned `legal_moves` vector is freshly allocated per call; callers
-/// that need zero-allocation on the MCTS hot path should reuse the vector
-/// themselves (e.g. by taking ownership and clearing it on the next call).
+/// The `legal_out` vector is provided by the caller and will be overwritten with
+/// the set of legal (or threat-constrained) moves.
 ///
 /// # Channel layout (13 channels)
 ///
@@ -142,15 +164,16 @@ pub fn encode_board(
 ///
 /// Channels 9 and 10 are populated by calling [`live_cells`] with a single
 /// reusable buffer. The caller should own and reuse a `Vec<Hex>` to amortize
-/// allocations across encode calls. The legal-moves return vector is also
-/// caller-owned to avoid per-call allocation on the MCTS hot path.
+/// allocations across encode calls. The `legal_out` vector is owned by the
+/// caller; its previous contents are cleared and replaced on each call.
 pub fn encode_board_into(
     game: &HexGameState,
     near_radius: i32,
     constrain_threats: bool,
     out: &mut [f32],
     hot_buf: &mut Vec<Hex>,
-) -> (i32, i32, Vec<Hex>) {
+    legal_out: &mut Vec<Hex>,
+) -> (i32, i32) {
     debug_assert!(
         out.len() >= TENSOR_SIZE,
         "encode_board_into: buffer too small ({} < {})",
@@ -224,7 +247,8 @@ pub fn encode_board_into(
     }
 
     // ── Channel 3: legal moves mask ──
-    let mut legal = game.legal_moves_near(near_radius);
+    legal_out.clear();
+    legal_out.extend(game.legal_moves_near(near_radius));
     if constrain_threats {
         let maybe_constrained = match threat_status(game) {
             ThreatStatus::Quiet | ThreatStatus::Unblockable => None,
@@ -234,7 +258,7 @@ pub fn encode_board_into(
                     allowed.push(s);
                 }
                 Some(
-                    legal
+                    legal_out
                         .iter()
                         .copied()
                         .filter(|h| allowed.contains(h))
@@ -242,7 +266,7 @@ pub fn encode_board_into(
                 )
             }
             ThreatStatus::MustBlock(b) => Some(
-                legal
+                legal_out
                     .iter()
                     .copied()
                     .filter(|h| b.cells().contains(h))
@@ -251,11 +275,11 @@ pub fn encode_board_into(
         };
         if let Some(constrained) = maybe_constrained {
             if !constrained.is_empty() {
-                legal = constrained;
+                *legal_out = constrained;
             }
         }
     }
-    for h in &legal {
+    for h in legal_out.iter() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
         if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
@@ -290,19 +314,11 @@ pub fn encode_board_into(
         out[start..start + BOARD_AREA].fill(1.0);
     }
 
-    // ── Channel 11: distance from centroid ──
-    // For every tensor cell, compute the hex distance to the board centroid
-    // (which maps to tensor coordinate (HALF_BOARD, HALF_BOARD)), then
-    // normalise by HALF_BOARD so values are in [0, 1].
+    // ── Channel 11: distance from centroid (pre-computed) ──
     {
-        let center = Hex::new(offset_q + HALF_BOARD, offset_r + HALF_BOARD);
-        for gi in 0..BOARD_SIZE {
-            for gj in 0..BOARD_SIZE {
-                let h = Hex::new(gi + offset_q, gj + offset_r);
-                let dist = hex_distance(h, center) as f32 / HALF_BOARD as f32;
-                out[idx(11, gi, gj)] = dist;
-            }
-        }
+        let ch11_start = 11 * BOARD_AREA as usize;
+        out[ch11_start..ch11_start + BOARD_AREA as usize]
+            .copy_from_slice(centroid_dist_channel());
     }
 
     // ── Channel 12: opponent's most recent completed turn ──
@@ -347,7 +363,7 @@ pub fn encode_board_into(
         }
     }
 
-    (offset_q, offset_r, legal)
+    (offset_q, offset_r)
 }
 
 // -------------------------------------------------------------------------

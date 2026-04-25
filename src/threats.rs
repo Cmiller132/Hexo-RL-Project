@@ -26,6 +26,7 @@
 
 use crate::board::HexGameState;
 use crate::core::{Hex, Turn, WindowKey, HEX_DIRECTIONS, WIN_LENGTH};
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 // -------------------------------------------------------------------------
@@ -58,7 +59,7 @@ pub enum ThreatStatus {
     /// The enclosed [`BlockConstraint`] describes exactly which cells (and
     /// which pairs of cells) cover every opponent threat window.  Any turn
     /// that does not satisfy the constraint loses immediately.
-    MustBlock(Box<BlockConstraint>),
+    MustBlock(BlockConstraint),
 
     /// Opponent threats cannot be blocked with the remaining placements.
     ///
@@ -145,33 +146,26 @@ fn window_empties(game: &HexGameState, key: WindowKey, out: &mut SmallVec<[Hex; 
     }
 }
 
-fn opponent_threat_windows(game: &HexGameState) -> SmallVec<[SmallVec<[Hex; 2]>; 16]> {
+fn opponent_threat_windows(
+    game: &HexGameState,
+) -> (SmallVec<[Hex; 32]>, SmallVec<[u8; 16]>) {
     let opp = 1 - game.current_player();
-
-    // Precondition: caller must only invoke this when the opponent has
-    // fours or fives.  threat_status already gates on this.
     debug_assert!(
         game.eval().has_threats(opp),
         "opponent_threat_windows called with no threats"
     );
-
-    let mut result = SmallVec::new();
+    let mut flat = SmallVec::<[Hex; 32]>::new();
+    let mut lengths = SmallVec::<[u8; 16]>::new();
     let mut empties = SmallVec::<[Hex; 2]>::new();
-
-    // Iterate every hot window for the opponent.  For each window, collect
-    // the empty cells that would complete it.
     for key in game.eval().hot_windows(opp) {
         empties.clear();
         window_empties(game, key, &mut empties);
-
-        // A window with zero empties is already a win and should not be
-        // treated as a "threat" that needs blocking.
         if !empties.is_empty() {
-            result.push(empties.clone());
+            lengths.push(empties.len() as u8);
+            flat.extend_from_slice(&empties);
         }
     }
-
-    result
+    (flat, lengths)
 }
 
 // -------------------------------------------------------------------------
@@ -241,9 +235,17 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
         return ThreatStatus::WinningTurn(turn);
     }
 
-    let must_hit = opponent_threat_windows(game);
-    if must_hit.is_empty() {
+    let (flat_empties, window_lengths) = opponent_threat_windows(game);
+    if flat_empties.is_empty() {
         return ThreatStatus::Quiet;
+    }
+
+    let mut must_hit = SmallVec::<[&[Hex]; 16]>::new();
+    let mut offset = 0usize;
+    for &len in &window_lengths {
+        let s = &flat_empties[offset..offset + len as usize];
+        must_hit.push(s);
+        offset += len as usize;
     }
 
     // Build exact BlockConstraint.
@@ -272,7 +274,7 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
             return ThreatStatus::Unblockable;
         }
         let pairs = SmallVec::<[(Hex, Hex); 32]>::new();
-        return ThreatStatus::MustBlock(Box::new(BlockConstraint { cells, pairs }));
+        return ThreatStatus::MustBlock(BlockConstraint { cells, pairs });
     }
 
     // placements >= 2: enumerate every distinct pair of candidate cells.
@@ -295,7 +297,7 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
         return ThreatStatus::Unblockable;
     }
 
-    ThreatStatus::MustBlock(Box::new(BlockConstraint { cells, pairs }))
+    ThreatStatus::MustBlock(BlockConstraint { cells, pairs })
 }
 
 /// Check whether a single turn is legal under threat constraints,
@@ -434,11 +436,12 @@ pub fn live_cells(game: &HexGameState, player: u8, out: &mut Vec<Hex>) {
     }
 
     let mut empties = SmallVec::<[Hex; 2]>::new();
+    let mut seen = FxHashSet::default();
     for key in game.eval().hot_windows(player) {
         empties.clear();
         window_empties(game, key, &mut empties);
         for &h in &empties {
-            if !out.contains(&h) {
+            if seen.insert(h) {
                 out.push(h);
             }
         }

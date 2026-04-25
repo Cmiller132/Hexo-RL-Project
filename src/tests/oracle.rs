@@ -255,7 +255,11 @@ pub fn analyse(game: &mut HexGameState) -> TurnAnalysis {
 /// This captures the opponent's perspective after the current player finishes
 /// their turn, which is what blocking analysis needs.
 fn opp_winning_turns_after_turn(game: &HexGameState, player: u8) -> Vec<Turn> {
-    let stones: Vec<(i32, i32, u8)> = game.stones().iter().map(|(&h, &p)| (h.q, h.r, p)).collect();
+    let stones: Vec<(i32, i32, u8)> = game
+        .move_history()
+        .iter()
+        .map(|m| (m.cell().q, m.cell().r, m.player()))
+        .collect();
     let mut g = HexGameState::new();
     g.set_position(&stones, player, 2)
         .expect("oracle: invalid test position");
@@ -330,19 +334,19 @@ mod tests {
     fn oracle_finds_blocking_single() {
         let mut g = HexGameState::new();
         let stones = &[
-            (-1, 0, 0),
-            (0, 0, 1),
+            (0, 0, 0),
             (1, 0, 1),
             (2, 0, 1),
             (3, 0, 1),
             (4, 0, 1),
+            (5, 0, 1),
             (0, 1, 0),
             (1, 1, 0),
         ];
         g.set_position(stones, 0, 1)
             .expect("oracle: blocking_single set_position");
         let analysis = analyse(&mut g);
-        assert!(analysis.blocking_single.contains(&Hex::new(5, 0)));
+        assert!(analysis.blocking_single.contains(&Hex::new(6, 0)));
     }
 
     /// Player 1 has four in a row with open ends and player 0 has two
@@ -373,18 +377,19 @@ mod tests {
     fn oracle_unblockable_single() {
         let mut g = HexGameState::new();
         let stones = &[
-            (-1, 0, 0),
-            (0, 0, 1),
+            (0, 0, 0),
             (1, 0, 1),
             (2, 0, 1),
             (3, 0, 1),
             (4, 0, 1),
-            (-1, 1, 0),
-            (0, 1, 1),
+            (5, 0, 1),
+            (0, 1, 0),
             (1, 1, 1),
             (2, 1, 1),
             (3, 1, 1),
             (4, 1, 1),
+            (5, 1, 1),
+            (0, 2, 0),
         ];
         g.set_position(stones, 0, 1)
             .expect("oracle: unblockable_single set_position");

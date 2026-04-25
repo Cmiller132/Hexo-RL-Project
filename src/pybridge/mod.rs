@@ -325,7 +325,7 @@ impl PyHexGame {
     /// `radius = 2` is usually sufficient.
     fn legal_moves_near(&self, radius: i32) -> Vec<(i32, i32)> {
         self.inner
-            .legal_moves_near(radius)
+            .legal_moves_near_sorted(radius)
             .into_iter()
             .map(|h| (h.q, h.r))
             .collect()
@@ -380,7 +380,7 @@ impl PyHexGame {
     /// decode. This is much faster than returning a list of tuples when
     /// shipping large move lists across the FFI boundary.
     fn legal_moves_near_bytes<'py>(&self, py: Python<'py>, radius: i32) -> Bound<'py, PyBytes> {
-        let moves = self.inner.legal_moves_near(radius);
+        let moves = self.inner.legal_moves_near_sorted(radius);
         let mut buf: Vec<u8> = Vec::with_capacity(moves.len() * 8);
         for h in &moves {
             buf.extend_from_slice(&h.q.to_le_bytes());
@@ -455,21 +455,24 @@ impl PyHexGame {
         constrain_threats: bool,
     ) -> PyResult<(Bound<'py, PyArray3<f32>>, i32, i32, Bound<'py, PyBytes>)> {
         let encoded = encoder::encode_board(&self.inner, near_radius, constrain_threats);
+        let legal_moves = encoded.legal_moves().to_vec();
+        let offset_q = encoded.offset_q;
+        let offset_r = encoded.offset_r;
         let arr = ndarray::Array3::from_shape_vec(
             (NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize),
             encoded.tensor,
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray3::from_owned_array(py, arr);
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(encoded.legal_moves().len() * 8);
-        for h in encoded.legal_moves() {
+        let mut legal_buf: Vec<u8> = Vec::with_capacity(legal_moves.len() * 8);
+        for h in &legal_moves {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
         Ok((
             arr,
-            encoded.offset_q,
-            encoded.offset_r,
+            offset_q,
+            offset_r,
             PyBytes::new(py, &legal_buf),
         ))
     }
@@ -656,7 +659,10 @@ impl PyHexGame {
 ///     engine.expand_and_backprop(policies, values)
 ///
 /// # 4. Extract results
-/// visits, q_values, priors = engine.root_child_stats()
+/// moves_q, moves_r, visit_counts, root_value = engine.get_results()
+/// # For priors and Q-values per child:
+/// priors = engine.root_child_priors()
+/// q_values = engine.root_child_q_values()
 /// ```
 ///
 /// The `classical_self_play` function generates bootstrap training data
@@ -755,5 +761,8 @@ fn hexgame(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FEATURE_COUNT", encoder::FEATURE_COUNT)?;
     m.add("WIN_LENGTH", crate::core::WIN_LENGTH)?;
     m.add("PLACEMENT_RADIUS", crate::core::PLACEMENT_RADIUS)?;
+    m.add("BOARD_SIZE", encoder::BOARD_SIZE)?;
+    m.add("NUM_CHANNELS", encoder::NUM_CHANNELS)?;
+    m.add("TENSOR_SIZE", encoder::TENSOR_SIZE)?;
     Ok(())
 }

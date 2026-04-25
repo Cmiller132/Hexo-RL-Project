@@ -69,14 +69,16 @@ mod tests {
     #[test]
     fn block_constraint_single_placement_intersection() {
         let mut game = HexGameState::new();
-        // P1 has a 4-stone run (0,0)..(3,0) and P0 already blocked one end at (-2,0).
+        // P1 has a 4-stone run (3,0)..(6,0). P0 already blocked the left window
+        // with stones at (0,0) [origin] and (1,0).
         game.set_position(
             &[
-                (-2, 0, 0), // P0 blocker
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
+                (0, 0, 0),
+                (1, 0, 0),
                 (3, 0, 1),
+                (4, 0, 1),
+                (5, 0, 1),
+                (6, 0, 1),
             ],
             0,
             1,
@@ -86,7 +88,7 @@ mod tests {
         match threat_status(&game) {
             ThreatStatus::MustBlock(b) => {
                 assert_eq!(b.cells().len(), 1);
-                assert_eq!(b.cells()[0], Hex::new(4, 0));
+                assert_eq!(b.cells()[0], Hex::new(7, 0));
                 assert!(b.pairs().is_empty());
             }
             other => panic!("expected MustBlock, got {:?}", other),
@@ -176,14 +178,16 @@ mod tests {
     #[test]
     fn not_unblockable_when_common_cell_exists() {
         let mut game = HexGameState::new();
-        // P1 has a 4-run (0,0)..(3,0) and P0 (current player) already blocked one end at (-2,0).
+        // P1 has a 4-run (3,0)..(6,0) and P0 already blocked the left window
+        // with stones at (0,0) [origin] and (1,0). A single blocking cell exists.
         game.set_position(
             &[
-                (-2, 0, 0), // P0 blocker
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
+                (0, 0, 0),
+                (1, 0, 0),
                 (3, 0, 1),
+                (4, 0, 1),
+                (5, 0, 1),
+                (6, 0, 1),
             ],
             0,
             1,
@@ -192,7 +196,7 @@ mod tests {
 
         match threat_status(&game) {
             ThreatStatus::MustBlock(b) => {
-                assert!(b.cells().contains(&Hex::new(4, 0)));
+                assert!(b.cells().contains(&Hex::new(7, 0)));
             }
             other => panic!("expected MustBlock, got {:?}", other),
         }
@@ -225,11 +229,12 @@ mod tests {
         let mut game = HexGameState::new();
         game.set_position(
             &[
-                (-2, 0, 0), // P0 blocker
-                (0, 0, 1),
-                (1, 0, 1),
-                (2, 0, 1),
+                (0, 0, 0),
+                (1, 0, 0),
                 (3, 0, 1),
+                (4, 0, 1),
+                (5, 0, 1),
+                (6, 0, 1),
             ],
             0,
             1,
@@ -237,8 +242,8 @@ mod tests {
         .unwrap();
 
         let status = threat_status(&game);
-        assert!(turn_satisfies_status(&status, Turn::single(Hex::new(4, 0))));
-        assert!(!turn_satisfies_status(&status, Turn::single(Hex::new(-1, 0))));
+        assert!(turn_satisfies_status(&status, Turn::single(Hex::new(7, 0))));
+        assert!(!turn_satisfies_status(&status, Turn::single(Hex::new(2, 0))));
     }
 
     #[test]
@@ -362,8 +367,8 @@ mod tests {
         let mut game = HexGameState::new();
         game.set_position(
             &[
-                (-1, 0, 0),
                 (0, 0, 0),
+                (-1, 0, 0),
                 (2, 0, 1), // P1 blocker inside
                 (3, 0, 0),
                 (4, 0, 0),

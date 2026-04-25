@@ -1,5 +1,5 @@
-use crate::encoder::*;
-use crate::board::HexGameState;
+use hexgame::encoder::*;
+use hexgame::board::HexGameState;
 
 #[cfg(test)]
 mod tests {
@@ -46,12 +46,12 @@ mod tests {
         let mut game = HexGameState::new();
         game.set_position(
             &[
-                (-1, 0, 1),
                 (0, 0, 0),
                 (1, 0, 0),
                 (2, 0, 0),
                 (3, 0, 0),
                 (4, 0, 0),
+                (-1, 0, 1),
                 (5, 0, 1),
             ],
             0,
@@ -123,5 +123,28 @@ mod tests {
         let feats = extract_features(&game);
         assert_eq!(feats[4], 1.0);
         assert_eq!(feats[10], 1.0);
+    }
+
+    // -- Proptests ----------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..ProptestConfig::default() })]
+
+        #[test]
+        fn encode_output_range(moves in prop::collection::vec((-4i32..=4, -4i32..=4), 0..10)) {
+            let mut game = HexGameState::new();
+            let _ = game.place(0, 0);
+            for (q, r) in moves {
+                let _ = game.place(q, r);
+            }
+            let encoded = encode_board(&game, 2, false);
+            for &v in &encoded.tensor {
+                assert!(v >= 0.0,
+                    "tensor value {} is negative", v);
+            }
+            assert_eq!(encoded.tensor.len(), TENSOR_SIZE);
+        }
     }
 }

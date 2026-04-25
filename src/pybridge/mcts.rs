@@ -36,15 +36,15 @@ impl PyMCTSEngine {
         arena_sim_hint: Option<u32>,
     ) -> Self {
         let hint = arena_sim_hint.unwrap_or(num_simulations);
-        let mut engine = MCTSEngine::with_arena_sim_hint(
+        let engine = MCTSEngine::with_arena_sim_hint(
             game.inner.clone(),
             num_simulations,
             hint,
             c_puct,
             near_radius,
             constrain_threats,
+            c_puct_init,
         );
-        engine.c_puct_init = c_puct_init;
         Self { inner: engine }
     }
 
@@ -80,11 +80,15 @@ impl PyMCTSEngine {
         let policy_slice = policy
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
+        if legal_bytes.len() % 8 != 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                format!("legal_bytes length {} is not a multiple of 8", legal_bytes.len())
+            ));
+        }
         let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
-        let mut ints = legal_bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()));
-        while let (Some(q), Some(r)) = (ints.next(), ints.next()) {
+        for chunk in legal_bytes.chunks_exact(8) {
+            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
             legal.push(Hex::new(q, r));
         }
         self.inner
@@ -114,7 +118,10 @@ impl PyMCTSEngine {
         py: Python<'py>,
         batch_size: u32,
     ) -> PyResult<(Bound<'py, PyArray4<f32>>, u32)> {
-        let (tensors, count) = self.inner.select_leaves(batch_size);
+        let (count, tensor_vec) = py.allow_threads(|| {
+            let (tensors, count) = self.inner.select_leaves(batch_size);
+            (count, tensors.to_vec())
+        });
         let view = ndarray::ArrayView4::from_shape(
             (
                 count as usize,
@@ -122,7 +129,7 @@ impl PyMCTSEngine {
                 BOARD_SIZE as usize,
                 BOARD_SIZE as usize,
             ),
-            tensors,
+            &tensor_vec,
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray4::from_array(py, &view);
@@ -133,6 +140,7 @@ impl PyMCTSEngine {
         &mut self,
         policies: PyReadonlyArray1<'py, f32>,
         values: PyReadonlyArray1<'py, f32>,
+        py: Python<'py>,
     ) -> PyResult<()> {
         let policies_slice = policies
             .as_slice()
@@ -140,7 +148,11 @@ impl PyMCTSEngine {
         let values_slice = values
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
-        self.inner.expand_and_backprop(policies_slice, values_slice);
+        let p = policies_slice.to_vec();
+        let v = values_slice.to_vec();
+        py.allow_threads(|| {
+            self.inner.expand_and_backprop(&p, &v);
+        });
         Ok(())
     }
 

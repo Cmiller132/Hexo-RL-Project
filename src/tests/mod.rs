@@ -1,15 +1,14 @@
 //! Test-only modules for the Hexgame engine.
 //!
-//! This directory contains ten complementary test modules:
+//! This directory contains test modules:
 //!
 //! | Module             | Purpose |
 //! |--------------------|---------|
-//! | `board`            | Board rules and win detection |
 //! | `core`             | Hex coordinates, turns, and window keys |
-//! | `encoder`          | Neural-network tensor encoding |
 //! | `eval_state`       | Incremental evaluation consistency |
 //! | `grid`             | Win-grid spatial indexing |
 //! | `hot`              | Hot-window cache correctness |
+//! | `mcts`             | MCTS engine correctness and determinism |
 //! | `oracle`           | Brute-force threat-analysis verifier |
 //! | `patterns`         | Pattern table integrity |
 //! | `threats`          | Property-based threat-analysis verification |
@@ -19,17 +18,15 @@
 //! builds.
 
 #[cfg(test)]
-pub mod board;
-#[cfg(test)]
 pub mod core;
-#[cfg(test)]
-pub mod encoder;
 #[cfg(test)]
 pub mod eval_state;
 #[cfg(test)]
 pub mod grid;
 #[cfg(test)]
 pub mod hot;
+#[cfg(test)]
+pub mod mcts;
 #[cfg(test)]
 pub mod oracle;
 #[cfg(test)]

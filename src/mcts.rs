@@ -92,7 +92,7 @@ const CHILD_CAPACITY_HINT: usize = 64;
 /// Children of a given node are always stored contiguously, so a node's
 /// children span `children_start .. children_start + children_count`.
 #[derive(Clone, Copy)]
-struct MCTSNode {
+pub(crate) struct MCTSNode {
     /// Arena index of the parent node. `NO_PARENT` for the root.
     parent: u32,
     /// The move `(q, r)` that led to this node, relative to board origin.
@@ -102,7 +102,7 @@ struct MCTSNode {
     prior: f32,
     /// Total visit count (includes virtual-loss visits while the node is
     /// in-flight during batch selection).
-    visit_count: u32,
+    pub(crate) visit_count: u32,
     /// Sum of all backpropagated values from this node's perspective.
     ///
     /// Because values are stored from each node's own player perspective,
@@ -224,14 +224,14 @@ pub struct MCTSEngine {
     /// Contiguous storage for all MCTS nodes.
     ///
     /// Nodes are never deleted; `re_root` simply moves the root pointer.
-    arena: Vec<MCTSNode>,
+    pub(crate) arena: Vec<MCTSNode>,
     /// Internal game state used during tree traversal.
     ///
     /// Moves are applied during `select_leaves` and undone before the
     /// function returns, so the game state is always valid for the root.
     game: HexGameState,
     /// Arena index of the current root node.
-    root_idx: u32,
+    pub(crate) root_idx: u32,
     /// Controls how far from existing stones legal moves are generated.
     near_radius: i32,
     /// Enables threat-based move filtering at the root.
@@ -248,7 +248,7 @@ pub struct MCTSEngine {
     /// ```
     ///
     /// Set to 0.0 to disable (use static c_puct).
-    pub c_puct_init: f32,
+    c_puct_init: f32,
     /// Number of simulations already completed.
     sims_done: u32,
     /// Total number of simulations to perform.
@@ -265,6 +265,7 @@ pub struct MCTSEngine {
     scratch_priors: Vec<f32>,
     /// Reusable buffer for `encode_board_into` live-cells channels.
     hot_buf: Vec<Hex>,
+    legal_buf: Vec<Hex>,
 }
 
 type TreeNodeStates = (Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize);
@@ -293,6 +294,7 @@ impl MCTSEngine {
             c_puct,
             near_radius,
             constrain_threats,
+            19652.0,
         )
     }
 
@@ -308,6 +310,7 @@ impl MCTSEngine {
         c_puct: f32,
         near_radius: i32,
         constrain_threats: bool,
+        c_puct_init: f32,
     ) -> Self {
         let mut arena = Vec::with_capacity(arena_sim_hint as usize * CHILD_CAPACITY_HINT + 64);
         // Root node has no parent and a dummy action.
@@ -320,7 +323,7 @@ impl MCTSEngine {
             near_radius,
             constrain_threats,
             c_puct,
-            c_puct_init: 19652.0,
+            c_puct_init,
             sims_done: 0,
             num_simulations,
             batch_buf: Vec::new(),
@@ -328,6 +331,7 @@ impl MCTSEngine {
             scratch_raw: Vec::new(),
             scratch_priors: Vec::new(),
             hot_buf: Vec::new(),
+            legal_buf: Vec::new(),
         }
     }
 
@@ -346,15 +350,17 @@ impl MCTSEngine {
 
         // Allocate a local tensor buffer and encode directly into it.
         let mut tensor = vec![0.0f32; TENSOR_SIZE];
-        let (oq, or_, legal) = encoder::encode_board_into(
+        self.legal_buf.clear();
+        let (oq, or_) = encoder::encode_board_into(
             &self.game,
             self.near_radius,
             self.constrain_threats,
             &mut tensor,
             &mut self.hot_buf,
+            &mut self.legal_buf,
         );
 
-        Some((tensor, oq, or_, legal))
+        Some((tensor, oq, or_, self.legal_buf.clone()))
     }
 
     /// Expand the root node with policy output from the GPU.
@@ -390,6 +396,12 @@ impl MCTSEngine {
     /// `noise_fraction` controls the blend between original prior and noise
     /// (0.0 = no noise, 1.0 = pure noise).
     pub fn add_dirichlet_noise(&mut self, noise: &[f32], noise_fraction: f32) {
+        let count = self.arena[self.root_idx as usize].children_count as usize;
+        assert!(
+            noise.len() >= count,
+            "add_dirichlet_noise: noise length {} < root children count {}",
+            noise.len(), count
+        );
         let root = &self.arena[self.root_idx as usize];
         let start = root.children_start as usize;
         let count = root.children_count as usize;
@@ -462,6 +474,7 @@ impl MCTSEngine {
             for &ni in &search_path {
                 let n = &mut self.arena[ni as usize];
                 n.visit_count += VIRTUAL_LOSS_VISITS;
+                n.total_value -= VIRTUAL_LOSS_VISITS as f32;
             }
 
             // We replayed `search_path.len() - 1` moves (root is not a move).
@@ -492,12 +505,14 @@ impl MCTSEngine {
                 // Only constrain threats at root (init_root), not internal
                 // nodes — the O(n²) unblockable check is too expensive to run
                 // on every leaf expansion during tree search.
-                let (oq, or_, legal) = encoder::encode_board_into(
+                self.legal_buf.clear();
+                let (oq, or_) = encoder::encode_board_into(
                     &self.game,
                     self.near_radius,
                     false,
                     tensor_slice,
                     &mut self.hot_buf,
+                    &mut self.legal_buf,
                 );
 
                 non_terminal_count += 1;
@@ -508,7 +523,7 @@ impl MCTSEngine {
                     terminal_value: 0.0,
                     offset_q: oq,
                     offset_r: or_,
-                    legal_moves: legal,
+                    legal_moves: self.legal_buf.clone(),
                 });
             }
 
@@ -517,8 +532,6 @@ impl MCTSEngine {
                 self.game.unplace();
             }
         }
-
-        self.sims_done += actual_batch;
 
         (
             &self.batch_buf[..non_terminal_count as usize * TENSOR_SIZE],
@@ -541,16 +554,31 @@ impl MCTSEngine {
     ///    level so that every node stores values from its own player's
     ///    perspective.
     pub fn expand_and_backprop(&mut self, policies: &[f32], values: &[f32]) {
+        let non_terminal_count = self.pending.iter().filter(|l| !l.is_terminal).count();
+        assert!(
+            policies.len() == non_terminal_count * BOARD_AREA,
+            "expand_and_backprop: policies length {} != {} (non_terminal={} * BOARD_AREA={})",
+            policies.len(), non_terminal_count * BOARD_AREA,
+            non_terminal_count, BOARD_AREA,
+        );
+        assert!(
+            values.len() == non_terminal_count,
+            "expand_and_backprop: values length {} != non_terminal_count {}",
+            values.len(), non_terminal_count,
+        );
+
         let mut eval_idx = 0usize;
 
         // Take pending out temporarily to avoid borrow issues with &mut self.
         let leaves = std::mem::take(&mut self.pending);
+        self.sims_done += leaves.len() as u32;
 
         for leaf in &leaves {
             // Remove virtual loss before recording real visits.
             for &ni in &leaf.search_path {
                 let n = &mut self.arena[ni as usize];
                 n.visit_count -= VIRTUAL_LOSS_VISITS;
+                n.total_value += VIRTUAL_LOSS_VISITS as f32;
             }
 
             let value;
@@ -575,18 +603,13 @@ impl MCTSEngine {
                 eval_idx += 1;
             }
 
-            // Flip sign when the parent player differs from the leaf player
-            // so every node stores values from its own perspective.
-            let leaf_player = self.arena[leaf.node_idx as usize].player;
+            // Flip sign at each depth so every node stores values from its own perspective.
+            let mut parity_value = value;
             for &ni in leaf.search_path.iter().rev() {
                 let n = &mut self.arena[ni as usize];
-                let pv_value = if n.player == leaf_player {
-                    value
-                } else {
-                    -value
-                };
                 n.visit_count += 1;
-                n.total_value += pv_value;
+                n.total_value += parity_value;
+                parity_value = -parity_value;
             }
         }
 
@@ -824,12 +847,14 @@ impl MCTSEngine {
                         }
                         let start = packed.len();
                         packed.resize(start + TENSOR_SIZE, 0.0);
+                        self.legal_buf.clear();
                         encoder::encode_board_into(
                             &self.game,
                             self.near_radius,
                             false,
                             &mut packed[start..start + TENSOR_SIZE],
                             &mut self.hot_buf,
+                            &mut self.legal_buf,
                         );
                         scratch_history.clear();
                         scratch_history.extend(
@@ -983,7 +1008,13 @@ impl MCTSEngine {
 
         // Allocate children contiguously in arena.
         let children_start = self.arena.len() as u32;
-        let children_count = legal_moves.len() as u16;
+        let child_count = legal_moves.len();
+        assert!(
+            child_count <= u16::MAX as usize,
+            "expand_node: legal_moves count {} exceeds u16::MAX",
+            child_count
+        );
+        let children_count = child_count as u16;
 
         for (i, h) in legal_moves.iter().enumerate() {
             let child = MCTSNode::new(node_idx, (h.q as i16, h.r as i16), self.scratch_priors[i]);

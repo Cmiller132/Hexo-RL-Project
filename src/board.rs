@@ -120,7 +120,7 @@ pub struct MoveRecord {
     pub(crate) current_player_before: u8,
     pub(crate) placements_remaining_before: u8,
     pub(crate) winner_before: Option<u8>,
-    pub(crate) winning_line_before: Option<Vec<Hex>>,
+    pub(crate) winning_line_before: Option<[Hex; WIN_LENGTH as usize]>,
 }
 
 impl MoveRecord {
@@ -146,7 +146,7 @@ impl MoveRecord {
     }
     /// The winning line BEFORE this move was made.
     pub fn winning_line_before(&self) -> Option<&[Hex]> {
-        self.winning_line_before.as_deref()
+        self.winning_line_before.as_ref().map(|a| a.as_slice())
     }
 }
 
@@ -180,6 +180,10 @@ impl CandidateSet {
             rc: FxHashMap::default(),
             radius,
         }
+    }
+
+    pub(crate) fn contains(&self, cell: Hex) -> bool {
+        self.rc.contains_key(&cell)
     }
 
     pub(crate) fn remove(&mut self, cell: Hex) {
@@ -266,7 +270,7 @@ pub struct HexGameState {
     /// `Some(winner)` when the game has ended; `None` while ongoing.
     winner: Option<u8>,
     /// The exact 6-in-a-row that produced the win, if any.
-    winning_line: Option<Vec<Hex>>,
+    winning_line: Option<[Hex; WIN_LENGTH as usize]>,
     /// Total number of individual stone placements so far.
     move_count: u32,
     /// Stack of snapshots for undo.  One entry per placement (not per turn).
@@ -277,6 +281,8 @@ pub struct HexGameState {
     eval: EvalState,
     /// Reference-counted empty cells near stones (radius 2).
     candidates: CandidateSet,
+    /// Reference-counted empty cells within PLACEMENT_RADIUS of any stone for O(1) radius check.
+    placement_candidates: CandidateSet,
 }
 
 impl Default for HexGameState {
@@ -315,7 +321,7 @@ impl HexGameState {
 
     /// The winning line of 6 cells, if the game is over.
     pub fn winning_line(&self) -> Option<&[Hex]> {
-        self.winning_line.as_deref()
+        self.winning_line.as_ref().map(|a| &a[..])
     }
 
     /// Total number of individual tile placements so far.
@@ -354,6 +360,7 @@ impl HexGameState {
             zobrist: 0,
             eval: EvalState::new(),
             candidates: CandidateSet::new(2),
+            placement_candidates: CandidateSet::new(PLACEMENT_RADIUS),
         }
     }
 
@@ -397,6 +404,7 @@ impl HexGameState {
         self.move_count -= 1;
 
         self.candidates.on_unplace(rec.cell, &self.stones);
+        self.placement_candidates.on_unplace(rec.cell, &self.stones);
 
         self.current_player = rec.current_player_before;
         self.placements_remaining = rec.placements_remaining_before;
@@ -444,33 +452,49 @@ impl HexGameState {
         let mut sim_player = self.current_player;
         let mut sim_remaining = self.placements_remaining;
 
-        for &(q, r, player) in stones {
+        for &(q, r, stone_player) in stones {
             let cell = Hex::new(q, r);
             if self.stones.contains_key(&cell) {
                 return Err(GameError::CellOccupied(cell));
             }
+            if stone_player > 1 {
+                return Err(GameError::InvalidPlayer(stone_player));
+            }
+            if self.stones.is_empty() && cell != Hex::ORIGIN {
+                return Err(GameError::MustPlaceAtOrigin);
+            }
+            if !self.stones.is_empty()
+                && !self
+                    .stones
+                    .keys()
+                    .any(|&e| hex_distance(e, cell) <= PLACEMENT_RADIUS)
+            {
+                return Err(GameError::OutOfRadius(cell));
+            }
 
             let record = MoveRecord {
                 cell,
-                player,
+                player: stone_player,
                 current_player_before: sim_player,
                 placements_remaining_before: sim_remaining,
                 winner_before: self.winner,
                 winning_line_before: self.winning_line.clone(),
             };
 
-            self.stones.insert(cell, player);
-            self.zobrist ^= zobrist_piece(player, cell);
+            self.stones.insert(cell, stone_player);
+            self.zobrist ^= zobrist_piece(stone_player, cell);
             self.move_count += 1;
             self.move_history.push(record);
 
             self.candidates.remove(cell);
+            self.placement_candidates.remove(cell);
             self.incr_candidate_neighbors(cell);
-            self.eval.place(cell, player);
+            self.incr_placement_candidate_neighbors(cell);
+            self.eval.place(cell, stone_player);
 
             if self.winner.is_none() {
-                if let Some(line) = self.find_winning_line(cell, player) {
-                    self.winner = Some(player);
+                if let Some(line) = self.find_winning_line(cell, stone_player) {
+                    self.winner = Some(stone_player);
                     self.winning_line = Some(line);
                 }
             }
@@ -497,8 +521,9 @@ impl HexGameState {
         self.move_count = 0;
         self.move_history.clear();
         self.zobrist = 0;
-        self.eval = EvalState::new();
+        self.eval.clear();
         self.candidates = CandidateSet::new(2);
+        self.placement_candidates = CandidateSet::new(PLACEMENT_RADIUS);
     }
 
     #[cfg(test)]
@@ -526,7 +551,9 @@ impl HexGameState {
         self.placements_remaining -= 1;
 
         self.candidates.remove(cell);
+        self.placement_candidates.remove(cell);
         self.incr_candidate_neighbors(cell);
+        self.incr_placement_candidate_neighbors(cell);
         self.eval.place(cell, player);
 
         if let Some(line) = self.find_winning_line(cell, player) {
@@ -567,12 +594,7 @@ impl HexGameState {
         }
         // Radius invariant: every non-opening stone must be within
         // PLACEMENT_RADIUS of at least one existing stone.
-        if !self.stones.is_empty()
-            && !self
-                .stones
-                .keys()
-                .any(|&existing| hex_distance(existing, cell) <= PLACEMENT_RADIUS)
-        {
+        if !self.stones.is_empty() && !self.placement_candidates.contains(cell) {
             return Err(GameError::OutOfRadius(cell));
         }
         Ok(())
@@ -606,8 +628,7 @@ impl HexGameState {
             }
         }
 
-        let mut result: Vec<Hex> = candidates.into_iter().collect();
-        result.sort();
+        let result: Vec<Hex> = candidates.into_iter().collect();
         result
     }
 
@@ -626,9 +647,7 @@ impl HexGameState {
 
         // Use incremental candidate set if radius matches (fast path).
         if radius == self.candidates.radius && !self.candidates.rc.is_empty() {
-            let mut result: Vec<Hex> = self.candidates.rc.keys().copied().collect();
-            result.sort();
-            return result;
+            return self.candidates.rc.keys().copied().collect();
         }
 
         // Fallback: full scan for different radius.
@@ -645,8 +664,7 @@ impl HexGameState {
             }
         }
 
-        let mut result: Vec<Hex> = candidates.into_iter().collect();
-        result.sort();
+        let result: Vec<Hex> = candidates.into_iter().collect();
         result
     }
 
@@ -662,19 +680,31 @@ impl HexGameState {
         if self.stones.is_empty() {
             return vec![Hex::ORIGIN];
         }
-        let mut result = if !self.candidates.rc.is_empty() {
+        let result = if !self.candidates.rc.is_empty() {
             self.candidates.rc.keys().copied().collect()
         } else {
             self.legal_moves_near(2)
         };
-        result.sort();
         result
+    }
+
+    /// Sorted version of legal_moves_near — for tests and Python export only.
+    pub fn legal_moves_near_sorted(&self, radius: i32) -> Vec<Hex> {
+        let mut v = self.legal_moves_near(radius);
+        v.sort();
+        v
+    }
+
+    pub fn candidates_near2_sorted(&self) -> Vec<Hex> {
+        let mut v = self.candidates_near2();
+        v.sort();
+        v
     }
 
     /// The opponent's most recent completed turn as an ordered list of cells.
     ///
     /// Returns one cell for Player 0's opening turn, otherwise two cells.
-    pub fn opponent_last_turn_cells(&self) -> Vec<Hex> {
+    pub fn opponent_last_turn_cells(&self) -> smallvec::SmallVec<[Hex; 2]> {
         let mut idx = self.move_history.len();
 
         // Skip the current player's partial turn, if any.
@@ -683,7 +713,7 @@ impl HexGameState {
         }
 
         // Collect the opponent's last completed turn.
-        let mut cells = Vec::with_capacity(2);
+        let mut cells = smallvec::SmallVec::new();
         while idx > 0 && self.move_history[idx - 1].player != self.current_player {
             cells.push(self.move_history[idx - 1].cell);
             idx -= 1;
@@ -704,7 +734,7 @@ impl HexGameState {
     ///
     /// `Some(winning_line)` — a vector of exactly 6 [`Hex`] cells forming the
     /// winning segment, preferring one centered on `last` if possible.
-    pub(crate) fn find_winning_line(&self, last: Hex, player: u8) -> Option<Vec<Hex>> {
+    pub(crate) fn find_winning_line(&self, last: Hex, player: u8) -> Option<[Hex; WIN_LENGTH as usize]> {
         for &(dq, dr) in &HEX_DIRECTIONS {
             // Collect the contiguous run on both sides of `last` along this axis.
             let mut backward = self.collect_run(last, -dq, -dr, player);
@@ -753,17 +783,15 @@ impl HexGameState {
     /// If `line` has 8 stones and `pivot` is 3, the preferred segment starts
     /// at `3 - 2 = 1` (zero-based), giving indices 1..7 — a 6-stone window
     /// centred roughly on the pivot.
-    fn select_segment(line: &[Hex], pivot: usize) -> Vec<Hex> {
+    fn select_segment(line: &[Hex], pivot: usize) -> [Hex; WIN_LENGTH as usize] {
         let wl = WIN_LENGTH as usize;
-        // Earliest start that still includes the pivot in the 6-window.
         let lo = pivot.saturating_sub(wl - 1);
-        // Latest start such that the window fits inside the line.
         let hi = pivot.min(line.len() - wl);
-        // Ideal start: centre the window on the pivot.
         let preferred = pivot.saturating_sub((wl - 1) / 2);
-        // Clamp preferred start to the valid [lo, hi] range.
         let start = hi.min(lo.max(preferred));
-        line[start..start + wl].to_vec()
+        line[start..start + wl]
+            .try_into()
+            .expect("select_segment: slice length != WIN_LENGTH")
     }
 
     // ── Candidate helpers ───────────────────────────────────────────────
@@ -780,6 +808,19 @@ impl HexGameState {
                 let h = Hex::new(cell.q + dq, cell.r + dr);
                 if hex_distance(cell, h) <= r2 && !self.stones.contains_key(&h) {
                     *self.candidates.rc.entry(h).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// Increment placement-candidate reference counts for empty cells within PLACEMENT_RADIUS.
+    fn incr_placement_candidate_neighbors(&mut self, cell: Hex) {
+        let r = PLACEMENT_RADIUS;
+        for dq in -r..=r {
+            for dr in -r..=r {
+                let h = Hex::new(cell.q + dq, cell.r + dr);
+                if hex_distance(cell, h) <= r && !self.stones.contains_key(&h) {
+                    *self.placement_candidates.rc.entry(h).or_insert(0) += 1;
                 }
             }
         }
