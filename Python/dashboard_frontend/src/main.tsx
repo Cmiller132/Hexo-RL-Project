@@ -366,17 +366,13 @@ function AxisPanel({ prototypes, results, setResults }: {
   }, [axisSession?.session_id, axisSession?.position?.turn_index, selectedPrototype, paramsKey]);
   const offsetQ = axisSession?.position?.encoding?.offset_q ?? -16;
   const offsetR = axisSession?.position?.encoding?.offset_r ?? -16;
-  const overlayMoves = (selected?.top || []).map((m: AnyRow, idx: number) => {
-    const action = Number(m.action);
+  const overlayMoves = (selected?.cells || []).map((m: AnyRow) => {
     return {
-      q: Number.isFinite(Number(m.q)) ? Number(m.q) : Math.floor(action / 33) + offsetQ,
-      r: Number.isFinite(Number(m.r)) ? Number(m.r) : (action % 33) + offsetR,
-      prob: Number(m.prob),
+      q: Number(m.q),
+      r: Number(m.r),
       score: Number(m.score),
       owner: Number.isFinite(Number(m.owner)) ? Number(m.owner) : undefined,
-      axes: m.axes,
-      action,
-      rank: idx + 1
+      axes: m.axes
     };
   });
   return (
@@ -428,7 +424,7 @@ function AxisPanel({ prototypes, results, setResults }: {
             <div className="result" key={r.prototype_id}>
               <h3>{r.prototype_id}</h3>
               <Table rows={r.axis_summaries || []} columns={["axis", "min", "max", "nonzero"]} />
-              <Table rows={(r.top || []).map((m: AnyRow, i: number) => ({ rank: i + 1, ...m }))} columns={["rank", "q", "r", "score", "prob", "axes"]} />
+              <Table rows={(r.cells || []).slice(0, 96)} columns={["q", "r", "score", "owner", "axes"]} />
             </div>
           ))}
         </div>
@@ -451,7 +447,16 @@ function Board({
   const [hover, setHover] = useState<AnyRow | null>(null);
   const [view, setView] = useState({ x: 0, y: 0, z: 1 });
   const [panning, setPanning] = useState(false);
-  const drag = useRef<{ x: number; y: number; vx: number; vy: number; moved: boolean } | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const drag = useRef<{
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    uxPerPx: number;
+    uyPerPx: number;
+    moved: boolean;
+  } | null>(null);
   const stones = position?.stones || [];
   const legal = position?.legal_moves || [];
   const threat = position?.threat_moves || [];
@@ -466,17 +471,53 @@ function Board({
   const last = position?.overlays?.last_move;
   const resetView = () => setView({ x: 0, y: 0, z: 1 });
   const zoomBy = (factor: number) => setView((v) => ({ ...v, z: clamp(v.z * factor, 0.45, 2.8) }));
+  const zoomAt = (clientX: number, clientY: number, factor: number) => {
+    const svg = svgRef.current;
+    if (!svg) {
+      zoomBy(factor);
+      return;
+    }
+    const rect = svg.getBoundingClientRect();
+    const px = (clientX - rect.left) * (geometry.width / rect.width);
+    const py = (clientY - rect.top) * (geometry.height / rect.height);
+    setView((v) => {
+      const nextZ = clamp(v.z * factor, 0.45, 2.8);
+      const anchorX = (px - v.x) / v.z;
+      const anchorY = (py - v.y) / v.z;
+      return {
+        x: px - anchorX * nextZ,
+        y: py - anchorY * nextZ,
+        z: nextZ
+      };
+    });
+  };
   const clickCell = (q: number, r: number) => {
     if (!interactive || !onCellClick || !legalSet.has(`${q},${r}`)) return;
     onCellClick(q, r);
   };
-  const onWheel = (e: React.WheelEvent<SVGSVGElement>) => {
-    e.preventDefault();
-    zoomBy(clamp(1 - e.deltaY * 0.0007, 0.94, 1.06));
-  };
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onNativeWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      zoomAt(e.clientX, e.clientY, clamp(1 - e.deltaY * 0.0007, 0.94, 1.06));
+    };
+    svg.addEventListener("wheel", onNativeWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onNativeWheel);
+  }, [geometry.width, geometry.height]);
   const onPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if (e.button !== 0) return;
-    drag.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false };
+    const rect = e.currentTarget.getBoundingClientRect();
+    drag.current = {
+      x: e.clientX,
+      y: e.clientY,
+      vx: view.x,
+      vy: view.y,
+      uxPerPx: geometry.width / rect.width,
+      uyPerPx: geometry.height / rect.height,
+      moved: false
+    };
     setPanning(true);
   };
   const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -485,10 +526,7 @@ function Board({
     const dx = e.clientX - start.x;
     const dy = e.clientY - start.y;
     if (Math.abs(dx) + Math.abs(dy) > 7) start.moved = true;
-    setView((v) => {
-      const panScale = Math.max(v.z, 1) * 1.2;
-      return { ...v, x: start.vx + dx / panScale, y: start.vy + dy / panScale };
-    });
+    setView((v) => ({ ...v, x: start.vx + dx * start.uxPerPx, y: start.vy + dy * start.uyPerPx }));
   };
   const onPointerUp = () => {
     drag.current = null;
@@ -497,16 +535,16 @@ function Board({
   return (
     <div className="viewerBoardArea">
       <svg
+        ref={svgRef}
         className={`board ${interactive ? "interactive" : ""} ${panning ? "panning" : ""}`}
         viewBox={`0 0 ${geometry.width} ${geometry.height}`}
-        onWheel={onWheel}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
         onMouseLeave={() => setHover(null)}
       >
-        <g transform={`translate(${view.x} ${view.y}) scale(${view.z})`}>
+        <g transform={`matrix(${view.z} 0 0 ${view.z} ${view.x} ${view.y})`}>
           {geometry.cells.map((cell) => {
             const key = `${cell.q},${cell.r}`;
             const stone = stoneMap.get(key);
@@ -526,7 +564,9 @@ function Board({
               interactive && isLegal ? "clickable" : "",
               isLast ? "last" : ""
             ].filter(Boolean).join(" ");
-            const opacity = overlay ? Math.min(0.82, 0.18 + Number(overlay.prob || 0) * 3.2) : undefined;
+            const opacity = overlay
+              ? Math.min(0.82, 0.16 + Math.min(Math.abs(Number(overlay.score || 0)), 1.5) * 0.36)
+              : undefined;
             return (
               <g key={key}>
                 <path
@@ -543,7 +583,7 @@ function Board({
                   onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
                 />
                 {overlay && !stone && (
-                  <text className="overlayRank" x={cell.x} y={cell.y + 3}>{overlay.rank}</text>
+                  <text className="overlayValue" x={cell.x} y={cell.y + 3}>{formatStrength(overlay.score)}</text>
                 )}
                 {stone && (
                   <text className="moveNumber" x={cell.x} y={cell.y + 4}>{moveNum.get(key) || ""}</text>
@@ -637,13 +677,17 @@ function hoverText(hover: AnyRow) {
     const axes = Array.isArray(hover.overlay.axes)
       ? hover.overlay.axes.map((v: number) => Number(v).toFixed(2)).join(",")
       : "";
-    parts.push(`rank ${hover.overlay.rank}`);
     parts.push(`score ${Number(hover.overlay.score || 0).toFixed(2)}`);
     if (Number.isFinite(Number(hover.overlay.owner))) parts.push(`P${Number(hover.overlay.owner)} strength`);
-    parts.push(`mass ${(Number(hover.overlay.prob || 0) * 100).toFixed(2)}%`);
     if (axes) parts.push(`axes [${axes}]`);
   }
   return parts.join(" · ");
+}
+
+function formatStrength(value: number) {
+  const n = Number(value || 0);
+  const prefix = n > 0 ? "+" : "";
+  return `${prefix}${n.toFixed(2)}`;
 }
 
 function clamp(value: number, min: number, max: number) {

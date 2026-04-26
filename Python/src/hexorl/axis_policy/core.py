@@ -67,34 +67,26 @@ class AxisPolicyResult:
     offset_r: int = DEFAULT_OFFSET
     current_player: int = 0
 
-    def to_json(self, *, top_k: int = 24) -> dict[str, Any]:
-        flat = self.combined_policy.reshape(-1)
-        top = []
-        if flat.size:
-            order = np.argsort(-flat)[:top_k]
-            for idx in order:
-                prob = float(flat[int(idx)])
-                if prob <= 0:
+    def to_json(self) -> dict[str, Any]:
+        cells = []
+        axis_count = min(3, self.axis_maps.shape[0])
+        for i in range(self.axis_maps.shape[1]):
+            for j in range(self.axis_maps.shape[2]):
+                axis_values = [float(self.axis_maps[axis, i, j]) for axis in range(axis_count)]
+                if not any(abs(value) > 1e-7 for value in axis_values):
                     continue
-                q = int(idx) // BOARD_SIZE + int(self.offset_q)
-                r = int(idx) % BOARD_SIZE + int(self.offset_r)
-                axis_values = [
-                    float(self.axis_maps[axis, q - self.offset_q, r - self.offset_r])
-                    for axis in range(min(3, self.axis_maps.shape[0]))
-                ]
-                score = max(axis_values, key=lambda value: abs(value)) if axis_values else prob
+                score = max(axis_values, key=lambda value: abs(value))
                 owner = int(self.current_player) if score >= 0 else 1 - int(self.current_player)
-                top.append(
+                cells.append(
                     {
-                        "action": int(idx),
-                        "q": q,
-                        "r": r,
-                        "prob": prob,
+                        "q": int(i + self.offset_q),
+                        "r": int(j + self.offset_r),
                         "score": float(score),
                         "owner": owner,
                         "axes": axis_values,
                     }
                 )
+        cells.sort(key=lambda cell: abs(float(cell["score"])), reverse=True)
         return {
             "prototype_id": self.prototype_id,
             "parameters": self.parameters,
@@ -111,7 +103,7 @@ class AxisPolicyResult:
                 }
                 for axis in range(3)
             ],
-            "top": top,
+            "cells": cells,
             "debug_terms": self.debug_terms,
         }
 

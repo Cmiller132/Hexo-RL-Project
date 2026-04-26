@@ -291,16 +291,16 @@ tr.selected {
 }
 
 .moveNumber,
-.overlayRank {
+.overlayValue {
   fill: #ffffff;
   text-anchor: middle;
   font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 10px;
+  font-size: 8px;
   font-weight: 700;
   pointer-events: none;
 }
 
-.overlayRank {
+.overlayValue {
   fill: #ffffff;
   paint-order: stroke;
   stroke: rgba(0, 0, 0, 0.78);

@@ -28,7 +28,6 @@ class LegacyAxisInfluencePrototype:
         ParameterSpec("w3", 0.15, 0.0, 0.8, 0.01, "Urgency for three stones in a pure 6-cell window."),
         ParameterSpec("w4", 0.45, 0.0, 2.0, 0.01, "Urgency for four stones in a pure 6-cell window."),
         ParameterSpec("w5", 1.0, 0.0, 4.0, 0.05, "Urgency for five stones in a pure 6-cell window."),
-        ParameterSpec("positive_temperature", 1.0, 0.1, 4.0, 0.05, "Sharpness for the derived positive top-cell overlay."),
     )
 
     def compute(
@@ -68,8 +67,6 @@ class LegacyAxisInfluencePrototype:
         positive = np.maximum(maps.max(axis=0), 0.0)
         negative = np.maximum((-maps).max(axis=0), 0.0)
         display = np.maximum(positive, negative)
-        if params["positive_temperature"] != 1.0:
-            display = np.power(display, params["positive_temperature"])
         combined = normalize_policy(
             display,
             position.legal_set,
