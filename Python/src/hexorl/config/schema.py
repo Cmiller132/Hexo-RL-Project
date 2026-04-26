@@ -62,6 +62,15 @@ class TrainConfig(BaseModel):
     loss_weights: dict = Field(default_factory=lambda: {
         "policy": 1.0,
         "value": 1.5,
+        "lookahead_6": 0.15,
+        "lookahead_12": 0.15,
+        "lookahead_36": 0.1,
+        "regret_rank": 0.1,
+        "regret_value": 0.1,
+        "opp_policy": 0.15,
+        "axis": 0.05,
+        "moves_left": 0.05,
+        "entropy": 0.01,
     })
 
 

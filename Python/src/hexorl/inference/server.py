@@ -255,12 +255,12 @@ class InferenceServer:
         with torch.no_grad():
             if self.fp16 and self._device.type == "cuda":
                 with torch.cuda.amp.autocast(dtype=torch.float16):
-                    p, v = self._model(batch_tensor)
+                    out = self._model(batch_tensor)
             else:
-                p, v = self._model(batch_tensor)
+                out = self._model(batch_tensor)
 
-        p = p.float()
-        v = v.float().squeeze(-1)
+        p = out["policy"].float()
+        v = HexNet.bins_to_value(out["value"]).float()
 
         policies = p.cpu().numpy()
         values = v.cpu().numpy()

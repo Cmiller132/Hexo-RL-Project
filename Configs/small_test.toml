@@ -42,4 +42,4 @@ batches_per_epoch = 100
 optimizer = "adamw"
 lr_schedule = "cosine"
 peak_lr = 0.003
-loss_weights = { policy = 1.0, value = 1.5 }
+loss_weights = { policy = 1.0, value = 1.5, lookahead_6 = 0.15, lookahead_12 = 0.15 }

@@ -35,6 +35,20 @@ def compute_value_targets(
         pos.outcome = outcome
 
 
+def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
+    """Return indices of positions that are turn boundaries.
+
+    In Hexo, a turn boundary is a position where a new full turn starts.
+    Since players alternate every placement, boundaries occur every 2
+    placements: indices 0, 2, 4, ...
+    """
+    boundaries = []
+    for i, pos in enumerate(positions):
+        if pos.turn_index % 2 == 0:
+            boundaries.append(i)
+    return boundaries
+
+
 def compute_ema_lookahead(
     positions: List[PositionRecord],
     horizon: int,
@@ -42,17 +56,18 @@ def compute_ema_lookahead(
 ) -> np.ndarray:
     """Compute EMA-weighted lookahead value targets at a given horizon.
 
+    Uses MCTS root values (not final outcomes) and counts horizons
+    in turn boundaries, matching the KataGo-adapted design.
+
     KataGo-style: for each position at index i, the lookahead target is:
-      target_i = (1 - λ) * outcome_i + λ * target_{i + horizon}
+      target_i = (1 - λ) * root_value_i + λ * target_{i + horizon_boundaries}
 
-    where outcome_i is the position player's value target.
-
-    This provides a smoother training signal that accounts for
-    intermediate who-is-winning transitions.
+    where root_value_i is the MCTS root value from that position's
+    perspective, and the horizon is counted in turn boundaries.
 
     Args:
         positions: List of positions from one game.
-        horizon: Number of future positions to look ahead (in turn boundaries).
+        horizon: Number of turn boundaries to look ahead.
         lambda_: EMA decay factor (λ ∈ [0, 1)).
 
     Returns:
@@ -62,16 +77,28 @@ def compute_ema_lookahead(
     if n == 0:
         return np.array([], dtype=np.float32)
 
-    outcomes = np.array([pos.to_value_target() for pos in positions], dtype=np.float32)
-    result = np.copy(outcomes)
+    boundaries = _turn_boundary_indices(positions)
+    mcts_values = np.array([pos.root_value for pos in positions], dtype=np.float32)
+    result = np.copy(mcts_values)
 
-    # Backward EMA: result[i] = λ * result[i+horizon] + (1-λ) * outcomes[i]
     for i in range(n - 1, -1, -1):
-        j = i + horizon
-        if j < n:
-            result[i] = (1.0 - lambda_) * outcomes[i] + lambda_ * result[j]
+        try:
+            bi = boundaries.index(i)
+        except ValueError:
+            bi = 0
+            for b in boundaries:
+                if b >= i:
+                    bi = boundaries.index(b)
+                    break
+            else:
+                bi = len(boundaries) - 1
+
+        target_bi = bi + horizon
+        if target_bi < len(boundaries):
+            j = boundaries[target_bi]
+            result[i] = (1.0 - lambda_) * mcts_values[i] + lambda_ * result[j]
         else:
-            result[i] = outcomes[i]
+            result[i] = mcts_values[i]
 
     return result
 
