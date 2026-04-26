@@ -230,6 +230,13 @@ tr.selected {
   width: 100%;
   height: 560px;
   background: #0a0e14;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.board.panning {
+  cursor: grabbing;
 }
 
 .hexCell {
@@ -357,6 +364,23 @@ tr.selected {
   border: 1px solid #30363d;
   border-radius: 4px;
   color: #c9d1d9;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.boardControls {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  display: flex;
+  gap: 5px;
+}
+
+.boardControls button {
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: 4px;
+  background: rgba(13, 17, 23, 0.88);
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 11px;
 }

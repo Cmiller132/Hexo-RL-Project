@@ -81,12 +81,14 @@ class AxisPolicyResult:
                     float(self.axis_maps[axis, q - self.offset_q, r - self.offset_r])
                     for axis in range(min(3, self.axis_maps.shape[0]))
                 ]
+                score = max(axis_values, key=lambda value: abs(value)) if axis_values else prob
                 top.append(
                     {
                         "action": int(idx),
                         "q": q,
                         "r": r,
                         "prob": prob,
+                        "score": float(score),
                         "axes": axis_values,
                     }
                 )
@@ -99,6 +101,7 @@ class AxisPolicyResult:
                 {
                     "axis": axis,
                     "sum": float(self.axis_maps[axis].sum()),
+                    "min": float(self.axis_maps[axis].min()),
                     "max": float(self.axis_maps[axis].max()),
                     "nonzero": int(np.count_nonzero(self.axis_maps[axis])),
                 }

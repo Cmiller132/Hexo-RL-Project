@@ -95,13 +95,14 @@ def test_axis_policy_prototypes_are_python_tunable():
         stones=[{"player": 0, "q": 0, "r": 0}, {"player": 1, "q": 1, "r": 0}],
         legal_moves=[{"q": -1, "r": 0}, {"q": 0, "r": 1}, {"q": 2, "r": 0}],
         current_player=0,
+        metadata={"placements_remaining": 2},
     )
-    results = evaluate_all(position, {"line_pressure": {"own_weight": 2.0}})
+    results = evaluate_all(position, {"threat_window_strength": {"own_weight": 2.0}})
     assert {r["prototype_id"] for r in results} == {
         "legacy_axis_influence",
-        "line_pressure",
-        "threat_balance",
-        "cell_potential",
+        "threat_window_strength",
+        "forcing_cells",
+        "multi_line_threats",
     }
     assert all(r["top"] for r in results)
     assert {"q", "r", "axes"} <= set(results[0]["top"][0])

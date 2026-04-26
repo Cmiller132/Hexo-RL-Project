@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -425,8 +425,8 @@ function AxisPanel({ prototypes, results, setResults }: {
           {results.map((r) => (
             <div className="result" key={r.prototype_id}>
               <h3>{r.prototype_id}</h3>
-              <Table rows={r.axis_summaries || []} columns={["axis", "sum", "max", "nonzero"]} />
-              <Table rows={(r.top || []).map((m: AnyRow, i: number) => ({ rank: i + 1, ...m }))} columns={["rank", "q", "r", "prob", "axes"]} />
+              <Table rows={r.axis_summaries || []} columns={["axis", "min", "max", "nonzero"]} />
+              <Table rows={(r.top || []).map((m: AnyRow, i: number) => ({ rank: i + 1, ...m }))} columns={["rank", "q", "r", "score", "prob", "axes"]} />
             </div>
           ))}
         </div>
@@ -447,6 +447,10 @@ function Board({
   overlayMoves?: AnyRow[];
 }) {
   const [hover, setHover] = useState<AnyRow | null>(null);
+  const [view, setView] = useState({ x: 0, y: 0, z: 1 });
+  const [panning, setPanning] = useState(false);
+  const drag = useRef<{ x: number; y: number; vx: number; vy: number; moved: boolean } | null>(null);
+  const suppressClick = useRef(false);
   const stones = position?.stones || [];
   const legal = position?.legal_moves || [];
   const threat = position?.threat_moves || [];
@@ -459,52 +463,93 @@ function Board({
   const stoneMap = new Map<string, AnyRow>(stones.map((s: AnyRow) => [`${s.q},${s.r}`, s]));
   const currentPlayer = position?.current_player ?? 0;
   const last = position?.overlays?.last_move;
+  const resetView = () => setView({ x: 0, y: 0, z: 1 });
+  const zoomBy = (factor: number) => setView((v) => ({ ...v, z: clamp(v.z * factor, 0.35, 3.2) }));
   const clickCell = (q: number, r: number) => {
+    if (suppressClick.current) return;
     if (!interactive || !onCellClick || !legalSet.has(`${q},${r}`)) return;
     onCellClick(q, r);
+  };
+  const onWheel = (e: React.WheelEvent<SVGSVGElement>) => {
+    e.preventDefault();
+    zoomBy(e.deltaY < 0 ? 1.12 : 0.89);
+  };
+  const onPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    drag.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false };
+    setPanning(true);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const start = drag.current;
+    if (!start) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) start.moved = true;
+    setView((v) => ({ ...v, x: start.vx + dx / v.z, y: start.vy + dy / v.z }));
+  };
+  const onPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (drag.current?.moved) {
+      suppressClick.current = true;
+      window.setTimeout(() => { suppressClick.current = false; }, 0);
+    }
+    drag.current = null;
+    setPanning(false);
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
   };
   return (
     <div className="viewerBoardArea">
       <svg
-        className={`board ${interactive ? "interactive" : ""}`}
+        className={`board ${interactive ? "interactive" : ""} ${panning ? "panning" : ""}`}
         viewBox={`0 0 ${geometry.width} ${geometry.height}`}
+        onWheel={onWheel}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
         onMouseLeave={() => setHover(null)}
       >
-        {geometry.cells.map((cell) => {
-          const key = `${cell.q},${cell.r}`;
-          const stone = stoneMap.get(key);
-          const isLegal = legalSet.has(key);
-          const isThreat = threatSet.has(key);
-          const overlay = overlayMap.get(key);
-          const isLast = last && last.q === cell.q && last.r === cell.r;
-          const classes = [
-            "hexCell",
-            stone ? `stone p${stone.player}` : "empty",
-            isLegal ? "legal" : "",
-            isThreat ? "threat" : "",
-            overlay ? "overlay" : "",
-            interactive && isLegal ? "clickable" : "",
-            isLast ? "last" : ""
-          ].filter(Boolean).join(" ");
-          const opacity = overlay ? Math.min(0.82, 0.18 + Number(overlay.prob || 0) * 3.2) : undefined;
-          return (
-            <g key={key}>
-              <path
-                d={hexPath(cell.x, cell.y, 23)}
-                className={classes}
-                style={overlay ? { "--overlay-alpha": opacity } as React.CSSProperties : undefined}
-                onClick={() => clickCell(cell.q, cell.r)}
-                onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
-              />
-              {overlay && !stone && (
-                <text className="overlayRank" x={cell.x} y={cell.y + 3}>{overlay.rank}</text>
-              )}
-              {stone && (
-                <text className="moveNumber" x={cell.x} y={cell.y + 4}>{moveNum.get(key) || ""}</text>
-              )}
-            </g>
-          );
-        })}
+        <g transform={`translate(${view.x} ${view.y}) scale(${view.z})`}>
+          {geometry.cells.map((cell) => {
+            const key = `${cell.q},${cell.r}`;
+            const stone = stoneMap.get(key);
+            const isLegal = legalSet.has(key);
+            const isThreat = threatSet.has(key);
+            const overlay = overlayMap.get(key);
+            const isLast = last && last.q === cell.q && last.r === cell.r;
+            const classes = [
+              "hexCell",
+              stone ? `stone p${stone.player}` : "empty",
+              isLegal ? "legal" : "",
+              isThreat ? "threat" : "",
+              overlay ? "overlay" : "",
+              interactive && isLegal ? "clickable" : "",
+              isLast ? "last" : ""
+            ].filter(Boolean).join(" ");
+            const opacity = overlay ? Math.min(0.82, 0.18 + Number(overlay.prob || 0) * 3.2) : undefined;
+            return (
+              <g key={key}>
+                <path
+                  d={hexPath(cell.x, cell.y, 23)}
+                  className={classes}
+                  style={overlay ? { "--overlay-alpha": opacity } as React.CSSProperties : undefined}
+                  onClick={() => clickCell(cell.q, cell.r)}
+                  onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
+                />
+                {overlay && !stone && (
+                  <text className="overlayRank" x={cell.x} y={cell.y + 3}>{overlay.rank}</text>
+                )}
+                {stone && (
+                  <text className="moveNumber" x={cell.x} y={cell.y + 4}>{moveNum.get(key) || ""}</text>
+                )}
+              </g>
+            );
+          })}
+        </g>
         <g className="boardBadge">
           <rect x="8" y="8" width="128" height="42" rx="5" />
           <circle cx="22" cy="24" r="6" className={`badgeDot p${currentPlayer}`} />
@@ -514,6 +559,11 @@ function Board({
       </svg>
       <div className="coordTip">
         {hover ? hoverText(hover) : "Hover a cell"}
+      </div>
+      <div className="boardControls">
+        <button onClick={() => zoomBy(1.18)}>+</button>
+        <button onClick={() => zoomBy(0.85)}>-</button>
+        <button onClick={resetView}>Fit</button>
       </div>
     </div>
   );
@@ -586,10 +636,15 @@ function hoverText(hover: AnyRow) {
       ? hover.overlay.axes.map((v: number) => Number(v).toFixed(2)).join(",")
       : "";
     parts.push(`rank ${hover.overlay.rank}`);
-    parts.push(`p ${(Number(hover.overlay.prob || 0) * 100).toFixed(2)}%`);
+    parts.push(`score ${Number(hover.overlay.score || 0).toFixed(2)}`);
+    parts.push(`mass ${(Number(hover.overlay.prob || 0) * 100).toFixed(2)}%`);
     if (axes) parts.push(`axes [${axes}]`);
   }
   return parts.join(" · ");
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {

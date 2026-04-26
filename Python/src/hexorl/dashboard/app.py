@@ -324,10 +324,13 @@ def _axis_input_from_request(store: DashboardStore, req: AxisEvaluateRequest) ->
         return AxisPolicyInput(
             stones=list(req.position.get("stones", [])),
             legal_moves=list(req.position.get("legal_moves", [])),
-            current_player=int(req.position.get("current_player", 0)),
-            offset_q=int(req.position.get("offset_q", -16)),
-            offset_r=int(req.position.get("offset_r", -16)),
-            metadata=dict(req.position.get("metadata", {})),
+        current_player=int(req.position.get("current_player", 0)),
+        offset_q=int(req.position.get("offset_q", -16)),
+        offset_r=int(req.position.get("offset_r", -16)),
+        metadata={
+            "placements_remaining": int(req.position.get("placements_remaining", 2)),
+            **dict(req.position.get("metadata", {})),
+        },
         )
     if req.session_id:
         payload = session_payload(store, req.session_id)
@@ -349,7 +352,11 @@ def _axis_input_from_request(store: DashboardStore, req: AxisEvaluateRequest) ->
         current_player=int(pos["current_player"]),
         offset_q=int(pos["encoding"].get("offset_q", -16)),
         offset_r=int(pos["encoding"].get("offset_r", -16)),
-        metadata={"source": "dashboard"},
+        metadata={
+            "source": "dashboard",
+            "turn_index": int(pos.get("turn_index", 0)),
+            "placements_remaining": int(pos.get("placements_remaining", 2)),
+        },
     )
 
 

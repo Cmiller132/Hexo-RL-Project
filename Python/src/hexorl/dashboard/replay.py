@@ -28,6 +28,7 @@ Move = tuple[int, int, int]
 class ReplayPosition:
     turn_index: int
     current_player: int
+    placements_remaining: int
     moves: list[Move]
     stones: list[dict[str, int]]
     is_over: bool
@@ -123,6 +124,7 @@ def position_payload(position: ReplayPosition) -> dict[str, Any]:
     return {
         "turn_index": position.turn_index,
         "current_player": position.current_player,
+        "placements_remaining": position.placements_remaining,
         "moves": [_move_dict(m) for m in position.moves],
         "stones": position.stones,
         "is_over": position.is_over,
@@ -144,6 +146,7 @@ def _position_from_game(
 ) -> ReplayPosition:
     if HAS_ENGINE and game is not None:
         current_player = int(getattr(game, "current_player", len(moves) % 2))
+        placements_remaining = int(getattr(game, "placements_remaining", _fallback_placements_remaining(moves)))
         is_over = bool(getattr(game, "is_over", False))
         winner = getattr(game, "winner", None)
         stones = _engine_stones(game)
@@ -154,6 +157,7 @@ def _position_from_game(
         encoding = _encoding_summary(tensor, offsets, legal_mask)
     else:
         current_player = len(moves) % 2
+        placements_remaining = _fallback_placements_remaining(moves)
         winner = None
         is_over = False
         stones = [_move_dict(m) for m in moves]
@@ -170,6 +174,7 @@ def _position_from_game(
     return ReplayPosition(
         turn_index=len(moves),
         current_player=current_player,
+        placements_remaining=placements_remaining,
         moves=moves,
         stones=stones,
         is_over=is_over,
@@ -183,6 +188,12 @@ def _position_from_game(
             "history_b64_len": len(history),
         },
     )
+
+
+def _fallback_placements_remaining(moves: list[Move]) -> int:
+    if not moves:
+        return 1
+    return 2 if (len(moves) - 1) % 2 == 0 else 1
 
 
 def _game_from_moves(moves: list[Move]) -> Any:
