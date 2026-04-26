@@ -1,0 +1,22 @@
+[package]
+name = "hexgame-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmarks for hexgame-core"
+
+[dev-dependencies]
+hexgame-core.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "mcts"
+harness = false
+
+[[bench]]
+name = "threats"
+harness = false

@@ -1,0 +1,45 @@
+[run]
+seed = 42
+output_dir = "./runs/small_test"
+log_level = "DEBUG"
+
+[model]
+channels = 32
+blocks = 4
+heads = ["policy", "value"]
+
+[selfplay]
+num_workers = 2
+games_per_epoch = 100
+states_per_epoch = 5000
+batch_size_per_worker = 4
+mcts_simulations = 100
+c_puct = 1.5
+c_puct_init = 19652.0
+temperature_schedule = [[0, 1.0], [30, 0.0]]
+dirichlet_alpha = 0.3
+dirichlet_fraction = 0.25
+pcr_low_sim_prob = 0.0
+pcr_low_sims = 50
+resign_threshold = -0.95
+resign_disable_prob = 0.1
+
+[inference]
+max_batch_size = 16
+max_wait_us = 1000
+fp16 = false
+ema_update_every = 100
+
+[buffer]
+capacity = 10000
+recency_decay = 0.99
+pcr_weight = 1.0
+regret_fraction = 0.0
+
+[train]
+batch_size = 64
+batches_per_epoch = 100
+optimizer = "adamw"
+lr_schedule = "cosine"
+peak_lr = 0.003
+loss_weights = { policy = 1.0, value = 1.5 }

@@ -1,27 +1,24 @@
-[package]
-name = "hexgame"
+[workspace]
+members = ["crates/hexgame-core", "crates/hexgame-py", "crates/hexgame-bench", "crates/hexgame-cli"]
+resolver = "2"
+
+[workspace.package]
 version = "0.2.0"
 edition = "2021"
-description = "Hexo — Rust game engine with Python ML pipeline"
 license = "MIT"
+description = "Hexo — Rust game engine with Python ML pipeline"
 
-[lib]
-name = "hexgame"
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
+[workspace.dependencies]
 rustc-hash = "2"
 smallvec = "1"
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
-numpy = { version = "0.24", optional = true }
-
-[dev-dependencies]
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
+numpy = "0.24"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[features]
-default = []
-python = ["pyo3", "numpy"]
+hexgame-core = { path = "crates/hexgame-core" }
+hexgame-py = { path = "crates/hexgame-py" }
+hexgame-bench = { path = "crates/hexgame-bench" }
+hexgame-cli = { path = "crates/hexgame-cli" }
 
 [profile.test]
 opt-level = 1
@@ -38,7 +35,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 inherits = "release"
-
-[[bench]]
-name = "engine"
-harness = false

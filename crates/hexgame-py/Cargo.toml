@@ -1,0 +1,14 @@
+[package]
+name = "hexgame-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PyO3 Python bindings for hexgame-core"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hexgame-core.workspace = true
+pyo3.workspace = true
+numpy.workspace = true
