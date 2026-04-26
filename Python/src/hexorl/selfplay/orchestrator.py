@@ -19,6 +19,7 @@ from hexorl.config import Config
 from hexorl.inference.server import InferenceServer
 from hexorl.buffer.ring import RingBuffer
 from hexorl.selfplay.worker import SelfPlayWorker
+from hexorl.dashboard.recorder import RunRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class SelfPlayOrchestrator:
         cfg: Config,
         buffer_capacity: int = 100_000,
         initial_model_state: Optional[dict] = None,
+        recorder: Optional[RunRecorder] = None,
     ):
         self.cfg = cfg
         self.num_workers = cfg.selfplay.num_workers
@@ -40,6 +42,7 @@ class SelfPlayOrchestrator:
         # Inference server
         self._server: Optional[InferenceServer] = None
         self._initial_model_state = initial_model_state
+        self._recorder = recorder
 
         # Ring buffer
         self._buffer = RingBuffer(
@@ -191,6 +194,8 @@ class SelfPlayOrchestrator:
             # Push all positions into the ring buffer
             valid_positions = list(game_record.positions)
             self._buffer.extend(valid_positions)
+            if self._recorder is not None:
+                self._recorder.game(game_record, source="selfplay")
 
             with self._stats_lock:
                 self._games_done += 1
@@ -234,6 +239,7 @@ def run_orchestrator(
     cfg: Config,
     buffer_capacity: int = 100_000,
     initial_model_state: Optional[dict] = None,
+    recorder: Optional[RunRecorder] = None,
 ):
     """Run the orchestrator until interrupted, then clean up.
 
@@ -243,6 +249,7 @@ def run_orchestrator(
         cfg,
         buffer_capacity=buffer_capacity,
         initial_model_state=initial_model_state,
+        recorder=recorder,
     )
 
     # Handle SIGINT/SIGTERM gracefully

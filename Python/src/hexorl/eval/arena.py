@@ -12,6 +12,7 @@ from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
 from hexorl.model.network import HexNet, from_config
+from hexorl.eval.players import noisy_model_player
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +126,28 @@ def model_move_fn(
     model: HexNet,
     *,
     device: Optional[torch.device] = None,
+    temperature: float = 0.35,
+    top_p: float = 0.98,
+    seed: int = 0,
     near_radius: int = 8,
     constrain_threats: bool = True,
 ) -> Callable:
-    """Create an arena callback that chooses the model's best legal move."""
+    """Create the default arena model callback.
+
+    Eval intentionally samples from the legal-masked policy by default so games
+    are varied.  Use temperature near zero for legacy greedy behavior.
+    """
+    if temperature > 1e-4 or top_p < 1.0:
+        return noisy_model_player(
+            model,
+            device=device,
+            temperature=temperature,
+            top_p=top_p,
+            near_radius=near_radius,
+            constrain_threats=constrain_threats,
+            seed=seed,
+        )
+
     if device is None:
         device = next(model.parameters()).device
     model.eval()

@@ -41,6 +41,10 @@ __pycache__/
 dist/
 build/
 
+# Frontend
+node_modules/
+Python/dashboard_frontend/dist/
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb

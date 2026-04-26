@@ -5,8 +5,11 @@ import logging
 from pathlib import Path
 
 from hexorl.config import load_config
+from hexorl.dashboard.checkpoints import scan_checkpoints
+from hexorl.dashboard.db import DashboardStore
 from hexorl.epoch import run_epoch, run_tiny_training_smoke
 from hexorl.eval.arena import run_arena
+from hexorl.eval.arena import load_checkpoint_model, model_move_fn
 from hexorl.eval.classical import classical_opponent_fn
 
 
@@ -30,6 +33,26 @@ def main():
     arena_p.add_argument("--games", type=int, default=4)
     arena_p.add_argument("--time-ms", type=int, default=25)
     arena_p.add_argument("--depth", type=int, default=2)
+
+    eval_p = subparsers.add_parser("eval", help="Run noisy checkpoint-vs-classical eval")
+    eval_p.add_argument("checkpoint", type=Path)
+    eval_p.add_argument("--config", type=Path, default=None)
+    eval_p.add_argument("--games", type=int, default=20)
+    eval_p.add_argument("--temperature", type=float, default=0.35)
+    eval_p.add_argument("--top-p", type=float, default=0.98)
+    eval_p.add_argument("--seed", type=int, default=0)
+    eval_p.add_argument("--time-ms", type=int, default=50)
+    eval_p.add_argument("--depth", type=int, default=3)
+
+    dash_p = subparsers.add_parser("dashboard", help="Serve the FastAPI/React dashboard")
+    dash_p.add_argument("--db", type=Path, default=Path("./runs/dashboard.sqlite3"))
+    dash_p.add_argument("--host", default="127.0.0.1")
+    dash_p.add_argument("--port", type=int, default=8765)
+
+    idx_p = subparsers.add_parser("index-checkpoints", help="Import/index checkpoints into dashboard DB")
+    idx_p.add_argument("path", type=Path)
+    idx_p.add_argument("--db", type=Path, default=Path("./runs/dashboard.sqlite3"))
+    idx_p.add_argument("--run-id", default=None)
 
     subparsers.add_parser("bench", help="Run the tiny training benchmark smoke")
 
@@ -67,6 +90,38 @@ def main():
             f"games={stats.total_games} win_rate_a={stats.win_rate_a:.3f} "
             f"avg_moves={stats.avg_moves:.1f} elo_diff={stats.elo_diff:.1f}"
         )
+    elif args.command == "eval":
+        cfg = load_config(args.config)
+        model = load_checkpoint_model(args.checkpoint, cfg)
+        side_a = model_move_fn(
+            model,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            seed=args.seed,
+        )
+        side_b = classical_opponent_fn(time_ms=args.time_ms, max_depth=args.depth)
+        stats = run_arena(side_a, side_b, num_games=args.games)
+        print(
+            f"games={stats.total_games} model_win_rate={stats.win_rate_a:.3f} "
+            f"avg_moves={stats.avg_moves:.1f} elo_diff={stats.elo_diff:.1f}"
+        )
+    elif args.command == "dashboard":
+        import uvicorn
+
+        from hexorl.dashboard.app import create_app
+
+        app = create_app(args.db)
+        print(f"Serving dashboard at http://{args.host}:{args.port}")
+        uvicorn.run(app, host=args.host, port=args.port)
+    elif args.command == "index-checkpoints":
+        store = DashboardStore(args.db)
+        results = scan_checkpoints(args.path, store, run_id=args.run_id)
+        for result in results:
+            status = "loadable" if result.is_loadable else "metadata-only"
+            print(
+                f"{result.checkpoint_id}: {result.path} "
+                f"epoch={result.epoch} step={result.global_step} {status}"
+            )
 
 
 def _format_result(result) -> str:

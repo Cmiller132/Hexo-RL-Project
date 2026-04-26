@@ -28,6 +28,7 @@ from hexorl.model.network import HexNet
 from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import GameRecord, PositionRecord, action_to_board_index
 from hexorl.train.trainer import Trainer
+from hexorl.dashboard.recorder import RunRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ def run_epoch(
     use_selfplay: bool = False,
     train: bool = True,
     device: Optional[torch.device] = None,
+    recorder: Optional[RunRecorder] = None,
 ) -> EpochResult:
     """Run one complete epoch.
 
@@ -68,6 +70,16 @@ def run_epoch(
     t0 = time.monotonic()
     output_dir = Path(output_dir or cfg.run.output_dir.format(name="default"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    recorder = recorder or RunRecorder.for_run_dir(output_dir)
+    recorder.event(
+        "epoch_start",
+        {
+            "bootstrap_games": bootstrap_games,
+            "use_selfplay": use_selfplay,
+            "train": train,
+        },
+        phase="epoch",
+    )
 
     replay = buffer or RingBuffer(
         capacity=cfg.buffer.capacity,
@@ -76,7 +88,16 @@ def run_epoch(
     )
 
     if bootstrap_games > 0:
-        replay.extend(_make_bootstrap_positions(cfg, bootstrap_games))
+        bootstrap_records = _make_bootstrap_game_records(cfg, bootstrap_games)
+        bootstrap_positions: List[PositionRecord] = []
+        for game in bootstrap_records:
+            bootstrap_positions.extend(game.positions)
+            recorder.game(game, source="bootstrap")
+        replay.extend(bootstrap_positions)
+        recorder.metric(
+            {"buffer": replay.stats, "bootstrap_games": bootstrap_games},
+            phase="bootstrap",
+        )
 
     if model is None:
         model = HexNet(
@@ -90,8 +111,10 @@ def run_epoch(
             cfg,
             buffer_capacity=cfg.buffer.capacity,
             initial_model_state=model.state_dict(),
+            recorder=recorder,
         )
         replay = orchestrator.buffer
+        recorder.metric(orchestrator.stats, phase="selfplay")
 
     train_stats: Dict[str, float] = {}
     checkpoint_path: Optional[Path] = None
@@ -116,13 +139,41 @@ def run_epoch(
 
         checkpoint_path = output_dir / f"epoch_{int(train_stats.get('epoch', 1)):04d}.pt"
         trainer.save_checkpoint(checkpoint_path)
+        recorder.metric(
+            {
+                "train": train_stats,
+                "buffer": replay.stats,
+                "checkpoint_path": str(checkpoint_path),
+            },
+            phase="train",
+            epoch=int(train_stats.get("epoch", 0)),
+            global_step=int(getattr(trainer, "global_step", 0)),
+        )
+        recorder.checkpoint(
+            checkpoint_path,
+            {"buffer": replay.stats},
+            epoch=int(train_stats.get("epoch", 0)),
+            global_step=int(getattr(trainer, "global_step", 0)),
+        )
 
-    return EpochResult(
+    result = EpochResult(
         train_stats=train_stats,
         buffer_stats=replay.stats,
         checkpoint_path=checkpoint_path,
         elapsed_s=time.monotonic() - t0,
     )
+    recorder.event(
+        "epoch_complete",
+        {
+            "train_stats": result.train_stats,
+            "buffer_stats": result.buffer_stats,
+            "checkpoint_path": str(result.checkpoint_path) if result.checkpoint_path else None,
+            "elapsed_s": result.elapsed_s,
+        },
+        phase="epoch",
+        epoch=int(train_stats.get("epoch", 0)) if train_stats else None,
+    )
+    return result
 
 
 def run_tiny_training_smoke(
@@ -219,6 +270,18 @@ def _make_bootstrap_positions(
     start_game_id: int = 0,
 ) -> List[PositionRecord]:
     records: List[PositionRecord] = []
+    for game in _make_bootstrap_game_records(cfg, num_games, start_game_id=start_game_id):
+        records.extend(game.positions)
+    return records
+
+
+def _make_bootstrap_game_records(
+    cfg: Config,
+    num_games: int,
+    *,
+    start_game_id: int = 0,
+) -> List[GameRecord]:
+    games: List[GameRecord] = []
     for game_id in range(start_game_id, start_game_id + num_games):
         game = _make_synthetic_game(cfg, game_id)
         process_game_record(
@@ -226,8 +289,8 @@ def _make_bootstrap_positions(
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             lookahead_lambdas=cfg.buffer.lookahead_lambdas,
         )
-        records.extend(game.positions)
-    return records
+        games.append(game)
+    return games
 
 
 def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
