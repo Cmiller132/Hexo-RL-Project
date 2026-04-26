@@ -66,13 +66,16 @@ class LegacyAxisInfluencePrototype:
                     maps[axis, gi, gj] = total
 
         positive = np.maximum(maps.max(axis=0), 0.0)
+        negative = np.maximum((-maps).max(axis=0), 0.0)
+        display = np.maximum(positive, negative)
         if params["positive_temperature"] != 1.0:
-            positive = np.power(positive, params["positive_temperature"])
+            display = np.power(display, params["positive_temperature"])
         combined = normalize_policy(
-            positive,
+            display,
             position.legal_set,
             position.offset_q,
             position.offset_r,
+            fallback_uniform=False,
         )
         debug = {
             "target_kind": "signed_axis_field",
@@ -90,4 +93,5 @@ class LegacyAxisInfluencePrototype:
             debug,
             position.offset_q,
             position.offset_r,
+            position.current_player,
         )

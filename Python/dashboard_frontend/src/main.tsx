@@ -372,6 +372,8 @@ function AxisPanel({ prototypes, results, setResults }: {
       q: Number.isFinite(Number(m.q)) ? Number(m.q) : Math.floor(action / 33) + offsetQ,
       r: Number.isFinite(Number(m.r)) ? Number(m.r) : (action % 33) + offsetR,
       prob: Number(m.prob),
+      score: Number(m.score),
+      owner: Number.isFinite(Number(m.owner)) ? Number(m.owner) : undefined,
       axes: m.axes,
       action,
       rank: idx + 1
@@ -450,7 +452,6 @@ function Board({
   const [view, setView] = useState({ x: 0, y: 0, z: 1 });
   const [panning, setPanning] = useState(false);
   const drag = useRef<{ x: number; y: number; vx: number; vy: number; moved: boolean } | null>(null);
-  const suppressClick = useRef(false);
   const stones = position?.stones || [];
   const legal = position?.legal_moves || [];
   const threat = position?.threat_moves || [];
@@ -464,42 +465,34 @@ function Board({
   const currentPlayer = position?.current_player ?? 0;
   const last = position?.overlays?.last_move;
   const resetView = () => setView({ x: 0, y: 0, z: 1 });
-  const zoomBy = (factor: number) => setView((v) => ({ ...v, z: clamp(v.z * factor, 0.35, 3.2) }));
+  const zoomBy = (factor: number) => setView((v) => ({ ...v, z: clamp(v.z * factor, 0.45, 2.8) }));
   const clickCell = (q: number, r: number) => {
-    if (suppressClick.current) return;
     if (!interactive || !onCellClick || !legalSet.has(`${q},${r}`)) return;
     onCellClick(q, r);
   };
   const onWheel = (e: React.WheelEvent<SVGSVGElement>) => {
     e.preventDefault();
-    zoomBy(e.deltaY < 0 ? 1.12 : 0.89);
+    zoomBy(clamp(1 - e.deltaY * 0.0007, 0.94, 1.06));
   };
   const onPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if (e.button !== 0) return;
     drag.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false };
     setPanning(true);
-    e.currentTarget.setPointerCapture(e.pointerId);
   };
   const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const start = drag.current;
     if (!start) return;
     const dx = e.clientX - start.x;
     const dy = e.clientY - start.y;
-    if (Math.abs(dx) + Math.abs(dy) > 4) start.moved = true;
-    setView((v) => ({ ...v, x: start.vx + dx / v.z, y: start.vy + dy / v.z }));
+    if (Math.abs(dx) + Math.abs(dy) > 7) start.moved = true;
+    setView((v) => {
+      const panScale = Math.max(v.z, 1) * 1.2;
+      return { ...v, x: start.vx + dx / panScale, y: start.vy + dy / panScale };
+    });
   };
-  const onPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (drag.current?.moved) {
-      suppressClick.current = true;
-      window.setTimeout(() => { suppressClick.current = false; }, 0);
-    }
+  const onPointerUp = () => {
     drag.current = null;
     setPanning(false);
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      // Pointer capture may already be released by the browser.
-    }
   };
   return (
     <div className="viewerBoardArea">
@@ -520,6 +513,9 @@ function Board({
             const isLegal = legalSet.has(key);
             const isThreat = threatSet.has(key);
             const overlay = overlayMap.get(key);
+            const overlayOwner = overlayOwnerFor(overlay, currentPlayer);
+            const overlayColor = overlayOwner === 1 ? "221, 51, 51" : "51, 119, 238";
+            const overlayStroke = overlayOwner === 1 ? "#ff9d93" : "#95b8ff";
             const isLast = last && last.q === cell.q && last.r === cell.r;
             const classes = [
               "hexCell",
@@ -536,8 +532,14 @@ function Board({
                 <path
                   d={hexPath(cell.x, cell.y, 23)}
                   className={classes}
-                  style={overlay ? { "--overlay-alpha": opacity } as React.CSSProperties : undefined}
-                  onClick={() => clickCell(cell.q, cell.r)}
+                  style={overlay ? {
+                    "--overlay-alpha": opacity,
+                    "--overlay-rgb": overlayColor,
+                    "--overlay-stroke": overlayStroke
+                  } as React.CSSProperties : undefined}
+                  onPointerUp={() => {
+                    if (!drag.current?.moved) clickCell(cell.q, cell.r);
+                  }}
                   onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
                 />
                 {overlay && !stone && (
@@ -561,8 +563,8 @@ function Board({
         {hover ? hoverText(hover) : "Hover a cell"}
       </div>
       <div className="boardControls">
-        <button onClick={() => zoomBy(1.18)}>+</button>
-        <button onClick={() => zoomBy(0.85)}>-</button>
+        <button onClick={() => zoomBy(1.1)}>+</button>
+        <button onClick={() => zoomBy(0.91)}>-</button>
         <button onClick={resetView}>Fit</button>
       </div>
     </div>
@@ -637,6 +639,7 @@ function hoverText(hover: AnyRow) {
       : "";
     parts.push(`rank ${hover.overlay.rank}`);
     parts.push(`score ${Number(hover.overlay.score || 0).toFixed(2)}`);
+    if (Number.isFinite(Number(hover.overlay.owner))) parts.push(`P${Number(hover.overlay.owner)} strength`);
     parts.push(`mass ${(Number(hover.overlay.prob || 0) * 100).toFixed(2)}%`);
     if (axes) parts.push(`axes [${axes}]`);
   }
@@ -645,6 +648,12 @@ function hoverText(hover: AnyRow) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function overlayOwnerFor(overlay: AnyRow | undefined, currentPlayer: number) {
+  if (!overlay) return currentPlayer;
+  if (Number.isFinite(Number(overlay.owner))) return Number(overlay.owner);
+  return Number(overlay.score || 0) >= 0 ? currentPlayer : 1 - currentPlayer;
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {

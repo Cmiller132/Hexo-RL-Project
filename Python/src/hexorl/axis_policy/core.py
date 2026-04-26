@@ -65,6 +65,7 @@ class AxisPolicyResult:
     debug_terms: dict[str, Any]
     offset_q: int = DEFAULT_OFFSET
     offset_r: int = DEFAULT_OFFSET
+    current_player: int = 0
 
     def to_json(self, *, top_k: int = 24) -> dict[str, Any]:
         flat = self.combined_policy.reshape(-1)
@@ -82,6 +83,7 @@ class AxisPolicyResult:
                     for axis in range(min(3, self.axis_maps.shape[0]))
                 ]
                 score = max(axis_values, key=lambda value: abs(value)) if axis_values else prob
+                owner = int(self.current_player) if score >= 0 else 1 - int(self.current_player)
                 top.append(
                     {
                         "action": int(idx),
@@ -89,6 +91,7 @@ class AxisPolicyResult:
                         "r": r,
                         "prob": prob,
                         "score": float(score),
+                        "owner": owner,
                         "axes": axis_values,
                     }
                 )
@@ -97,6 +100,7 @@ class AxisPolicyResult:
             "parameters": self.parameters,
             "offset_q": self.offset_q,
             "offset_r": self.offset_r,
+            "current_player": self.current_player,
             "axis_summaries": [
                 {
                     "axis": axis,
@@ -140,7 +144,14 @@ def empty_axis_maps() -> np.ndarray:
     return np.zeros((3, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
 
 
-def normalize_policy(scores: np.ndarray, legal_moves: set[tuple[int, int]], offset_q: int, offset_r: int) -> np.ndarray:
+def normalize_policy(
+    scores: np.ndarray,
+    legal_moves: set[tuple[int, int]],
+    offset_q: int,
+    offset_r: int,
+    *,
+    fallback_uniform: bool = True,
+) -> np.ndarray:
     """Legal-mask and normalize a flat or board-shaped score array."""
     flat_scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     masked = np.zeros(BOARD_AREA, dtype=np.float64)
@@ -149,7 +160,7 @@ def normalize_policy(scores: np.ndarray, legal_moves: set[tuple[int, int]], offs
         if idx >= 0:
             masked[idx] = max(float(flat_scores[idx]), 0.0)
     total = float(masked.sum())
-    if total <= 0.0 and legal_moves:
+    if fallback_uniform and total <= 0.0 and legal_moves:
         for q, r in legal_moves:
             idx = flat_index(q, r, offset_q, offset_r)
             if idx >= 0:

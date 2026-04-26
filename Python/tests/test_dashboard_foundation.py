@@ -101,11 +101,12 @@ def test_axis_policy_prototypes_are_python_tunable():
     assert {r["prototype_id"] for r in results} == {
         "legacy_axis_influence",
         "threat_window_strength",
-        "forcing_cells",
+        "axis_development",
         "multi_line_threats",
     }
-    assert all(r["top"] for r in results)
-    assert {"q", "r", "axes"} <= set(results[0]["top"][0])
+    assert any(r["top"] for r in results)
+    first_top = next(r["top"][0] for r in results if r["top"])
+    assert {"q", "r", "axes", "owner"} <= set(first_top)
 
 
 def test_fastapi_dashboard_smoke(tmp_path):

@@ -268,8 +268,8 @@ tr.selected {
 }
 
 .hexCell.empty.overlay {
-  fill: rgba(88, 166, 255, var(--overlay-alpha, 0.35));
-  stroke: #58a6ff;
+  fill: rgba(var(--overlay-rgb, 88, 166, 255), var(--overlay-alpha, 0.35));
+  stroke: var(--overlay-stroke, #58a6ff);
   stroke-width: 1.6;
 }
 

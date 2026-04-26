@@ -7,7 +7,7 @@ from typing import Mapping
 from hexorl.axis_policy.core import AxisPolicyInput, AxisPolicyPrototype
 from hexorl.axis_policy.legacy_influence import LegacyAxisInfluencePrototype
 from hexorl.axis_policy.threat_lines import (
-    ForcingCellPrototype,
+    AxisDevelopmentPrototype,
     MultiLineThreatPrototype,
     ThreatWindowStrengthPrototype,
 )
@@ -17,7 +17,7 @@ def builtins() -> list[AxisPolicyPrototype]:
     return [
         LegacyAxisInfluencePrototype(),
         ThreatWindowStrengthPrototype(),
-        ForcingCellPrototype(),
+        AxisDevelopmentPrototype(),
         MultiLineThreatPrototype(),
     ]
 
