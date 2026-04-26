@@ -48,26 +48,32 @@ class ModelEMA:
         self._init_shadow()
 
     def _init_shadow(self):
-        """Copy all model parameters into shadow storage."""
+        """Copy all model parameters and persistent buffers into shadow storage."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self._shadow[name] = param.data.clone().detach()
+        # Also track BatchNorm running stats and other persistent buffers.
+        for name, buf in self.model.named_buffers():
+            if buf is not None:
+                self._shadow[f"__buf__{name}"] = buf.data.clone().detach()
 
     def update(self):
         """Update shadow parameters using polyak averaging."""
         self._num_updates += 1
 
-        # Adaptive decay: decay = 1 - 1/(1 + num_updates) for first few steps,
-        # then switches to fixed decay for stability
-        if self._num_updates <= 0:
-            d = min(self.decay, 1.0 - 1.0 / (1.0 + self._num_updates))
-        else:
-            d = self.decay
+        # Adaptive warmup: ramp up from near-0 to self.decay over first ~1000 steps.
+        # Once num_updates is large enough, 1 - 1/(1+n) ≈ self.decay and clamps there.
+        d = min(self.decay, 1.0 - 1.0 / (1.0 + self._num_updates))
 
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if param.requires_grad and name in self._shadow:
                     self._shadow[name].mul_(1.0 - d).add_(param.data, alpha=d)
+            # Update buffer shadows (BatchNorm stats etc.) with same decay.
+            for name, buf in self.model.named_buffers():
+                key = f"__buf__{name}"
+                if buf is not None and key in self._shadow:
+                    self._shadow[key].mul_(1.0 - d).add_(buf.data, alpha=d)
 
     def update_step(self):
         """Alias for update() — called after each optimizer step."""
@@ -84,6 +90,11 @@ class ModelEMA:
                 if param.requires_grad and name in self._shadow:
                     self._backup[name] = param.data.clone()
                     param.data.copy_(self._shadow[name])
+            for name, buf in self.model.named_buffers():
+                key = f"__buf__{name}"
+                if buf is not None and key in self._shadow:
+                    self._backup[key] = buf.data.clone()
+                    buf.data.copy_(self._shadow[key])
 
     def restore(self):
         """Restore model weights from backup (after apply_shadow())."""
@@ -91,6 +102,10 @@ class ModelEMA:
             for name, param in self.model.named_parameters():
                 if name in self._backup:
                     param.data.copy_(self._backup.pop(name))
+            for name, buf in self.model.named_buffers():
+                key = f"__buf__{name}"
+                if key in self._backup:
+                    buf.data.copy_(self._backup.pop(key))
 
     def state_dict(self) -> dict:
         """Return serializable state for checkpointing."""

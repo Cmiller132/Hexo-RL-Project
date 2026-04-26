@@ -75,8 +75,14 @@ def regret_rank_loss(
     Returns:
         Scalar loss.
     """
+    # Normalize regrets to [0, 1] so they are comparable to log-probabilities.
+    r_min = regrets.min()
+    r_max = regrets.max()
+    r_range = (r_max - r_min).clamp(min=1e-6)
+    regrets_norm = (regrets - r_min) / r_range
+
     log_softmax_scores = F.log_softmax(scores, dim=0)
-    combined = log_softmax_scores + regrets
+    combined = log_softmax_scores + regrets_norm
     loss = -torch.logsumexp(combined, dim=0)
     return loss
 

@@ -6,7 +6,7 @@ log_level = "INFO"
 [model]
 channels = 128
 blocks = 16
-heads = ["policy", "value"]
+heads = ["policy", "value", "lookahead_6", "lookahead_12", "lookahead_36", "regret_rank", "regret_value", "opp_policy", "axis", "moves_left"]
 
 [selfplay]
 num_workers = 24
@@ -35,6 +35,8 @@ capacity = 2000000
 recency_decay = 0.99
 pcr_weight = 0.25
 regret_fraction = 0.08
+lookahead_horizons = [6, 12, 36]
+lookahead_lambdas = [0.75, 0.90, 0.97]
 
 [train]
 batch_size = 256

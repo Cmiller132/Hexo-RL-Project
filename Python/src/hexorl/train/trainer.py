@@ -63,6 +63,10 @@ class Trainer:
 
         self._loss_weights = dict(self.train_cfg.loss_weights)
         self._n_bins = getattr(self.model, 'n_bins', 65)
+        # Lookahead horizon names derived from buffer config
+        self._lookahead_keys = [
+            f"lookahead_{h}" for h in getattr(cfg.buffer, 'lookahead_horizons', [])
+        ]
 
         self.global_step = 0
         self.epoch = 0
@@ -130,7 +134,8 @@ class Trainer:
 
     def train_epoch(self) -> Dict[str, float]:
         self.epoch += 1
-        self._epoch_losses = {k: [] for k in ("total", "policy", "value")}
+        tracked_keys = ["total"] + list(self.train_cfg.loss_weights.keys())
+        self._epoch_losses = {k: [] for k in tracked_keys}
         self._start_time = time.monotonic()
         self.model.train()
 
@@ -146,8 +151,9 @@ class Trainer:
             loss_dict = self._train_step(batch, batch_idx)
 
             for k, v in loss_dict.items():
-                if k in self._epoch_losses:
-                    self._epoch_losses[k].append(v)
+                if k not in self._epoch_losses:
+                    self._epoch_losses[k] = []
+                self._epoch_losses[k].append(v)
 
             self.global_step += 1
 
@@ -157,12 +163,22 @@ class Trainer:
         return self._epoch_stats()
 
     def _train_step(self, batch, batch_idx: int) -> Dict[str, float]:
-        tensors, policies, values = batch
+        # Batch is (tensors, policies, values[, lookahead_list])
+        # lookahead_list is a list of per-horizon arrays when present.
+        if len(batch) == 4:
+            tensors, policies, values, lookahead_list = batch
+        else:
+            tensors, policies, values = batch
+            lookahead_list = []
+
         tensors = tensors.to(self.device, non_blocking=True)
         policies = policies.to(self.device, non_blocking=True)
         values = values.to(self.device, non_blocking=True)
 
         targets = {"policy": policies, "value": values}
+
+        for key, lv_arr in zip(self._lookahead_keys, lookahead_list):
+            targets[key] = lv_arr.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
 

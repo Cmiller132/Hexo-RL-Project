@@ -285,7 +285,7 @@ class HexNet(nn.Module):
             Dict of requested head outputs (all heads if requested_heads is None).
         """
         if autocast and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.amp.autocast("cuda", dtype=torch.float16):
                 out = self.forward(x)
         else:
             out = self.forward(x)

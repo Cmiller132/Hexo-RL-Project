@@ -43,12 +43,13 @@ class SelfPlayOrchestrator:
         self._buffer = RingBuffer(
             capacity=buffer_capacity,
             recency_decay=cfg.buffer.recency_decay,
+            num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
 
         # Worker management
         self._workers: List[mp.Process] = []
         self._record_queue = mp.Queue(maxsize=5000)
-        self._stop_event = mp.Event()
+        self._stop_event = threading.Event()
         self._collector_thread: Optional[threading.Thread] = None
 
         # Stats
@@ -161,12 +162,8 @@ class SelfPlayOrchestrator:
     def _ingest_game(self, game_record):
         """Process and store one completed game record."""
         try:
-            # Ensure targets are computed
-            process_game_record(
-                game_record,
-                lookahead_horizons=self.cfg.buffer.lookahead_horizons,
-                lookahead_lambdas=self.cfg.buffer.lookahead_lambdas,
-            )
+            # Targets are already computed by the worker before pushing.
+            # Do not reprocess — it overwrites correct EMA lookahead values.
 
             # Push all positions into the ring buffer
             valid_positions = [p for p in game_record.positions

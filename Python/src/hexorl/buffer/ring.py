@@ -24,10 +24,12 @@ class RingBuffer:
         capacity: int,
         max_policy_entries: int = 20,
         recency_decay: float = 0.99,
+        num_lookahead: int = 0,
     ):
         self.capacity = capacity
         self.max_policy_entries = max_policy_entries
         self.recency_decay = recency_decay
+        self.num_lookahead = num_lookahead
 
         # Storage arrays — struct of arrays
         self._histories: List[Optional[bytes]] = [None] * capacity
@@ -38,6 +40,11 @@ class RingBuffer:
         self._game_ids = np.zeros(capacity, dtype=np.uint32)
         self._is_full = np.zeros(capacity, dtype=np.bool_)
         self._players = np.zeros(capacity, dtype=np.uint8)
+        # Per-horizon lookahead value targets — shape (capacity, num_lookahead)
+        if num_lookahead > 0:
+            self._lookahead = np.zeros((capacity, num_lookahead), dtype=np.float32)
+        else:
+            self._lookahead = None
 
         # Ring pointers
         self._head: int = 0
@@ -81,6 +88,12 @@ class RingBuffer:
             self._game_ids[idx] = record.game_id
             self._is_full[idx] = record.is_full_search
             self._players[idx] = record.player
+            if self._lookahead is not None:
+                lv = record.lookahead_values
+                k = min(len(lv), self.num_lookahead)
+                self._lookahead[idx, :k] = lv[:k]
+                if k < self.num_lookahead:
+                    self._lookahead[idx, k:] = self._values[idx]
 
             self._head = (self._head + 1) % self.capacity
             if self._size == self.capacity:
@@ -110,6 +123,12 @@ class RingBuffer:
         self._game_ids[idx] = record.game_id
         self._is_full[idx] = record.is_full_search
         self._players[idx] = record.player
+        if self._lookahead is not None:
+            lv = record.lookahead_values
+            k = min(len(lv), self.num_lookahead)
+            self._lookahead[idx, :k] = lv[:k]
+            if k < self.num_lookahead:
+                self._lookahead[idx, k:] = self._values[idx]
         self._head = (self._head + 1) % self.capacity
         if self._size == self.capacity:
             self._tail = (self._tail + 1) % self.capacity
@@ -151,33 +170,39 @@ class RingBuffer:
         return physical.astype(np.int64)
 
     def __getitem__(self, idx: int) -> Optional[PositionRecord]:
-        """Retrieve a single position record by physical index."""
+        """Retrieve a single position record by physical index. Thread-safe."""
         if idx < 0 or idx >= self.capacity:
             raise IndexError(f"Index {idx} out of range [0, {self.capacity})")
-        if self._histories[idx] is None:
-            return None
+        with self._lock:
+            if self._histories[idx] is None:
+                return None
 
-        policy = {}
-        n = int(self._policy_counts[idx])
-        for j in range(n):
-            action_idx = int(self._policies[idx, j])
-            prob = float(self._policy_probs[idx, j])
-            if prob > 0:
-                policy[action_idx] = prob
+            policy = {}
+            n = int(self._policy_counts[idx])
+            for j in range(n):
+                action_idx = int(self._policies[idx, j])
+                prob = float(self._policy_probs[idx, j])
+                if prob > 0:
+                    policy[action_idx] = prob
 
-        stored_value = float(self._values[idx])
-        player = int(self._players[idx])
-        outcome = stored_value if player == 0 else -stored_value
+            stored_value = float(self._values[idx])
+            player = int(self._players[idx])
+            outcome = stored_value if player == 0 else -stored_value
 
-        return PositionRecord(
-            move_history=self._histories[idx],
-            policy_target=policy,
-            root_value=0.0,
-            player=player,
-            game_id=int(self._game_ids[idx]),
-            is_full_search=bool(self._is_full[idx]),
-            outcome=outcome,
-        )
+            lv = []
+            if self._lookahead is not None:
+                lv = self._lookahead[idx].tolist()
+
+            return PositionRecord(
+                move_history=self._histories[idx],
+                policy_target=policy,
+                root_value=0.0,
+                player=player,
+                game_id=int(self._game_ids[idx]),
+                is_full_search=bool(self._is_full[idx]),
+                outcome=outcome,
+                lookahead_values=lv,
+            )
 
     def get_batch(self, indices: np.ndarray) -> List[PositionRecord]:
         """Retrieve multiple records by physical indices."""
@@ -223,3 +248,5 @@ class RingBuffer:
             self._tail = 0
             self._size = 0
             self._max_game_id = 0
+            if self._lookahead is not None:
+                self._lookahead.fill(0.0)

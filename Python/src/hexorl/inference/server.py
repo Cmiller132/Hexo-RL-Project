@@ -157,49 +157,66 @@ class InferenceServer:
               f"fp16={self.fp16}, max_batch={self.max_batch}, "
               f"workers={self.num_workers}", flush=True)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        wait_s = self.max_wait_us / 1_000_000.0
 
         while not self._stop_event.is_set():
-            ready_workers = self._drain_ready_workers()
+            # Poll until at least one worker is ready, then wait for more.
+            if not self._any_worker_ready():
+                await asyncio.sleep(wait_s)
+                continue
 
-            if ready_workers:
-                batch_tensor, per_worker_counts, total_count = self._build_batch(ready_workers)
+            # At least one worker ready — wait max_wait_us for more to arrive.
+            await asyncio.sleep(wait_s)
 
-                if total_count > 0:
-                    policies, values = await loop.run_in_executor(
-                        None, self._forward, batch_tensor
-                    )
+            ready_workers = self._drain_ready_workers(max_total=self.max_batch)
+            if not ready_workers:
+                continue
 
-                    self._scatter_results(ready_workers, per_worker_counts, policies, values)
+            batch_tensor, per_worker_counts, total_count = self._build_batch(ready_workers)
 
-                    for worker_id in ready_workers:
-                        slot = self._queue.get_slot(worker_id)
-                        slot.req_ready.clear()
-                        slot.res_ready.set()
+            if total_count > 0:
+                # Clear req_ready before the forward pass (P1-1 fix).
+                for worker_id in ready_workers:
+                    self._queue.get_slot(worker_id).req_ready.clear()
 
-                    self.n_batches += 1
-                    self.n_positions += total_count
-            else:
-                await asyncio.sleep(0.0)
-                await asyncio.sleep(self.max_wait_us / 1_000_000.0)
+                policies, values = await loop.run_in_executor(
+                    None, self._forward, batch_tensor
+                )
+
+                self._scatter_results(ready_workers, per_worker_counts, policies, values)
+
+                for worker_id in ready_workers:
+                    self._queue.get_slot(worker_id).res_ready.set()
+
+                self.n_batches += 1
+                self.n_positions += total_count
 
         print(f"[inference-server] Shutting down. "
               f"Batches: {self.n_batches}, Positions: {self.n_positions}", flush=True)
 
     # ── Worker drain ──────────────────────────────────────────────────────
 
-    def _drain_ready_workers(self) -> List[int]:
+    def _drain_ready_workers(self, max_total: Optional[int] = None) -> List[int]:
         """Collect worker IDs whose req_ready event is set.
 
+        Stops accumulating when the cumulative position count reaches max_total.
         Returns list of ready worker IDs (may be empty).
         """
+        if max_total is None:
+            max_total = self.max_batch
+
         ready = []
+        total = 0
         for i in range(self.num_workers):
+            if total >= max_total:
+                break
             slot = self._queue.get_slot(i)
             if slot.req_ready.is_set():
                 count = int(slot.req_count[0])
                 if count > 0:
                     ready.append(i)
+                    total += count
                 else:
                     slot.req_ready.clear()
 
@@ -254,7 +271,7 @@ class InferenceServer:
 
         with torch.no_grad():
             if self.fp16 and self._device.type == "cuda":
-                with torch.cuda.amp.autocast(dtype=torch.float16):
+                with torch.amp.autocast("cuda", dtype=torch.float16):
                     out = self._model(batch_tensor)
             else:
                 out = self._model(batch_tensor)
@@ -288,6 +305,13 @@ class InferenceServer:
             offset += count
 
     # ── Stats ─────────────────────────────────────────────────────────────
+
+    def _any_worker_ready(self) -> bool:
+        """Return True if at least one worker slot has req_ready set."""
+        for i in range(self.num_workers):
+            if self._queue.get_slot(i).req_ready.is_set():
+                return True
+        return False
 
     @property
     def positions_per_sec(self) -> float:

@@ -8,6 +8,11 @@ On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 import numpy as np
 from typing import Iterator, Tuple, Optional, List
 
+try:
+    from torch.utils.data import IterableDataset as _IterableDataset
+except ImportError:
+    _IterableDataset = object  # type: ignore
+
 from hexorl.buffer.ring import RingBuffer
 from hexorl.selfplay.records import PositionRecord, BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
 
@@ -151,10 +156,11 @@ def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
     return result
 
 
-class ReplayDataset:
+class ReplayDataset(_IterableDataset):
     """Iterable dataset that samples from the ring buffer and decodes on-the-fly.
 
-    Compatible with torch.utils.data.DataLoader.
+    Each DataLoader worker calls __iter__ independently. Since the buffer is
+    shared, workers get different random samples automatically.
     Runs in DataLoader worker threads.
     """
 
@@ -166,6 +172,7 @@ class ReplayDataset:
         pcr_weight: float = 0.25,
         use_symmetry: bool = True,
         near_radius: int = 8,
+        lookahead_horizons: Optional[List[int]] = None,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -173,16 +180,18 @@ class ReplayDataset:
         self.pcr_weight = pcr_weight
         self.use_symmetry = use_symmetry
         self.near_radius = near_radius
+        self.lookahead_horizons = lookahead_horizons or []
 
         self._rng = np.random.RandomState()
 
-    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Yield (tensors, policies, values) batches.
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]]:
+        """Yield (tensors, policies, values, lookahead_list) batches.
 
         Yields:
             tensors: (batch_size, 13, 33, 33) float32
             policies: (batch_size, BOARD_AREA) float32
             values: (batch_size,) float32
+            lookahead_list: list of (batch_size,) float32 arrays, one per horizon
         """
         while True:
             batch = self._sample_batch()
@@ -192,7 +201,7 @@ class ReplayDataset:
 
     def _sample_batch(
         self,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]]:
         """Sample one batch from the buffer. Returns None if insufficient data."""
         if len(self.buffer) < self.batch_size:
             return None
@@ -213,6 +222,11 @@ class ReplayDataset:
         )
         policies = np.zeros((self.batch_size, BOARD_AREA), dtype=np.float32)
         values = np.zeros(self.batch_size, dtype=np.float32)
+
+        n_lookahead = len(self.lookahead_horizons)
+        lookahead_arrays = [
+            np.zeros(self.batch_size, dtype=np.float32) for _ in range(n_lookahead)
+        ]
 
         for i, rec in enumerate(records):
             if HAS_ENGINE and hasattr(_engine, 'encode_compact_record'):
@@ -243,7 +257,13 @@ class ReplayDataset:
             policies[i] = rec.to_dense_policy()
             values[i] = rec.to_value_target()
 
-        return tensors, policies, values
+            for h_idx in range(n_lookahead):
+                if h_idx < len(rec.lookahead_values):
+                    lookahead_arrays[h_idx][i] = rec.lookahead_values[h_idx]
+                else:
+                    lookahead_arrays[h_idx][i] = values[i]  # fallback
+
+        return tensors, policies, values, lookahead_arrays
 
     def __len__(self) -> int:
         """Number of batches available."""

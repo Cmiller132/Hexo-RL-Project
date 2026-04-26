@@ -29,6 +29,7 @@ from hexorl.selfplay.records import (
     PositionRecord,
     sparsify_policy,
     action_to_board_index,
+    BOARD_AREA,
 )
 from hexorl.buffer.targets import process_game_record, compute_value_targets
 
@@ -505,15 +506,9 @@ class SelfPlayWorker:
                 except Exception:
                     pass
 
-            try:
-                moves_q, moves_r, visits, root_value = engine.get_results()
-                priors = engine.root_child_priors()
-                q_values = engine.root_child_q_values()
-            except Exception:
-                visits = [1] * 10
-                priors = [0.1] * 10
-                q_values = [0.0] * 10
-                root_value = 0.0
+            moves_q, moves_r, visits, root_value = engine.get_results()
+            priors = engine.root_child_priors()
+            q_values = engine.root_child_q_values()
 
             temp = get_temperature(move_idx, self.temperature_schedule)
             q, r = engine.sample_action(temp)
@@ -527,7 +522,13 @@ class SelfPlayWorker:
 
             record_history = bytes(move_history)
 
-            policy = sparsify_policy(np.array(priors), top_k=20)
+            # Build visit distribution over the full board (MCTS-improved policy).
+            # offset_q/offset_r come from init_root() above — still in scope.
+            visit_arr = np.zeros(BOARD_AREA, dtype=np.float32)
+            for q_coord, r_coord, v in zip(moves_q, moves_r, visits):
+                flat_idx = action_to_board_index(q_coord, r_coord, offset_q, offset_r)
+                visit_arr[flat_idx] = float(v)
+            policy = sparsify_policy(visit_arr, top_k=20)
 
             positions.append(
                 PositionRecord(
@@ -547,15 +548,13 @@ class SelfPlayWorker:
 
             move_idx += 1
 
-            try:
-                engine.re_root(q, r, sims)
-            except Exception:
-                pass
-
-            if engine.is_over:
+            # Check resignation BEFORE advancing the tree to the next position.
+            if resign_enabled and engine.should_resign(self.resign_threshold):
                 break
 
-            if resign_enabled and engine.should_resign(self.resign_threshold):
+            engine.re_root(q, r, sims)
+
+            if engine.is_over:
                 break
 
         if HAS_ENGINE:

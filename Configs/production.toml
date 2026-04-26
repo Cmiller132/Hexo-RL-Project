@@ -6,7 +6,7 @@ log_level = "INFO"
 [model]
 channels = 128
 blocks = 16
-heads = ["policy", "value", "lookahead_short", "lookahead_mid", "axis"]
+heads = ["policy", "value", "lookahead_4", "lookahead_12", "lookahead_36", "axis"]
 
 [selfplay]
 num_workers = 28
@@ -44,4 +44,4 @@ batches_per_epoch = 2000
 optimizer = "adamw"
 lr_schedule = "cosine"
 peak_lr = 0.003
-loss_weights = { policy = 1.0, value = 1.5, lookahead_short = 0.2, lookahead_mid = 0.2 }
+loss_weights = { policy = 1.0, value = 1.5, lookahead_4 = 0.2, lookahead_12 = 0.2, lookahead_36 = 0.1 }

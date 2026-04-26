@@ -28,22 +28,21 @@ fn encode_compact_record<'py>(
         return Err(PyValueError::new_err("empty history"));
     }
 
-    let mut game = HexGameState::new();
-    let mut positions = Vec::with_capacity(num_moves * TENSOR_SIZE);
+    // Copy bytes so the closure owns them (history_bytes lifetime doesn't cross thread boundary).
+    let bytes_owned: Vec<u8> = history_bytes.to_vec();
 
-    for chunk in history_bytes.chunks_exact(12) {
-        let tensor = encoder::encode_board(&game, near_radius, false).tensor;
-        positions.extend_from_slice(&tensor);
-
-        let _player = i32::from_le_bytes(chunk[0..4].try_into().unwrap()) as u8;
-        let q = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-        let r = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
-
-        if game.move_count() == 0 {
-            game.place(0, 0).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let positions = py.allow_threads(move || -> Result<Vec<f32>, String> {
+        let mut game = HexGameState::new();
+        let mut positions = Vec::with_capacity(num_moves * TENSOR_SIZE);
+        for chunk in bytes_owned.chunks_exact(12) {
+            let tensor = encoder::encode_board(&game, near_radius, false).tensor;
+            positions.extend_from_slice(&tensor);
+            let q = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            let r = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            game.place(q, r).map_err(|e| e.to_string())?;
         }
-        game.place(q, r).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    }
+        Ok(positions)
+    }).map_err(|e| PyValueError::new_err(e))?;
 
     let shape = (num_moves, NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize);
     let arr = numpy::ndarray::Array4::from_shape_vec(shape, positions)
@@ -77,43 +76,46 @@ fn apply_d6_symmetry<'py>(
         )));
     }
 
-    let mut out = numpy::ndarray::Array3::zeros((ch, h, w));
-    let half = BOARD_SIZE / 2;
-
-    for c in 0..ch {
-        for i in 0..BOARD_SIZE {
-            for j in 0..BOARD_SIZE {
-                let val = arr[[c, i as usize, j as usize]];
-
-                let qi = i - half;
-                let rj = j - half;
-
-                let (qi_t, rj_t) = match sym {
-                    0 => (qi, rj),
-                    1 => (-rj, qi + rj),
-                    2 => (-qi - rj, qi),
-                    3 => (-qi, -rj),
-                    4 => (rj, -qi - rj),
-                    5 => (qi + rj, -qi),
-                    6 => (-qi, qi + rj),
-                    7 => (-qi - rj, -qi),
-                    8 => (-rj, -qi - rj),
-                    9 => (qi, -qi - rj),
-                    10 => (qi + rj, rj),
-                    11 => (rj, qi),
-                    _ => unreachable!(),
-                };
-
-                let ti = (qi_t + half) as usize;
-                let tj = (rj_t + half) as usize;
-                if ti < BOARD_SIZE as usize && tj < BOARD_SIZE as usize {
-                    out[[c, ti, tj]] = val;
+    // Copy input to owned Vec so we can release the GIL during the transform.
+    let arr_vec: Vec<f32> = arr.iter().copied().collect();
+    let out_vec = py.allow_threads(move || -> Vec<f32> {
+        let mut out = vec![0.0f32; ch * h * w];
+        let half = BOARD_SIZE / 2;
+        for c in 0..ch {
+            for i in 0..BOARD_SIZE {
+                for j in 0..BOARD_SIZE {
+                    let val = arr_vec[c * h * w + i as usize * w + j as usize];
+                    let qi = i - half;
+                    let rj = j - half;
+                    let (qi_t, rj_t) = match sym {
+                        0 => (qi, rj),
+                        1 => (-rj, qi + rj),
+                        2 => (-qi - rj, qi),
+                        3 => (-qi, -rj),
+                        4 => (rj, -qi - rj),
+                        5 => (qi + rj, -qi),
+                        6 => (-qi, qi + rj),
+                        7 => (-qi - rj, -qi),
+                        8 => (-rj, -qi - rj),
+                        9 => (qi, -qi - rj),
+                        10 => (qi + rj, rj),
+                        11 => (rj, qi),
+                        _ => unreachable!(),
+                    };
+                    let ti = (qi_t + half) as usize;
+                    let tj = (rj_t + half) as usize;
+                    if ti < BOARD_SIZE as usize && tj < BOARD_SIZE as usize {
+                        out[c * h * w + ti * w + tj] = val;
+                    }
                 }
             }
         }
-    }
+        out
+    });
 
-    Ok(PyArray3::from_owned_array(py, out))
+    let out_arr = numpy::ndarray::Array3::from_shape_vec((ch, h, w), out_vec)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyArray3::from_owned_array(py, out_arr))
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
