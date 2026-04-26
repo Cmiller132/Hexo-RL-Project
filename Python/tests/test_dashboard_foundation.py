@@ -98,6 +98,7 @@ def test_axis_policy_prototypes_are_python_tunable():
     )
     results = evaluate_all(position, {"line_pressure": {"own_weight": 2.0}})
     assert {r["prototype_id"] for r in results} == {
+        "legacy_axis_influence",
         "line_pressure",
         "threat_balance",
         "cell_potential",

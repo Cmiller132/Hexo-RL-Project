@@ -80,7 +80,7 @@ def session_payload(
     session_id: str,
     *,
     near_radius: int = 8,
-    constrain_threats: bool = True,
+    constrain_threats: bool = False,
 ) -> dict[str, Any]:
     session = get_session(store, session_id)
     pos = get_replay_position(
@@ -99,7 +99,7 @@ def session_payload(
 
 def apply_move(store: DashboardStore, session_id: str, q: int, r: int) -> PlaySession:
     session = get_session(store, session_id)
-    current = get_replay_position(session.move_history)
+    current = get_replay_position(session.move_history, constrain_threats=False)
     if current.is_over:
         raise ValueError("Cannot play a move into a completed game")
     legal = {(m["q"], m["r"]) for m in current.legal_moves}

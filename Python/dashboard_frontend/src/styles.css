@@ -163,6 +163,10 @@ h1 {
   gap: 12px;
 }
 
+.viewerGrid.playGrid {
+  grid-template-columns: minmax(560px, 1.55fr) minmax(320px, 0.75fr);
+}
+
 .panel {
   border: 1px solid #30363d;
   background: #161b22;

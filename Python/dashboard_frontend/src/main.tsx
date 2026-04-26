@@ -242,7 +242,6 @@ function PlayPanel({ session, setSession }: { session: AnyRow | null; setSession
   const create = () => api<AnyRow>("/api/session/create", { method: "POST", body: "{}" }).then(setSession);
   const undo = () => session && api<AnyRow>(`/api/session/${session.session_id}/undo`, { method: "POST", body: "{}" }).then(setSession);
   const reset = () => session && api<AnyRow>(`/api/session/${session.session_id}/reset`, { method: "POST", body: "{}" }).then(setSession);
-  const legal = session?.position?.legal_moves || [];
   const playMove = (m: AnyRow) => session && api<AnyRow>(`/api/session/${session.session_id}/move`, {
     method: "POST",
     body: JSON.stringify({ q: m.q, r: m.r })
@@ -252,7 +251,7 @@ function PlayPanel({ session, setSession }: { session: AnyRow | null; setSession
     if (!session) create();
   }, [session]);
   return (
-    <section className="viewerGrid">
+    <section className="viewerGrid playGrid">
       <Panel title="Interactive Board">
         <div className="toolbar compact">
           <button onClick={create}><Play size={15} /> New</button>
@@ -263,18 +262,6 @@ function PlayPanel({ session, setSession }: { session: AnyRow | null; setSession
           </span>
         </div>
         <Board position={session?.position} interactive onCellClick={clickMove} />
-      </Panel>
-      <Panel title="Legal Moves">
-        <div className="viewerInfo">
-          <div><span>Legal</span><strong>{legal.length}</strong></div>
-          <div><span>Threat filter</span><strong>{(session?.position?.threat_moves || []).length || "off"}</strong></div>
-          <div><span>Moves</span><strong>{session?.position?.turn_index ?? 0}</strong></div>
-        </div>
-        <div className="moveList">
-          {legal.slice(0, 80).map((m: AnyRow, i: number) => (
-            <button key={i} onClick={() => playMove(m)}>({m.q},{m.r})</button>
-          ))}
-        </div>
       </Panel>
       <Panel title="Debug">
         <pre>{JSON.stringify(session?.position?.encoding || {}, null, 2)}</pre>
@@ -507,7 +494,7 @@ function Board({
                 className={classes}
                 style={overlay ? { "--overlay-alpha": opacity } as React.CSSProperties : undefined}
                 onClick={() => clickCell(cell.q, cell.r)}
-                onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat })}
+                onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
               />
               {overlay && !stone && (
                 <text className="overlayRank" x={cell.x} y={cell.y + 3}>{overlay.rank}</text>
@@ -526,7 +513,7 @@ function Board({
         </g>
       </svg>
       <div className="coordTip">
-        {hover ? `(${hover.q}, ${hover.r}) ${hover.legal ? "legal" : "not legal"}${hover.threat ? " threat" : ""}` : "Hover a cell"}
+        {hover ? hoverText(hover) : "Hover a cell"}
       </div>
     </div>
   );
@@ -589,6 +576,20 @@ function hexPath(cx: number, cy: number, size: number) {
     pts.push(`${(cx + size * Math.cos(a)).toFixed(2)},${(cy + size * Math.sin(a)).toFixed(2)}`);
   }
   return `M${pts.join("L")}Z`;
+}
+
+function hoverText(hover: AnyRow) {
+  const parts = [`(${hover.q}, ${hover.r})`, hover.legal ? "legal" : "not legal"];
+  if (hover.threat) parts.push("threat");
+  if (hover.overlay) {
+    const axes = Array.isArray(hover.overlay.axes)
+      ? hover.overlay.axes.map((v: number) => Number(v).toFixed(2)).join(",")
+      : "";
+    parts.push(`rank ${hover.overlay.rank}`);
+    parts.push(`p ${(Number(hover.overlay.prob || 0) * 100).toFixed(2)}%`);
+    if (axes) parts.push(`axes [${axes}]`);
+  }
+  return parts.join(" · ");
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
