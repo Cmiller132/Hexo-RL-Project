@@ -73,4 +73,6 @@ class CellPotentialPrototype:
             maps,
             combined,
             {"own_stones": len(own), "opp_stones": len(opp), "legal_moves": len(position.legal_set)},
+            position.offset_q,
+            position.offset_r,
         )

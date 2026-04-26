@@ -79,9 +79,15 @@ def test_replay_and_play_session_roundtrip(tmp_path):
     assert after["position"]["turn_index"] == 1
     assert after["position"]["stones"][0] == {"q": move["q"], "r": move["r"], "player": 0}
 
+    apply_move(store, session.session_id, 1, -1)
+    second = session_payload(store, session.session_id)
+    assert second["position"]["turn_index"] == 2
+    assert second["position"]["stones"][1] == {"q": 1, "r": -1, "player": 1}
+    assert second["position"]["moves"][-1] == {"player": 1, "q": 1, "r": -1}
+
     undo_move(store, session.session_id)
     undone = session_payload(store, session.session_id)
-    assert undone["position"]["turn_index"] == 0
+    assert undone["position"]["turn_index"] == 1
 
 
 def test_axis_policy_prototypes_are_python_tunable():
@@ -97,6 +103,7 @@ def test_axis_policy_prototypes_are_python_tunable():
         "cell_potential",
     }
     assert all(r["top"] for r in results)
+    assert {"q", "r", "axes"} <= set(results[0]["top"][0])
 
 
 def test_fastapi_dashboard_smoke(tmp_path):

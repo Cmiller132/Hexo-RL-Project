@@ -76,4 +76,12 @@ class ThreatBalancePrototype:
             position.offset_r,
         )
         debug["legal_moves"] = len(position.legal_set)
-        return AxisPolicyResult(self.prototype_id, params, maps, combined, debug)
+        return AxisPolicyResult(
+            self.prototype_id,
+            params,
+            maps,
+            combined,
+            debug,
+            position.offset_q,
+            position.offset_r,
+        )

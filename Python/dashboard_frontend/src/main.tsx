@@ -325,6 +325,7 @@ function AxisPanel({ prototypes, results, setResults }: {
   const [params, setParams] = useState<Record<string, number>>({});
   const selected = results.find((r) => r.prototype_id === selectedPrototype) || results[0];
   const selectedSpec = prototypes.find((p) => p.id === (selectedPrototype || prototypes[0]?.id));
+  const paramsKey = JSON.stringify(params);
   useEffect(() => {
     if (!selectedPrototype && prototypes.length) setSelectedPrototype(prototypes[0].id);
   }, [prototypes, selectedPrototype]);
@@ -360,14 +361,32 @@ function AxisPanel({ prototypes, results, setResults }: {
     api<AnyRow>("/api/axis/evaluate", { method: "POST", body: JSON.stringify(body) })
       .then((data) => setResults(data.results || [data]));
   };
+  useEffect(() => {
+    if (!axisSession?.session_id || !selectedPrototype) return;
+    const handle = window.setTimeout(() => {
+      api<AnyRow>("/api/axis/evaluate", {
+        method: "POST",
+        body: JSON.stringify({
+          session_id: axisSession.session_id,
+          prototype_id: selectedPrototype,
+          parameters: params
+        })
+      })
+        .then((data) => setResults(data.results || [data]))
+        .catch(() => setResults([]));
+    }, 180);
+    return () => window.clearTimeout(handle);
+  }, [axisSession?.session_id, axisSession?.position?.turn_index, selectedPrototype, paramsKey]);
   const offsetQ = axisSession?.position?.encoding?.offset_q ?? -16;
   const offsetR = axisSession?.position?.encoding?.offset_r ?? -16;
   const overlayMoves = (selected?.top || []).map((m: AnyRow, idx: number) => {
     const action = Number(m.action);
     return {
-      q: Math.floor(action / 33) + offsetQ,
-      r: (action % 33) + offsetR,
+      q: Number.isFinite(Number(m.q)) ? Number(m.q) : Math.floor(action / 33) + offsetQ,
+      r: Number.isFinite(Number(m.r)) ? Number(m.r) : (action % 33) + offsetR,
       prob: Number(m.prob),
+      axes: m.axes,
+      action,
       rank: idx + 1
     };
   });
@@ -420,7 +439,7 @@ function AxisPanel({ prototypes, results, setResults }: {
             <div className="result" key={r.prototype_id}>
               <h3>{r.prototype_id}</h3>
               <Table rows={r.axis_summaries || []} columns={["axis", "sum", "max", "nonzero"]} />
-              <Table rows={r.top || []} columns={["action", "prob"]} />
+              <Table rows={(r.top || []).map((m: AnyRow, i: number) => ({ rank: i + 1, ...m }))} columns={["rank", "q", "r", "prob", "axes"]} />
             </div>
           ))}
         </div>

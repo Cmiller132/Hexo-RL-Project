@@ -236,6 +236,7 @@ tr.selected {
 }
 
 .hexCell.empty.legal {
+  fill: rgba(88, 166, 255, 0.055);
   stroke: rgba(88, 166, 255, 0.42);
   stroke-width: 1.2;
 }
@@ -258,6 +259,7 @@ tr.selected {
 .hexCell.empty.overlay {
   fill: rgba(88, 166, 255, var(--overlay-alpha, 0.35));
   stroke: #58a6ff;
+  stroke-width: 1.6;
 }
 
 .hexCell.stone.p0 {

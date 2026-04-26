@@ -12,6 +12,7 @@ from hexorl.axis_policy.core import (
     AxisPolicyResult,
     ParameterSpec,
     board_index,
+    distance_to_stones,
     empty_axis_maps,
     line_count,
     merge_parameters,
@@ -28,6 +29,7 @@ class LinePressurePrototype:
         ParameterSpec("opp_weight", 0.65, 0.0, 4.0, 0.05, "Weight for blocking opponent runs."),
         ParameterSpec("length_power", 1.35, 0.5, 3.0, 0.05, "Nonlinear reward for longer contiguous runs."),
         ParameterSpec("axis_sharpness", 0.35, 0.0, 3.0, 0.05, "Extra reward when one axis dominates."),
+        ParameterSpec("distance_falloff", 0.75, 0.0, 2.5, 0.05, "Downweight cells far from existing stones."),
     )
 
     def compute(
@@ -39,8 +41,13 @@ class LinePressurePrototype:
         maps = empty_axis_maps()
         own = position.own_stones
         opp = position.opp_stones
+        all_stones = own | opp
 
         for q, r in position.legal_set:
+            if all_stones:
+                proximity = 1.0 / (1.0 + params["distance_falloff"] * distance_to_stones(q, r, all_stones))
+            else:
+                proximity = 1.0
             axis_scores = []
             for axis, (dq, dr) in enumerate(AXES):
                 own_len = (
@@ -54,7 +61,7 @@ class LinePressurePrototype:
                 score = (
                     params["own_weight"] * ((own_len + 1.0) ** params["length_power"])
                     + params["opp_weight"] * ((opp_len + 1.0) ** params["length_power"])
-                )
+                ) * proximity
                 axis_scores.append(score)
                 ij = board_index(q, r, position.offset_q, position.offset_r)
                 if ij is not None:
@@ -76,5 +83,12 @@ class LinePressurePrototype:
             params,
             maps,
             combined,
-            {"own_stones": len(own), "opp_stones": len(opp), "legal_moves": len(position.legal_set)},
+            {
+                "own_stones": len(own),
+                "opp_stones": len(opp),
+                "legal_moves": len(position.legal_set),
+                "falloff_applied": bool(all_stones),
+            },
+            position.offset_q,
+            position.offset_r,
         )

@@ -63,6 +63,8 @@ class AxisPolicyResult:
     axis_maps: np.ndarray
     combined_policy: np.ndarray
     debug_terms: dict[str, Any]
+    offset_q: int = DEFAULT_OFFSET
+    offset_r: int = DEFAULT_OFFSET
 
     def to_json(self, *, top_k: int = 24) -> dict[str, Any]:
         flat = self.combined_policy.reshape(-1)
@@ -73,10 +75,26 @@ class AxisPolicyResult:
                 prob = float(flat[int(idx)])
                 if prob <= 0:
                     continue
-                top.append({"action": int(idx), "prob": prob})
+                q = int(idx) // BOARD_SIZE + int(self.offset_q)
+                r = int(idx) % BOARD_SIZE + int(self.offset_r)
+                axis_values = [
+                    float(self.axis_maps[axis, q - self.offset_q, r - self.offset_r])
+                    for axis in range(min(3, self.axis_maps.shape[0]))
+                ]
+                top.append(
+                    {
+                        "action": int(idx),
+                        "q": q,
+                        "r": r,
+                        "prob": prob,
+                        "axes": axis_values,
+                    }
+                )
         return {
             "prototype_id": self.prototype_id,
             "parameters": self.parameters,
+            "offset_q": self.offset_q,
+            "offset_r": self.offset_r,
             "axis_summaries": [
                 {
                     "axis": axis,
