@@ -49,8 +49,10 @@ class InferenceServer:
         self._process: Optional[mp.Process] = None
         self._stop_event = mp.Event()
         self._ready_event = mp.Event()
+        self._weight_queue = mp.Queue(maxsize=2)
         self._model: Optional[torch.nn.Module] = None
         self._device: Optional[torch.device] = None
+        self._forward_stream = None
 
         self.n_batches = 0
         self.n_positions = 0
@@ -107,6 +109,23 @@ class InferenceServer:
             self._owned_queue.close()
             self._owned_queue = None
 
+    def update_weights(self, state_dict: dict):
+        """Queue a model state update for hot-swap in the inference process.
+
+        Tensors are moved to CPU before crossing the process boundary. The child
+        process loads them onto its inference device between batches.
+        """
+        cpu_state = {
+            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in state_dict.items()
+        }
+        while self._weight_queue.full():
+            try:
+                self._weight_queue.get_nowait()
+            except Exception:
+                break
+        self._weight_queue.put(cpu_state)
+
     def is_running(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
@@ -124,6 +143,8 @@ class InferenceServer:
             self._device = torch.device("cpu")
 
         self._model = from_config(self.cfg, device=self._device)
+        if self._device.type == "cuda":
+            self._forward_stream = torch.cuda.Stream(priority=-1)
 
         # Reconnect to the queue created in start().
         self._queue = connect_inference_queue(self.num_workers, self.max_batch)
@@ -161,6 +182,7 @@ class InferenceServer:
         wait_s = self.max_wait_us / 1_000_000.0
 
         while not self._stop_event.is_set():
+            self._poll_weight_updates()
             # Poll until at least one worker is ready, then wait for more.
             if not self._any_worker_ready():
                 await asyncio.sleep(wait_s)
@@ -251,7 +273,7 @@ class InferenceServer:
 
         batch = np.concatenate(tensors, axis=0)
         total = batch.shape[0]
-        batch_tensor = torch.from_numpy(batch).to(self._device)
+        batch_tensor = torch.from_numpy(batch).to(self._device, non_blocking=True)
 
         return batch_tensor, counts, total
 
@@ -272,7 +294,15 @@ class InferenceServer:
         t0 = time.monotonic()
 
         with torch.no_grad():
-            if self.fp16 and self._device.type == "cuda":
+            if self._device.type == "cuda" and self._forward_stream is not None:
+                with torch.cuda.stream(self._forward_stream):
+                    if self.fp16:
+                        with torch.amp.autocast("cuda", dtype=torch.float16):
+                            out = self._model(batch_tensor)
+                    else:
+                        out = self._model(batch_tensor)
+                self._forward_stream.synchronize()
+            elif self.fp16 and self._device.type == "cuda":
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     out = self._model(batch_tensor)
             else:
@@ -314,6 +344,22 @@ class InferenceServer:
             if self._queue.get_slot(i).req_ready.is_set():
                 return True
         return False
+
+    def _poll_weight_updates(self):
+        """Apply the newest queued model weights, dropping stale updates."""
+        latest = None
+        while True:
+            try:
+                latest = self._weight_queue.get_nowait()
+            except Exception:
+                break
+        if latest is not None and self._model is not None:
+            latest = {
+                k: v.to(self._device) if isinstance(v, torch.Tensor) else v
+                for k, v in latest.items()
+            }
+            self._model.load_state_dict(latest, strict=False)
+            self._model.eval()
 
     @property
     def positions_per_sec(self) -> float:

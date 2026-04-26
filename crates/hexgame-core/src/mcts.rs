@@ -283,7 +283,6 @@ pub struct MCTSEngine {
     /// Reusable buffer for `encode_board_into` live-cells channels.
     hot_buf: Vec<Hex>,
     legal_buf: Vec<Hex>,
-    #[allow(dead_code)]
     seed: u64,
 }
 
@@ -425,7 +424,8 @@ impl MCTSEngine {
         assert!(
             noise.len() >= count,
             "add_dirichlet_noise: noise length {} < root children count {}",
-            noise.len(), count
+            noise.len(),
+            count
         );
         let root = &self.arena[self.root_idx as usize];
         let start = root.children_start as usize;
@@ -483,7 +483,8 @@ impl MCTSEngine {
             {
                 node_idx = self.select_child_puct(node_idx);
                 let child = &self.arena[node_idx as usize];
-                let _ = self.game
+                let _ = self
+                    .game
                     .place(child.action.0 as i32, child.action.1 as i32);
                 search_path.push(node_idx);
             }
@@ -582,13 +583,16 @@ impl MCTSEngine {
         assert!(
             policies.len() == non_terminal_count * BOARD_AREA,
             "expand_and_backprop: policies length {} != {} (non_terminal={} * BOARD_AREA={})",
-            policies.len(), non_terminal_count * BOARD_AREA,
-            non_terminal_count, BOARD_AREA,
+            policies.len(),
+            non_terminal_count * BOARD_AREA,
+            non_terminal_count,
+            BOARD_AREA,
         );
         assert!(
             values.len() == non_terminal_count,
             "expand_and_backprop: values length {} != non_terminal_count {}",
-            values.len(), non_terminal_count,
+            values.len(),
+            non_terminal_count,
         );
 
         let mut eval_idx = 0usize;
@@ -616,7 +620,8 @@ impl MCTSEngine {
                 assert!(
                     v.is_finite(),
                     "expand_and_backprop: NN returned non-finite value at leaf {} (v={})",
-                    leaf.node_idx, v
+                    leaf.node_idx,
+                    v
                 );
 
                 // Expand the leaf node with its policy and legal moves.
@@ -1073,7 +1078,10 @@ impl MCTSEngine {
     ///
     /// `rng_state` is an in-out XOR-shift state. The caller should seed it
     /// from the deterministic seed chain and pass it by mutable reference.
-    pub fn sample_action(&self, temperature: f32, rng_state: &mut u64) -> (i16, i16) {
+    pub fn sample_action(&mut self, temperature: f32, rng_state: &mut u64) -> (i16, i16) {
+        if *rng_state == 0 {
+            *rng_state = self.seed.max(1);
+        }
         let root = &self.arena[self.root_idx as usize];
         let start = root.children_start as usize;
         let count = root.children_count as usize;
@@ -1086,19 +1094,27 @@ impl MCTSEngine {
             let best = (start..start + count)
                 .max_by_key(|&i| self.arena[i].visit_count)
                 .unwrap();
-            return (self.arena[best].action.0, self.arena[best].action.1);
+            let action = (self.arena[best].action.0, self.arena[best].action.1);
+            self.seed = *rng_state;
+            return action;
         }
 
         let inv_t = 1.0 / temperature.max(1e-8);
         let weights: Vec<f32> = (start..start + count)
             .map(|i| {
                 let vc = self.arena[i].visit_count as f32;
-                if vc <= 0.0 { 1e-12f32.powf(inv_t) } else { vc.powf(inv_t) }
+                if vc <= 0.0 {
+                    1e-12f32.powf(inv_t)
+                } else {
+                    vc.powf(inv_t)
+                }
             })
             .collect();
         let sum: f32 = weights.iter().sum();
         if sum <= 0.0 {
-            return (self.arena[start].action.0, self.arena[start].action.1);
+            let action = (self.arena[start].action.0, self.arena[start].action.1);
+            self.seed = *rng_state;
+            return action;
         }
         let r = next_uniform(rng_state) * sum;
         let mut acc = 0.0f32;
@@ -1106,11 +1122,15 @@ impl MCTSEngine {
             acc += w;
             if acc >= r {
                 let n = &self.arena[start + offset];
-                return (n.action.0, n.action.1);
+                let action = (n.action.0, n.action.1);
+                self.seed = *rng_state;
+                return action;
             }
         }
         let last = start + count - 1;
-        (self.arena[last].action.0, self.arena[last].action.1)
+        let action = (self.arena[last].action.0, self.arena[last].action.1);
+        self.seed = *rng_state;
+        action
     }
 
     /// Returns true if the root Q-value is below the resign threshold.

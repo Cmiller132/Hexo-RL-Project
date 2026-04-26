@@ -3,7 +3,7 @@
 **Hardware target:** RTX 4070 Ti (12 GB VRAM), AMD 7950X (16C / 32T), 32 GB DDR5.
 **Goal:** A maintainable, modular AlphaZero/KataGo-style training system that saturates both the GPU (inference) and CPU (self-play tree search) with minimum tail-latency and maximum future flexibility.
 
-This document is a **design plan**, not an implementation. It defines the architecture, component boundaries, data formats, and migration path. Code lives in subsequent implementation tickets.
+This document is the **active system design** for the implementation in this repository. It defines the intended production topology, the component boundaries, the data formats, the completed implementation surface, and the remaining operational checks needed before a long training run.
 
 ---
 
@@ -605,43 +605,37 @@ Cost: ~10-15% throughput. Off by default in production runs, on for ablations.
 
 ---
 
-## 11. Migration Path from Current State
+## 11. Implementation Status
 
-The current state: Rust engine is solid (per `FINALIZATION_PASS.md`). Python is empty stubs. Single-crate layout. No inference server.
+The repository is now a working single-machine prototype rather than a stub-only skeleton. The production CUDA path still needs validation on the target NVIDIA host, but the code paths are present and the CPU smoke path runs end-to-end.
 
-### Phase 1 — Foundation (1-2 weeks)
-1. Split Rust into a workspace (`crates/hexgame-core` + `crates/hexgame-py` + `crates/hexgame-bench` + `crates/hexgame-cli`).
-2. Implement the 5 FFI entry points in `hexgame-py`.
-3. Apply the 6 blocker fixes from `FINALIZATION_PASS.md` §6 (NaN-safe PUCT, no-panic re_root, deterministic seeding, temperature/resign in Rust, T1-7 underflow guard, zero-copy FFI tensor).
-4. Add `bench_single_mcts_sim` and `bench_threat_status` to `hexgame-bench`.
+### Completed Foundation
 
-### Phase 2 — Inference Server (1-2 weeks)
-1. Implement `python/hexorl/inference/server.py` with shared-memory queues.
-2. Implement `python/hexorl/inference/client.py` (worker side).
-3. Stub model in `python/hexorl/model/network.py` (small CNN; correct shapes, untrained).
-4. Benchmark inference throughput: target > 30k positions/sec FP16 batch=64.
+1. Rust is split into a workspace with `hexgame-core`, `hexgame-py`, `hexgame-bench`, and `hexgame-cli`.
+2. `_engine` builds through maturin and exposes the engine, compact record encoder, legal move encoder, symmetry transform, and MCTS wrapper.
+3. Core MCTS failure paths avoid training-run panics where possible; root re-selection returns errors, seed state is consumed and advanced, and temperature sampling is deterministic when seeded.
+4. Rust tests, Python tests, workspace `cargo check`, and a Python training smoke pass are part of the local verification loop.
 
-### Phase 3 — Self-Play & Buffer (2 weeks)
-1. Implement `selfplay/worker.py` and `selfplay/orchestrator.py`.
-2. Implement `buffer/ring.py`, `buffer/sampler.py`, `buffer/targets.py`.
-3. Implement Rust `encode_compact_record` and `apply_d6_symmetry` kernels.
-4. Run 1k-game self-play with the stub model. Measure: games/min, samples/min, GPU utilization.
+### Completed Python Pipeline
 
-### Phase 4 — Training Loop (1 week)
-1. Implement `model/network.py` properly (KataGo-style heads).
-2. Implement `train/trainer.py`, `train/losses.py`, `train/ema.py`.
-3. Run a single epoch end-to-end on `configs/small_test.toml`.
+1. `hexorl.inference` provides the shared-memory inference server/client path with adaptive batching, CUDA autocast, CUDA stream support, and queued model-weight hot swap for EMA inference.
+2. `hexorl.selfplay` provides worker and orchestrator processes with cooperative stop signaling.
+3. `hexorl.buffer` provides the ring buffer, compact record processing, recency/PCR/regret sampling, dense policy symmetry transforms, and a dedicated `BufferProcess` owner for process-isolated replay storage.
+4. `hexorl.train` provides multi-head loss computation, missing-target skips, optimizer/scheduler handling, AMP on CUDA, gradient clipping, and EMA.
+5. `hexorl.epoch.pipeline` wires bootstrap data, optional self-play, replay sampling, training, and checkpointing into `run_epoch`; `run_tiny_training_smoke` performs a real multi-epoch CPU check with one trainer lifecycle.
+6. `hexorl.eval` provides classical arena evaluation plus helpers for loading checkpoints and using trained models as move functions.
+7. `hexorl.cli` exposes `epoch`, `smoke-train`, `arena`, and `bench`.
+8. Dashboard behavior is specified in executable-friendly pseudocode in `Docs/DASHBOARD_PSEUDOCODE.md` and exported as `hexorl.dashboard.DASHBOARD_PSEUDOCODE`.
 
-### Phase 5 — Evaluation & Stability (1 week)
-1. Implement `eval/arena.py` and `eval/elo.py`.
-2. Implement `eval/classical.py` (alpha-beta opponent for ELO anchor).
-3. Run 10-epoch stability test.
+### Required Production Validation
 
-### Phase 6 — Polish (ongoing)
-1. Auto-tuning (`epoch/autotune.py`).
-2. Dashboard (`dashboard/tui.py` + TensorBoard).
-3. Long-run benchmarking + flamegraph regression tracking.
-4. Bootstrap data generation (one-time, reused).
+These are not missing implementations; they are hardware validation tasks that require the target 7950X / 4070 Ti machine.
+
+1. Run CUDA inference throughput characterization for `max_batch_size` in `[32, 64, 128, 256]` with `fp16=true`.
+2. Run worker-count sweeps for 16, 20, 24, 28, and 32 self-play workers and record games/min, positions/sec, and GPU utilization.
+3. Validate CUDA stream behavior during concurrent training and inference; tune stream priority and inference wait windows from measured p50/p99 latency.
+4. Run a 10-epoch stability job with checkpoint reload, EMA hot-swap, arena evaluation, and buffer persistence enabled.
+5. Turn the dashboard pseudocode into a Rich/TensorBoard implementation once the production metrics schema has stabilized.
 
 ---
 
@@ -674,15 +668,15 @@ If you decide to grow the buffer to 8M samples (~3 GB) or run 32 workers (~3.2 G
 
 ---
 
-## 13. Open Design Questions
+## 13. Design Decisions Closed For V1
 
-These are decisions to make during implementation, not now:
+The following decisions are closed for the first complete prototype:
 
-1. **Single trainer or async actor-critic split?** AlphaZero uses one trainer reading from a buffer. Some papers (R2D2-style) use an async setup. Start with the simple version.
-2. **Curriculum learning?** KataGo uses a "playout doubling" trick for early training. Worth considering if early training is unstable.
-3. **Tournament-based opponent pool vs. trainer EMA?** Eval setup; doesn't block self-play architecture.
-4. **Distributed training?** Out of scope for single-machine. The architecture allows it (workers can run on different boxes hitting a remote inference server) but adds complexity.
-5. **Game record retention beyond the buffer?** SQLite or compressed files for offline analysis. Cheap and easy; just make `buffer/ring.py` also write to disk on game completion.
+1. **Trainer topology:** use one trainer reading from the replay buffer. Do not add an async actor-critic split until single-machine AlphaZero-style training is stable.
+2. **Self-play opponent:** use the trainer EMA as the self-play network and the classical alpha-beta player as the arena anchor.
+3. **Curriculum:** start with fixed playout settings plus PCR. Add playout-doubling only if the first stability run shows early policy collapse.
+4. **Distribution:** keep V1 single-machine. The process boundaries leave room for a remote inference server later, but that is not part of the first production run.
+5. **Record retention:** keep RAM replay as the hot path. Add compressed completed-game archives after the dashboard metrics and checkpoint format settle.
 
 ---
 
@@ -696,4 +690,4 @@ The system is built around three load-bearing decisions:
 
 Everything else (config schema, benchmarks, FFI surface, workspace layout, crash recovery, autotuning) follows from making those three things work well.
 
-The Rust engine is ready. The Python pipeline is the next 6-8 weeks of work, broken down in §11. Performance targets in §9.3 give concrete pass/fail criteria for each phase.
+The Rust engine and Python training pipeline are ready for small local smoke runs. The next milestone is production validation on the 7950X / 4070 Ti machine using the performance targets in §9.3 and the validation checklist in §11.

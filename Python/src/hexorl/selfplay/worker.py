@@ -323,10 +323,12 @@ class SelfPlayWorker:
         record_queue: mp.Queue,
         num_workers: int = 24,
         max_batch_size: int = 128,
+        stop_event: Optional[mp.Event] = None,
     ):
         self.worker_id = worker_id
         self.cfg = cfg
         self.record_queue = record_queue
+        self.stop_event = stop_event
         self.num_workers = num_workers
         self.max_batch = max_batch_size
 
@@ -370,7 +372,7 @@ class SelfPlayWorker:
             )
             client = None
 
-        while True:
+        while self.stop_event is None or not self.stop_event.is_set():
             try:
                 game_record = self._play_one_game(client)
                 if game_record is not None and len(game_record.positions) > 0:

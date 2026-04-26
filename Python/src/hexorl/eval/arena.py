@@ -6,8 +6,12 @@ Each side uses its own inference server or classical engine.
 
 import time
 import logging
+import numpy as np
+import torch
 from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
+
+from hexorl.model.network import HexNet, from_config
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +121,60 @@ def run_arena(
 
     stats.total_time_ms = (time.monotonic() - t_start) * 1000.0
     return stats
+
+
+def model_move_fn(
+    model: HexNet,
+    *,
+    device: Optional[torch.device] = None,
+    near_radius: int = 8,
+    constrain_threats: bool = True,
+) -> Callable:
+    """Create an arena callback that chooses the model's best legal move."""
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+
+    def _fn(move_history, time_ms_override, player):
+        if HAS_ENGINE:
+            game = _engine.HexGame()
+            for _p, q, r in move_history:
+                game.place(int(q), int(r))
+            encoded = game.encode_board_and_legal(near_radius, constrain_threats)
+            tensor_3d, offset_q, offset_r, legal_bytes = encoded
+            legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+            if len(legal) == 0:
+                return None, None
+            tensor = torch.from_numpy(np.array(tensor_3d, dtype=np.float32)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                policy = model(tensor)["policy"][0].detach().cpu().numpy()
+            best = max(
+                legal,
+                key=lambda qr: policy[(int(qr[0]) - offset_q) * 33 + (int(qr[1]) - offset_r)]
+                if 0 <= int(qr[0]) - offset_q < 33 and 0 <= int(qr[1]) - offset_r < 33
+                else -np.inf,
+            )
+            return int(best[0]), int(best[1])
+
+        # Fallback for environments without _engine: choose the strongest centered action.
+        with torch.no_grad():
+            tensor = torch.zeros(1, 13, 33, 33, device=device)
+            policy = model(tensor)["policy"][0].detach().cpu().numpy()
+        idx = int(policy.argmax())
+        return idx // 33 - 16, idx % 33 - 16
+
+    return _fn
+
+
+def load_checkpoint_model(checkpoint_path, cfg, device: Optional[torch.device] = None) -> HexNet:
+    """Load a HexNet checkpoint for arena evaluation."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = from_config(cfg, device=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    return model
 
 
 def _play_engine_match(

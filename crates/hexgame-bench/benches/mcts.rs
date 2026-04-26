@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, black_box};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use hexgame_core::board::HexGameState;
 use hexgame_core::MCTSEngine;
 
@@ -6,10 +6,18 @@ fn bench_single_mcts_sim(c: &mut Criterion) {
     let mut game = HexGameState::new();
     game.place(0, 0).unwrap();
     let placements = [
-        (1, 0), (0, 1),
-        (2, 0), (1, 1), (0, 2),
-        (3, 0), (2, 1), (1, 2), (0, 3),
-        (4, 0), (3, 1), (2, 2),
+        (1, 0),
+        (0, 1),
+        (2, 0),
+        (1, 1),
+        (0, 2),
+        (3, 0),
+        (2, 1),
+        (1, 2),
+        (0, 3),
+        (4, 0),
+        (3, 1),
+        (2, 2),
     ];
     for &(q, r) in &placements {
         let _ = game.place(q, r);
@@ -19,11 +27,11 @@ fn bench_single_mcts_sim(c: &mut Criterion) {
         b.iter(|| {
             let mut engine = MCTSEngine::new(
                 game.clone(),
-                10,  // 10 simulations per bench iteration
-                1.5,  // c_puct
-                2,    // near_radius
+                10,    // 10 simulations per bench iteration
+                1.5,   // c_puct
+                2,     // near_radius
                 false, // no threat constraints
-                0,    // seed
+                0,     // seed
             );
 
             if let Some((_tensor, oq, or_, legal)) = engine.init_root() {

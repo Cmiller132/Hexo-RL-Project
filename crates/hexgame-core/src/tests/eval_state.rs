@@ -1,5 +1,5 @@
-use crate::eval::state::*;
 use crate::core::Hex;
+use crate::eval::state::*;
 use rustc_hash::FxHashMap;
 
 #[cfg(test)]
@@ -76,7 +76,11 @@ mod tests {
         }
 
         let counts = state.counts(0);
-        assert!(counts.fives() >= 1, "expected at least one five threat, got {:?}", counts);
+        assert!(
+            counts.fives() >= 1,
+            "expected at least one five threat, got {:?}",
+            counts
+        );
     }
 
     #[test]
@@ -93,7 +97,10 @@ mod tests {
         }
 
         let hot: Vec<_> = state.hot_windows(0).collect();
-        assert!(!hot.is_empty(), "expected hot windows for P0 after 4-in-a-row");
+        assert!(
+            !hot.is_empty(),
+            "expected hot windows for P0 after 4-in-a-row"
+        );
 
         // P1 should have no hot windows
         assert_eq!(state.hot_windows(1).count(), 0);
@@ -109,7 +116,10 @@ mod tests {
         state.place(cell, 0);
         let actual_delta = state.score() - score_before;
 
-        assert_eq!(hypo, actual_delta, "hypothetical score delta should match actual");
+        assert_eq!(
+            hypo, actual_delta,
+            "hypothetical score delta should match actual"
+        );
     }
 
     #[test]
@@ -118,7 +128,14 @@ mod tests {
         let mut stones = FxHashMap::default();
 
         // Place and unplace several stones to exercise the invariant check.
-        let cells = vec![(0, 0, 0), (1, 0, 1), (2, 0, 0), (3, 0, 1), (0, 1, 0), (1, 1, 1)];
+        let cells = vec![
+            (0, 0, 0),
+            (1, 0, 1),
+            (2, 0, 0),
+            (3, 0, 1),
+            (0, 1, 0),
+            (1, 1, 1),
+        ];
         for &(q, r, p) in &cells {
             let cell = Hex::new(q, r);
             state.place(cell, p);
@@ -162,7 +179,8 @@ mod tests {
         assert!(
             after_block.fives() < before_block.fives(),
             "blocking should reduce fives: before={:?}, after={:?}",
-            before_block, after_block
+            before_block,
+            after_block
         );
 
         // Unplace should restore everything back to default

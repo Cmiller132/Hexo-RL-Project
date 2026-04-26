@@ -7,7 +7,7 @@
 //! position.
 
 use crate::core::{Hex, HEX_DIRECTIONS, WIN_LENGTH};
-use crate::eval::grid::{WIN_GRID_RADIUS, win_grid_in_bounds};
+use crate::eval::grid::{win_grid_in_bounds, WIN_GRID_RADIUS};
 use crate::eval::patterns::{PATTERN_COUNTS, PATTERN_VALUES, POW3};
 use crate::eval::state::{EvalState, ThreatCounts};
 use rustc_hash::FxHashMap;
@@ -119,9 +119,11 @@ mod tests {
             stones.insert(cell, player);
             let recomputed = recompute_score(&stones);
             assert_eq!(
-                eval.score(), recomputed,
+                eval.score(),
+                recomputed,
                 "score mismatch after placing at {:?} for player {}",
-                cell, player
+                cell,
+                player
             );
         }
     }
@@ -275,7 +277,9 @@ mod tests {
             hash = hash.wrapping_mul(0x100000001b3);
         }
         // If this fails after an intentional retune, replace the literal.
-        assert_eq!(hash, 0x9f5d14a209044de4,
-            "PATTERN_VALUES checksum mismatch — table may be corrupted");
+        assert_eq!(
+            hash, 0x9f5d14a209044de4,
+            "PATTERN_VALUES checksum mismatch — table may be corrupted"
+        );
     }
 }

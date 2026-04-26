@@ -14,15 +14,15 @@ def test_constants_exported():
 def test_game_basic():
     g = _engine.PyHexGame()
     g.place(0, 0)
-    assert not g.is_over()
+    assert not g.is_over
     g.unplace()
-    assert not g.is_over()
+    assert not g.is_over
 
 
 def test_encode_shape():
     g = _engine.PyHexGame()
     g.place(0, 0)
-    tensor, oq, or_, legal_bytes = g.encode_board(near_radius=2, constrain_threats=False)
+    tensor, oq, or_, legal_bytes = g.encode_board_and_legal(near_radius=2, constrain_threats=False)
     assert tensor.shape == (_engine.NUM_CHANNELS, _engine.BOARD_SIZE, _engine.BOARD_SIZE)
     assert tensor.dtype == np.float32
 

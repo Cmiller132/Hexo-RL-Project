@@ -67,7 +67,7 @@ pub mod threats;
 mod tests;
 
 // Re-exports for convenient access
-pub use core::{hex_distance, Hex, Turn, PLACEMENT_RADIUS, WIN_LENGTH};
 pub use board::{GameError, HexGameState};
+pub use core::{hex_distance, Hex, Turn, PLACEMENT_RADIUS, WIN_LENGTH};
 pub use mcts::{MCTSEngine, MCTSError};
-pub use threats::{threat_status, ThreatStatus, live_cells};
+pub use threats::{live_cells, threat_status, ThreatStatus};

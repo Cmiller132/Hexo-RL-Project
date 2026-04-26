@@ -317,8 +317,7 @@ pub fn encode_board_into(
     // ── Channel 11: distance from centroid (pre-computed) ──
     {
         let ch11_start = 11 * BOARD_AREA;
-        out[ch11_start..ch11_start + BOARD_AREA]
-            .copy_from_slice(centroid_dist_channel());
+        out[ch11_start..ch11_start + BOARD_AREA].copy_from_slice(centroid_dist_channel());
     }
 
     // ── Channel 12: opponent's most recent completed turn ──

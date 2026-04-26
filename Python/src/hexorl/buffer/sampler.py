@@ -194,6 +194,8 @@ class ReplayDataset(_IterableDataset):
         use_symmetry: bool = True,
         near_radius: int = 8,
         lookahead_horizons: Optional[List[int]] = None,
+        regret_fraction: float = 0.0,
+        regret_temperature: float = 0.1,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -202,6 +204,8 @@ class ReplayDataset(_IterableDataset):
         self.use_symmetry = use_symmetry
         self.near_radius = near_radius
         self.lookahead_horizons = lookahead_horizons or []
+        self.regret_fraction = max(0.0, min(1.0, regret_fraction))
+        self.regret_temperature = regret_temperature
 
         self._rng = np.random.RandomState()
 
@@ -227,11 +231,26 @@ class ReplayDataset(_IterableDataset):
         if len(self.buffer) < self.batch_size:
             return None
 
-        indices = self.buffer.sample_indices(
-            self.batch_size,
+        n_regret = int(round(self.batch_size * self.regret_fraction))
+        n_base = self.batch_size - n_regret
+        base_indices = self.buffer.sample_indices(
+            n_base,
             recency_decay=self.recency_decay,
             pcr_weight=self.pcr_weight,
         )
+        regret_indices = self.buffer.sample_regret_indices(
+            n_regret,
+            temperature=self.regret_temperature,
+        )
+        indices = np.concatenate([base_indices, regret_indices])
+        if len(indices) < self.batch_size:
+            extra = self.buffer.sample_indices(
+                self.batch_size - len(indices),
+                recency_decay=self.recency_decay,
+                pcr_weight=self.pcr_weight,
+            )
+            indices = np.concatenate([indices, extra])
+        self._rng.shuffle(indices)
 
         records = self.buffer.get_batch(indices)
         if len(records) < self.batch_size:

@@ -6,6 +6,7 @@ license.workspace = true
 description = "PyO3 Python bindings for hexgame-core"
 
 [lib]
+name = "_engine"
 crate-type = ["cdylib"]
 
 [dependencies]

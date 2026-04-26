@@ -23,5 +23,8 @@ dev = [
     "mypy>=1.8",
 ]
 
+[project.scripts]
+hexorl = "hexorl.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

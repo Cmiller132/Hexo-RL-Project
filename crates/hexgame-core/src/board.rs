@@ -734,7 +734,11 @@ impl HexGameState {
     ///
     /// `Some(winning_line)` — a vector of exactly 6 [`Hex`] cells forming the
     /// winning segment, preferring one centered on `last` if possible.
-    pub(crate) fn find_winning_line(&self, last: Hex, player: u8) -> Option<[Hex; WIN_LENGTH as usize]> {
+    pub(crate) fn find_winning_line(
+        &self,
+        last: Hex,
+        player: u8,
+    ) -> Option<[Hex; WIN_LENGTH as usize]> {
         for &(dq, dr) in &HEX_DIRECTIONS {
             // Collect the contiguous run on both sides of `last` along this axis.
             let mut backward = self.collect_run(last, -dq, -dr, player);

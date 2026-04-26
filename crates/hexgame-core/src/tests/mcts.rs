@@ -10,9 +10,8 @@ mod tests {
     #[test]
     fn mcts_deterministic_replay() {
         let game = HexGameState::new();
-        let mut engine1 = MCTSEngine::with_arena_sim_hint(
-            game.clone(), 50, 200, 1.5, 2, false, 19652.0, 0,
-        );
+        let mut engine1 =
+            MCTSEngine::with_arena_sim_hint(game.clone(), 50, 200, 1.5, 2, false, 19652.0, 0);
         // init_root returns (tensor, offset_q, offset_r, legal_moves)
         let (_tensor1, oq, or_, legal1) = engine1.init_root().expect("init_root");
         // Expand with uniform policy
@@ -29,9 +28,8 @@ mod tests {
 
         // Second identical run
         let game2 = HexGameState::new();
-        let mut engine2 = MCTSEngine::with_arena_sim_hint(
-            game2, 50, 200, 1.5, 2, false, 19652.0, 0,
-        );
+        let mut engine2 =
+            MCTSEngine::with_arena_sim_hint(game2, 50, 200, 1.5, 2, false, 19652.0, 0);
         let (_tensor2, oq2, or2, legal2) = engine2.init_root().expect("init_root");
         let uniform2 = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
         engine2.expand_root(&uniform2, 0.0, oq2, or2, &legal2);
@@ -43,7 +41,10 @@ mod tests {
             engine2.expand_and_backprop(&policies, &values);
         }
         let (_, _, visits2, _) = engine2.get_results();
-        assert_eq!(visits1, visits2, "MCTS visit distributions must be deterministic");
+        assert_eq!(
+            visits1, visits2,
+            "MCTS visit distributions must be deterministic"
+        );
     }
 
     /// After re-rooting to a child, the new root's visit count must equal
@@ -51,9 +52,7 @@ mod tests {
     #[test]
     fn mcts_reroot_visit_counts_preserved() {
         let game = HexGameState::new();
-        let mut engine = MCTSEngine::with_arena_sim_hint(
-            game, 100, 300, 1.5, 2, false, 19652.0, 0,
-        );
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
@@ -78,7 +77,9 @@ mod tests {
         let best_q = moves_q[best_idx];
         let best_r = moves_r[best_idx];
 
-        engine.re_root(best_q as i16, best_r as i16, 50).expect("re_root should find child");
+        engine
+            .re_root(best_q as i16, best_r as i16, 50)
+            .expect("re_root should find child");
         let root_visits = engine.arena[engine.root_idx as usize].visit_count;
         assert_eq!(root_visits, visits_before, "re_root: visit count mismatch");
     }
@@ -87,9 +88,7 @@ mod tests {
     #[test]
     fn mcts_root_value_bounded() {
         let game = HexGameState::new();
-        let mut engine = MCTSEngine::with_arena_sim_hint(
-            game, 80, 300, 1.5, 2, false, 19652.0, 0,
-        );
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 80, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
@@ -101,15 +100,20 @@ mod tests {
             let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
             let values: Vec<f32> = (0..count as usize)
                 .map(|_| {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     (seed as f32 / u64::MAX as f32) * 2.0 - 1.0
                 })
                 .collect();
             engine.expand_and_backprop(&policies, &values);
         }
         let (_, _, _, root_q) = engine.get_results();
-        assert!(root_q >= -1.0 && root_q <= 1.0,
-            "root Q {} out of range [-1, 1]", root_q);
+        assert!(
+            root_q >= -1.0 && root_q <= 1.0,
+            "root Q {} out of range [-1, 1]",
+            root_q
+        );
     }
 
     /// Verify that T1-4's assertion fires on wrong-length batch.
@@ -117,9 +121,7 @@ mod tests {
     #[should_panic(expected = "policies length")]
     fn mcts_expand_and_backprop_wrong_length_panics() {
         let game = HexGameState::new();
-        let mut engine = MCTSEngine::with_arena_sim_hint(
-            game, 100, 300, 1.5, 2, false, 19652.0, 0,
-        );
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
@@ -138,20 +140,25 @@ mod tests {
     #[test]
     fn mcts_done_not_true_before_backprop() {
         let game = HexGameState::new();
-        let mut engine = MCTSEngine::with_arena_sim_hint(
-            game.clone(), 100, 300, 1.5, 2, false, 0.0, 0,
-        );
+        let mut engine =
+            MCTSEngine::with_arena_sim_hint(game.clone(), 100, 300, 1.5, 2, false, 0.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
 
         let (_, count) = engine.select_leaves(8);
         assert!(count > 0, "expected non-zero leaves");
-        assert!(!engine.done(), "done() must be false after select_leaves but before backprop");
+        assert!(
+            !engine.done(),
+            "done() must be false after select_leaves but before backprop"
+        );
 
         let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
         let values = vec![0.0f32; count as usize];
         engine.expand_and_backprop(&policies, &values);
-        assert!(!engine.done(), "done() must be false after only 8 of 100 sims");
+        assert!(
+            !engine.done(),
+            "done() must be false after only 8 of 100 sims"
+        );
     }
 }

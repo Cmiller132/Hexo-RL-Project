@@ -90,5 +90,3 @@ pub fn win_grid_in_bounds(q: i32, r: i32) -> bool {
     let ri = r + WIN_GRID_RADIUS;
     qi >= 0 && (qi as usize) < WIN_GRID_SIDE && ri >= 0 && (ri as usize) < WIN_GRID_SIDE
 }
-
-

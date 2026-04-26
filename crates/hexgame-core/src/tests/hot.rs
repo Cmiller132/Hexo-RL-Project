@@ -1,5 +1,5 @@
-use crate::eval::hot::*;
 use crate::core::WindowKey;
+use crate::eval::hot::*;
 
 #[cfg(test)]
 mod tests {

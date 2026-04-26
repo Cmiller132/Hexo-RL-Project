@@ -762,7 +762,7 @@ impl PyMCTSEngine {
     /// `rng_state` is used as XOR-shift state for deterministic sampling.
     /// Pass `None` (or omit) to use state `0`.
     #[pyo3(signature = (temperature, rng_state=None))]
-    fn sample_action(&self, temperature: f32, rng_state: Option<u64>) -> (i16, i16) {
+    fn sample_action(&mut self, temperature: f32, rng_state: Option<u64>) -> (i16, i16) {
         let mut state = rng_state.unwrap_or(0);
         self.inner.sample_action(temperature, &mut state)
     }

@@ -4,8 +4,8 @@ Runs CPU-side on completed game records. Computes:
   - Value targets (outcome-based, with optional EMA lookahead).
   - Policy targets (sparse from MCTS visits, top-K renormalized).
   - Lookahead value targets (KataGo-style multi-horizon).
-
-Phase 3: Simple outcome assignment. Phase 4: Full EMA lookahead.
+  - Auxiliary targets used by the full training head set:
+    opponent policy, regret rank/value, dominant axis, and moves-left.
 """
 
 import numpy as np
@@ -20,16 +20,14 @@ def compute_value_targets(
 ) -> None:
     """Assign value targets to each position in a game.
 
-    Simple outcome assignment (Phase 3):
+    Outcome assignment:
       - Player 0: value = outcome
       - Player 1: value = -outcome
-
-    Phase 4 will add KataGo-style EMA lookahead at specified horizons.
 
     Args:
         positions: List of positions from one game (in order).
         outcome: Final game outcome from P0's perspective (1.0, -1.0).
-        lookahead_horizons: Future: EMA lookahead horizons in turn boundaries.
+        lookahead_horizons: EMA lookahead horizons in turn boundaries.
     """
     for pos in positions:
         pos.outcome = outcome
@@ -146,7 +144,7 @@ def process_game_record(
     Steps:
       1. Assign value targets (outcome-based).
       2. Optionally compute EMA lookahead targets at each horizon.
-      3. Sparsify policy targets to top-K.
+      3. Populate auxiliary targets for the configured model heads.
 
     Returns:
         List of PositionRecords ready for buffer insertion.

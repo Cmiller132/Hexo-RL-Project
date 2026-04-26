@@ -444,7 +444,8 @@ mod tests {
     #[test]
     fn set_position_basic() {
         let mut g = HexGameState::new();
-        g.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 1)], 0, 2).unwrap();
+        g.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 1)], 0, 2)
+            .unwrap();
         assert_eq!(g.stones().len(), 4);
         assert_eq!(g.stones().get(&Hex::new(0, 0)), Some(&0));
         assert_eq!(g.stones().get(&Hex::new(1, 0)), Some(&0));
@@ -506,12 +507,8 @@ mod tests {
     #[test]
     fn unmake_restores_eval_counters() {
         let mut g = HexGameState::new();
-        g.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
+        g.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2)
+            .unwrap();
 
         let eval0 = g.eval().score();
         let fives0 = [g.eval().counts(0).fives(), g.eval().counts(1).fives()];
@@ -523,9 +520,18 @@ mod tests {
         g.unplace();
 
         assert_eq!(g.eval().score(), eval0);
-        assert_eq!([g.eval().counts(0).fives(), g.eval().counts(1).fives()], fives0);
-        assert_eq!([g.eval().counts(0).fours(), g.eval().counts(1).fours()], fours0);
-        assert_eq!([g.eval().counts(0).threes(), g.eval().counts(1).threes()], threes0);
+        assert_eq!(
+            [g.eval().counts(0).fives(), g.eval().counts(1).fives()],
+            fives0
+        );
+        assert_eq!(
+            [g.eval().counts(0).fours(), g.eval().counts(1).fours()],
+            fours0
+        );
+        assert_eq!(
+            [g.eval().counts(0).threes(), g.eval().counts(1).threes()],
+            threes0
+        );
         assert_eq!(g.eval().hot_len(0), hot0);
     }
 

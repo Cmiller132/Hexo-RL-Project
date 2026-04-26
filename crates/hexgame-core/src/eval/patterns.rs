@@ -149,5 +149,3 @@ const fn build_pattern_counts() -> [(u8, u8); 729] {
 /// stones of each player occupy a window after a stone is placed or removed,
 /// without iterating over the six individual cells.
 pub const PATTERN_COUNTS: [(u8, u8); 729] = build_pattern_counts();
-
-

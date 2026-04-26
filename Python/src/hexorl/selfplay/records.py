@@ -54,7 +54,6 @@ class PositionRecord:
     turn_index: int = 0
 
     # Lookahead value targets at multiple horizons (KataGo-style).
-    # Phase 3 placeholder: just the final outcome. Phase 4 adds EMA lookahead.
     lookahead_values: List[float] = field(default_factory=list)
     opp_policy_target: Dict[int, float] = field(default_factory=dict)
     regret_rank: float = 0.0

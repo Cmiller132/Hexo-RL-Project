@@ -178,6 +178,32 @@ class RingBuffer:
         physical = (self._tail + logical) % self.capacity
         return physical.astype(np.int64)
 
+    def sample_regret_indices(
+        self,
+        n: int,
+        temperature: float = 0.1,
+    ) -> np.ndarray:
+        """Sample physical indices biased toward high-regret positions."""
+        if n <= 0 or self._size == 0:
+            return np.array([], dtype=np.int64)
+
+        with self._lock:
+            regrets = np.zeros(self._size, dtype=np.float64)
+            for i in range(self._size):
+                idx = (self._tail + i) % self.capacity
+                regrets[i] = max(float(self._regret_rank[idx]), 1e-8)
+
+        inv_temp = 1.0 / max(temperature, 1e-6)
+        weights = regrets ** inv_temp
+        total = weights.sum()
+        if not np.isfinite(total) or total <= 0:
+            return self.sample_indices(n)
+
+        probs = weights / total
+        logical = np.random.choice(self._size, size=n, p=probs, replace=True)
+        physical = (self._tail + logical) % self.capacity
+        return physical.astype(np.int64)
+
     def __getitem__(self, idx: int) -> Optional[PositionRecord]:
         """Retrieve a single position record by physical index. Thread-safe."""
         if idx < 0 or idx >= self.capacity:

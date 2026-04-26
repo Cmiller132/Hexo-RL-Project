@@ -6,10 +6,18 @@ fn bench_encode_board(c: &mut Criterion) {
     let mut game = HexGameState::new();
     let _ = game.place(0, 0);
     let placements = [
-        (1, 0), (0, 1),
-        (2, 0), (1, 1), (0, 2),
-        (3, 0), (2, 1), (1, 2), (0, 3),
-        (4, 0), (3, 1), (2, 2),
+        (1, 0),
+        (0, 1),
+        (2, 0),
+        (1, 1),
+        (0, 2),
+        (3, 0),
+        (2, 1),
+        (1, 2),
+        (0, 3),
+        (4, 0),
+        (3, 1),
+        (2, 2),
     ];
     for &(q, r) in &placements {
         let _ = game.place(q, r);
@@ -29,26 +37,31 @@ fn bench_legal_moves(c: &mut Criterion) {
     let mut game = HexGameState::new();
     let _ = game.place(0, 0);
     let placements = [
-        (1, 0), (0, 1),
-        (2, 0), (1, 1), (0, 2),
-        (3, 0), (2, 1), (1, 2),
-        (4, 0), (3, 1),
-        (5, 0), (4, 1), (3, 2), (2, 3),
+        (1, 0),
+        (0, 1),
+        (2, 0),
+        (1, 1),
+        (0, 2),
+        (3, 0),
+        (2, 1),
+        (1, 2),
+        (4, 0),
+        (3, 1),
+        (5, 0),
+        (4, 1),
+        (3, 2),
+        (2, 3),
     ];
     for &(q, r) in &placements {
         let _ = game.place(q, r);
     }
 
     c.bench_function("legal_moves_near_radius2", |b| {
-        b.iter(|| {
-            game.legal_moves_near(2)
-        });
+        b.iter(|| game.legal_moves_near(2));
     });
 
     c.bench_function("candidates_near2", |b| {
-        b.iter(|| {
-            game.candidates_near2()
-        });
+        b.iter(|| game.candidates_near2());
     });
 }
 

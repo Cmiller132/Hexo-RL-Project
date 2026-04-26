@@ -1,5 +1,5 @@
-use hexgame_core::encoder::*;
 use hexgame_core::board::HexGameState;
+use hexgame_core::encoder::*;
 
 #[cfg(test)]
 mod tests {
@@ -85,12 +85,8 @@ mod tests {
     #[test]
     fn live_four_is_counted() {
         let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 2)
+            .unwrap();
         let feats = extract_features(&game);
         assert_eq!(feats[2], 1.0);
     }
@@ -98,7 +94,8 @@ mod tests {
     #[test]
     fn live_three_and_live_two() {
         let mut game = HexGameState::new();
-        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2).unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2)
+            .unwrap();
         let feats = extract_features(&game);
         assert_eq!(feats[4], 1.0);
         assert_eq!(feats[5], 0.0);

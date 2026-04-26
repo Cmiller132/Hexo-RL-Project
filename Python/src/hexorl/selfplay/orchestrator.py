@@ -50,7 +50,7 @@ class SelfPlayOrchestrator:
         # Worker management
         self._workers: List[mp.Process] = []
         self._record_queue = mp.Queue(maxsize=5000)
-        self._stop_event = threading.Event()
+        self._stop_event = mp.Event()
         self._collector_thread: Optional[threading.Thread] = None
 
         # Stats
@@ -124,6 +124,7 @@ class SelfPlayOrchestrator:
             record_queue=self._record_queue,
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
+            stop_event=self._stop_event,
         )
 
         p = mp.Process(
@@ -144,6 +145,7 @@ class SelfPlayOrchestrator:
             record_queue=self._record_queue,
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
+            stop_event=self._stop_event,
         )
         p = mp.Process(
             target=worker.run,

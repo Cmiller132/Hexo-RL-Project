@@ -1,6 +1,6 @@
-use crate::threats::*;
 use crate::board::HexGameState;
 use crate::core::{Hex, Turn};
+use crate::threats::*;
 
 #[cfg(test)]
 mod tests {
@@ -34,12 +34,8 @@ mod tests {
     fn winning_turn_four_window_with_two_placements() {
         let mut game = HexGameState::new();
         // P0 has a 4-stone run along (1,0): (0,0)..(3,0).
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 2)
+            .unwrap();
 
         match threat_status(&game) {
             ThreatStatus::WinningTurn(t) => {
@@ -55,12 +51,8 @@ mod tests {
     #[test]
     fn no_winning_turn_with_one_placement_on_four_window() {
         let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            1,
-        )
-        .unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 1)
+            .unwrap();
         assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
     }
 
@@ -101,12 +93,8 @@ mod tests {
     fn block_constraint_two_placements_exact_pairs() {
         let mut game = HexGameState::new();
         // P1 bare 4-run (0,0)..(3,0). P0 has 2 placements.
-        game.set_position(
-            &[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)],
-            0,
-            2,
-        )
-        .unwrap();
+        game.set_position(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 0, 2)
+            .unwrap();
 
         match threat_status(&game) {
             ThreatStatus::MustBlock(b) => {
@@ -221,7 +209,10 @@ mod tests {
         };
 
         assert!(turn_satisfies_status(&status, winning));
-        assert!(!turn_satisfies_status(&status, Turn::single(Hex::new(100, 0))));
+        assert!(!turn_satisfies_status(
+            &status,
+            Turn::single(Hex::new(100, 0))
+        ));
     }
 
     #[test]
@@ -243,18 +234,17 @@ mod tests {
 
         let status = threat_status(&game);
         assert!(turn_satisfies_status(&status, Turn::single(Hex::new(7, 0))));
-        assert!(!turn_satisfies_status(&status, Turn::single(Hex::new(2, 0))));
+        assert!(!turn_satisfies_status(
+            &status,
+            Turn::single(Hex::new(2, 0))
+        ));
     }
 
     #[test]
     fn turn_satisfies_status_must_block_pair() {
         let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)],
-            0,
-            2,
-        )
-        .unwrap();
+        game.set_position(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 0, 2)
+            .unwrap();
 
         let status = threat_status(&game);
 
@@ -279,8 +269,14 @@ mod tests {
         ));
 
         // Single placement cannot block all threats when 2 placements are required.
-        assert!(!turn_satisfies_status(&status, Turn::single(Hex::new(-1, 0))));
-        assert!(!turn_satisfies_status(&status, Turn::single(Hex::new(100, 0))));
+        assert!(!turn_satisfies_status(
+            &status,
+            Turn::single(Hex::new(-1, 0))
+        ));
+        assert!(!turn_satisfies_status(
+            &status,
+            Turn::single(Hex::new(100, 0))
+        ));
     }
 
     #[test]
@@ -307,7 +303,10 @@ mod tests {
         let status = threat_status(&game);
         // Unblockable means the threat filter does not constrain moves.
         assert!(turn_satisfies_status(&status, Turn::single(Hex::new(5, 0))));
-        assert!(turn_satisfies_status(&status, Turn::single(Hex::new(100, 0))));
+        assert!(turn_satisfies_status(
+            &status,
+            Turn::single(Hex::new(100, 0))
+        ));
     }
 
     // ── live_cells ────────────────────────────────────────────────────────
@@ -334,12 +333,8 @@ mod tests {
     #[test]
     fn live_cells_four_window() {
         let mut game = HexGameState::new();
-        game.set_position(
-            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)],
-            0,
-            2,
-        )
-        .unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 2)
+            .unwrap();
 
         let mut cells = Vec::new();
         live_cells(&game, 0, &mut cells);
@@ -353,7 +348,8 @@ mod tests {
     #[test]
     fn live_cells_empty_when_no_threats() {
         let mut game = HexGameState::new();
-        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2).unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2)
+            .unwrap();
 
         let mut cells = Vec::new();
         live_cells(&game, 0, &mut cells);
@@ -389,7 +385,8 @@ mod tests {
     #[test]
     fn three_window_is_not_hot() {
         let mut game = HexGameState::new();
-        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2).unwrap();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2)
+            .unwrap();
 
         assert!(game.eval().hot_is_empty(0));
         assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
