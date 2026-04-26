@@ -56,6 +56,11 @@ class PositionRecord:
     # Lookahead value targets at multiple horizons (KataGo-style).
     # Phase 3 placeholder: just the final outcome. Phase 4 adds EMA lookahead.
     lookahead_values: List[float] = field(default_factory=list)
+    opp_policy_target: Dict[int, float] = field(default_factory=dict)
+    regret_rank: float = 0.0
+    regret_value: float = 0.0
+    axis_label: int = -1
+    moves_left: float = 0.0
 
     def to_value_target(self) -> float:
         """Compute the training value target for this position.
@@ -72,6 +77,14 @@ class PositionRecord:
         """Convert sparse policy target to dense (BOARD_AREA,) float32 array."""
         dense = np.zeros(BOARD_AREA, dtype=np.float32)
         for idx, prob in self.policy_target.items():
+            if 0 <= idx < BOARD_AREA:
+                dense[idx] = prob
+        return dense
+
+    def to_dense_opp_policy(self) -> np.ndarray:
+        """Convert sparse opponent-policy target to dense (BOARD_AREA,) float32 array."""
+        dense = np.zeros(BOARD_AREA, dtype=np.float32)
+        for idx, prob in self.opp_policy_target.items():
             if 0 <= idx < BOARD_AREA:
                 dense[idx] = prob
         return dense
@@ -95,6 +108,10 @@ class GameRecord:
 
     # Total number of placements in the game.
     game_length: int = 0
+
+    # Complete placement history including the terminal move. Position histories
+    # remain prefixes before each decision.
+    final_move_history: bytes = b""
 
     def assign_outcomes(self):
         """Assign the game outcome to all positions."""
@@ -143,6 +160,19 @@ class GameRecord:
             # Turn index
             parts.extend(struct.pack("<I", pos.turn_index))
 
+            # Auxiliary targets
+            opp_entries = list(pos.opp_policy_target.items())
+            parts.extend(struct.pack("<H", len(opp_entries)))
+            for idx, prob in opp_entries:
+                parts.extend(struct.pack("<Hf", idx, prob))
+            parts.extend(struct.pack(
+                "<ffhf",
+                pos.regret_rank,
+                pos.regret_value,
+                pos.axis_label,
+                pos.moves_left,
+            ))
+
         return bytes(parts)
 
     @staticmethod
@@ -177,6 +207,21 @@ class GameRecord:
 
             # Turn index
             turn_idx = struct.unpack_from("<I", data, offset)[0]; offset += 4
+            opp_policy = {}
+            regret_rank = 0.0
+            regret_value = 0.0
+            axis_label = -1
+            moves_left = 0.0
+            if offset < len(data):
+                num_opp_entries = struct.unpack_from("<H", data, offset)[0]; offset += 2
+                for _ in range(num_opp_entries):
+                    idx = struct.unpack_from("<H", data, offset)[0]; offset += 2
+                    prob = struct.unpack_from("<f", data, offset)[0]; offset += 4
+                    opp_policy[idx] = prob
+                regret_rank, regret_value, axis_label, moves_left = struct.unpack_from(
+                    "<ffhf", data, offset
+                )
+                offset += struct.calcsize("<ffhf")
 
             positions.append(PositionRecord(
                 move_history=move_history,
@@ -187,6 +232,11 @@ class GameRecord:
                 game_id=game_id,
                 is_full_search=is_full,
                 turn_index=turn_idx,
+                opp_policy_target=opp_policy,
+                regret_rank=regret_rank,
+                regret_value=regret_value,
+                axis_label=axis_label,
+                moves_left=moves_left,
             ))
 
         return GameRecord(
@@ -194,6 +244,7 @@ class GameRecord:
             outcome=outcome,
             game_id=game_id,
             game_length=num_pos,
+            final_move_history=positions[-1].move_history if positions else b"",
         )
 
     @staticmethod
@@ -248,6 +299,9 @@ class GameRecord:
             outcome=outcome,
             game_id=game_id,
             game_length=len(positions),
+            final_move_history=move_history_bytes if isinstance(move_history_bytes, bytes) else (
+                pos_histories[-1] if pos_histories else b""
+            ),
         )
 
 
@@ -283,17 +337,20 @@ def sparsify_policy(
     total = values.sum()
     if total > 0:
         values = values / total
+    else:
+        values = np.full_like(values, 1.0 / max(len(values), 1), dtype=np.float32)
     return {int(idx): float(val) for idx, val in zip(indices, values)}
 
 
-def action_to_board_index(q: int, r: int, offset_q: int = 16, offset_r: int = 16) -> int:
+def action_to_board_index(q: int, r: int, offset_q: int = -16, offset_r: int = -16) -> int:
     """Convert axial hex coordinates (q, r) to flat BOARD_AREA index.
 
     The board tensor uses a 33×33 window centered at the board centroid.
-    offset_q and offset_r map tensor index (0,0) to board coordinates.
-    Default offsets center the tensor at (16, 16).
+    offset_q and offset_r are board coordinates for tensor index (0, 0).
+    Returns -1 when the action is outside the encoded policy window.
     """
     gi = q - offset_q
     gj = r - offset_r
-    idx = gi * BOARD_SIZE + gj
-    return max(0, min(BOARD_AREA - 1, idx))
+    if not (0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE):
+        return -1
+    return gi * BOARD_SIZE + gj

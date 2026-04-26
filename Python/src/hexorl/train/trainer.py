@@ -163,9 +163,12 @@ class Trainer:
         return self._epoch_stats()
 
     def _train_step(self, batch, batch_idx: int) -> Dict[str, float]:
-        # Batch is (tensors, policies, values[, lookahead_list])
+        # Batch is (tensors, policies, values[, lookahead_list[, aux_targets]])
         # lookahead_list is a list of per-horizon arrays when present.
-        if len(batch) == 4:
+        aux_targets = {}
+        if len(batch) == 5:
+            tensors, policies, values, lookahead_list, aux_targets = batch
+        elif len(batch) == 4:
             tensors, policies, values, lookahead_list = batch
         else:
             tensors, policies, values = batch
@@ -179,6 +182,8 @@ class Trainer:
 
         for key, lv_arr in zip(self._lookahead_keys, lookahead_list):
             targets[key] = lv_arr.to(self.device, non_blocking=True)
+        for key, value in aux_targets.items():
+            targets[key] = value.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
 

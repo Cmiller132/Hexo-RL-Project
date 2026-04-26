@@ -6,11 +6,16 @@ Each side uses its own inference server or classical engine.
 
 import time
 import logging
-import random
 from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+try:
+    import _engine
+    HAS_ENGINE = True
+except ImportError:
+    HAS_ENGINE = False
 
 
 @dataclass
@@ -79,7 +84,7 @@ def run_arena(
         a_is_black = (game_idx % 2 == 0)
         t_game_start = time.monotonic()
 
-        result = _play_mock_match(
+        result = _play_engine_match(
             side_a_fn, side_b_fn, game_idx, a_is_black, sims=sims,
         )
 
@@ -114,7 +119,72 @@ def run_arena(
     return stats
 
 
-def _play_mock_match(
+def _play_engine_match(
+    side_a_fn, side_b_fn, game_idx: int, a_is_black: bool,
+    sims: int = 400, max_moves: int = 200,
+) -> MatchResult:
+    if not HAS_ENGINE:
+        return _play_fallback_match(side_a_fn, side_b_fn, game_idx, a_is_black, sims, max_moves)
+
+    game = _engine.HexGame()
+    move_history: List[Tuple[int, int, int]] = []
+    moves_played = 0
+    winner = -1
+    reason = "normal"
+
+    while moves_played < max_moves and not game.is_over:
+        player = int(game.current_player)
+        is_side_a = (
+            (player == 0 and a_is_black) or (player == 1 and not a_is_black)
+        )
+        current_fn = side_a_fn if is_side_a else side_b_fn
+
+        try:
+            q, r = current_fn(list(move_history), 100, player)
+        except Exception as e:
+            winner = 1 if is_side_a else 0
+            reason = f"crash:{e}"
+            break
+
+        if q is None or r is None:
+            winner = 1 if is_side_a else 0
+            reason = "resign"
+            break
+
+        try:
+            game.place(int(q), int(r))
+        except Exception as e:
+            winner = 1 if is_side_a else 0
+            reason = f"illegal:{e}"
+            break
+
+        move_history.append((player, int(q), int(r)))
+        moves_played += 1
+
+    if winner == -1:
+        engine_winner = game.winner
+        if engine_winner is None:
+            winner = -1
+            reason = "max_moves"
+        else:
+            winner = 0 if (
+                (engine_winner == 0 and a_is_black) or
+                (engine_winner == 1 and not a_is_black)
+            ) else 1
+            reason = "terminal"
+
+    return MatchResult(
+        winner=winner,
+        side_a_score=1.0 if winner == 0 else 0.0,
+        side_b_score=1.0 if winner == 1 else 0.0,
+        moves=moves_played,
+        time_ms=0.0,
+        opening_is_black=a_is_black,
+        reason=reason,
+    )
+
+
+def _play_fallback_match(
     side_a_fn, side_b_fn, game_idx: int, a_is_black: bool,
     sims: int = 400, max_moves: int = 200,
 ) -> MatchResult:

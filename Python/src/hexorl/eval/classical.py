@@ -60,8 +60,8 @@ class ClassicalOpponent:
             for p, q, r in move_history:
                 try:
                     self._game.place(q, r)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Ignoring invalid replayed move (%s,%s,%s): %s", p, q, r, exc)
             self._moves_played = len(move_history)
 
         t = time_ms if time_ms is not None else self.time_ms
@@ -99,8 +99,8 @@ def classical_opponent_fn(
             if opponent._game:
                 try:
                     opponent._game.place(q, r)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Ignoring invalid replayed move (%s,%s,%s): %s", p, q, r, exc)
         return opponent.select_move(move_history, time_ms, player)
 
     return _fn

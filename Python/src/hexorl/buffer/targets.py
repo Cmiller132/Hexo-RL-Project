@@ -167,4 +167,78 @@ def process_game_record(
             float(lookahead_targets[h][i]) for h in lookahead_targets
         ]
 
+    _assign_auxiliary_targets(record)
+
     return record.positions
+
+
+def _assign_auxiliary_targets(record: GameRecord) -> None:
+    """Populate auxiliary targets that can be computed once the game is complete."""
+    positions = record.positions
+    total = len(positions)
+    if total == 0:
+        return
+
+    for i, pos in enumerate(positions):
+        if i + 1 < total:
+            pos.opp_policy_target = dict(positions[i + 1].policy_target)
+        else:
+            pos.opp_policy_target = {}
+        perspective_outcome = record.outcome if pos.player == 0 else -record.outcome
+        tail = positions[i:]
+        regret = sum(
+            (
+                p.root_value
+                - (record.outcome if p.player == 0 else -record.outcome)
+            ) ** 2
+            for p in tail
+        ) / max(len(tail), 1)
+        pos.regret_rank = float(regret)
+        pos.regret_value = float(max(-1.0, min(1.0, 2.0 * regret - 1.0)))
+        pos.moves_left = float(max(total - pos.turn_index, 0))
+        if pos.outcome is None:
+            pos.outcome = perspective_outcome if pos.player == 0 else -perspective_outcome
+
+    winner = 0 if record.outcome > 0 else 1 if record.outcome < 0 else None
+    axis_history = record.final_move_history or positions[-1].move_history
+    axis = _dominant_axis_label(axis_history, winner)
+    for pos in positions:
+        pos.axis_label = axis
+
+
+def _dominant_axis_label(history_bytes: bytes, winner: int | None) -> int:
+    """Return the longest-run axis for the winner, or -1 when unknown."""
+    if winner is None or not history_bytes:
+        return -1
+
+    stones = set()
+    stride = 12
+    for offset in range(0, len(history_bytes) - stride + 1, stride):
+        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
+        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
+        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
+        if player == winner:
+            stones.add((q, r))
+
+    if not stones:
+        return -1
+
+    axes = [(1, 0), (0, 1), (1, -1)]
+    best_axis = -1
+    best_len = 0
+    for axis_idx, (dq, dr) in enumerate(axes):
+        for q, r in stones:
+            prev = (q - dq, r - dr)
+            if prev in stones:
+                continue
+            run = 1
+            nq, nr = q + dq, r + dr
+            while (nq, nr) in stones:
+                run += 1
+                nq += dq
+                nr += dr
+            if run > best_len:
+                best_len = run
+                best_axis = axis_idx
+
+    return best_axis if best_len > 0 else -1

@@ -1,17 +1,17 @@
+use hexgame_core::encoder::{self, BOARD_SIZE, NUM_CHANNELS, TENSOR_SIZE};
+use hexgame_core::HexGameState;
 use numpy::{PyArray3, PyArray4, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use hexgame_core::{HexGameState};
-use hexgame_core::encoder::{self, BOARD_SIZE, NUM_CHANNELS, TENSOR_SIZE};
 
 /// Replay a compact move history and encode each position as a 13-channel tensor.
 ///
 /// `history_bytes` is a flat byte buffer of little-endian `(player: i32, q: i32, r: i32)` triples.
 /// Each triple represents one stone placement.
 ///
-/// Returns a numpy array of shape `(N, 13, 33, 33)` where N is the number of positions.
-/// Position `i` is the board state BEFORE the `i`-th placement (i.e., the state the player
-/// at turn `i` sees when deciding their move).
+/// Returns a numpy array of shape `(N + 1, 13, 33, 33)` where N is the number of moves.
+/// Position `i` is the board state after the first `i` placements. Empty histories are valid
+/// and return a single empty-board tensor.
 #[pyfunction]
 fn encode_compact_record<'py>(
     py: Python<'py>,
@@ -19,32 +19,39 @@ fn encode_compact_record<'py>(
     near_radius: i32,
 ) -> PyResult<Bound<'py, PyArray4<f32>>> {
     if !history_bytes.len().is_multiple_of(12) {
-        return Err(PyValueError::new_err(
-            format!("history_bytes length {} is not a multiple of 12", history_bytes.len())
-        ));
+        return Err(PyValueError::new_err(format!(
+            "history_bytes length {} is not a multiple of 12",
+            history_bytes.len()
+        )));
     }
     let num_moves = history_bytes.len() / 12;
-    if num_moves == 0 {
-        return Err(PyValueError::new_err("empty history"));
-    }
 
     // Copy bytes so the closure owns them (history_bytes lifetime doesn't cross thread boundary).
     let bytes_owned: Vec<u8> = history_bytes.to_vec();
 
-    let positions = py.allow_threads(move || -> Result<Vec<f32>, String> {
-        let mut game = HexGameState::new();
-        let mut positions = Vec::with_capacity(num_moves * TENSOR_SIZE);
-        for chunk in bytes_owned.chunks_exact(12) {
+    let positions = py
+        .allow_threads(move || -> Result<Vec<f32>, String> {
+            let mut game = HexGameState::new();
+            let mut positions = Vec::with_capacity((num_moves + 1) * TENSOR_SIZE);
+            for chunk in bytes_owned.chunks_exact(12) {
+                let tensor = encoder::encode_board(&game, near_radius, false).tensor;
+                positions.extend_from_slice(&tensor);
+                let q = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let r = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                game.place(q, r).map_err(|e| e.to_string())?;
+            }
             let tensor = encoder::encode_board(&game, near_radius, false).tensor;
             positions.extend_from_slice(&tensor);
-            let q = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            let r = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
-            game.place(q, r).map_err(|e| e.to_string())?;
-        }
-        Ok(positions)
-    }).map_err(|e| PyValueError::new_err(e))?;
+            Ok(positions)
+        })
+        .map_err(|e| PyValueError::new_err(e))?;
 
-    let shape = (num_moves, NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize);
+    let shape = (
+        num_moves + 1,
+        NUM_CHANNELS,
+        BOARD_SIZE as usize,
+        BOARD_SIZE as usize,
+    );
     let arr = numpy::ndarray::Array4::from_shape_vec(shape, positions)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(PyArray4::from_owned_array(py, arr))

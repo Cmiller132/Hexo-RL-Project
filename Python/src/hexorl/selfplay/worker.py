@@ -364,9 +364,9 @@ class SelfPlayWorker:
 
         try:
             client.connect()
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                f"Worker {self.worker_id}: inference server not available, using mock evaluations"
+                f"Worker {self.worker_id}: inference server not available, using mock evaluations: {exc}"
             )
             client = None
 
@@ -447,7 +447,13 @@ class SelfPlayWorker:
                     engine.expand_root(
                         p, v[0], offset_q, offset_r, legal_bytes
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "Worker %s: root inference failed at move %s: %s",
+                        self.worker_id,
+                        move_idx,
+                        exc,
+                    )
                     engine.expand_root(
                         np.ones(1089, dtype=np.float32) / 1089,
                         0.0,
@@ -472,7 +478,8 @@ class SelfPlayWorker:
                         if hasattr(child_priors, "shape")
                         else len(child_priors)
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Worker %s: root noise skipped: %s", self.worker_id, exc)
                     n_children = 20
                 noise = np.random.dirichlet(
                     [self.dirichlet_alpha] * max(n_children, 1)
@@ -503,12 +510,16 @@ class SelfPlayWorker:
                             np.ones(count * 1089, dtype=np.float32),
                             np.zeros(count, dtype=np.float32),
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "Worker %s: leaf expansion failed at move %s: %s",
+                        self.worker_id,
+                        move_idx,
+                        exc,
+                    )
+                    break
 
             moves_q, moves_r, visits, root_value = engine.get_results()
-            priors = engine.root_child_priors()
-            q_values = engine.root_child_q_values()
 
             temp = get_temperature(move_idx, self.temperature_schedule)
             q, r = engine.sample_action(temp)
@@ -527,7 +538,8 @@ class SelfPlayWorker:
             visit_arr = np.zeros(BOARD_AREA, dtype=np.float32)
             for q_coord, r_coord, v in zip(moves_q, moves_r, visits):
                 flat_idx = action_to_board_index(q_coord, r_coord, offset_q, offset_r)
-                visit_arr[flat_idx] = float(v)
+                if flat_idx >= 0:
+                    visit_arr[flat_idx] = float(v)
             policy = sparsify_policy(visit_arr, top_k=20)
 
             positions.append(
@@ -584,6 +596,7 @@ class SelfPlayWorker:
             game_id=self.cfg.run.seed * 100000 + self._game_counter,
             is_full_search=not use_pcr,
         )
+        record.final_move_history = full_history
 
         record.assign_outcomes()
         return record

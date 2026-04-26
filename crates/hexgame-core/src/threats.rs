@@ -147,9 +147,7 @@ fn window_empties(game: &HexGameState, key: WindowKey, out: &mut SmallVec<[Hex; 
     }
 }
 
-fn opponent_threat_windows(
-    game: &HexGameState,
-) -> (SmallVec<[Hex; 32]>, SmallVec<[u8; 16]>) {
+fn opponent_threat_windows(game: &HexGameState) -> (SmallVec<[Hex; 32]>, SmallVec<[u8; 16]>) {
     let opp = 1 - game.current_player();
     debug_assert!(
         game.eval().has_threats(opp),
@@ -234,6 +232,11 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
 
     if let Some(turn) = pair_win {
         return ThreatStatus::WinningTurn(turn);
+    }
+
+    let opp = 1 - current;
+    if !game.eval().has_threats(opp) {
+        return ThreatStatus::Quiet;
     }
 
     let (flat_empties, window_lengths) = opponent_threat_windows(game);

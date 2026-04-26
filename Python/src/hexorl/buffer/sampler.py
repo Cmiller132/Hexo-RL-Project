@@ -6,7 +6,7 @@ On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 """
 
 import numpy as np
-from typing import Iterator, Tuple, Optional, List
+from typing import Dict, Iterator, Tuple, Optional, List
 
 try:
     from torch.utils.data import IterableDataset as _IterableDataset
@@ -35,13 +35,30 @@ def _py_encode_from_coords(
     """
     half = BOARD_SIZE // 2
     positions = np.zeros(
-        (num_moves, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE),
+        (num_moves + 1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE),
         dtype=np.float32,
     )
     cells_p0: List[Tuple[int, int, int]] = []
     cells_p1: List[Tuple[int, int, int]] = []
 
-    for i in range(num_moves):
+    dist = np.sqrt(
+        (np.arange(BOARD_SIZE)[:, None] - half) ** 2 +
+        (np.arange(BOARD_SIZE)[None, :] - half) ** 2
+    )
+
+    for i in range(num_moves + 1):
+        for (gqi, grj, p) in cells_p0 + cells_p1:
+            gi2, gj2 = gqi + half, grj + half
+            if 0 <= gi2 < BOARD_SIZE and 0 <= gj2 < BOARD_SIZE:
+                if p == 0:
+                    positions[i, 0, gi2, gj2] = 1.0
+                else:
+                    positions[i, 1, gi2, gj2] = 1.0
+        positions[i, 2] = 1.0 - positions[i, 0] - positions[i, 1]
+        positions[i, 11] = dist / half
+        if i >= num_moves:
+            break
+
         offset = i * stride
         player = int.from_bytes(history_bytes[offset:offset+4], 'little', signed=True)
         q = int.from_bytes(history_bytes[offset+4:offset+8], 'little', signed=True)
@@ -50,32 +67,11 @@ def _py_encode_from_coords(
         gi = q + half
         gj = r + half
 
-        for (gqi, grj, p) in cells_p0 + cells_p1:
-            gi2, gj2 = gqi + half, grj + half
-            if 0 <= gi2 < BOARD_SIZE and 0 <= gj2 < BOARD_SIZE:
-                if p == 0:
-                    positions[i, 0, gi2, gj2] = 1.0
-                else:
-                    positions[i, 1, gi2, gj2] = 1.0
-
         if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
             if player == 0:
                 cells_p0.append((q, r, 0))
-                positions[i, 0, gi, gj] = 1.0
             else:
                 cells_p1.append((q, r, 1))
-                positions[i, 1, gi, gj] = 1.0
-
-        positions[i, 2] = 1.0 - positions[i, 0] - positions[i, 1]
-
-        if player == 0:
-            positions[i, 6] = 1.0
-
-        dist = np.sqrt(
-            (np.arange(BOARD_SIZE)[:, None] - half) ** 2 +
-            (np.arange(BOARD_SIZE)[None, :] - half) ** 2
-        )
-        positions[i, 11] = dist / half
 
     return positions
 
@@ -87,7 +83,7 @@ def _py_decode_compact_record(
     """Pure Python fallback for encode_compact_record.
 
     Replays the move history on a fresh board and encodes each position.
-    Returns (N, 13, 33, 33) float32 array.
+    Returns (N + 1, 13, 33, 33) float32 array.
     """
     if not history_bytes or len(history_bytes) < 12:
         return np.zeros((1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
@@ -184,8 +180,8 @@ class ReplayDataset(_IterableDataset):
 
         self._rng = np.random.RandomState()
 
-    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]]:
-        """Yield (tensors, policies, values, lookahead_list) batches.
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray], Dict[str, np.ndarray]]]:
+        """Yield (tensors, policies, values, lookahead_list, aux_targets) batches.
 
         Yields:
             tensors: (batch_size, 13, 33, 33) float32
@@ -201,7 +197,7 @@ class ReplayDataset(_IterableDataset):
 
     def _sample_batch(
         self,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]]:
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray], Dict[str, np.ndarray]]]:
         """Sample one batch from the buffer. Returns None if insufficient data."""
         if len(self.buffer) < self.batch_size:
             return None
@@ -222,6 +218,13 @@ class ReplayDataset(_IterableDataset):
         )
         policies = np.zeros((self.batch_size, BOARD_AREA), dtype=np.float32)
         values = np.zeros(self.batch_size, dtype=np.float32)
+        aux_targets: Dict[str, np.ndarray] = {
+            "opp_policy": np.zeros((self.batch_size, BOARD_AREA), dtype=np.float32),
+            "regret_rank": np.zeros(self.batch_size, dtype=np.float32),
+            "regret_value": np.zeros(self.batch_size, dtype=np.float32),
+            "axis": np.full(self.batch_size, -1, dtype=np.int64),
+            "moves_left": np.zeros(self.batch_size, dtype=np.float32),
+        }
 
         n_lookahead = len(self.lookahead_horizons)
         lookahead_arrays = [
@@ -235,7 +238,7 @@ class ReplayDataset(_IterableDataset):
                     dtype=np.float32,
                 )
                 if tensor.ndim == 4:
-                    tensor = tensor[0]
+                    tensor = tensor[-1]
                 tensors[i] = tensor
             else:
                 decoded = _py_decode_compact_record(rec.move_history, self.near_radius)
@@ -248,7 +251,7 @@ class ReplayDataset(_IterableDataset):
                 sym_idx = self._rng.randint(0, 12)
                 if HAS_ENGINE and hasattr(_engine, 'apply_d6_symmetry'):
                     tensors[i] = np.array(
-                        _engine.apply_d6_symmetry(tensors[i].tolist(), sym_idx),
+                        _engine.apply_d6_symmetry(tensors[i], sym_idx),
                         dtype=np.float32,
                     )
                 else:
@@ -256,6 +259,11 @@ class ReplayDataset(_IterableDataset):
 
             policies[i] = rec.to_dense_policy()
             values[i] = rec.to_value_target()
+            aux_targets["opp_policy"][i] = rec.to_dense_opp_policy()
+            aux_targets["regret_rank"][i] = rec.regret_rank
+            aux_targets["regret_value"][i] = rec.regret_value
+            aux_targets["axis"][i] = rec.axis_label
+            aux_targets["moves_left"][i] = rec.moves_left
 
             for h_idx in range(n_lookahead):
                 if h_idx < len(rec.lookahead_values):
@@ -263,7 +271,7 @@ class ReplayDataset(_IterableDataset):
                 else:
                     lookahead_arrays[h_idx][i] = values[i]  # fallback
 
-        return tensors, policies, values, lookahead_arrays
+        return tensors, policies, values, lookahead_arrays, aux_targets
 
     def __len__(self) -> int:
         """Number of batches available."""

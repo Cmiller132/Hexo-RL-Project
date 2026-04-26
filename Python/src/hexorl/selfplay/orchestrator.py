@@ -12,6 +12,7 @@ import signal
 import logging
 import threading
 import multiprocessing as mp
+import queue
 from typing import Optional, List
 
 from hexorl.config import Config
@@ -134,18 +135,30 @@ class SelfPlayOrchestrator:
         self._workers.append(p)
         logger.info(f"Worker {worker_id} started (pid={p.pid})")
 
-    def _respawn_worker(self, worker_id: int):
+    def _respawn_worker(self, worker_id: int) -> mp.Process:
         """Replace a dead worker with a new one."""
         logger.warning(f"Worker {worker_id} died — respawning")
-        self._spawn_worker(worker_id)
+        worker = SelfPlayWorker(
+            worker_id=worker_id,
+            cfg=self.cfg,
+            record_queue=self._record_queue,
+            num_workers=self.num_workers,
+            max_batch_size=self.max_batch,
+        )
+        p = mp.Process(
+            target=worker.run,
+            name=f"selfplay-worker-{worker_id}",
+            daemon=False,
+        )
+        p.start()
+        logger.info(f"Worker {worker_id} restarted (pid={p.pid})")
+        return p
 
     def _monitor_workers(self):
         """Check worker health and respawn dead ones."""
         for i, p in enumerate(self._workers):
             if not p.is_alive():
-                self._respawn_worker(i)
-                self._workers[i] = self._workers[-1]
-                self._workers.pop()
+                self._workers[i] = self._respawn_worker(i)
 
     # ── Record Collection ────────────────────────────────────────────────
 
@@ -155,9 +168,10 @@ class SelfPlayOrchestrator:
             try:
                 game_record = self._record_queue.get(timeout=0.5)
                 self._ingest_game(game_record)
-            except Exception:
-                # Timeout or queue.Empty — loop and check stop_event
-                pass
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.warning("Record collector error: %s", e)
 
     def _ingest_game(self, game_record):
         """Process and store one completed game record."""
@@ -166,8 +180,7 @@ class SelfPlayOrchestrator:
             # Do not reprocess — it overwrites correct EMA lookahead values.
 
             # Push all positions into the ring buffer
-            valid_positions = [p for p in game_record.positions
-                               if p.move_history and len(p.move_history) > 0]
+            valid_positions = list(game_record.positions)
             self._buffer.extend(valid_positions)
 
             with self._stats_lock:

@@ -155,7 +155,10 @@ def axis_loss(
     """
     if target_axis is None:
         return torch.tensor(0.0, device=pred_logits.device)
-    return F.cross_entropy(pred_logits, target_axis)
+    valid = target_axis >= 0
+    if not torch.any(valid):
+        return torch.tensor(0.0, device=pred_logits.device)
+    return F.cross_entropy(pred_logits[valid], target_axis[valid])
 
 
 def moves_left_loss(
@@ -171,7 +174,7 @@ def moves_left_loss(
     Returns:
         Scalar loss.
     """
-    return F.mse_loss(pred.squeeze(), target)
+    return F.mse_loss(pred.squeeze(-1), target)
 
 
 def entropy_loss(policy_logits: torch.Tensor) -> torch.Tensor:
@@ -214,19 +217,31 @@ def compute_losses(
             continue
 
         weight = loss_weights[head_name]
+        required_targets = {
+            "policy": "policy",
+            "value": "value",
+            "regret_rank": "regret_rank",
+            "regret_value": "regret_value",
+            "moves_left": "moves_left",
+        }
+        if head_name in required_targets and required_targets[head_name] not in targets:
+            continue
+        if head_name.startswith("lookahead_") and head_name not in targets:
+            continue
 
         if head_name == "policy":
             loss = policy_loss(pred, targets["policy"])
         elif head_name == "opp_policy":
             target = targets.get("opp_policy", targets.get("policy"))
+            if target is None:
+                continue
             loss = opp_policy_loss(pred, target)
         elif head_name == "value":
             loss = binned_value_loss(pred, targets["value"], n_bins)
         elif head_name.startswith("lookahead_"):
-            horizon_key = head_name
-            loss = binned_value_loss(pred, targets.get(head_name, targets.get(horizon_key)), n_bins)
+            loss = binned_value_loss(pred, targets[head_name], n_bins)
         elif head_name == "regret_rank":
-            loss = regret_rank_loss(pred.squeeze(), targets["regret_rank"])
+            loss = regret_rank_loss(pred.squeeze(-1), targets["regret_rank"])
         elif head_name == "regret_value":
             loss = regret_value_loss(pred, targets["regret_value"], n_bins)
         elif head_name == "axis":

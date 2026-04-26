@@ -81,6 +81,10 @@ class InferenceClient:
             raise ValueError(
                 f"Batch count {count} exceeds max_batch {self.max_batch}"
             )
+        if count <= 0:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+
+        self._slot.res_ready.clear()
 
         # 1. Write tensor data to the shared-memory request slot.
         req_view = self._slot.req_tensor[:count]          # (count, 13, 33, 33)

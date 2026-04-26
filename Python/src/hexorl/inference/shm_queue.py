@@ -12,6 +12,7 @@ Plus two shared-memory doorbell bytes per worker (spawn-safe):
 """
 
 import time as _time
+import contextlib
 import multiprocessing as mp
 import numpy as np
 from multiprocessing.shared_memory import SharedMemory
@@ -214,10 +215,8 @@ class WorkerSlots:
                 evt.close()
 
     def __del__(self):
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 class InferenceQueue:
@@ -246,10 +245,8 @@ class InferenceQueue:
             slot.close()
 
     def __del__(self):
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 def create_inference_queue(num_workers: int, max_batch_size: int) -> InferenceQueue:

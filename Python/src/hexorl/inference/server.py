@@ -215,6 +215,8 @@ class InferenceServer:
             if slot.req_ready.is_set():
                 count = int(slot.req_count[0])
                 if count > 0:
+                    if total + count > max_total and ready:
+                        continue
                     ready.append(i)
                     total += count
                 else:

@@ -37,6 +37,13 @@ class RingBuffer:
         self._policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
         self._policy_counts = np.zeros(capacity, dtype=np.uint16)
         self._values = np.zeros(capacity, dtype=np.float32)
+        self._regret_rank = np.zeros(capacity, dtype=np.float32)
+        self._regret_value = np.zeros(capacity, dtype=np.float32)
+        self._axis = np.full(capacity, -1, dtype=np.int16)
+        self._moves_left = np.zeros(capacity, dtype=np.float32)
+        self._opp_policies = np.zeros((capacity, max_policy_entries), dtype=np.uint16)
+        self._opp_policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
+        self._opp_policy_counts = np.zeros(capacity, dtype=np.uint16)
         self._game_ids = np.zeros(capacity, dtype=np.uint32)
         self._is_full = np.zeros(capacity, dtype=np.bool_)
         self._players = np.zeros(capacity, dtype=np.uint8)
@@ -85,6 +92,7 @@ class RingBuffer:
                 self._policy_probs[idx, j] = prob
 
             self._values[idx] = record.to_value_target()
+            self._write_aux_targets(idx, record)
             self._game_ids[idx] = record.game_id
             self._is_full[idx] = record.is_full_search
             self._players[idx] = record.player
@@ -120,6 +128,7 @@ class RingBuffer:
             self._policies[idx, j] = action_idx
             self._policy_probs[idx, j] = prob
         self._values[idx] = record.to_value_target()
+        self._write_aux_targets(idx, record)
         self._game_ids[idx] = record.game_id
         self._is_full[idx] = record.is_full_search
         self._players[idx] = record.player
@@ -192,6 +201,13 @@ class RingBuffer:
             lv = []
             if self._lookahead is not None:
                 lv = self._lookahead[idx].tolist()
+            opp_policy = {}
+            n_opp = int(self._opp_policy_counts[idx])
+            for j in range(n_opp):
+                action_idx = int(self._opp_policies[idx, j])
+                prob = float(self._opp_policy_probs[idx, j])
+                if prob > 0:
+                    opp_policy[action_idx] = prob
 
             return PositionRecord(
                 move_history=self._histories[idx],
@@ -202,6 +218,11 @@ class RingBuffer:
                 is_full_search=bool(self._is_full[idx]),
                 outcome=outcome,
                 lookahead_values=lv,
+                opp_policy_target=opp_policy,
+                regret_rank=float(self._regret_rank[idx]),
+                regret_value=float(self._regret_value[idx]),
+                axis_label=int(self._axis[idx]),
+                moves_left=float(self._moves_left[idx]),
             )
 
     def get_batch(self, indices: np.ndarray) -> List[PositionRecord]:
@@ -241,6 +262,13 @@ class RingBuffer:
             self._policy_probs.fill(0.0)
             self._policy_counts.fill(0)
             self._values.fill(0.0)
+            self._regret_rank.fill(0.0)
+            self._regret_value.fill(0.0)
+            self._axis.fill(-1)
+            self._moves_left.fill(0.0)
+            self._opp_policies.fill(0)
+            self._opp_policy_probs.fill(0.0)
+            self._opp_policy_counts.fill(0)
             self._game_ids.fill(0)
             self._is_full.fill(False)
             self._players.fill(0)
@@ -250,3 +278,19 @@ class RingBuffer:
             self._max_game_id = 0
             if self._lookahead is not None:
                 self._lookahead.fill(0.0)
+
+    def _write_aux_targets(self, idx: int, record: PositionRecord):
+        """Write optional auxiliary targets into struct-of-arrays storage."""
+        self._regret_rank[idx] = record.regret_rank
+        self._regret_value[idx] = record.regret_value
+        self._axis[idx] = record.axis_label
+        self._moves_left[idx] = record.moves_left
+
+        opp_entries = list(record.opp_policy_target.items())
+        n_opp = min(len(opp_entries), self.max_policy_entries)
+        self._opp_policy_counts[idx] = n_opp
+        self._opp_policies[idx].fill(0)
+        self._opp_policy_probs[idx].fill(0.0)
+        for j, (action_idx, prob) in enumerate(opp_entries[:n_opp]):
+            self._opp_policies[idx, j] = action_idx
+            self._opp_policy_probs[idx, j] = prob

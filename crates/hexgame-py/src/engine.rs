@@ -5,12 +5,12 @@ use pyo3::types::PyBytes;
 use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1};
 
 use hexgame_core::board::{GameError, HexGameState};
-use hexgame_core::Hex;
+use hexgame_core::core::HEX_DIRECTIONS;
 use hexgame_core::encoder;
 use hexgame_core::search;
 use hexgame_core::threats::{threat_status, ThreatStatus};
+use hexgame_core::Hex;
 use hexgame_core::MCTSEngine;
-use hexgame_core::core::HEX_DIRECTIONS;
 use hexgame_core::WIN_LENGTH;
 
 use std::time::Duration;
@@ -370,12 +370,7 @@ impl PyHexGame {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
-        Ok((
-            arr,
-            offset_q,
-            offset_r,
-            PyBytes::new(py, &legal_buf),
-        ))
+        Ok((arr, offset_q, offset_r, PyBytes::new(py, &legal_buf)))
     }
 
     /// Extract the 13-element classical feature vector.
@@ -632,9 +627,10 @@ impl PyMCTSEngine {
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
         if !legal_bytes.len().is_multiple_of(8) {
-            return Err(PyErr::new::<PyValueError, _>(
-                format!("legal_bytes length {} is not a multiple of 8", legal_bytes.len())
-            ));
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "legal_bytes length {} is not a multiple of 8",
+                legal_bytes.len()
+            )));
         }
         let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
         for chunk in legal_bytes.chunks_exact(8) {
@@ -780,9 +776,12 @@ impl PyMCTSEngine {
 
     #[pyo3(signature = (q, r, new_num_simulations))]
     fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> PyResult<()> {
-        let q = i16::try_from(q).map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
-        let r = i16::try_from(r).map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
-        self.inner.re_root(q, r, new_num_simulations)
+        let q =
+            i16::try_from(q).map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
+        let r =
+            i16::try_from(r).map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
+        self.inner
+            .re_root(q, r, new_num_simulations)
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
 }
@@ -871,6 +870,8 @@ fn classical_self_play(
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHexGame>()?;
     m.add_class::<PyMCTSEngine>()?;
+    m.add("PyHexGame", m.getattr("HexGame")?)?;
+    m.add("PyMCTSEngine", m.getattr("MCTSEngine")?)?;
     m.add_function(wrap_pyfunction!(classical_self_play, m)?)?;
     m.add("FEATURE_COUNT", encoder::FEATURE_COUNT)?;
     m.add("WIN_LENGTH", WIN_LENGTH)?;

@@ -54,7 +54,7 @@ class ModelEMA:
                 self._shadow[name] = param.data.clone().detach()
         # Also track BatchNorm running stats and other persistent buffers.
         for name, buf in self.model.named_buffers():
-            if buf is not None:
+            if buf is not None and torch.is_floating_point(buf):
                 self._shadow[f"__buf__{name}"] = buf.data.clone().detach()
 
     def update(self):
@@ -73,7 +73,10 @@ class ModelEMA:
             for name, buf in self.model.named_buffers():
                 key = f"__buf__{name}"
                 if buf is not None and key in self._shadow:
-                    self._shadow[key].mul_(1.0 - d).add_(buf.data, alpha=d)
+                    if torch.is_floating_point(buf):
+                        self._shadow[key].mul_(1.0 - d).add_(buf.data, alpha=d)
+                    else:
+                        self._shadow[key].copy_(buf.data)
 
     def update_step(self):
         """Alias for update() — called after each optimizer step."""
@@ -136,5 +139,5 @@ class ModelEMA:
     @property
     def effective_decay(self) -> float:
         if self._num_updates <= 0:
-            return min(self.decay, 1.0 - 1.0 / (1.0 + max(self._num_updates, 1)))
-        return self.decay
+            return 0.0
+        return min(self.decay, 1.0 - 1.0 / (1.0 + self._num_updates))

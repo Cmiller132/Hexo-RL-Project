@@ -15,7 +15,12 @@ else:
 def load_config(path: Optional[Path] = None) -> Config:
     """Load and validate a configuration file."""
     if path is None:
-        path = Path(__file__).resolve().parent.parent.parent.parent.parent / "configs" / "default.toml"
+        repo_root = Path(__file__).resolve().parents[4]
+        candidates = [
+            repo_root / "Configs" / "default.toml",
+            repo_root / "configs" / "default.toml",
+        ]
+        path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     elif not isinstance(path, Path):
         path = Path(path)
 
