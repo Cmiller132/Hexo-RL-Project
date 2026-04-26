@@ -235,8 +235,26 @@ This is cleaner than legacy's per-loop model execution and aligns with the activ
 
 - Keep the rewrite inference-server topology.
 - Keep sparse replay storage and computed moves-left targets.
-- Avoid restoring sparring until its data path is explicitly tested end to end.
+- Avoid adding sparring until its data path is explicitly tested end to end.
 - Add regression tests for every target head, especially moves-left, value perspective, opponent policy, and lookahead horizons.
 - Treat legacy RGSC, Gumbel, and selector variants as optional experiments, not core training requirements.
 - Add structured metrics emission before rebuilding the dashboard; the dashboard should consume stable JSON/DB/WebSocket contracts rather than scraping logs.
 
+## Idea Assessment
+
+| Idea | Recommendation | Rationale |
+|---|---|---|
+| Central inference server | Adopt | Cleaner than legacy per-loop inference and matches the rewrite's robustness goal. |
+| Compact replay from move histories | Adopt | Saves memory and keeps encoding canonical. |
+| Sparse policy storage | Adopt | Better than legacy dense fp16 policy storage for memory and clarity. |
+| D6 augmentation | Adopt | Domain-correct and already supported. |
+| Recency-weighted sampling | Adopt | Standard for nonstationary self-play data. |
+| PCR / low-sim samples | Adopt cautiously | Useful throughput idea, but losses must gate/weight low-sim samples explicitly. |
+| Policy-surprise weighting | Investigate | Could improve sample efficiency; add metrics first. |
+| Sparring/adaptive opponents | Investigate later | Conceptually useful, but legacy wiring appears broken. |
+| RGSC candidate scoring | Investigate | Interesting idea, but depends on reliable regret labels and heads. |
+| Gating | Investigate after eval is robust | Good safety idea, but legacy optimizer-state behavior was unsafe. |
+| Bootstrap classical data | Adopt as optional | Useful warm start/debug baseline if clearly labeled and weighted. |
+| Dashboard-driven hot config reload | Adopt carefully | Useful workflow; must have one file-backed source of truth and clear reload boundaries. |
+| Monolithic epoch loop | Avoid | The rewrite's separated services are easier to test. |
+| Legacy moves-left/ownership target generation | Avoid | They inject misleading signals. |

@@ -97,7 +97,7 @@ This is one of the rewrite's strongest improvements.
 
 ## Classical Search
 
-Both projects preserve the same broad alpha-beta design:
+Both projects share the same broad alpha-beta design:
 
 - Search operates on whole turns, not individual placements.
 - Iterative deepening.
@@ -206,31 +206,32 @@ Rewrite bridge:
 - Releases GIL around heavy Rust work.
 - Smaller MCTS API surface.
 
-## Preservation Matrix
+## Idea Assessment
 
-| Feature | Legacy | Rewrite Status |
-|---|---:|---|
-| Game rules | Yes | Preserved |
-| Win detection | Yes | Preserved |
-| Radius placement | Yes | Preserved, cleaner |
-| Threat constraints | Yes | Preserved in search, Python/legal-mask gap to audit |
-| Incremental eval | Yes | Preserved, cleaner |
-| Classical search | Yes | Preserved, hardened |
-| 13-channel encoder | Yes | Preserved, canonicalized |
-| MCTS PUCT | Yes | Preserved |
-| Virtual loss | Yes | Preserved |
-| Batched leaves | Yes | Preserved |
-| Subtree reuse | Yes | Preserved |
-| Gumbel SH | Yes | Missing/simplified |
-| Variance selectors | Yes | Missing/simplified |
-| Pipeline FFI | Yes | Missing/simplified |
-| Axis/tactical Rust target APIs | Yes | Missing from current rewrite bindings |
+| Idea | Recommendation | Rationale |
+|---|---|---|
+| Core game rules | Adopt | Stable game definition; already cleaner in rewrite. |
+| Explicit `Turn` primitive | Adopt | Reduces duplicate turn canonicalization and search edge cases. |
+| Split board/eval/threat modules | Adopt | Makes subtle engine bugs easier to isolate. |
+| Incremental eval with invariant tests | Adopt | Good performance idea, but must stay test-backed. |
+| Pair-aware threat constraints | Adopt with audit | Important tactical idea; Python-facing legal masks need pair-aware semantics or clear approximation labels. |
+| Canonical Rust encoder | Adopt | Prevents Python/Rust tensor drift. |
+| 13-channel tensor layout | Adopt for continuity | Compatible with existing intuition and tests; changes should be deliberate. |
+| Classical alpha-beta engine | Adopt as evaluator/baseline | Useful for bootstrap/eval/debug even if not core training target. |
+| Baseline PUCT MCTS | Adopt | Necessary simple baseline for debugging learning. |
+| Subtree reuse | Adopt after correctness tests | Useful speed idea, but subtle with threat invalidation and turn phases. |
+| Dirichlet root noise | Adopt | Standard AlphaZero exploration mechanism. |
+| Gumbel Sequential Halving | Investigate later | Potentially useful exploration idea, but should return only behind isolated tests and metrics. |
+| Variance-aware selectors | Investigate later | Could help uncertainty handling, but adds complexity and another plateau suspect. |
+| Pipelined MCTS FFI | Investigate after profiling | The rewrite inference server may make legacy pipeline overlap unnecessary. |
+| Axis/tactical Rust target APIs | Investigate | Useful for dashboard/debug/training targets, but do not couple them back into the core loop prematurely. |
+| Raw byte PyO3 APIs | Avoid unless measured | Typed NumPy bindings are clearer; raw bytes are only justified by profiling. |
+| Monolithic game state owner | Avoid | The split rewrite design is easier to test and reason about. |
 
 ## Rebuild Guidance
 
 - Keep rewrite engine boundaries.
 - Treat `encoder.rs` as the canonical training/inference tensor source.
-- Add tests before restoring any legacy MCTS exploration feature.
+- Add tests before adding any legacy MCTS exploration idea.
 - Keep Python-facing threat masks pair-aware, or explicitly document when they are only approximate.
-- Do not restore raw byte bridge APIs unless profiling proves NumPy array interop is a bottleneck.
-
+- Do not add raw byte bridge APIs unless profiling proves NumPy array interop is a bottleneck.

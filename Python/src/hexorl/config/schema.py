@@ -1,7 +1,7 @@
 """Pydantic configuration schema."""
 
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from pydantic import BaseModel, Field, model_validator
+from typing import List
 
 
 class RunConfig(BaseModel):
@@ -81,3 +81,23 @@ class Config(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     buffer: BufferConfig = Field(default_factory=BufferConfig)
     train: TrainConfig = Field(default_factory=TrainConfig)
+
+    @model_validator(mode="after")
+    def validate_cross_section_consistency(self) -> "Config":
+        if len(self.buffer.lookahead_horizons) != len(self.buffer.lookahead_lambdas):
+            raise ValueError(
+                "buffer.lookahead_horizons and buffer.lookahead_lambdas must have the same length"
+            )
+
+        configured_horizons = {f"lookahead_{h}" for h in self.buffer.lookahead_horizons}
+        model_lookahead_heads = {
+            head for head in self.model.heads if head.startswith("lookahead_")
+        }
+        missing_horizons = sorted(model_lookahead_heads - configured_horizons)
+        if missing_horizons:
+            raise ValueError(
+                "model lookahead heads must match buffer.lookahead_horizons; "
+                f"missing horizons for heads: {missing_horizons}"
+            )
+
+        return self

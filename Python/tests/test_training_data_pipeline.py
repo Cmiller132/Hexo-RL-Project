@@ -4,7 +4,12 @@ import numpy as np
 import torch
 
 from hexorl.buffer.ring import RingBuffer
-from hexorl.buffer.sampler import _py_decode_compact_record, _transform_dense_policy
+from hexorl.buffer.sampler import (
+    _py_apply_d6_symmetry,
+    _py_decode_compact_record,
+    _transform_axis_label,
+    _transform_dense_policy,
+)
 from hexorl.buffer.targets import process_game_record
 from hexorl.selfplay.records import GameRecord, PositionRecord, BOARD_SIZE, action_to_board_index
 from hexorl.train.losses import compute_losses
@@ -20,7 +25,11 @@ def test_python_decoder_returns_final_position_for_history():
 
     assert decoded.shape == (2, 13, BOARD_SIZE, BOARD_SIZE)
     assert decoded[0, 0].sum() == 0.0
-    assert decoded[-1, 0, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
+    assert decoded[0, 2].sum() == BOARD_SIZE * BOARD_SIZE
+    assert decoded[0, 3, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
+    assert decoded[0, 6].sum() == BOARD_SIZE * BOARD_SIZE
+    assert decoded[-1, 1, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
+    assert decoded[-1, 6].sum() == 0.0
 
 
 def test_policy_symmetry_transform_tracks_dense_target():
@@ -35,6 +44,28 @@ def test_policy_symmetry_transform_tracks_dense_target():
     dst_j = BOARD_SIZE // 2
     assert transformed[dst_i * BOARD_SIZE + dst_j] == 1.0
     assert transformed.sum() == 1.0
+
+
+def test_tensor_and_policy_symmetry_match_for_all_transforms():
+    src_i = BOARD_SIZE // 2 + 2
+    src_j = BOARD_SIZE // 2 - 1
+    tensor = np.zeros((13, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    tensor[0, src_i, src_j] = 1.0
+    policy = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
+    policy[src_i * BOARD_SIZE + src_j] = 1.0
+
+    for sym_idx in range(12):
+        transformed_tensor = _py_apply_d6_symmetry(tensor, sym_idx)
+        transformed_policy = _transform_dense_policy(policy, sym_idx)
+        tensor_idx = int(transformed_tensor[0].argmax())
+        policy_idx = int(transformed_policy.argmax())
+        assert tensor_idx == policy_idx
+
+
+def test_axis_label_symmetry_transform_remains_valid():
+    for axis in range(3):
+        for sym_idx in range(12):
+            assert _transform_axis_label(axis, sym_idx) in {0, 1, 2}
 
 
 def test_process_game_record_populates_auxiliary_targets():

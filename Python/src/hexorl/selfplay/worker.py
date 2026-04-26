@@ -13,7 +13,7 @@ import queue
 import logging
 import multiprocessing as mp
 import numpy as np
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Tuple
 
 try:
     import _engine
@@ -31,7 +31,7 @@ from hexorl.selfplay.records import (
     action_to_board_index,
     BOARD_AREA,
 )
-from hexorl.buffer.targets import process_game_record, compute_value_targets
+from hexorl.buffer.targets import process_game_record
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +177,6 @@ class MockMCTSEngine:
         self, temperature: float, rng_state: Optional[int] = None
     ) -> Tuple[int, int]:
         """Sample a mock action."""
-        i = self._rng.randint(0, max(1, self._num_children - 1))
         return int(self._rng.randint(-8, 9)), int(self._rng.randint(-8, 9))
 
     def should_resign(self, threshold: float) -> bool:
@@ -242,12 +241,16 @@ class RealMCTSEngine:
         c_puct: float,
         near_radius: int,
         seed: int,
+        c_puct_init: float = 19652.0,
+        constrain_threats: bool = True,
     ):
         self._engine = _engine.MCTSEngine(
             game=game,
             num_simulations=num_simulations,
             c_puct=c_puct,
             near_radius=near_radius,
+            c_puct_init=c_puct_init,
+            constrain_threats=constrain_threats,
             seed=seed,
         )
         self._game = game
@@ -291,6 +294,7 @@ class RealMCTSEngine:
 
     def re_root(self, q, r, new_sims):
         self._engine.re_root(q, r, new_sims)
+        self._game.place(q, r)
         return True
 
     def root_child_priors(self):
@@ -365,40 +369,51 @@ class SelfPlayWorker:
         )
 
         try:
-            client.connect()
-        except Exception as exc:
-            logger.warning(
-                f"Worker {self.worker_id}: inference server not available, using mock evaluations: {exc}"
-            )
-            client = None
-
-        while self.stop_event is None or not self.stop_event.is_set():
             try:
-                game_record = self._play_one_game(client)
-                if game_record is not None and len(game_record.positions) > 0:
-                    process_game_record(
-                        game_record,
-                        lookahead_horizons=self.cfg.buffer.lookahead_horizons,
-                        lookahead_lambdas=self.cfg.buffer.lookahead_lambdas,
-                    )
-                    self.record_queue.put(game_record)
-                    self._game_counter += 1
-            except queue.Full:
+                client.connect()
+            except Exception as exc:
                 logger.warning(
-                    f"Worker {self.worker_id}: record queue full, retrying..."
+                    f"Worker {self.worker_id}: inference server not available, using mock evaluations: {exc}"
                 )
-                time.sleep(0.1)
-            except Exception as e:
-                self._crash_count += 1
-                logger.error(
-                    f"Worker {self.worker_id} crash #{self._crash_count}: {e}"
-                )
-                time.sleep(0.5)
-                if self._crash_count > 10:
-                    logger.critical(
-                        f"Worker {self.worker_id} exceeded max crashes, stopping"
+                client = None
+
+            while self.stop_event is None or not self.stop_event.is_set():
+                try:
+                    game_record = self._play_one_game(client)
+                    if game_record is not None and len(game_record.positions) > 0:
+                        process_game_record(
+                            game_record,
+                            lookahead_horizons=self.cfg.buffer.lookahead_horizons,
+                            lookahead_lambdas=self.cfg.buffer.lookahead_lambdas,
+                        )
+                        while self.stop_event is None or not self.stop_event.is_set():
+                            try:
+                                self.record_queue.put(game_record, timeout=0.5)
+                                break
+                            except queue.Full:
+                                logger.warning(
+                                    f"Worker {self.worker_id}: record queue full, retrying..."
+                                )
+                        self._game_counter += 1
+                except queue.Full:
+                    logger.warning(
+                        f"Worker {self.worker_id}: record queue full, retrying..."
                     )
-                    break
+                    time.sleep(0.1)
+                except Exception as e:
+                    self._crash_count += 1
+                    logger.error(
+                        f"Worker {self.worker_id} crash #{self._crash_count}: {e}"
+                    )
+                    time.sleep(0.5)
+                    if self._crash_count > 10:
+                        logger.critical(
+                            f"Worker {self.worker_id} exceeded max crashes, stopping"
+                        )
+                        break
+        finally:
+            if client is not None:
+                client.disconnect()
 
     def _play_one_game(
         self, client: Optional[InferenceClient]
@@ -413,10 +428,17 @@ class SelfPlayWorker:
             self.cfg.run.seed + self.worker_id * 10000 + self._game_counter
         )
 
+        game_id = self._game_id()
         if HAS_ENGINE:
             game = _engine.HexGame()
             engine = RealMCTSEngine(
-                game, sims, self.c_puct, self.near_radius, game_seed
+                game,
+                sims,
+                self.c_puct,
+                self.near_radius,
+                game_seed,
+                c_puct_init=self.c_puct_init,
+                constrain_threats=self.constrain_threats,
             )
         else:
             engine = MockMCTSEngine(
@@ -426,6 +448,7 @@ class SelfPlayWorker:
         positions: List[PositionRecord] = []
         move_history = bytearray()
         move_idx = 0
+        resigned_player: Optional[int] = None
 
         resign_enabled = np.random.random() > self.resign_disable_prob
 
@@ -508,8 +531,13 @@ class SelfPlayWorker:
                         )
                         engine.expand_and_backprop(p, v)
                     else:
+                        uniform_policy = np.full(
+                            count * 1089,
+                            1.0 / 1089.0,
+                            dtype=np.float32,
+                        )
                         engine.expand_and_backprop(
-                            np.ones(count * 1089, dtype=np.float32),
+                            uniform_policy,
                             np.zeros(count, dtype=np.float32),
                         )
                 except Exception as exc:
@@ -550,28 +578,34 @@ class SelfPlayWorker:
                     policy_target=policy,
                     root_value=root_value,
                     player=player,
-                    game_id=self.cfg.run.seed * 100000 + self._game_counter,
+                    game_id=game_id,
                     is_full_search=not use_pcr,
                     turn_index=move_idx,
                 )
             )
 
+            # Resignation is a terminal decision from this position, not an
+            # extra board move. Keep the searched position but do not append a
+            # sampled action to the final history.
+            if resign_enabled and engine.should_resign(self.resign_threshold):
+                resigned_player = player
+                break
+
+            q, r = int(q), int(r)
             move_history.extend(player.to_bytes(4, "little", signed=True))
             move_history.extend(q.to_bytes(4, "little", signed=True))
             move_history.extend(r.to_bytes(4, "little", signed=True))
 
             move_idx += 1
 
-            # Check resignation BEFORE advancing the tree to the next position.
-            if resign_enabled and engine.should_resign(self.resign_threshold):
-                break
-
             engine.re_root(q, r, sims)
 
             if engine.is_over:
                 break
 
-        if HAS_ENGINE:
+        if resigned_player is not None:
+            outcome = -1.0 if resigned_player == 0 else 1.0
+        elif HAS_ENGINE:
             outcome = (
                 1.0
                 if engine.winner == 0
@@ -595,10 +629,15 @@ class SelfPlayWorker:
             root_values=[p.root_value for p in positions],
             players=[p.player for p in positions],
             outcome=outcome,
-            game_id=self.cfg.run.seed * 100000 + self._game_counter,
+            game_id=game_id,
             is_full_search=not use_pcr,
         )
         record.final_move_history = full_history
 
         record.assign_outcomes()
         return record
+
+    def _game_id(self) -> int:
+        worker_part = (int(self.worker_id) & 0xFF) << 24
+        game_part = int(self._game_counter) & 0xFF_FFFF
+        return worker_part | game_part

@@ -1,4 +1,3 @@
-"""Monitoring and visualization."""
 """Dashboard subsystem."""
 
 from .pseudocode import DASHBOARD_PSEUDOCODE

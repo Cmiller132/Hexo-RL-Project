@@ -78,16 +78,20 @@ def run_epoch(
     if bootstrap_games > 0:
         replay.extend(_make_bootstrap_positions(cfg, bootstrap_games))
 
-    if use_selfplay:
-        orchestrator = run_orchestrator(cfg, buffer_capacity=cfg.buffer.capacity)
-        replay = orchestrator.buffer
-
     if model is None:
         model = HexNet(
             channels=cfg.model.channels,
             blocks=cfg.model.blocks,
             heads=cfg.model.heads,
         )
+
+    if use_selfplay:
+        orchestrator = run_orchestrator(
+            cfg,
+            buffer_capacity=cfg.buffer.capacity,
+            initial_model_state=model.state_dict(),
+        )
+        replay = orchestrator.buffer
 
     train_stats: Dict[str, float] = {}
     checkpoint_path: Optional[Path] = None

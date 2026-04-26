@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document summarizes how complete the current rewrite is compared with legacy Hexagon and identifies what should be rebuilt, redesigned, or intentionally left behind.
+This document summarizes which legacy ideas are worth carrying into the rewrite, which should be investigated in isolation, and which should be intentionally left behind. It is not a parity checklist.
 
 ## Current Rewrite Source Anchors
 
@@ -18,27 +18,27 @@ This document summarizes how complete the current rewrite is compared with legac
 - Rust core: `/Users/coltonmiller/Documents/GitHub/Hexo-RL-Project/crates/hexgame-core/`
 - PyO3: `/Users/coltonmiller/Documents/GitHub/Hexo-RL-Project/crates/hexgame-py/`
 
-## Completion Summary
+## Current Rewrite Status
 
-| Subsystem | Rewrite Status | Legacy Parity |
+| Subsystem | Rewrite Status | Idea Status |
 |---|---|---|
-| Rust project structure | Strong | Better than legacy |
-| Game rules | Strong | Near parity |
-| Eval/threat internals | Strong | Cleaner than legacy, one Python-facing threat-mask gap to audit |
-| Classical search | Strong | Near parity |
-| Encoder | Strong | Near parity, cleaner canonical source |
-| PyO3 bridge | Moderate | Simpler than legacy |
-| MCTS | Moderate | Baseline parity, missing advanced exploration/pipeline features |
-| Model | Moderate/strong | Cleaner, but axis semantics changed and legacy trunk features removed |
-| Replay buffer | Moderate/strong | Cleaner sparse storage, lacks DB/history integration |
-| Training loop | Moderate | Runnable smoke/epoch path, not full legacy production loop |
-| Self-play orchestration | Moderate | New inference-server design, less mature than legacy |
-| Eval/gating | Partial | Missing legacy gating and full evaluation workflow |
-| Checkpoint migration | Minimal | Far below legacy, intentionally clean |
-| Dashboard | Minimal | Not feature-complete |
-| DB persistence | Missing | Not feature-complete |
-| Model lab/play/arena UI | Missing | Not feature-complete |
-| Corpus/opening analysis | Missing | Not feature-complete |
+| Rust project structure | Strong | Adopt rewrite design; legacy only informs missing ideas. |
+| Game rules | Strong | Adopt. |
+| Eval/threat internals | Strong | Adopt, with Python threat-mask audit. |
+| Classical search | Strong | Adopt as evaluator/baseline. |
+| Encoder | Strong | Adopt canonical Rust encoder. |
+| PyO3 bridge | Moderate | Prefer rewrite clarity; avoid raw legacy byte APIs unless measured. |
+| MCTS | Moderate | Adopt baseline; investigate advanced exploration later. |
+| Model | Moderate/strong | Adopt simpler baseline; investigate axis/global context ideas. |
+| Replay buffer | Moderate/strong | Adopt sparse storage; add persistence/metrics ideas. |
+| Training loop | Moderate | Adopt modular topology; avoid legacy monolith. |
+| Self-play orchestration | Moderate | Adopt inference-server idea; harden operationally. |
+| Eval/gating | Partial | Investigate clean eval/gating, not legacy behavior. |
+| Checkpoint migration | Minimal | Keep normal path clean; migration can be separate tooling. |
+| Dashboard | Minimal | Carry over visual style and workflows, not implementation. |
+| DB persistence | Missing | Adopt the idea of durable run/game history. |
+| Model lab/play/arena UI | Missing | Carry over as dashboard workflows. |
+| Corpus/opening analysis | Missing | Investigate as analysis/dashboard feature. |
 
 ## Architecture Training Pipeline Comparison
 
@@ -85,7 +85,7 @@ Rewrite:
 
 Assessment:
 
-The rewrite model is simpler and cleaner. It should be easier to debug plateauing. The main feature to reconsider later is whether per-cell axis influence was useful enough to bring back in a tested form.
+The rewrite model is simpler and cleaner. It should be easier to debug plateauing. The main legacy idea to reconsider later is per-cell axis influence, but as a tested idea, not as a default assumption.
 
 ## Dashboard Comparison
 
@@ -103,11 +103,11 @@ Rewrite:
 
 Assessment:
 
-Dashboard is the biggest missing piece. A rebuild should not clone the implementation, but it should preserve most user-facing features.
+Dashboard is the biggest missing idea-surface. A rebuild should not clone the implementation, but it should copy much of the visual style and user workflow.
 
-## Features To Keep From Legacy
+## Ideas Worth Carrying Forward
 
-Keep or rebuild:
+Adopt or build clean equivalents:
 
 - Dense GitHub-dark visual style.
 - Run KPIs and chart set.
@@ -122,25 +122,29 @@ Keep or rebuild:
 - Checkpoint/game import/indexing.
 - SQLite or equivalent persistent history.
 - Board renderer interactions: pan, zoom, fit, overlays, move list.
+- Centralized metrics/event stream for dashboard consumers.
+- File-backed, schema-validated config editing.
+- Clean classical baseline/evaluator.
+- Canonical Rust encoder with testable channel debug output.
+- Sparse compact replay and D6 augmentation.
 
-## Features To Redesign Before Keeping
+## Ideas Worth Investigating, Not Assuming
 
-Redesign:
+Run as isolated experiments or second-pass features:
 
-- Dashboard backend route organization.
-- Frontend component structure.
-- WebSocket live update model.
-- REST error status codes.
-- Training process control.
-- Model cache and GPU memory accounting.
-- Config validation and JSON schema exposure.
-- Analysis job scheduling.
-- Arena persistence.
-- Checkpoint migration boundaries.
 - RGSC candidate extraction and regret labels.
 - Gumbel/selector MCTS variants.
+- Variance-aware MCTS selectors.
+- Pipelined MCTS FFI versus the new inference-server topology.
+- Per-cell axis influence.
+- Axis-policy boosting.
+- Policy-surprise sampling.
+- Sparring/adaptive opponent data.
+- Eval gating with optimizer/scheduler rollback.
+- NBT/FixScale/RepVGG/global-pooling trunk upgrades.
+- Corpus/opening analysis as a training diagnostic, not just dashboard ornament.
 
-## Features To Drop Or Quarantine
+## Ideas To Avoid Or Quarantine
 
 Drop or quarantine unless specifically needed:
 
@@ -153,6 +157,10 @@ Drop or quarantine unless specifically needed:
 - CPU `_boost_with_axis()` dead path.
 - Sparse legacy sample path that modern compact buffer rejects.
 - Old docs as implementation truth.
+- HTTP 200 error payloads as normal API behavior.
+- Dashboard-owned in-memory state as source of truth.
+- Training code importing dashboard internals for observability.
+- Compatibility shims in the normal training path.
 
 ## Recommended Next Build Order
 
@@ -167,7 +175,7 @@ Drop or quarantine unless specifically needed:
 9. Model Lab.
 10. Arena.
 11. Corpus/opening analysis.
-12. Optional advanced MCTS experiments behind flags.
+12. Optional advanced MCTS/model experiments behind flags and ablation metrics.
 
 ## Suggested Dashboard Data Contracts
 
@@ -230,7 +238,6 @@ Minimum game record:
 
 ## Overall Assessment
 
-The rewrite is on the right path for the reason it was created: it removes large amounts of legacy coupling while preserving the core engine and training concepts. It is not done. It is currently a strong foundation with a partial production training stack and almost no dashboard parity.
+The rewrite is on the right path for the reason it was created: it removes large amounts of legacy coupling while keeping the strongest ideas. It is currently a strong foundation with a partial production training stack and almost no dashboard workflow coverage.
 
-The legacy dashboard should be treated as a product spec and visual reference, not as code to port. The highest-value next work is to establish clean metrics/game persistence and rebuild the dashboard around that contract.
-
+The legacy dashboard should be treated as a product spec and visual reference, not as code to port. The highest-value next work is to establish clean metrics/game persistence and build the dashboard around that contract.

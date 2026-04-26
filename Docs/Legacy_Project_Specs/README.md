@@ -8,6 +8,8 @@ Rewrite project: `/Users/coltonmiller/Documents/GitHub/Hexo-RL-Project`
 
 These documents capture the legacy Hexagon system as implemented, not as its older docs describe it. Several legacy docs are stale; the source code is the authority here.
 
+The intent is not to restore the legacy project. The intent is to mine it for ideas: which ideas are worth carrying forward, which should be redesigned first, and which should be left behind. The dashboard is the partial exception: its visual language and major workflows are worth copying more directly, but its implementation should still be replaced.
+
 ## Document Set
 
 - [01 Project Structure](01_PROJECT_STRUCTURE.md): repository layout, build system, Python package map, CLIs, data stores, and major feature inventory.
@@ -21,7 +23,7 @@ These documents capture the legacy Hexagon system as implemented, not as its old
 
 The rewrite is much cleaner and safer architecturally. It keeps the core rules, classical search, 13-channel encoder shape, baseline neural MCTS loop, compact replay concept, multi-head training intent, and a process-separated inference-server design. It also meaningfully improves Rust decomposition, undo correctness, eval/threat separation, and source-of-truth clarity.
 
-The rewrite is not yet feature-complete versus legacy. The largest missing surface is the dashboard, which is currently only a Rich TUI pseudocode sketch. Other missing or simplified areas include legacy Gumbel Sequential Halving, variance-aware MCTS selectors, pipelined MCTS FFI, historical checkpoint/database migration tooling, full persisted run/game analysis database, model lab, interactive play, arena spectator UI, corpus/opening explorer, and several advanced target/debug endpoints.
+The rewrite is not meant to chase legacy parity. The largest missing idea-surface is the dashboard, which is currently only a Rich TUI pseudocode sketch. Other ideas that may be worth evaluating include Gumbel Sequential Halving, variance-aware MCTS selectors, richer persisted run/game analysis, model inspection tools, interactive play, arena evaluation, corpus/opening analysis, and advanced target/debug endpoints. These should be added only when they serve the cleaner architecture.
 
 Legacy was bloated, but it had many useful workflows. The dashboard rebuild should copy its dense GitHub-dark operational style and major tabs, while replacing the monolithic HTML/JS backend coupling with explicit typed APIs, persistent state boundaries, resilient WebSocket polling, local chart assets, and componentized board/model tooling.
 
@@ -37,9 +39,9 @@ Legacy was bloated, but it had many useful workflows. The dashboard rebuild shou
 
 ## How To Use These Specs
 
-Use these as rebuild targets, not as instructions to preserve legacy implementation details. For each subsystem, distinguish:
+Use these as idea inventories, not as instructions to preserve legacy implementation details. For each subsystem, distinguish:
 
-- Keep: workflows, metrics, visual language, and proven core game/search contracts.
-- Redesign: process boundaries, UI architecture, APIs, config validation, persistence, and monitoring.
-- Drop or quarantine: stale compatibility shims, one-off diagnostic scripts, global mutable dashboard state, implicit checkpoint migration paths, and experimental code that was not wired into training.
-
+- Adopt: ideas that are already clean, proven, and aligned with the rewrite.
+- Investigate: ideas that might improve strength or observability but need isolated tests.
+- Avoid: ideas that created ambiguity, hidden state, or misleading training signals.
+- Dashboard carryover: visual language and user workflows worth copying, without copying the monolithic implementation.

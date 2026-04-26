@@ -7,13 +7,12 @@ expand_and_backprop → get_results.
 
 import sys
 import os
-import time
 import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from hexorl.config import load_config, Config
+from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import connect_inference_queue
@@ -146,7 +145,6 @@ class TestInferenceServerWithEngine(unittest.TestCase):
         self.assertEqual(tensor_3d.shape, (13, 33, 33))
 
         # Expand root with mock uniform policy
-        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
         uniform = np.ones(1089, dtype=np.float32) / 1089.0
         engine.expand_root(uniform, 0.0, oq, or_, legal_bytes)
 

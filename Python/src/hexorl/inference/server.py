@@ -18,13 +18,8 @@ from typing import List, Optional, Tuple
 from hexorl.config import Config
 from hexorl.model.network import from_config, HexNet
 from hexorl.inference.shm_queue import (
-    InferenceQueue,
-    WorkerSlots,
     create_inference_queue,
     connect_inference_queue,
-    BOARD_AREA,
-    NUM_CHANNELS,
-    BOARD_SIZE,
 )
 
 
@@ -39,7 +34,12 @@ class InferenceServer:
         server.join()        # Waits for graceful exit
     """
 
-    def __init__(self, cfg: Config, num_workers: int):
+    def __init__(
+        self,
+        cfg: Config,
+        num_workers: int,
+        initial_state_dict: Optional[dict] = None,
+    ):
         self.cfg = cfg
         self.num_workers = num_workers
         self.max_batch = cfg.inference.max_batch_size
@@ -50,6 +50,7 @@ class InferenceServer:
         self._stop_event = mp.Event()
         self._ready_event = mp.Event()
         self._weight_queue = mp.Queue(maxsize=2)
+        self._initial_state_dict = self._state_to_cpu(initial_state_dict)
         self._model: Optional[torch.nn.Module] = None
         self._device: Optional[torch.device] = None
         self._forward_stream = None
@@ -57,6 +58,15 @@ class InferenceServer:
         self.n_batches = 0
         self.n_positions = 0
         self.total_forward_ms = 0.0
+
+    @staticmethod
+    def _state_to_cpu(state_dict: Optional[dict]) -> Optional[dict]:
+        if state_dict is None:
+            return None
+        return {
+            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in state_dict.items()
+        }
 
     def __getstate__(self):
         """Exclude non-picklable attributes for spawn-mode transport."""
@@ -102,6 +112,7 @@ class InferenceServer:
             if self._process.exitcode is None:
                 self._process.terminate()
             self._process = None
+        self.close()
 
     def close(self):
         """Release shared-memory resources (main process side)."""
@@ -115,10 +126,9 @@ class InferenceServer:
         Tensors are moved to CPU before crossing the process boundary. The child
         process loads them onto its inference device between batches.
         """
-        cpu_state = {
-            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-            for k, v in state_dict.items()
-        }
+        cpu_state = self._state_to_cpu(state_dict)
+        if cpu_state is None:
+            return
         while self._weight_queue.full():
             try:
                 self._weight_queue.get_nowait()
@@ -143,6 +153,13 @@ class InferenceServer:
             self._device = torch.device("cpu")
 
         self._model = from_config(self.cfg, device=self._device)
+        if self._initial_state_dict is not None:
+            initial = {
+                k: v.to(self._device) if isinstance(v, torch.Tensor) else v
+                for k, v in self._initial_state_dict.items()
+            }
+            self._model.load_state_dict(initial, strict=False)
+            self._model.eval()
         if self._device.type == "cuda":
             self._forward_stream = torch.cuda.Stream(priority=-1)
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document captures the legacy dashboard as a rebuild target. The goal is to preserve the visual style and major workflows while replacing brittle implementation details.
+This document captures dashboard ideas worth carrying forward. The goal is to copy the visual style and major workflows while replacing brittle implementation details.
 
 ## Legacy Source Anchors
 
@@ -47,7 +47,7 @@ The dashboard uses a dense GitHub-dark operational style:
 | Danger | `#f85149` |
 | Warning | `#d29922` |
 
-UI qualities to preserve:
+UI qualities to carry forward:
 
 - Dense, dashboard-first layout.
 - Small uppercase section labels.

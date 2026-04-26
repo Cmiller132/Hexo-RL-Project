@@ -10,7 +10,7 @@ axis (3-class), regret_rank (scalar), regret_value (binned), moves_left (scalar)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 class GatedResBlock(nn.Module):

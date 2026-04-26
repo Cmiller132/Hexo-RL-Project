@@ -1,7 +1,8 @@
 """Smoke tests for the Rust-compiled Python extension."""
 import numpy as np
 import pytest
-import _engine  # maturin-built extension
+
+_engine = pytest.importorskip("_engine")
 
 
 def test_constants_exported():
@@ -13,6 +14,7 @@ def test_constants_exported():
 
 def test_game_basic():
     g = _engine.PyHexGame()
+    g.unplace()
     g.place(0, 0)
     assert not g.is_over
     g.unplace()

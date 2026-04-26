@@ -8,7 +8,7 @@ import time
 import logging
 import numpy as np
 import torch
-from typing import List, Tuple, Optional, Dict, Callable
+from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
 from hexorl.model.network import HexNet, from_config
@@ -55,10 +55,9 @@ class ArenaStats:
 
     @property
     def elo_diff(self) -> float:
-        if self.win_rate_a <= 0.01 or self.win_rate_a >= 0.99:
-            return 0.0
+        win_rate = min(max(self.win_rate_a, 0.01), 0.99)
         import math
-        return -400.0 * math.log10((1.0 - self.win_rate_a) / self.win_rate_a)
+        return -400.0 * math.log10((1.0 - win_rate) / win_rate)
 
     @property
     def avg_moves(self) -> float:
@@ -112,7 +111,6 @@ def run_arena(
             progress_callback(game_idx, result)
 
         if (game_idx + 1) % 10 == 0:
-            elapsed = time.monotonic() - t_start
             logger.info(
                 f"Arena: {game_idx + 1}/{num_games} | "
                 f"A: {stats.win_rate_a:.1%} B: {stats.win_rate_b:.1%} | "

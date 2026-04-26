@@ -247,7 +247,7 @@ pub(crate) type Stones = FxHashMap<Hex, u8>;
 /// # Example
 ///
 /// ```
-/// use hexgame::HexGameState;
+/// use hexgame_core::HexGameState;
 ///
 /// let mut g = HexGameState::new();
 /// g.place(0, 0).unwrap();   // Player 0 opens
@@ -651,7 +651,7 @@ impl HexGameState {
         }
 
         // Fallback: full scan for different radius.
-        let r = radius.min(PLACEMENT_RADIUS);
+        let r = radius.clamp(0, PLACEMENT_RADIUS);
         let mut candidates = FxHashSet::default();
         for &cell in self.stones.keys() {
             for dq in -r..=r {

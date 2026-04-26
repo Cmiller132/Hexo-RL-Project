@@ -13,8 +13,8 @@ Plus two shared-memory doorbell bytes per worker (spawn-safe):
 
 import time as _time
 import contextlib
-import multiprocessing as mp
 import numpy as np
+import logging
 from multiprocessing.shared_memory import SharedMemory
 from typing import List, Optional
 
@@ -23,6 +23,7 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 TENSOR_ELEMENTS = NUM_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 13 * 33 * 33 = 14157
+logger = logging.getLogger(__name__)
 
 
 def _shm_name(base: str, worker_id: int) -> str:
@@ -40,7 +41,7 @@ def _create_shm(name: str, size: int) -> SharedMemory:
             existing.close()
             existing.unlink()
         except FileNotFoundError:
-            pass
+            logger.debug("SharedMemory %s disappeared before cleanup", name)
         return SharedMemory(name=name, create=True, size=size)
 
 
@@ -86,7 +87,7 @@ class SharedEvent:
             try:
                 self._shm.unlink()
             except FileNotFoundError:
-                pass
+                logger.debug("SharedEvent %s already unlinked", self._name)
 
 
 class WorkerSlots:
@@ -209,7 +210,7 @@ class WorkerSlots:
                     try:
                         shm.unlink()
                     except FileNotFoundError:
-                        pass
+                        logger.debug("SharedMemory %s already unlinked", shm.name)
         for evt in (self.req_ready, self.res_ready):
             if evt is not None:
                 evt.close()

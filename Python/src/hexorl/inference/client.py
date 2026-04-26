@@ -8,7 +8,7 @@ only Python call in the MCTS inner loop.
 import time
 import numpy as np
 from typing import Optional
-from hexorl.inference.shm_queue import InferenceQueue, connect_inference_queue, BOARD_AREA
+from hexorl.inference.shm_queue import InferenceQueue, connect_inference_queue
 
 
 class InferenceClient:

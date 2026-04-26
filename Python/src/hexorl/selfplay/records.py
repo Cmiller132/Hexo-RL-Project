@@ -10,7 +10,7 @@ Each record represents one position from a self-play game:
 
 import struct
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 
 
@@ -179,43 +179,58 @@ class GameRecord:
         """Deserialize a game record from compact bytes."""
         offset = 0
 
-        game_id = struct.unpack_from("<I", data, offset)[0]; offset += 4
-        outcome = struct.unpack_from("<f", data, offset)[0]; offset += 4
-        num_pos = struct.unpack_from("<I", data, offset)[0]; offset += 4
+        game_id = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        outcome = struct.unpack_from("<f", data, offset)[0]
+        offset += 4
+        num_pos = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
 
         positions = []
         for _ in range(num_pos):
             # Move history
-            mh_len = struct.unpack_from("<I", data, offset)[0]; offset += 4
-            move_history = data[offset:offset + mh_len]; offset += mh_len
+            mh_len = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
+            move_history = data[offset:offset + mh_len]
+            offset += mh_len
 
             # Flags
-            player = data[offset]; offset += 1
-            is_full = bool(data[offset]); offset += 1
+            player = data[offset]
+            offset += 1
+            is_full = bool(data[offset])
+            offset += 1
 
             # Root value
-            root_value = struct.unpack_from("<f", data, offset)[0]; offset += 4
+            root_value = struct.unpack_from("<f", data, offset)[0]
+            offset += 4
 
             # Policy target
-            num_entries = struct.unpack_from("<H", data, offset)[0]; offset += 2
+            num_entries = struct.unpack_from("<H", data, offset)[0]
+            offset += 2
             policy = {}
             for _ in range(num_entries):
-                idx = struct.unpack_from("<H", data, offset)[0]; offset += 2
-                prob = struct.unpack_from("<f", data, offset)[0]; offset += 4
+                idx = struct.unpack_from("<H", data, offset)[0]
+                offset += 2
+                prob = struct.unpack_from("<f", data, offset)[0]
+                offset += 4
                 policy[idx] = prob
 
             # Turn index
-            turn_idx = struct.unpack_from("<I", data, offset)[0]; offset += 4
+            turn_idx = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
             opp_policy = {}
             regret_rank = 0.0
             regret_value = 0.0
             axis_label = -1
             moves_left = 0.0
             if offset < len(data):
-                num_opp_entries = struct.unpack_from("<H", data, offset)[0]; offset += 2
+                num_opp_entries = struct.unpack_from("<H", data, offset)[0]
+                offset += 2
                 for _ in range(num_opp_entries):
-                    idx = struct.unpack_from("<H", data, offset)[0]; offset += 2
-                    prob = struct.unpack_from("<f", data, offset)[0]; offset += 4
+                    idx = struct.unpack_from("<H", data, offset)[0]
+                    offset += 2
+                    prob = struct.unpack_from("<f", data, offset)[0]
+                    offset += 4
                     opp_policy[idx] = prob
                 regret_rank, regret_value, axis_label, moves_left = struct.unpack_from(
                     "<ffhf", data, offset

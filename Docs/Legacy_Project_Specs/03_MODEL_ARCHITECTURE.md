@@ -122,7 +122,7 @@ The live target is not true ownership. It marks occupied cells:
 - Opponent stones: `-1`.
 - Empty cells: `0`.
 
-This is more like occupancy-relative-to-perspective. It is a weak strategic signal and should not be blindly preserved as an "ownership" feature in a rebuild.
+This is more like occupancy-relative-to-perspective. It is a weak strategic signal and should not be carried forward as an "ownership" feature in a rebuild.
 
 ## Moves-Left Head
 
@@ -203,8 +203,26 @@ Supported rewrite heads:
 - Prefer the rewrite's dict output and config-driven heads.
 - Do not copy the legacy positional output contract into new code.
 - Reconsider whether axis should be per-cell influence, 3-class winner-axis classification, or both.
-- If restoring axis-policy boosting, add isolated tests because it changes MCTS priors and training policy loss.
+- If adding axis-policy boosting, add isolated tests because it changes MCTS priors and training policy loss.
 - Drop legacy ownership unless a true target can be generated.
 - Keep binned value targets and lookahead heads from the rewrite; they address sparse terminal-value learning better than legacy.
 - Keep checkpoint migration separate from the clean checkpoint format.
 
+## Idea Assessment
+
+| Idea | Recommendation | Rationale |
+|---|---|---|
+| Dict-based model outputs | Adopt | Much safer than legacy tuple positions. |
+| Binned value head | Adopt | Better target geometry than scalar regression or stale 2-bin docs. |
+| Multi-horizon lookahead values | Adopt | Directly addresses sparse terminal-value learning. |
+| Configurable heads | Adopt | Allows experiments without architecture churn. |
+| Hex-masked convolutions | Investigate | Domain-aligned idea, but the simpler rewrite trunk is easier to debug first. |
+| Global pooling in trunk | Investigate | Likely useful for board-wide context, but should be added only with ablation tests. |
+| NBT blocks/FixScale/RepVGG | Investigate later | Potential strength/speed ideas, but not needed for the first robust baseline. |
+| Per-cell axis influence | Investigate | More expressive than 3-class axis labels and useful for debug; risky if it directly boosts policy without tests. |
+| Axis-policy boosting | Investigate cautiously | It changes both training loss and MCTS priors, so it can hide bugs or amplify bad targets. |
+| Opponent policy head | Adopt if labels are reliable | Useful auxiliary target; keep masking explicit. |
+| Regret heads/RGSC | Investigate | Interesting prioritization idea, but noisy early and should not be core until validated. |
+| Legacy ownership head | Avoid as named | The old target is occupancy, not ownership. Rename or replace with true control/territory target. |
+| Legacy moves-left target | Avoid | The idea is good; the old implementation is broken. Use rewrite-style final length targets. |
+| Legacy checkpoint migration in core path | Avoid | Keep migration as tooling, not part of normal training/inference. |

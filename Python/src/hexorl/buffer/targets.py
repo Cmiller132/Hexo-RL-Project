@@ -10,7 +10,7 @@ Runs CPU-side on completed game records. Computes:
 
 import numpy as np
 from typing import List, Tuple, Optional
-from hexorl.selfplay.records import GameRecord, PositionRecord, sparsify_policy
+from hexorl.selfplay.records import GameRecord, PositionRecord
 
 
 def compute_value_targets(

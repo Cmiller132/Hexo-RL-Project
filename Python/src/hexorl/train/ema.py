@@ -7,7 +7,6 @@ for more stable self-play evaluation.
 
 import torch
 import torch.nn as nn
-import copy
 from typing import Dict, Optional
 
 
@@ -15,7 +14,7 @@ class ModelEMA:
     """Exponential Moving Average of model parameters.
 
     Shadow parameters are updated as:
-        shadow = (1 - decay) * shadow + decay * model
+        shadow = decay * shadow + (1 - decay) * model
 
     where decay is a fixed value like 0.9999 (or 0.99 for faster tracking),
     with optional adaptive warmup: decay = min(fixed, 1 - 1/(1 + num_updates)).
@@ -68,13 +67,13 @@ class ModelEMA:
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if param.requires_grad and name in self._shadow:
-                    self._shadow[name].mul_(1.0 - d).add_(param.data, alpha=d)
+                    self._shadow[name].mul_(d).add_(param.data, alpha=1.0 - d)
             # Update buffer shadows (BatchNorm stats etc.) with same decay.
             for name, buf in self.model.named_buffers():
                 key = f"__buf__{name}"
                 if buf is not None and key in self._shadow:
                     if torch.is_floating_point(buf):
-                        self._shadow[key].mul_(1.0 - d).add_(buf.data, alpha=d)
+                        self._shadow[key].mul_(d).add_(buf.data, alpha=1.0 - d)
                     else:
                         self._shadow[key].copy_(buf.data)
 

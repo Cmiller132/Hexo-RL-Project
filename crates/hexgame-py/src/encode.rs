@@ -36,15 +36,25 @@ fn encode_compact_record<'py>(
             for chunk in bytes_owned.chunks_exact(12) {
                 let tensor = encoder::encode_board(&game, near_radius, false).tensor;
                 positions.extend_from_slice(&tensor);
+                let player = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
                 let q = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
                 let r = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                if player != game.current_player() as i32 {
+                    return Err(format!(
+                        "history player mismatch: stored {}, expected {} before move ({}, {})",
+                        player,
+                        game.current_player(),
+                        q,
+                        r
+                    ));
+                }
                 game.place(q, r).map_err(|e| e.to_string())?;
             }
             let tensor = encoder::encode_board(&game, near_radius, false).tensor;
             positions.extend_from_slice(&tensor);
             Ok(positions)
         })
-        .map_err(|e| PyValueError::new_err(e))?;
+        .map_err(PyValueError::new_err)?;
 
     let shape = (
         num_moves + 1,

@@ -265,13 +265,20 @@ pub fn encode_board_into(
                         .collect::<Vec<_>>(),
                 )
             }
-            ThreatStatus::MustBlock(b) => Some(
-                legal_out
-                    .iter()
-                    .copied()
-                    .filter(|h| b.cells().contains(h))
-                    .collect::<Vec<_>>(),
-            ),
+            ThreatStatus::MustBlock(b) => {
+                let mut allowed = b.cells().to_vec();
+                for (a, c) in b.pairs() {
+                    allowed.push(*a);
+                    allowed.push(*c);
+                }
+                Some(
+                    legal_out
+                        .iter()
+                        .copied()
+                        .filter(|h| allowed.contains(h))
+                        .collect::<Vec<_>>(),
+                )
+            }
         };
         if let Some(constrained) = maybe_constrained {
             if !constrained.is_empty() {

@@ -637,13 +637,18 @@ impl MCTSEngine {
                 eval_idx += 1;
             }
 
-            // Flip sign at each depth so every node stores values from its own perspective.
+            // Flip only when crossing to a node owned by the other player.
+            // Hexo turns may contain two same-player placement edges.
             let mut parity_value = value;
+            let mut value_player = self.arena[leaf.node_idx as usize].player;
             for &ni in leaf.search_path.iter().rev() {
                 let n = &mut self.arena[ni as usize];
+                if n.player != 255 && value_player != 255 && n.player != value_player {
+                    parity_value = -parity_value;
+                    value_player = n.player;
+                }
                 n.visit_count += 1;
                 n.total_value += parity_value;
-                parity_value = -parity_value;
             }
         }
 

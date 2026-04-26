@@ -15,7 +15,7 @@ use hexgame_core::WIN_LENGTH;
 
 use std::time::Duration;
 
-use hexgame_core::encoder::{BOARD_SIZE, NUM_CHANNELS};
+use hexgame_core::encoder::{BOARD_AREA, BOARD_SIZE, NUM_CHANNELS};
 
 // -------------------------------------------------------------------------
 // Python-facing wrapper for HexGameState
@@ -61,7 +61,9 @@ impl PyHexGame {
     /// If the game is over this resets the winner as well. Safe to call even
     /// when the history is empty (no-op).
     fn unplace(&mut self) {
-        self.inner.unplace();
+        if self.inner.move_count() > 0 {
+            self.inner.unplace();
+        }
     }
 
     /// Whether the game has ended.
@@ -260,9 +262,14 @@ impl PyHexGame {
             }
             ThreatStatus::MustBlock(b) => {
                 let legal = self.inner.legal_moves_near(radius);
+                let mut allowed = b.cells().to_vec();
+                for (a, c) in b.pairs() {
+                    allowed.push(*a);
+                    allowed.push(*c);
+                }
                 let result: Vec<(i32, i32)> = legal
                     .into_iter()
-                    .filter(|h| b.cells().contains(h))
+                    .filter(|h| allowed.contains(h))
                     .map(|h| (h.q, h.r))
                     .collect();
                 if result.is_empty() {
@@ -562,6 +569,7 @@ impl PyHexGame {
 #[pyclass(name = "MCTSEngine")]
 pub struct PyMCTSEngine {
     inner: MCTSEngine,
+    last_non_terminal_count: u32,
 }
 
 #[pymethods]
@@ -590,7 +598,10 @@ impl PyMCTSEngine {
             c_puct_init,
             seed,
         );
-        Self { inner: engine }
+        Self {
+            inner: engine,
+            last_non_terminal_count: 0,
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -626,6 +637,13 @@ impl PyMCTSEngine {
         let policy_slice = policy
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
+        if policy_slice.len() != BOARD_AREA {
+            return Err(PyValueError::new_err(format!(
+                "policy length {} must equal BOARD_AREA {}",
+                policy_slice.len(),
+                BOARD_AREA
+            )));
+        }
         if !legal_bytes.len().is_multiple_of(8) {
             return Err(PyErr::new::<PyValueError, _>(format!(
                 "legal_bytes length {} is not a multiple of 8",
@@ -652,6 +670,14 @@ impl PyMCTSEngine {
         let noise_slice = noise
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("noise array must be contiguous"))?;
+        let child_count = self.inner.root_child_count() as usize;
+        if noise_slice.len() < child_count {
+            return Err(PyValueError::new_err(format!(
+                "noise length {} is smaller than root child count {}",
+                noise_slice.len(),
+                child_count
+            )));
+        }
         self.inner.add_dirichlet_noise(noise_slice, noise_fraction);
         Ok(())
     }
@@ -669,6 +695,7 @@ impl PyMCTSEngine {
             let (tensors, count) = self.inner.select_leaves(batch_size);
             (count, tensors.to_vec())
         });
+        self.last_non_terminal_count = count;
         let view = ndarray::ArrayView4::from_shape(
             (
                 count as usize,
@@ -695,11 +722,28 @@ impl PyMCTSEngine {
         let values_slice = values
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
+        let expected_policies = self.last_non_terminal_count as usize * BOARD_AREA;
+        if policies_slice.len() != expected_policies {
+            return Err(PyValueError::new_err(format!(
+                "policies length {} must equal {} ({} leaves * BOARD_AREA)",
+                policies_slice.len(),
+                expected_policies,
+                self.last_non_terminal_count
+            )));
+        }
+        if values_slice.len() != self.last_non_terminal_count as usize {
+            return Err(PyValueError::new_err(format!(
+                "values length {} must equal selected non-terminal leaf count {}",
+                values_slice.len(),
+                self.last_non_terminal_count
+            )));
+        }
         let p = policies_slice.to_vec();
         let v = values_slice.to_vec();
         py.allow_threads(|| {
             self.inner.expand_and_backprop(&p, &v);
         });
+        self.last_non_terminal_count = 0;
         Ok(())
     }
 
@@ -762,9 +806,14 @@ impl PyMCTSEngine {
     /// `rng_state` is used as XOR-shift state for deterministic sampling.
     /// Pass `None` (or omit) to use state `0`.
     #[pyo3(signature = (temperature, rng_state=None))]
-    fn sample_action(&mut self, temperature: f32, rng_state: Option<u64>) -> (i16, i16) {
+    fn sample_action(&mut self, temperature: f32, rng_state: Option<u64>) -> PyResult<(i16, i16)> {
+        if self.inner.root_child_count() == 0 {
+            return Err(PyValueError::new_err(
+                "sample_action requires an expanded root with at least one child",
+            ));
+        }
         let mut state = rng_state.unwrap_or(0);
-        self.inner.sample_action(temperature, &mut state)
+        Ok(self.inner.sample_action(temperature, &mut state))
     }
 
     /// Returns true if the root Q-value is below the resign threshold.

@@ -14,7 +14,7 @@ except ImportError:
     _IterableDataset = object  # type: ignore
 
 from hexorl.buffer.ring import RingBuffer
-from hexorl.selfplay.records import PositionRecord, BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
+from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
 
 try:
     import _engine
@@ -27,6 +27,7 @@ def _py_encode_from_coords(
     history_bytes: bytes,
     stride: int,
     num_moves: int,
+    near_radius: int,
 ) -> np.ndarray:
     """Encode a sequence of positions from coordinate history.
 
@@ -38,42 +39,131 @@ def _py_encode_from_coords(
         (num_moves + 1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE),
         dtype=np.float32,
     )
-    cells_p0: List[Tuple[int, int, int]] = []
-    cells_p1: List[Tuple[int, int, int]] = []
+    moves: List[Tuple[int, int, int]] = []
+    stones: dict[Tuple[int, int], int] = {}
+    current_player = 0
+    placements_remaining = 1
 
-    dist = np.sqrt(
-        (np.arange(BOARD_SIZE)[:, None] - half) ** 2 +
-        (np.arange(BOARD_SIZE)[None, :] - half) ** 2
-    )
+    qi_grid = np.arange(BOARD_SIZE)[:, None] - half
+    rj_grid = np.arange(BOARD_SIZE)[None, :] - half
+    dist = np.maximum(
+        np.maximum(np.abs(qi_grid), np.abs(rj_grid)),
+        np.abs(qi_grid + rj_grid),
+    ).astype(np.float32)
 
     for i in range(num_moves + 1):
-        for (gqi, grj, p) in cells_p0 + cells_p1:
-            gi2, gj2 = gqi + half, grj + half
-            if 0 <= gi2 < BOARD_SIZE and 0 <= gj2 < BOARD_SIZE:
-                if p == 0:
-                    positions[i, 0, gi2, gj2] = 1.0
-                else:
-                    positions[i, 1, gi2, gj2] = 1.0
-        positions[i, 2] = 1.0 - positions[i, 0] - positions[i, 1]
-        positions[i, 11] = dist / half
+        _encode_position_fallback(
+            positions[i],
+            stones,
+            moves,
+            current_player,
+            placements_remaining,
+            dist / half,
+            near_radius=near_radius,
+        )
         if i >= num_moves:
             break
 
         offset = i * stride
-        player = int.from_bytes(history_bytes[offset:offset+4], 'little', signed=True)
-        q = int.from_bytes(history_bytes[offset+4:offset+8], 'little', signed=True)
-        r = int.from_bytes(history_bytes[offset+8:offset+12], 'little', signed=True)
+        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
+        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
+        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
+        if player != current_player:
+            raise ValueError(
+                f"Invalid compact history: move {i} stores player {player}, "
+                f"expected {current_player}"
+            )
+        if (q, r) in stones:
+            raise ValueError(f"Invalid compact history: duplicate cell ({q}, {r})")
 
-        gi = q + half
-        gj = r + half
-
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            if player == 0:
-                cells_p0.append((q, r, 0))
-            else:
-                cells_p1.append((q, r, 1))
+        stones[(q, r)] = player
+        moves.append((player, q, r))
+        if placements_remaining > 1:
+            placements_remaining -= 1
+        else:
+            current_player = 1 - current_player
+            placements_remaining = 2
 
     return positions
+
+
+def _encode_position_fallback(
+    out: np.ndarray,
+    stones: dict[Tuple[int, int], int],
+    moves: List[Tuple[int, int, int]],
+    current_player: int,
+    placements_remaining: int,
+    distance: np.ndarray,
+    near_radius: int,
+) -> None:
+    """Encode the non-tactical feature planes used by Python fallback tests."""
+    half = BOARD_SIZE // 2
+
+    for (gqi, grj), player in stones.items():
+            gi2, gj2 = gqi + half, grj + half
+            if 0 <= gi2 < BOARD_SIZE and 0 <= gj2 < BOARD_SIZE:
+                if player == current_player:
+                    out[0, gi2, gj2] = 1.0
+                else:
+                    out[1, gi2, gj2] = 1.0
+
+    out[2] = 1.0 - out[0] - out[1]
+    out[11] = distance
+    if current_player == 0:
+        out[6].fill(1.0)
+
+    if placements_remaining == 1 and moves:
+        out[4].fill(1.0)
+        _, q, r = moves[-1]
+        gi, gj = q + half, r + half
+        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
+            out[5, gi, gj] = 1.0
+
+    for q, r in _fallback_legal_moves(stones, near_radius):
+        gi, gj = q + half, r + half
+        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
+            out[3, gi, gj] = 1.0
+
+    opp = 1 - current_player
+    recent_opp: List[Tuple[int, int]] = []
+    for player, q, r in reversed(moves):
+        if player == current_player:
+            if recent_opp:
+                break
+            continue
+        if player == opp:
+            recent_opp.append((q, r))
+            if len(recent_opp) == 2:
+                break
+    for q, r in recent_opp:
+        gi, gj = q + half, r + half
+        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
+            out[12, gi, gj] = 1.0
+
+    move_count = len(moves)
+    for ply_idx, (player, q, r) in enumerate(moves):
+        gi, gj = q + half, r + half
+        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
+            recency = 1.0 / (1.0 + move_count - ply_idx)
+            out[7 if player == current_player else 8, gi, gj] = recency
+
+
+def _fallback_legal_moves(
+    stones: dict[Tuple[int, int], int],
+    near_radius: int,
+) -> List[Tuple[int, int]]:
+    if not stones:
+        return [(0, 0)]
+    radius = max(0, min(int(near_radius), 8))
+    legal: set[Tuple[int, int]] = set()
+    for q, r in stones:
+        for dq in range(-radius, radius + 1):
+            for dr in range(-radius, radius + 1):
+                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
+                    candidate = (q + dq, r + dr)
+                    if candidate not in stones:
+                        legal.add(candidate)
+    return sorted(legal)
 
 
 def _py_decode_compact_record(
@@ -85,15 +175,18 @@ def _py_decode_compact_record(
     Replays the move history on a fresh board and encodes each position.
     Returns (N + 1, 13, 33, 33) float32 array.
     """
-    if not history_bytes or len(history_bytes) < 12:
-        return np.zeros((1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-
+    if len(history_bytes) % 12 != 0:
+        raise ValueError(
+            f"history_bytes length {len(history_bytes)} is not a multiple of 12"
+        )
     stride = 12
     num_moves = len(history_bytes) // stride
-    if num_moves == 0:
-        return np.zeros((1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-
-    positions = _py_encode_from_coords(history_bytes, stride, num_moves)
+    positions = _py_encode_from_coords(
+        history_bytes[:num_moves * stride],
+        stride,
+        num_moves,
+        near_radius,
+    )
     return positions
 
 
@@ -147,9 +240,22 @@ def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
 
     result = np.zeros_like(tensor)
     for c in range(tensor.shape[0]):
-        result[c][valid] = tensor[c, ti[valid], tj[valid]]
+        result[c, ti[valid], tj[valid]] = tensor[c, yi[valid], xi[valid]]
 
     return result
+
+
+def _transform_axis_label(axis_label: int, sym_idx: int) -> int:
+    """Transform an unoriented axis label under a D6 symmetry."""
+    if axis_label < 0:
+        return axis_label
+    axes = [(1, 0), (0, 1), (1, -1)]
+    q, r = axes[axis_label % 3]
+    tq, tr = _hex_transform(q, r, sym_idx % 12)
+    for i, (aq, ar) in enumerate(axes):
+        if (tq, tr) == (aq, ar) or (tq, tr) == (-aq, -ar):
+            return i
+    return axis_label
 
 
 def _transform_dense_policy(policy: np.ndarray, sym_idx: int) -> np.ndarray:
@@ -304,13 +410,16 @@ class ReplayDataset(_IterableDataset):
                     tensors[i] = _py_apply_d6_symmetry(tensors[i], sym_idx)
                 policy = _transform_dense_policy(policy, sym_idx)
                 opp_policy = _transform_dense_policy(opp_policy, sym_idx)
+                axis_label = _transform_axis_label(rec.axis_label, sym_idx)
+            else:
+                axis_label = rec.axis_label
 
             policies[i] = policy
             values[i] = rec.to_value_target()
             aux_targets["opp_policy"][i] = opp_policy
             aux_targets["regret_rank"][i] = rec.regret_rank
             aux_targets["regret_value"][i] = rec.regret_value
-            aux_targets["axis"][i] = rec.axis_label
+            aux_targets["axis"][i] = axis_label
             aux_targets["moves_left"][i] = rec.moves_left
 
             for h_idx in range(n_lookahead):

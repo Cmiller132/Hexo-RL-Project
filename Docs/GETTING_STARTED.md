@@ -17,10 +17,10 @@ git clone <repo> && cd Hexo-RL-Project
 cargo build --workspace
 
 # Install Python package and dev tools
-python -m pip install -e 'Python[dev]' pytest maturin
+python3 -m pip install -e 'Python[dev]' pytest maturin
 
 # Build the Rust Python extension
-python -m maturin develop --manifest-path crates/hexgame-py/Cargo.toml
+python3 -m maturin develop --manifest-path crates/hexgame-py/Cargo.toml
 ```
 
 ## Verify Installation
@@ -30,16 +30,16 @@ python -m maturin develop --manifest-path crates/hexgame-py/Cargo.toml
 cargo test -p hexgame-core
 
 # Run Python smoke test
-PYTHONPATH=Python/src python -m pytest Python/tests/test_engine_smoke.py -v
+PYTHONPATH=Python/src python3 -m pytest Python/tests/test_engine_smoke.py -v
 
 # Check Python imports
-PYTHONPATH=Python/src python -c "import hexorl, _engine; print(hexorl.__version__, _engine.BOARD_SIZE)"
+PYTHONPATH=Python/src python3 -c "import hexorl, _engine; print(hexorl.__version__, _engine.BOARD_SIZE)"
 ```
 
 ## Quick Test: Inference Server
 
 ```bash
-PYTHONPATH=Python/src python -c "
+PYTHONPATH=Python/src python3 -c "
 from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 
@@ -60,17 +60,17 @@ print('Server stopped')
 ## Quick Test: One Training Epoch
 
 ```bash
-PYTHONPATH=Python/src python -m hexorl.cli smoke-train --epochs 3 --output-dir /tmp/hexorl_smoke
+PYTHONPATH=Python/src python3 -m hexorl.cli smoke-train --epochs 3 --output-dir /tmp/hexorl_smoke
 ```
 
 ## Running a Full Pipeline
 
 ```bash
 # Self-play + training
-PYTHONPATH=Python/src python -m hexorl.cli epoch --config configs/small_test.toml --output-dir runs/small --bootstrap-games 16
+PYTHONPATH=Python/src python3 -m hexorl.cli epoch --config configs/small_test.toml --output-dir runs/small --bootstrap-games 16 --selfplay
 
 # Arena evaluation
-PYTHONPATH=Python/src python -m hexorl.cli arena --games 20 --time-ms 250 --depth 2
+PYTHONPATH=Python/src python3 -m hexorl.cli arena --games 20 --time-ms 250 --depth 2
 ```
 
 ## Directory Structure
@@ -85,7 +85,7 @@ Docs/            — Technical documentation
 
 ## Common Issues
 
-1. **Rust extension not found:** Run `python -m maturin develop --manifest-path crates/hexgame-py/Cargo.toml`
+1. **Rust extension not found:** Run `python3 -m maturin develop --manifest-path crates/hexgame-py/Cargo.toml`
 2. **CUDA not available:** Training works on CPU/MPS (slower)
 3. **Shared memory errors:** macOS may need `ulimit -n` increased
 4. **Config validation fails:** Check `configs/small_test.toml` against `schema.py`

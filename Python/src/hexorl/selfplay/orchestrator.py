@@ -18,7 +18,6 @@ from typing import Optional, List
 from hexorl.config import Config
 from hexorl.inference.server import InferenceServer
 from hexorl.buffer.ring import RingBuffer
-from hexorl.buffer.targets import process_game_record
 from hexorl.selfplay.worker import SelfPlayWorker
 
 logger = logging.getLogger(__name__)
@@ -31,6 +30,7 @@ class SelfPlayOrchestrator:
         self,
         cfg: Config,
         buffer_capacity: int = 100_000,
+        initial_model_state: Optional[dict] = None,
     ):
         self.cfg = cfg
         self.num_workers = cfg.selfplay.num_workers
@@ -39,6 +39,7 @@ class SelfPlayOrchestrator:
 
         # Inference server
         self._server: Optional[InferenceServer] = None
+        self._initial_model_state = initial_model_state
 
         # Ring buffer
         self._buffer = RingBuffer(
@@ -67,7 +68,11 @@ class SelfPlayOrchestrator:
 
         # 1. Start inference server
         logger.info(f"Starting inference server (workers={self.num_workers})")
-        self._server = InferenceServer(self.cfg, num_workers=self.num_workers)
+        self._server = InferenceServer(
+            self.cfg,
+            num_workers=self.num_workers,
+            initial_state_dict=self._initial_model_state,
+        )
         self._server.start()
 
         # 2. Start record collector thread
@@ -90,16 +95,18 @@ class SelfPlayOrchestrator:
         # Signal workers to stop
         self._stop_event.set()
 
-        # Wait for collector to drain remaining records
-        if self._collector_thread and self._collector_thread.is_alive():
-            self._collector_thread.join(timeout=drain_timeout)
-
-        # Terminate workers
+        # Let workers observe the stop event before forcing termination.
         for p in self._workers:
+            if p.is_alive():
+                p.join(timeout=2.0)
             if p.is_alive():
                 p.terminate()
                 p.join(timeout=2.0)
         self._workers.clear()
+
+        # Wait for collector to drain records queued during worker shutdown.
+        if self._collector_thread and self._collector_thread.is_alive():
+            self._collector_thread.join(timeout=drain_timeout)
 
         # Stop inference server
         if self._server:
@@ -166,7 +173,7 @@ class SelfPlayOrchestrator:
 
     def _collect_records(self):
         """Continuously drain game records from the worker queue into the buffer."""
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() or not self._record_queue.empty():
             try:
                 game_record = self._record_queue.get(timeout=0.5)
                 self._ingest_game(game_record)
@@ -223,12 +230,20 @@ class SelfPlayOrchestrator:
         return min(1.0, self._games_done / self.games_per_epoch)
 
 
-def run_orchestrator(cfg: Config, buffer_capacity: int = 100_000):
+def run_orchestrator(
+    cfg: Config,
+    buffer_capacity: int = 100_000,
+    initial_model_state: Optional[dict] = None,
+):
     """Run the orchestrator until interrupted, then clean up.
 
     This is the main entry point called from the epoch runner.
     """
-    orchestrator = SelfPlayOrchestrator(cfg, buffer_capacity=buffer_capacity)
+    orchestrator = SelfPlayOrchestrator(
+        cfg,
+        buffer_capacity=buffer_capacity,
+        initial_model_state=initial_model_state,
+    )
 
     # Handle SIGINT/SIGTERM gracefully
     def _shutdown(signum, frame):

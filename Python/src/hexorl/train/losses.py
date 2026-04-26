@@ -257,5 +257,12 @@ def compute_losses(
         ent = entropy_loss(predictions["policy"])
         per_head["entropy"] = loss_weights["entropy"] * ent
 
+    if not per_head:
+        raise ValueError(
+            "No trainable losses were computed. Check model.heads, train.loss_weights, "
+            f"and available targets. Heads={sorted(predictions.keys())}, "
+            f"loss_weights={sorted(loss_weights.keys())}, targets={sorted(targets.keys())}"
+        )
+
     total = sum(per_head.values())
     return total, per_head

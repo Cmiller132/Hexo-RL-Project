@@ -15,12 +15,12 @@ mod tests {
         // init_root returns (tensor, offset_q, offset_r, legal_moves)
         let (_tensor1, oq, or_, legal1) = engine1.init_root().expect("init_root");
         // Expand with uniform policy
-        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         engine1.expand_root(&uniform, 0.0, oq, or_, &legal1);
 
         while !engine1.done() {
             let (_, count) = engine1.select_leaves(8);
-            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
+            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
             engine1.expand_and_backprop(&policies, &values);
         }
@@ -31,12 +31,12 @@ mod tests {
         let mut engine2 =
             MCTSEngine::with_arena_sim_hint(game2, 50, 200, 1.5, 2, false, 19652.0, 0);
         let (_tensor2, oq2, or2, legal2) = engine2.init_root().expect("init_root");
-        let uniform2 = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
+        let uniform2 = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         engine2.expand_root(&uniform2, 0.0, oq2, or2, &legal2);
 
         while !engine2.done() {
             let (_, count) = engine2.select_leaves(8);
-            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
+            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
             engine2.expand_and_backprop(&policies, &values);
         }
@@ -54,12 +54,12 @@ mod tests {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
-        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
 
         while !engine.done() {
             let (_, count) = engine.select_leaves(8);
-            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
+            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
             engine.expand_and_backprop(&policies, &values);
         }
@@ -90,14 +90,14 @@ mod tests {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 80, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
-        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
 
         // Use random values in [-1, 1] for each batch
         let mut seed = 42u64;
         while !engine.done() {
             let (_, count) = engine.select_leaves(8);
-            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
+            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values: Vec<f32> = (0..count as usize)
                 .map(|_| {
                     seed = seed
@@ -110,7 +110,7 @@ mod tests {
         }
         let (_, _, _, root_q) = engine.get_results();
         assert!(
-            root_q >= -1.0 && root_q <= 1.0,
+            (-1.0..=1.0).contains(&root_q),
             "root Q {} out of range [-1, 1]",
             root_q
         );
@@ -123,14 +123,14 @@ mod tests {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
-        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
 
         // Run a few selections to create pending leaves
         let (_, count) = engine.select_leaves(8);
 
         // Give wrong-length policies (should be count * BOARD_AREA)
-        let wrong_policies = vec![0.0f32; 1 * BOARD_AREA as usize]; // should be count * BOARD_AREA
+        let wrong_policies = vec![0.0f32; BOARD_AREA]; // should be count * BOARD_AREA
         let values = vec![0.0f32; count as usize];
         engine.expand_and_backprop(&wrong_policies, &values);
     }
@@ -143,7 +143,7 @@ mod tests {
         let mut engine =
             MCTSEngine::with_arena_sim_hint(game.clone(), 100, 300, 1.5, 2, false, 0.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
-        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA as usize];
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
 
         let (_, count) = engine.select_leaves(8);
@@ -153,12 +153,37 @@ mod tests {
             "done() must be false after select_leaves but before backprop"
         );
 
-        let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA as usize];
+        let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
         let values = vec![0.0f32; count as usize];
         engine.expand_and_backprop(&policies, &values);
         assert!(
             !engine.done(),
             "done() must be false after only 8 of 100 sims"
+        );
+    }
+
+    #[test]
+    fn mcts_backprop_does_not_flip_between_same_player_placements() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        assert_eq!(game.current_player(), 1);
+        assert_eq!(game.placements_remaining(), 2);
+
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
+        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+
+        let (_, count) = engine.select_leaves(1);
+        assert_eq!(count, 1);
+        let policies = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
+        let values = vec![1.0f32];
+        engine.expand_and_backprop(&policies, &values);
+
+        let (_, _, _, root_q) = engine.get_results();
+        assert!(
+            root_q > 0.5,
+            "same-player placement edge should preserve value sign, got {root_q}"
         );
     }
 }

@@ -12,7 +12,7 @@ Memory budget: ~700 MB at 2M capacity (avg 350 bytes/sample).
 
 import threading
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Optional
 from hexorl.selfplay.records import PositionRecord
 
 
@@ -26,6 +26,13 @@ class RingBuffer:
         recency_decay: float = 0.99,
         num_lookahead: int = 0,
     ):
+        if capacity <= 0:
+            raise ValueError("RingBuffer capacity must be positive")
+        if max_policy_entries <= 0:
+            raise ValueError("RingBuffer max_policy_entries must be positive")
+        if num_lookahead < 0:
+            raise ValueError("RingBuffer num_lookahead cannot be negative")
+
         self.capacity = capacity
         self.max_policy_entries = max_policy_entries
         self.recency_decay = recency_decay
