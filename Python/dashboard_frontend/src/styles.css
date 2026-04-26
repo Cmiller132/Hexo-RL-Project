@@ -82,6 +82,12 @@ h1 {
   margin-bottom: 10px;
 }
 
+.toolbar button.active {
+  border-color: #58a6ff;
+  background: rgba(88, 166, 255, 0.18);
+  color: #dbeafe;
+}
+
 .error {
   border: 1px solid #f85149;
   color: #ffdcd7;

@@ -1,0 +1,108 @@
+"""Perspective-indexed dual-player axis strength target."""
+
+from __future__ import annotations
+
+from typing import Mapping
+
+import numpy as np
+
+from hexorl.axis_policy.core import (
+    AXES,
+    AxisPolicyInput,
+    AxisPolicyResult,
+    ParameterSpec,
+    merge_parameters,
+    normalize_policy,
+)
+from hexorl.selfplay.records import BOARD_SIZE
+
+WIN_LENGTH = 6
+
+
+class DualAxisStrengthPrototype:
+    prototype_id = "dual_axis_strength"
+    label = "Dual Axis Strength"
+    description = "Perspective-indexed 6-plane dense target: own axes and opponent axes are kept separate."
+    parameters = (
+        ParameterSpec("w1", 0.02, 0.0, 0.2, 0.005, "Strength for one stone in a pure 6-cell window."),
+        ParameterSpec("w2", 0.06, 0.0, 0.4, 0.005, "Strength for two stones in a pure 6-cell window."),
+        ParameterSpec("w3", 0.15, 0.0, 0.8, 0.01, "Strength for three stones in a pure 6-cell window."),
+        ParameterSpec("w4", 1.0, 0.0, 3.0, 0.01, "Strength for four stones in a pure 6-cell window."),
+        ParameterSpec("w5", 1.0, 0.0, 3.0, 0.01, "Strength for five stones in a pure 6-cell window."),
+    )
+
+    def compute(
+        self,
+        position: AxisPolicyInput,
+        parameters: Mapping[str, float] | None = None,
+    ) -> AxisPolicyResult:
+        params = merge_parameters(self.parameters, parameters)
+        strength = np.array(
+            [0.0, params["w1"], params["w2"], params["w3"], params["w4"], params["w5"], params["w5"]],
+            dtype=np.float32,
+        )
+        maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        own = position.own_stones
+        opp = position.opp_stones
+        debug = {"own_windows": 0, "opp_windows": 0, "contested_skipped": 0}
+
+        for axis, (dq, dr) in enumerate(AXES):
+            own_plane = axis
+            opp_plane = axis + 3
+            for gi in range(BOARD_SIZE):
+                for gj in range(BOARD_SIZE):
+                    q = gi + position.offset_q
+                    r = gj + position.offset_r
+                    own_total = 0.0
+                    opp_total = 0.0
+                    for off in range(WIN_LENGTH):
+                        wq = q - dq * off
+                        wr = r - dr * off
+                        own_count = 0
+                        opp_count = 0
+                        for step in range(WIN_LENGTH):
+                            cell = (wq + dq * step, wr + dr * step)
+                            own_count += int(cell in own)
+                            opp_count += int(cell in opp)
+                        if own_count and opp_count:
+                            debug["contested_skipped"] += 1
+                            continue
+                        if own_count:
+                            own_total += float(strength[own_count])
+                            debug["own_windows"] += 1
+                        elif opp_count:
+                            opp_total += float(strength[opp_count])
+                            debug["opp_windows"] += 1
+                    maps[own_plane, gi, gj] = own_total
+                    maps[opp_plane, gi, gj] = opp_total
+
+        display = np.maximum(maps[:3].max(axis=0), maps[3:].max(axis=0))
+        combined = normalize_policy(
+            display,
+            position.legal_set,
+            position.offset_q,
+            position.offset_r,
+            fallback_uniform=False,
+        )
+        return AxisPolicyResult(
+            self.prototype_id,
+            params,
+            maps,
+            combined,
+            {
+                **debug,
+                "target_kind": "perspective_indexed_dual_axis_strength",
+                "channel_layout": [
+                    "own_axis_0",
+                    "own_axis_1",
+                    "own_axis_2",
+                    "opp_axis_0",
+                    "opp_axis_1",
+                    "opp_axis_2",
+                ],
+                "strength_weights": strength.tolist(),
+            },
+            position.offset_q,
+            position.offset_r,
+            position.current_player,
+        )

@@ -97,14 +97,14 @@ def test_axis_policy_prototypes_are_python_tunable():
         current_player=0,
         metadata={"placements_remaining": 2},
     )
-    results = evaluate_all(position, {"axis_development": {"multi_axis_bonus": 1.0}})
+    results = evaluate_all(position, {"dual_axis_strength": {"w4": 1.0, "w5": 1.0}})
     assert {r["prototype_id"] for r in results} == {
+        "dual_axis_strength",
         "legacy_axis_influence",
-        "axis_development",
     }
     assert any(r["cells"] for r in results)
     first_cell = next(r["cells"][0] for r in results if r["cells"])
-    assert {"q", "r", "score", "axes", "owner"} <= set(first_cell)
+    assert {"q", "r", "score", "axes", "own_axes", "opp_axes", "net_axes", "owner"} <= set(first_cell)
 
 
 def test_fastapi_dashboard_smoke(tmp_path):

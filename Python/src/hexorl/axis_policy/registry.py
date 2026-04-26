@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from hexorl.axis_policy.axis_development import AxisDevelopmentPrototype
 from hexorl.axis_policy.core import AxisPolicyInput, AxisPolicyPrototype
+from hexorl.axis_policy.dual_strength import DualAxisStrengthPrototype
 from hexorl.axis_policy.legacy_influence import LegacyAxisInfluencePrototype
 
 
 def builtins() -> list[AxisPolicyPrototype]:
     return [
+        DualAxisStrengthPrototype(),
         LegacyAxisInfluencePrototype(),
-        AxisDevelopmentPrototype(),
     ]
 
 

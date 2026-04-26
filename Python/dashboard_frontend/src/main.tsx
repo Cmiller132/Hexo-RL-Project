@@ -309,6 +309,7 @@ function AxisPanel({ prototypes, results, setResults }: {
 }) {
   const [axisSession, setAxisSession] = useState<AnyRow | null>(null);
   const [selectedPrototype, setSelectedPrototype] = useState<string>("");
+  const [axisView, setAxisView] = useState<string>("own");
   const [params, setParams] = useState<Record<string, number>>({});
   const selected = results.find((r) => r.prototype_id === selectedPrototype) || results[0];
   const selectedSpec = prototypes.find((p) => p.id === (selectedPrototype || prototypes[0]?.id));
@@ -364,17 +365,10 @@ function AxisPanel({ prototypes, results, setResults }: {
     }, 180);
     return () => window.clearTimeout(handle);
   }, [axisSession?.session_id, axisSession?.position?.turn_index, selectedPrototype, paramsKey]);
-  const offsetQ = axisSession?.position?.encoding?.offset_q ?? -16;
-  const offsetR = axisSession?.position?.encoding?.offset_r ?? -16;
-  const overlayMoves = (selected?.cells || []).map((m: AnyRow) => {
-    return {
-      q: Number(m.q),
-      r: Number(m.r),
-      score: Number(m.score),
-      owner: Number.isFinite(Number(m.owner)) ? Number(m.owner) : undefined,
-      axes: m.axes
-    };
-  });
+  const currentPlayer = Number(selected?.current_player ?? axisSession?.position?.current_player ?? 0);
+  const overlayMoves = (selected?.cells || [])
+    .map((m: AnyRow) => deriveAxisOverlay(m, axisView, currentPlayer))
+    .filter((m: AnyRow) => Math.abs(Number(m.score || 0)) > 1e-7);
   return (
     <section className="viewerGrid">
       <Panel title="Axis Target Board">
@@ -383,6 +377,15 @@ function AxisPanel({ prototypes, results, setResults }: {
           <button onClick={undo}>Undo</button>
           <button onClick={reset}>Reset</button>
           <button onClick={evaluate}><Target size={15} /> Evaluate</button>
+          {["own", "opp", "net", "max", "both"].map((mode) => (
+            <button
+              key={mode}
+              className={axisView === mode ? "active" : ""}
+              onClick={() => setAxisView(mode)}
+            >
+              {mode}
+            </button>
+          ))}
           <span className={`playerBadge p${axisSession?.position?.current_player ?? 0}`}>
             P{axisSession?.position?.current_player ?? 0} to move
           </span>
@@ -424,7 +427,7 @@ function AxisPanel({ prototypes, results, setResults }: {
             <div className="result" key={r.prototype_id}>
               <h3>{r.prototype_id}</h3>
               <Table rows={r.axis_summaries || []} columns={["axis", "min", "max", "nonzero"]} />
-              <Table rows={(r.cells || []).slice(0, 96)} columns={["q", "r", "score", "owner", "axes"]} />
+              <Table rows={(r.cells || []).slice(0, 96)} columns={["q", "r", "score", "owner", "own_axes", "opp_axes", "net_axes"]} />
             </div>
           ))}
         </div>
@@ -677,8 +680,16 @@ function hoverText(hover: AnyRow) {
     const axes = Array.isArray(hover.overlay.axes)
       ? hover.overlay.axes.map((v: number) => Number(v).toFixed(2)).join(",")
       : "";
+    const own = Array.isArray(hover.overlay.own_axes)
+      ? hover.overlay.own_axes.map((v: number) => Number(v).toFixed(2)).join(",")
+      : "";
+    const opp = Array.isArray(hover.overlay.opp_axes)
+      ? hover.overlay.opp_axes.map((v: number) => Number(v).toFixed(2)).join(",")
+      : "";
     parts.push(`score ${Number(hover.overlay.score || 0).toFixed(2)}`);
     if (Number.isFinite(Number(hover.overlay.owner))) parts.push(`P${Number(hover.overlay.owner)} strength`);
+    if (own) parts.push(`own [${own}]`);
+    if (opp) parts.push(`opp [${opp}]`);
     if (axes) parts.push(`axes [${axes}]`);
   }
   return parts.join(" · ");
@@ -698,6 +709,66 @@ function overlayOwnerFor(overlay: AnyRow | undefined, currentPlayer: number) {
   if (!overlay) return currentPlayer;
   if (Number.isFinite(Number(overlay.owner))) return Number(overlay.owner);
   return Number(overlay.score || 0) >= 0 ? currentPlayer : 1 - currentPlayer;
+}
+
+function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number) {
+  const ownAxes = toNumArray(cell.own_axes);
+  const oppAxes = toNumArray(cell.opp_axes);
+  const netAxes = cell.net_axes ? toNumArray(cell.net_axes) : ownAxes.map((v, i) => v - (oppAxes[i] || 0));
+  const ownScore = maxValue(ownAxes);
+  const oppScore = maxValue(oppAxes);
+  const opponent = 1 - currentPlayer;
+  let score = 0;
+  let owner = currentPlayer;
+  let axes = ownAxes;
+
+  if (mode === "opp") {
+    score = oppScore;
+    owner = opponent;
+    axes = oppAxes;
+  } else if (mode === "net") {
+    score = maxAbsValue(netAxes);
+    owner = score >= 0 ? currentPlayer : opponent;
+    axes = netAxes;
+  } else if (mode === "max") {
+    const ownAbs = Math.max(Math.abs(ownScore), 0);
+    const oppAbs = Math.max(Math.abs(oppScore), 0);
+    score = ownAbs >= oppAbs ? ownScore : oppScore;
+    owner = ownAbs >= oppAbs ? currentPlayer : opponent;
+    axes = ownAbs >= oppAbs ? ownAxes : oppAxes;
+  } else if (mode === "both") {
+    axes = ownAxes.map((v, i) => Math.min(v, oppAxes[i] || 0));
+    score = maxValue(axes);
+    owner = ownScore >= oppScore ? currentPlayer : opponent;
+  } else {
+    score = ownScore;
+    owner = currentPlayer;
+    axes = ownAxes;
+  }
+
+  return {
+    q: Number(cell.q),
+    r: Number(cell.r),
+    score,
+    owner,
+    axes,
+    own_axes: ownAxes,
+    opp_axes: oppAxes,
+    net_axes: netAxes
+  };
+}
+
+function toNumArray(value: any) {
+  return Array.isArray(value) ? value.slice(0, 3).map((v) => Number(v || 0)) : [0, 0, 0];
+}
+
+function maxValue(values: number[]) {
+  return values.length ? Math.max(...values) : 0;
+}
+
+function maxAbsValue(values: number[]) {
+  if (!values.length) return 0;
+  return values.reduce((best, value) => Math.abs(value) > Math.abs(best) ? value : best, values[0]);
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {

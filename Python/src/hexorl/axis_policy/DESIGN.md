@@ -8,6 +8,15 @@ The target should teach strategic line geometry, not immediate tactics.
 
 Immediate wins, must-block cells, and forced tactical responses are already handled by the engine threat logic and the NN legal-mask restriction. Axis targets should therefore avoid duplicating "close this threat" or "block this threat" policy behavior. They should instead describe the structure that leads to future threats, especially multi-axis strength and fork potential.
 
+## Current Lab Prototypes
+
+The current Axis Lab has two intentionally different prototypes:
+
+- `dual_axis_strength`: the main candidate. It emits six non-negative dense planes: three own-axis strength planes and three opponent-axis strength planes from the current-player perspective.
+- `legacy_axis_influence`: reference only. It keeps the older signed three-plane style so the new formulas can be compared against the legacy Hexagon idea without making the signed representation the preferred target.
+
+The main candidate is deliberately not a policy-ranked overlay. It shows the float strengths the model would be trained to predict if this target is enabled later.
+
 ## Perspective-Indexed Targets
 
 The preferred training target is perspective-indexed:
@@ -77,6 +86,14 @@ The exact weights are tunable. The legacy Hexagon weights were:
 ```
 
 These are a reasonable baseline, not sacred constants.
+
+The current `dual_axis_strength` default treats 4-stone and 5-stone pure windows as nearly equivalent:
+
+```text
+[0.00, 0.02, 0.06, 0.15, 1.00, 1.00, 1.00]
+```
+
+This is intentional for first-pass tuning because Hexo's two-placement turn structure makes a clean 4-window much closer to a forcing threat than it would be in a single-placement game.
 
 ## Dense Field vs Legal-Cell Prototype
 
@@ -164,15 +181,21 @@ The first-pass dense target does not need to encode all of these explicitly. But
 
 The Axis Lab should show raw target values, not policy ranks.
 
-Preferred visualization:
+Current visualization:
 
 - Blue values: P0 strength.
 - Red values: P1 strength.
-- Hover shows exact per-axis floats.
-- Toggles can switch between own, opponent, net, max, and both-strong views.
+- Hover shows exact per-axis floats for own, opponent, and net values.
+- `own`: show current-player axis strength.
+- `opp`: show opponent axis strength.
+- `net`: show `own - opp` as a derived signed view.
+- `max`: show whichever side has the stronger value at that cell.
+- `both`: show `min(own, opp)` per axis to reveal contested/both-strong cells.
 - Labels should be signed or explicitly player-owned.
 
 The UI should avoid normalized "probability mass" when the value being inspected is not a policy target.
+
+These views are diagnostic projections of the same raw target data. Only the six raw own/opponent planes should be considered the first candidate training target.
 
 ## Training Guidance
 
@@ -194,6 +217,18 @@ Potential target transforms:
 - Per-position clipping if rare extreme positions create unstable loss.
 
 Avoid per-position normalization early, because absolute threat strength may be meaningful.
+
+## Diagnostics, Not Targets
+
+Several useful strategy measurements should start as dashboard diagnostics instead of supervised model targets:
+
+- **Fork creation index**: how much a legal move increases strength on two or three own axes.
+- **Blocking efficiency**: how many cells or two-cell pairs can cover all urgent opponent windows.
+- **Threat independence**: whether hot windows have overlapping block cells or are genuinely separate.
+- **Shared pivot heat**: cells that participate in many pure windows across axes.
+- **Contested tension**: cells where both own and opponent strength are high.
+
+These may become training channels later, but only after visual inspection shows they measure stable strategic structure rather than noisy tactical artifacts.
 
 ## Open Questions
 

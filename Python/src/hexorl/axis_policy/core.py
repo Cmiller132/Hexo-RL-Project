@@ -69,14 +69,26 @@ class AxisPolicyResult:
 
     def to_json(self) -> dict[str, Any]:
         cells = []
-        axis_count = min(3, self.axis_maps.shape[0])
+        axis_count = int(self.axis_maps.shape[0])
         for i in range(self.axis_maps.shape[1]):
             for j in range(self.axis_maps.shape[2]):
                 axis_values = [float(self.axis_maps[axis, i, j]) for axis in range(axis_count)]
                 if not any(abs(value) > 1e-7 for value in axis_values):
                     continue
-                score = max(axis_values, key=lambda value: abs(value))
-                owner = int(self.current_player) if score >= 0 else 1 - int(self.current_player)
+                if axis_count >= 6:
+                    own_axes = axis_values[:3]
+                    opp_axes = axis_values[3:6]
+                    net_axes = [own - opp for own, opp in zip(own_axes, opp_axes, strict=False)]
+                    own_score = max(own_axes) if own_axes else 0.0
+                    opp_score = max(opp_axes) if opp_axes else 0.0
+                    score = own_score if own_score >= opp_score else opp_score
+                    owner = int(self.current_player) if own_score >= opp_score else 1 - int(self.current_player)
+                else:
+                    net_axes = axis_values
+                    own_axes = [max(value, 0.0) for value in axis_values[:3]]
+                    opp_axes = [max(-value, 0.0) for value in axis_values[:3]]
+                    score = max(net_axes, key=lambda value: abs(value))
+                    owner = int(self.current_player) if score >= 0 else 1 - int(self.current_player)
                 cells.append(
                     {
                         "q": int(i + self.offset_q),
@@ -84,6 +96,9 @@ class AxisPolicyResult:
                         "score": float(score),
                         "owner": owner,
                         "axes": axis_values,
+                        "own_axes": own_axes,
+                        "opp_axes": opp_axes,
+                        "net_axes": net_axes,
                     }
                 )
         cells.sort(key=lambda cell: abs(float(cell["score"])), reverse=True)
@@ -101,7 +116,7 @@ class AxisPolicyResult:
                     "max": float(self.axis_maps[axis].max()),
                     "nonzero": int(np.count_nonzero(self.axis_maps[axis])),
                 }
-                for axis in range(3)
+                for axis in range(axis_count)
             ],
             "cells": cells,
             "debug_terms": self.debug_terms,
