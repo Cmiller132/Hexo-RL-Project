@@ -17,6 +17,13 @@ The current Axis Lab has two intentionally different prototypes:
 
 The main candidate is deliberately not a policy-ranked overlay. It shows the float strengths the model would be trained to predict if this target is enabled later.
 
+There are also `exp_*` prototypes. These are deliberately dashboard experiments, not dashboard targets and not training targets:
+
+- `exp_delta_fork`: legal-cell marginal gain. It asks how much pure-axis strength a move would add, with a bonus for moves that improve several axes at once.
+- `exp_cross_axis_pivot`: dense field with cross-axis boosting. It asks where existing line geometry is structurally rich across more than one axis.
+
+These are useful angles for thinking about long-term planning, but they should remain exploratory until they are tested against actual games and visually inspected in many normal positions.
+
 ## Perspective-Indexed Targets
 
 The preferred training target is perspective-indexed:
@@ -190,12 +197,21 @@ Current visualization:
 - `opp`: show opponent axis strength.
 - `net`: show `own - opp` as a derived signed view.
 - `max`: show whichever side has the stronger value at that cell.
-- `both`: show `min(own, opp)` per axis to reveal contested/both-strong cells.
+- `both`: show cells where both players have nonzero strength, using `min(max(own_axes), max(opp_axes))` for opacity and showing actual P0/P1 values as separate blue/red bars and numbers.
 - Labels should be signed or explicitly player-owned.
 
 The UI should avoid normalized "probability mass" when the value being inspected is not a policy target.
 
 These views are diagnostic projections of the same raw target data. Only the six raw own/opponent planes should be considered the first candidate training target.
+
+The dashboard scale toggle is visual only:
+
+- `raw`: show target values exactly as computed.
+- `log`: show `sign(x) * log1p(abs(x)) / log1p(3)`.
+- `sqrt`: show `sign(x) * sqrt(min(abs(x), 3) / 3)`.
+- `unit`: show `clamp(x / 1.5, -1, 1)`.
+
+These modes are for readability and tuning intuition. They should not be confused with a final training-target decision.
 
 ## Training Guidance
 
@@ -210,10 +226,27 @@ loss = SmoothL1 or MSE
 
 Use modest loss weight at first. The axis target should regularize representation learning without overpowering policy/value learning.
 
-Potential target transforms:
+Recommended target transform:
+
+```text
+target = clamp(log1p(raw) / log1p(cap), 0, 1)
+prediction_head = linear
+loss = SmoothL1 or MSE
+```
+
+Why this is the current best default:
+
+- Axis strength is nonnegative in the preferred six-plane target, so a one-sided transform is simpler than `tanh`.
+- Raw values preserve absolute meaning, but high-threat windows can dominate loss because window sums can grow quickly.
+- `log1p` compresses large values while leaving small values distinguishable, so early structure does not disappear.
+- A fixed global cap preserves cross-position comparability. Per-position normalization would make a weak position and a decisive position look artificially similar.
+- A linear head avoids sigmoid saturation. If the target saturates near 1.0, a sigmoid head can make the model slow to correct strong-hot-window errors.
+
+Potential alternatives:
 
 - Raw values first, if scale is stable.
 - `log1p(value)` if high-threat windows dominate too much.
+- `sqrt(value / cap)` if midrange structure needs more visual/training emphasis than log gives.
 - Per-position clipping if rare extreme positions create unstable loss.
 
 Avoid per-position normalization early, because absolute threat strength may be meaningful.

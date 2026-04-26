@@ -6,6 +6,7 @@ from typing import Mapping
 
 from hexorl.axis_policy.core import AxisPolicyInput, AxisPolicyPrototype
 from hexorl.axis_policy.dual_strength import DualAxisStrengthPrototype
+from hexorl.axis_policy.experiments import CrossAxisPivotPrototype, DeltaForkPrototype
 from hexorl.axis_policy.legacy_influence import LegacyAxisInfluencePrototype
 
 
@@ -13,6 +14,8 @@ def builtins() -> list[AxisPolicyPrototype]:
     return [
         DualAxisStrengthPrototype(),
         LegacyAxisInfluencePrototype(),
+        DeltaForkPrototype(),
+        CrossAxisPivotPrototype(),
     ]
 
 

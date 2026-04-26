@@ -101,8 +101,13 @@ def test_axis_policy_prototypes_are_python_tunable():
     assert {r["prototype_id"] for r in results} == {
         "dual_axis_strength",
         "legacy_axis_influence",
+        "exp_delta_fork",
+        "exp_cross_axis_pivot",
     }
     assert any(r["cells"] for r in results)
+    delta = next(r for r in results if r["prototype_id"] == "exp_delta_fork")
+    assert len(delta["axis_summaries"]) == 6
+    assert delta["debug_terms"]["target_kind"] == "diagnostic_legal_delta_not_training_target"
     first_cell = next(r["cells"][0] for r in results if r["cells"])
     assert {"q", "r", "score", "axes", "own_axes", "opp_axes", "net_axes", "owner"} <= set(first_cell)
 

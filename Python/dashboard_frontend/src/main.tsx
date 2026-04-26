@@ -310,6 +310,7 @@ function AxisPanel({ prototypes, results, setResults }: {
   const [axisSession, setAxisSession] = useState<AnyRow | null>(null);
   const [selectedPrototype, setSelectedPrototype] = useState<string>("");
   const [axisView, setAxisView] = useState<string>("own");
+  const [axisScale, setAxisScale] = useState<string>("raw");
   const [params, setParams] = useState<Record<string, number>>({});
   const selected = results.find((r) => r.prototype_id === selectedPrototype) || results[0];
   const selectedSpec = prototypes.find((p) => p.id === (selectedPrototype || prototypes[0]?.id));
@@ -367,7 +368,7 @@ function AxisPanel({ prototypes, results, setResults }: {
   }, [axisSession?.session_id, axisSession?.position?.turn_index, selectedPrototype, paramsKey]);
   const currentPlayer = Number(selected?.current_player ?? axisSession?.position?.current_player ?? 0);
   const overlayMoves = (selected?.cells || [])
-    .map((m: AnyRow) => deriveAxisOverlay(m, axisView, currentPlayer))
+    .map((m: AnyRow) => deriveAxisOverlay(m, axisView, currentPlayer, axisScale))
     .filter((m: AnyRow) => Math.abs(Number(m.score || 0)) > 1e-7);
   return (
     <section className="viewerGrid">
@@ -382,6 +383,16 @@ function AxisPanel({ prototypes, results, setResults }: {
               key={mode}
               className={axisView === mode ? "active" : ""}
               onClick={() => setAxisView(mode)}
+            >
+              {mode}
+            </button>
+          ))}
+          <span className="toolbarLabel">scale</span>
+          {["raw", "log", "sqrt", "unit"].map((mode) => (
+            <button
+              key={mode}
+              className={axisScale === mode ? "active" : ""}
+              onClick={() => setAxisScale(mode)}
             >
               {mode}
             </button>
@@ -554,9 +565,10 @@ function Board({
             const isLegal = legalSet.has(key);
             const isThreat = threatSet.has(key);
             const overlay = overlayMap.get(key);
+            const isBothOverlay = overlay?.kind === "both";
             const overlayOwner = overlayOwnerFor(overlay, currentPlayer);
-            const overlayColor = overlayOwner === 1 ? "221, 51, 51" : "51, 119, 238";
-            const overlayStroke = overlayOwner === 1 ? "#ff9d93" : "#95b8ff";
+            const overlayColor = isBothOverlay ? "140, 150, 162" : overlayOwner === 1 ? "221, 51, 51" : "51, 119, 238";
+            const overlayStroke = isBothOverlay ? "#6e7681" : overlayOwner === 1 ? "#ff9d93" : "#95b8ff";
             const isLast = last && last.q === cell.q && last.r === cell.r;
             const classes = [
               "hexCell",
@@ -564,6 +576,7 @@ function Board({
               isLegal ? "legal" : "",
               isThreat ? "threat" : "",
               overlay ? "overlay" : "",
+              isBothOverlay ? "bothOverlay" : "",
               interactive && isLegal ? "clickable" : "",
               isLast ? "last" : ""
             ].filter(Boolean).join(" ");
@@ -585,7 +598,41 @@ function Board({
                   }}
                   onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
                 />
-                {overlay && !stone && (
+                {overlay && !stone && isBothOverlay && (
+                  <>
+                    <line
+                      className="bothHalo p0"
+                      x1={cell.x - 16}
+                      y1={cell.y - 7}
+                      x2={cell.x + 16}
+                      y2={cell.y - 7}
+                    />
+                    <line
+                      className="bothHalo p1"
+                      x1={cell.x - 16}
+                      y1={cell.y + 7}
+                      x2={cell.x + 16}
+                      y2={cell.y + 7}
+                    />
+                    <line
+                      className="bothBar p0"
+                      x1={cell.x - 14}
+                      y1={cell.y - 7}
+                      x2={cell.x - 14 + 28 * barScale(overlay.p0_score)}
+                      y2={cell.y - 7}
+                    />
+                    <line
+                      className="bothBar p1"
+                      x1={cell.x - 14}
+                      y1={cell.y + 7}
+                      x2={cell.x - 14 + 28 * barScale(overlay.p1_score)}
+                      y2={cell.y + 7}
+                    />
+                    <text className="bothValue p0" x={cell.x} y={cell.y - 4}>{formatMagnitude(overlay.p0_score)}</text>
+                    <text className="bothValue p1" x={cell.x} y={cell.y + 11}>{formatMagnitude(overlay.p1_score)}</text>
+                  </>
+                )}
+                {overlay && !stone && !isBothOverlay && (
                   <text className="overlayValue" x={cell.x} y={cell.y + 3}>{formatStrength(overlay.score)}</text>
                 )}
                 {stone && (
@@ -687,7 +734,20 @@ function hoverText(hover: AnyRow) {
       ? hover.overlay.opp_axes.map((v: number) => Number(v).toFixed(2)).join(",")
       : "";
     parts.push(`score ${Number(hover.overlay.score || 0).toFixed(2)}`);
-    if (Number.isFinite(Number(hover.overlay.owner))) parts.push(`P${Number(hover.overlay.owner)} strength`);
+    if (hover.overlay.scale_mode && hover.overlay.scale_mode !== "raw") {
+      parts.push(`scaled ${hover.overlay.scale_mode}`);
+    }
+    if (hover.overlay.kind === "both") {
+      parts.push(`P0 max ${Number(hover.overlay.p0_score || 0).toFixed(2)}`);
+      parts.push(`P1 max ${Number(hover.overlay.p1_score || 0).toFixed(2)}`);
+      parts.push(`raw P0 ${Number(hover.overlay.raw_p0_score || 0).toFixed(2)}`);
+      parts.push(`raw P1 ${Number(hover.overlay.raw_p1_score || 0).toFixed(2)}`);
+      parts.push(`own max ${Number(hover.overlay.own_score || 0).toFixed(2)}`);
+      parts.push(`opp max ${Number(hover.overlay.opp_score || 0).toFixed(2)}`);
+      parts.push(`product ${Number(hover.overlay.product_score || 0).toFixed(2)}`);
+    } else if (Number.isFinite(Number(hover.overlay.owner))) {
+      parts.push(`P${Number(hover.overlay.owner)} strength`);
+    }
     if (own) parts.push(`own [${own}]`);
     if (opp) parts.push(`opp [${opp}]`);
     if (axes) parts.push(`axes [${axes}]`);
@@ -701,8 +761,16 @@ function formatStrength(value: number) {
   return `${prefix}${n.toFixed(2)}`;
 }
 
+function formatMagnitude(value: number) {
+  return Number(value || 0).toFixed(2);
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function barScale(value: number) {
+  return clamp(Number(value || 0) / 1.5, 0, 1);
 }
 
 function overlayOwnerFor(overlay: AnyRow | undefined, currentPlayer: number) {
@@ -711,12 +779,21 @@ function overlayOwnerFor(overlay: AnyRow | undefined, currentPlayer: number) {
   return Number(overlay.score || 0) >= 0 ? currentPlayer : 1 - currentPlayer;
 }
 
-function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number) {
-  const ownAxes = toNumArray(cell.own_axes);
-  const oppAxes = toNumArray(cell.opp_axes);
-  const netAxes = cell.net_axes ? toNumArray(cell.net_axes) : ownAxes.map((v, i) => v - (oppAxes[i] || 0));
+function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number, scaleMode: string) {
+  const rawOwnAxes = toNumArray(cell.own_axes);
+  const rawOppAxes = toNumArray(cell.opp_axes);
+  const rawNetAxes = cell.net_axes ? toNumArray(cell.net_axes) : rawOwnAxes.map((v, i) => v - (rawOppAxes[i] || 0));
+  const ownAxes = rawOwnAxes.map((v) => scaleAxisValue(v, scaleMode));
+  const oppAxes = rawOppAxes.map((v) => scaleAxisValue(v, scaleMode));
+  const netAxes = rawNetAxes.map((v) => scaleAxisValue(v, scaleMode));
   const ownScore = maxValue(ownAxes);
   const oppScore = maxValue(oppAxes);
+  const rawOwnScore = maxValue(rawOwnAxes);
+  const rawOppScore = maxValue(rawOppAxes);
+  const p0Score = currentPlayer === 0 ? ownScore : oppScore;
+  const p1Score = currentPlayer === 1 ? ownScore : oppScore;
+  const rawP0Score = currentPlayer === 0 ? rawOwnScore : rawOppScore;
+  const rawP1Score = currentPlayer === 1 ? rawOwnScore : rawOppScore;
   const opponent = 1 - currentPlayer;
   let score = 0;
   let owner = currentPlayer;
@@ -738,8 +815,8 @@ function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number) {
     axes = ownAbs >= oppAbs ? ownAxes : oppAxes;
   } else if (mode === "both") {
     axes = ownAxes.map((v, i) => Math.min(v, oppAxes[i] || 0));
-    score = maxValue(axes);
-    owner = ownScore >= oppScore ? currentPlayer : opponent;
+    score = Math.min(p0Score, p1Score);
+    owner = p0Score >= p1Score ? 0 : 1;
   } else {
     score = ownScore;
     owner = currentPlayer;
@@ -751,6 +828,17 @@ function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number) {
     r: Number(cell.r),
     score,
     owner,
+    kind: mode === "both" ? "both" : mode,
+    scale_mode: scaleMode,
+    own_score: ownScore,
+    opp_score: oppScore,
+    p0_score: p0Score,
+    p1_score: p1Score,
+    raw_own_score: rawOwnScore,
+    raw_opp_score: rawOppScore,
+    raw_p0_score: rawP0Score,
+    raw_p1_score: rawP1Score,
+    product_score: ownScore * oppScore,
     axes,
     own_axes: ownAxes,
     opp_axes: oppAxes,
@@ -769,6 +857,16 @@ function maxValue(values: number[]) {
 function maxAbsValue(values: number[]) {
   if (!values.length) return 0;
   return values.reduce((best, value) => Math.abs(value) > Math.abs(best) ? value : best, values[0]);
+}
+
+function scaleAxisValue(value: number, mode: string) {
+  const n = Number(value || 0);
+  const sign = n < 0 ? -1 : 1;
+  const mag = Math.abs(n);
+  if (mode === "log") return sign * Math.log1p(mag) / Math.log1p(3);
+  if (mode === "sqrt") return sign * Math.sqrt(Math.min(mag, 3) / 3);
+  if (mode === "unit") return clamp(n / 1.5, -1, 1);
+  return n;
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
