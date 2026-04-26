@@ -77,6 +77,7 @@ def test_replay_and_play_session_roundtrip(tmp_path):
     apply_move(store, session.session_id, move["q"], move["r"])
     after = session_payload(store, session.session_id)
     assert after["position"]["turn_index"] == 1
+    assert after["position"]["stones"][0] == {"q": move["q"], "r": move["r"], "player": 0}
 
     undo_move(store, session.session_id)
     undone = session_payload(store, session.session_id)

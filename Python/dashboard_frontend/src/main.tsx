@@ -165,7 +165,7 @@ function App() {
       {active === "arena" && <ArenaPanel arena={arena} reload={load} />}
       {active === "checkpoints" && <CheckpointPanel checkpoints={checkpoints} reload={load} />}
       {active === "axis" && (
-        <AxisPanel prototypes={axis} results={axisResults} setResults={setAxisResults} session={session} />
+        <AxisPanel prototypes={axis} results={axisResults} setResults={setAxisResults} />
       )}
     </main>
   );
@@ -247,17 +247,29 @@ function PlayPanel({ session, setSession }: { session: AnyRow | null; setSession
     method: "POST",
     body: JSON.stringify({ q: m.q, r: m.r })
   }).then(setSession);
+  const clickMove = (q: number, r: number) => playMove({ q, r });
+  useEffect(() => {
+    if (!session) create();
+  }, [session]);
   return (
-    <section className="grid replay">
+    <section className="viewerGrid">
       <Panel title="Interactive Board">
         <div className="toolbar compact">
           <button onClick={create}><Play size={15} /> New</button>
           <button onClick={undo}>Undo</button>
           <button onClick={reset}>Reset</button>
+          <span className={`playerBadge p${session?.position?.current_player ?? 0}`}>
+            P{session?.position?.current_player ?? 0} to move
+          </span>
         </div>
-        <Board position={session?.position} />
+        <Board position={session?.position} interactive onCellClick={clickMove} />
       </Panel>
       <Panel title="Legal Moves">
+        <div className="viewerInfo">
+          <div><span>Legal</span><strong>{legal.length}</strong></div>
+          <div><span>Threat filter</span><strong>{(session?.position?.threat_moves || []).length || "off"}</strong></div>
+          <div><span>Moves</span><strong>{session?.position?.turn_index ?? 0}</strong></div>
+        </div>
         <div className="moveList">
           {legal.slice(0, 80).map((m: AnyRow, i: number) => (
             <button key={i} onClick={() => playMove(m)}>({m.q},{m.r})</button>
@@ -303,22 +315,102 @@ function CheckpointPanel({ checkpoints, reload }: { checkpoints: AnyRow[]; reloa
   );
 }
 
-function AxisPanel({ prototypes, results, setResults, session }: {
+function AxisPanel({ prototypes, results, setResults }: {
   prototypes: AnyRow[];
   results: AnyRow[];
   setResults: (rows: AnyRow[]) => void;
-  session: AnyRow | null;
 }) {
+  const [axisSession, setAxisSession] = useState<AnyRow | null>(null);
+  const [selectedPrototype, setSelectedPrototype] = useState<string>("");
+  const [params, setParams] = useState<Record<string, number>>({});
+  const selected = results.find((r) => r.prototype_id === selectedPrototype) || results[0];
+  const selectedSpec = prototypes.find((p) => p.id === (selectedPrototype || prototypes[0]?.id));
+  useEffect(() => {
+    if (!selectedPrototype && prototypes.length) setSelectedPrototype(prototypes[0].id);
+  }, [prototypes, selectedPrototype]);
+  const create = () => api<AnyRow>("/api/session/create", { method: "POST", body: JSON.stringify({ payload: { mode: "axis_lab" } }) }).then(setAxisSession);
+  useEffect(() => {
+    if (!axisSession) create();
+  }, [axisSession]);
+  const ensureSession = async () => {
+    if (axisSession) return axisSession;
+    const created = await api<AnyRow>("/api/session/create", { method: "POST", body: JSON.stringify({ payload: { mode: "axis_lab" } }) });
+    setAxisSession(created);
+    return created;
+  };
+  const playMove = async (q: number, r: number) => {
+    const s = await ensureSession();
+    const next = await api<AnyRow>(`/api/session/${s.session_id}/move`, {
+      method: "POST",
+      body: JSON.stringify({ q, r })
+    });
+    setAxisSession(next);
+    setResults([]);
+  };
+  const undo = () => axisSession && api<AnyRow>(`/api/session/${axisSession.session_id}/undo`, { method: "POST", body: "{}" }).then((s) => { setAxisSession(s); setResults([]); });
+  const reset = () => axisSession && api<AnyRow>(`/api/session/${axisSession.session_id}/reset`, { method: "POST", body: "{}" }).then((s) => { setAxisSession(s); setResults([]); });
   const evaluate = () => {
-    const body = session?.session_id ? { session_id: session.session_id } : { history_b64: "" };
+    const body = axisSession?.session_id
+      ? {
+          session_id: axisSession.session_id,
+          prototype_id: selectedPrototype || undefined,
+          parameters: params
+        }
+      : { history_b64: "", prototype_id: selectedPrototype || undefined, parameters: params };
     api<AnyRow>("/api/axis/evaluate", { method: "POST", body: JSON.stringify(body) })
       .then((data) => setResults(data.results || [data]));
   };
+  const offsetQ = axisSession?.position?.encoding?.offset_q ?? -16;
+  const offsetR = axisSession?.position?.encoding?.offset_r ?? -16;
+  const overlayMoves = (selected?.top || []).map((m: AnyRow, idx: number) => {
+    const action = Number(m.action);
+    return {
+      q: Math.floor(action / 33) + offsetQ,
+      r: (action % 33) + offsetR,
+      prob: Number(m.prob),
+      rank: idx + 1
+    };
+  });
   return (
-    <section className="grid two">
-      <Panel title="Python Prototypes">
+    <section className="viewerGrid">
+      <Panel title="Axis Target Board">
         <div className="toolbar compact">
-          <button onClick={evaluate}><Target size={15} /> Compare</button>
+          <button onClick={create}><Play size={15} /> New</button>
+          <button onClick={undo}>Undo</button>
+          <button onClick={reset}>Reset</button>
+          <button onClick={evaluate}><Target size={15} /> Evaluate</button>
+          <span className={`playerBadge p${axisSession?.position?.current_player ?? 0}`}>
+            P{axisSession?.position?.current_player ?? 0} to move
+          </span>
+        </div>
+        <Board
+          position={axisSession?.position}
+          interactive
+          onCellClick={playMove}
+          overlayMoves={overlayMoves}
+        />
+      </Panel>
+      <Panel title="Prototype Controls">
+        <select value={selectedPrototype} onChange={(e) => { setSelectedPrototype(e.target.value); setParams({}); }}>
+          {prototypes.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+        </select>
+        <div className="sliderStack">
+          {(selectedSpec?.parameters || []).map((spec: AnyRow) => {
+            const value = params[spec.name] ?? spec.default;
+            return (
+              <label key={spec.name}>
+                <span>{spec.name} <b>{Number(value).toFixed(2)}</b></span>
+                <input
+                  type="range"
+                  min={spec.min}
+                  max={spec.max}
+                  step={spec.step}
+                  value={value}
+                  onChange={(e) => setParams({ ...params, [spec.name]: Number(e.target.value) })}
+                />
+              </label>
+            );
+          })}
         </div>
         <Table rows={prototypes} columns={["id", "label", "description"]} />
       </Panel>
@@ -337,32 +429,147 @@ function AxisPanel({ prototypes, results, setResults, session }: {
   );
 }
 
-function Board({ position }: { position: AnyRow | null | undefined }) {
+function Board({
+  position,
+  interactive = false,
+  onCellClick,
+  overlayMoves = []
+}: {
+  position: AnyRow | null | undefined;
+  interactive?: boolean;
+  onCellClick?: (q: number, r: number) => void;
+  overlayMoves?: AnyRow[];
+}) {
+  const [hover, setHover] = useState<AnyRow | null>(null);
   const stones = position?.stones || [];
   const legal = position?.legal_moves || [];
-  const view = useMemo(() => ({ w: 620, h: 520, scale: 18 }), []);
-  const toXY = (q: number, r: number) => {
-    const x = view.w / 2 + view.scale * Math.sqrt(3) * (q + r / 2);
-    const y = view.h / 2 + view.scale * 1.5 * r;
-    return [x, y];
+  const threat = position?.threat_moves || [];
+  const moves = position?.moves || [];
+  const geometry = useMemo(() => buildBoardGeometry(position, overlayMoves), [position, overlayMoves]);
+  const legalSet = new Set(legal.map((m: AnyRow) => `${m.q},${m.r}`));
+  const threatSet = new Set(threat.map((m: AnyRow) => `${m.q},${m.r}`));
+  const overlayMap = new Map<string, AnyRow>(overlayMoves.map((m: AnyRow) => [`${m.q},${m.r}`, m]));
+  const moveNum = new Map<string, number>(moves.map((m: AnyRow, i: number) => [`${m.q},${m.r}`, i + 1]));
+  const stoneMap = new Map<string, AnyRow>(stones.map((s: AnyRow) => [`${s.q},${s.r}`, s]));
+  const currentPlayer = position?.current_player ?? 0;
+  const last = position?.overlays?.last_move;
+  const clickCell = (q: number, r: number) => {
+    if (!interactive || !onCellClick || !legalSet.has(`${q},${r}`)) return;
+    onCellClick(q, r);
   };
   return (
-    <svg className="board" viewBox={`0 0 ${view.w} ${view.h}`}>
-      {legal.slice(0, 240).map((m: AnyRow, i: number) => {
-        const [x, y] = toXY(m.q, m.r);
-        return <circle key={`l${i}`} cx={x} cy={y} r="5" className="legal" />;
-      })}
-      {stones.map((s: AnyRow, i: number) => {
-        const [x, y] = toXY(s.q, s.r);
-        return (
-          <g key={i}>
-            <circle cx={x} cy={y} r="9" className={s.player === 0 ? "p0" : "p1"} />
-            <text x={x} y={y + 3}>{i + 1}</text>
-          </g>
-        );
-      })}
-    </svg>
+    <div className="viewerBoardArea">
+      <svg
+        className={`board ${interactive ? "interactive" : ""}`}
+        viewBox={`0 0 ${geometry.width} ${geometry.height}`}
+        onMouseLeave={() => setHover(null)}
+      >
+        {geometry.cells.map((cell) => {
+          const key = `${cell.q},${cell.r}`;
+          const stone = stoneMap.get(key);
+          const isLegal = legalSet.has(key);
+          const isThreat = threatSet.has(key);
+          const overlay = overlayMap.get(key);
+          const isLast = last && last.q === cell.q && last.r === cell.r;
+          const classes = [
+            "hexCell",
+            stone ? `stone p${stone.player}` : "empty",
+            isLegal ? "legal" : "",
+            isThreat ? "threat" : "",
+            overlay ? "overlay" : "",
+            interactive && isLegal ? "clickable" : "",
+            isLast ? "last" : ""
+          ].filter(Boolean).join(" ");
+          const opacity = overlay ? Math.min(0.82, 0.18 + Number(overlay.prob || 0) * 3.2) : undefined;
+          return (
+            <g key={key}>
+              <path
+                d={hexPath(cell.x, cell.y, 23)}
+                className={classes}
+                style={overlay ? { "--overlay-alpha": opacity } as React.CSSProperties : undefined}
+                onClick={() => clickCell(cell.q, cell.r)}
+                onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat })}
+              />
+              {overlay && !stone && (
+                <text className="overlayRank" x={cell.x} y={cell.y + 3}>{overlay.rank}</text>
+              )}
+              {stone && (
+                <text className="moveNumber" x={cell.x} y={cell.y + 4}>{moveNum.get(key) || ""}</text>
+              )}
+            </g>
+          );
+        })}
+        <g className="boardBadge">
+          <rect x="8" y="8" width="128" height="42" rx="5" />
+          <circle cx="22" cy="24" r="6" className={`badgeDot p${currentPlayer}`} />
+          <text x="34" y="28">P{currentPlayer} to move</text>
+          <text x="22" y="43">Move {position?.turn_index ?? 0}</text>
+        </g>
+      </svg>
+      <div className="coordTip">
+        {hover ? `(${hover.q}, ${hover.r}) ${hover.legal ? "legal" : "not legal"}${hover.threat ? " threat" : ""}` : "Hover a cell"}
+      </div>
+    </div>
   );
+}
+
+const HEX_SIZE = 24;
+const NEIGHBORS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, -1], [-1, 1]];
+
+function buildBoardGeometry(position: AnyRow | null | undefined, overlayMoves: AnyRow[]) {
+  const coords = new Set<string>();
+  const stones = position?.stones || [];
+  const legal = position?.legal_moves || [];
+  const moves = position?.moves || [];
+  const add = (q: number, r: number, withNeighbors = true) => {
+    coords.add(`${q},${r}`);
+    if (withNeighbors) {
+      NEIGHBORS.forEach(([dq, dr]) => coords.add(`${q + dq},${r + dr}`));
+    }
+  };
+  stones.forEach((s: AnyRow) => add(Number(s.q), Number(s.r)));
+  legal.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
+  moves.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
+  overlayMoves.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
+  if (coords.size === 0) {
+    for (let q = -3; q <= 3; q++) {
+      for (let r = -3; r <= 3; r++) add(q, r, false);
+    }
+  }
+  const parsed = [...coords].map((key) => {
+    const [q, r] = key.split(",").map(Number);
+    const c = hexCenter(q, r);
+    return { q, r, rawX: c.x, rawY: c.y };
+  });
+  const minX = Math.min(...parsed.map((c) => c.rawX - HEX_SIZE));
+  const maxX = Math.max(...parsed.map((c) => c.rawX + HEX_SIZE));
+  const minY = Math.min(...parsed.map((c) => c.rawY - HEX_SIZE));
+  const maxY = Math.max(...parsed.map((c) => c.rawY + HEX_SIZE));
+  const width = Math.max(360, maxX - minX + 44);
+  const height = Math.max(360, maxY - minY + 44);
+  return {
+    width,
+    height,
+    cells: parsed
+      .map((c) => ({ q: c.q, r: c.r, x: c.rawX - minX + 22, y: c.rawY - minY + 22 }))
+      .sort((a, b) => a.r - b.r || a.q - b.q)
+  };
+}
+
+function hexCenter(q: number, r: number) {
+  return {
+    x: HEX_SIZE * (1.5 * q),
+    y: HEX_SIZE * ((Math.sqrt(3) / 2) * q + Math.sqrt(3) * r)
+  };
+}
+
+function hexPath(cx: number, cy: number, size: number) {
+  const pts = [];
+  for (let i = 0; i < 6; i++) {
+    const a = (Math.PI / 3) * i;
+    pts.push(`${(cx + size * Math.cos(a)).toFixed(2)},${(cy + size * Math.sin(a)).toFixed(2)}`);
+  }
+  return `M${pts.join("L")}Z`;
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {

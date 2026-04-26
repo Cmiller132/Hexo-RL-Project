@@ -199,8 +199,8 @@ def _engine_stones(game: Any) -> list[dict[str, int]]:
     if hasattr(game, "board_pieces"):
         pieces = game.board_pieces()
         return [
-            {"player": int(p), "q": int(q), "r": int(r)}
-            for p, q, r in pieces
+            {"q": int(q), "r": int(r), "player": int(p)}
+            for q, r, p in pieces
         ]
     if hasattr(game, "move_history_bytes"):
         return [_move_dict(m) for m in decode_move_history(game.move_history_bytes())]
