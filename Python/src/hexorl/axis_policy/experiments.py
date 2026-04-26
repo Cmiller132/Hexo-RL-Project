@@ -32,6 +32,8 @@ class DeltaForkPrototype:
         ParameterSpec("w5", 1.0, 0.0, 3.0, 0.01, "Strength after reaching five stones in a pure window."),
         ParameterSpec("fork_bonus", 0.45, 0.0, 2.0, 0.05, "Multiplier added for each extra active axis."),
         ParameterSpec("opp_weight", 1.0, 0.0, 2.0, 0.05, "Opponent delta multiplier."),
+        ParameterSpec("existing_credit", 0.25, 0.0, 1.0, 0.01, "How much pre-existing window strength is subtracted."),
+        ParameterSpec("tail_weight", 0.18, 0.0, 1.0, 0.01, "How much overlapping non-best windows contribute."),
     )
 
     def compute(
@@ -53,8 +55,33 @@ class DeltaForkPrototype:
             own_axes: list[float] = []
             opp_axes: list[float] = []
             for dq, dr in AXES:
-                own_axes.append(_marginal_axis_gain(q, r, dq, dr, own, opp, strength))
-                opp_axes.append(_marginal_axis_gain(q, r, dq, dr, opp, own, strength) * params["opp_weight"])
+                own_axes.append(
+                    _marginal_axis_gain(
+                        q,
+                        r,
+                        dq,
+                        dr,
+                        own,
+                        opp,
+                        strength,
+                        params["existing_credit"],
+                        params["tail_weight"],
+                    )
+                )
+                opp_axes.append(
+                    _marginal_axis_gain(
+                        q,
+                        r,
+                        dq,
+                        dr,
+                        opp,
+                        own,
+                        strength,
+                        params["existing_credit"],
+                        params["tail_weight"],
+                    )
+                    * params["opp_weight"]
+                )
             own_active = _active_count(own_axes)
             opp_active = _active_count(opp_axes)
             if own_active >= 2:
@@ -106,6 +133,7 @@ class CrossAxisPivotPrototype:
         ParameterSpec("active_threshold", 0.08, 0.0, 1.0, 0.01, "Axis value needed to count as active."),
         ParameterSpec("pivot_bonus", 0.35, 0.0, 2.0, 0.05, "Multiplier added for each extra active axis."),
         ParameterSpec("reserve_bonus", 0.25, 0.0, 2.0, 0.05, "Adds a small second-axis reserve value into active axes."),
+        ParameterSpec("tail_weight", 0.18, 0.0, 1.0, 0.01, "How much overlapping non-best windows contribute."),
     )
 
     def compute(
@@ -115,7 +143,7 @@ class CrossAxisPivotPrototype:
     ) -> AxisPolicyResult:
         params = merge_parameters(self.parameters, parameters)
         strength = _strength_array(params)
-        maps = _dense_axis_maps(position, strength)
+        maps = _dense_axis_maps(position, strength, params["tail_weight"])
         debug = {"own_pivot_cells": 0, "opp_pivot_cells": 0}
 
         for i in range(BOARD_SIZE):
@@ -174,7 +202,7 @@ def _strength_array(params: Mapping[str, float]) -> np.ndarray:
     )
 
 
-def _dense_axis_maps(position: AxisPolicyInput, strength: np.ndarray) -> np.ndarray:
+def _dense_axis_maps(position: AxisPolicyInput, strength: np.ndarray, tail_weight: float) -> np.ndarray:
     maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     own = position.own_stones
     opp = position.opp_stones
@@ -183,17 +211,17 @@ def _dense_axis_maps(position: AxisPolicyInput, strength: np.ndarray) -> np.ndar
             for gj in range(BOARD_SIZE):
                 q = gi + position.offset_q
                 r = gj + position.offset_r
-                own_total = 0.0
-                opp_total = 0.0
+                own_values: list[float] = []
+                opp_values: list[float] = []
                 for cells in _windows_containing(q, r, dq, dr):
                     own_count = _count(cells, own)
                     opp_count = _count(cells, opp)
                     if own_count and opp_count:
                         continue
-                    own_total += float(strength[own_count])
-                    opp_total += float(strength[opp_count])
-                maps[axis, gi, gj] = own_total
-                maps[axis + 3, gi, gj] = opp_total
+                    own_values.append(float(strength[own_count]))
+                    opp_values.append(float(strength[opp_count]))
+                maps[axis, gi, gj] = _best_plus_tail(own_values, tail_weight)
+                maps[axis + 3, gi, gj] = _best_plus_tail(opp_values, tail_weight)
     return maps
 
 
@@ -205,15 +233,17 @@ def _marginal_axis_gain(
     side: set[tuple[int, int]],
     blockers: set[tuple[int, int]],
     strength: np.ndarray,
+    existing_credit: float,
+    tail_weight: float,
 ) -> float:
-    total = 0.0
+    gains: list[float] = []
     for cells in _windows_containing(q, r, dq, dr):
         if any(cell in blockers for cell in cells):
             continue
         before = min(_count(cells, side), WIN_LENGTH)
         after = min(before + 1, WIN_LENGTH)
-        total += max(float(strength[after] - strength[before]), 0.0)
-    return total
+        gains.append(max(float(strength[after] - existing_credit * strength[before]), 0.0))
+    return _best_plus_tail(gains, tail_weight)
 
 
 def _windows_containing(q: int, r: int, dq: int, dr: int) -> list[list[tuple[int, int]]]:
@@ -225,6 +255,13 @@ def _windows_containing(q: int, r: int, dq: int, dr: int) -> list[list[tuple[int
 
 def _count(cells: Iterable[tuple[int, int]], stones: set[tuple[int, int]]) -> int:
     return sum(1 for cell in cells if cell in stones)
+
+
+def _best_plus_tail(values: Sequence[float], tail_weight: float) -> float:
+    positives = sorted((float(value) for value in values if value > 0.0), reverse=True)
+    if not positives:
+        return 0.0
+    return positives[0] + float(tail_weight) * sum(positives[1:])
 
 
 def _active_count(values: Sequence[float], threshold: float = 1e-7) -> int:

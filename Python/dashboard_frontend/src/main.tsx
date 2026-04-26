@@ -600,36 +600,34 @@ function Board({
                 />
                 {overlay && !stone && isBothOverlay && (
                   <>
-                    <line
-                      className="bothHalo p0"
-                      x1={cell.x - 16}
-                      y1={cell.y - 7}
-                      x2={cell.x + 16}
-                      y2={cell.y - 7}
-                    />
-                    <line
-                      className="bothHalo p1"
-                      x1={cell.x - 16}
-                      y1={cell.y + 7}
-                      x2={cell.x + 16}
-                      y2={cell.y + 7}
-                    />
-                    <line
-                      className="bothBar p0"
-                      x1={cell.x - 14}
-                      y1={cell.y - 7}
-                      x2={cell.x - 14 + 28 * barScale(overlay.p0_score)}
-                      y2={cell.y - 7}
-                    />
-                    <line
-                      className="bothBar p1"
-                      x1={cell.x - 14}
-                      y1={cell.y + 7}
-                      x2={cell.x - 14 + 28 * barScale(overlay.p1_score)}
-                      y2={cell.y + 7}
-                    />
-                    <text className="bothValue p0" x={cell.x} y={cell.y - 4}>{formatMagnitude(overlay.p0_score)}</text>
-                    <text className="bothValue p1" x={cell.x} y={cell.y + 11}>{formatMagnitude(overlay.p1_score)}</text>
+                    <defs>
+                      <clipPath id={bothClipId(cell.q, cell.r)}>
+                        <path d={hexPath(cell.x, cell.y, 16)} />
+                      </clipPath>
+                    </defs>
+                    <g clipPath={`url(#${bothClipId(cell.q, cell.r)})`}>
+                      <path
+                        className="bothPie p1"
+                        d={hexPath(cell.x, cell.y, 17)}
+                        style={{ opacity: pieAlpha(overlay.p1_score) }}
+                      />
+                      {Number(overlay.p0_share || 0) >= 0.999 ? (
+                        <path
+                          className="bothPie p0"
+                          d={hexPath(cell.x, cell.y, 17)}
+                          style={{ opacity: pieAlpha(overlay.p0_score) }}
+                        />
+                      ) : Number(overlay.p0_share || 0) > 0.001 ? (
+                        <path
+                          className="bothPie p0"
+                          d={pieSlicePath(cell.x, cell.y, 23, -Math.PI / 2, -Math.PI / 2 + Number(overlay.p0_share || 0) * Math.PI * 2)}
+                          style={{ opacity: pieAlpha(overlay.p0_score) }}
+                        />
+                      ) : null}
+                    </g>
+                    <path className="bothPieRing" d={hexPath(cell.x, cell.y, 16)} />
+                    <text className="bothPieValue p0" x={cell.x} y={cell.y - 2}>{formatMagnitude(overlay.p0_score)}</text>
+                    <text className="bothPieValue p1" x={cell.x} y={cell.y + 9}>{formatMagnitude(overlay.p1_score)}</text>
                   </>
                 )}
                 {overlay && !stone && !isBothOverlay && (
@@ -720,6 +718,22 @@ function hexPath(cx: number, cy: number, size: number) {
   return `M${pts.join("L")}Z`;
 }
 
+function pieSlicePath(cx: number, cy: number, radius: number, startAngle: number, endAngle: number) {
+  const span = Math.max(0, Math.min(Math.PI * 2 - 0.0001, endAngle - startAngle));
+  if (span <= 0) return "";
+  const end = startAngle + span;
+  const x1 = cx + radius * Math.cos(startAngle);
+  const y1 = cy + radius * Math.sin(startAngle);
+  const x2 = cx + radius * Math.cos(end);
+  const y2 = cy + radius * Math.sin(end);
+  const largeArc = span > Math.PI ? 1 : 0;
+  return `M${cx.toFixed(2)},${cy.toFixed(2)} L${x1.toFixed(2)},${y1.toFixed(2)} A${radius},${radius} 0 ${largeArc} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z`;
+}
+
+function bothClipId(q: number, r: number) {
+  return `both-pie-${q}-${r}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
 function hoverText(hover: AnyRow) {
   const parts = [`(${hover.q}, ${hover.r})`, hover.legal ? "legal" : "not legal"];
   if (hover.threat) parts.push("threat");
@@ -742,6 +756,7 @@ function hoverText(hover: AnyRow) {
       parts.push(`P1 max ${Number(hover.overlay.p1_score || 0).toFixed(2)}`);
       parts.push(`raw P0 ${Number(hover.overlay.raw_p0_score || 0).toFixed(2)}`);
       parts.push(`raw P1 ${Number(hover.overlay.raw_p1_score || 0).toFixed(2)}`);
+      parts.push(`P0 share ${Math.round(Number(hover.overlay.p0_share || 0) * 100)}%`);
       parts.push(`own max ${Number(hover.overlay.own_score || 0).toFixed(2)}`);
       parts.push(`opp max ${Number(hover.overlay.opp_score || 0).toFixed(2)}`);
       parts.push(`product ${Number(hover.overlay.product_score || 0).toFixed(2)}`);
@@ -769,8 +784,8 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
-function barScale(value: number) {
-  return clamp(Number(value || 0) / 1.5, 0, 1);
+function pieAlpha(value: number) {
+  return clamp(0.28 + Number(value || 0) * 0.52, 0.28, 0.9);
 }
 
 function overlayOwnerFor(overlay: AnyRow | undefined, currentPlayer: number) {
@@ -794,6 +809,9 @@ function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number, sc
   const p1Score = currentPlayer === 1 ? ownScore : oppScore;
   const rawP0Score = currentPlayer === 0 ? rawOwnScore : rawOppScore;
   const rawP1Score = currentPlayer === 1 ? rawOwnScore : rawOppScore;
+  const shareTotal = Math.max(p0Score + p1Score, 1e-9);
+  const p0Share = p0Score / shareTotal;
+  const p1Share = p1Score / shareTotal;
   const opponent = 1 - currentPlayer;
   let score = 0;
   let owner = currentPlayer;
@@ -815,7 +833,7 @@ function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number, sc
     axes = ownAbs >= oppAbs ? ownAxes : oppAxes;
   } else if (mode === "both") {
     axes = ownAxes.map((v, i) => Math.min(v, oppAxes[i] || 0));
-    score = Math.min(p0Score, p1Score);
+    score = Math.max(p0Score, p1Score);
     owner = p0Score >= p1Score ? 0 : 1;
   } else {
     score = ownScore;
@@ -834,6 +852,8 @@ function deriveAxisOverlay(cell: AnyRow, mode: string, currentPlayer: number, sc
     opp_score: oppScore,
     p0_score: p0Score,
     p1_score: p1Score,
+    p0_share: p0Share,
+    p1_share: p1Share,
     raw_own_score: rawOwnScore,
     raw_opp_score: rawOppScore,
     raw_p0_score: rawP0Score,

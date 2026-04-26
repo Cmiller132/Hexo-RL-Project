@@ -13,6 +13,9 @@ Immediate wins, must-block cells, and forced tactical responses are already hand
 The current Axis Lab has two intentionally different prototypes:
 
 - `dual_axis_strength`: the main candidate. It emits six non-negative dense planes: three own-axis strength planes and three opponent-axis strength planes from the current-player perspective.
+- `dual_axis_strength_tail`: same six-plane target, but uses best-window-plus-tail aggregation to reduce shifted-window overcounting.
+- `dual_axis_strength_legacy_weights`: same six-plane layout, but uses the older gentler 4-window weight.
+- `dual_axis_strength_hot`: same six-plane layout, but suppresses early loose structure and emphasizes 4/5-window pressure.
 - `legacy_axis_influence`: reference only. It keeps the older signed three-plane style so the new formulas can be compared against the legacy Hexagon idea without making the signed representation the preferred target.
 
 The main candidate is deliberately not a policy-ranked overlay. It shows the float strengths the model would be trained to predict if this target is enabled later.
@@ -197,7 +200,7 @@ Current visualization:
 - `opp`: show opponent axis strength.
 - `net`: show `own - opp` as a derived signed view.
 - `max`: show whichever side has the stronger value at that cell.
-- `both`: show cells where both players have nonzero strength, using `min(max(own_axes), max(opp_axes))` for opacity and showing actual P0/P1 values as separate blue/red bars and numbers.
+- `both`: show any cell where either player has strength, using `max(P0, P1)` for display intensity and an inner hex pie showing the P0/P1 share of scaled strength.
 - Labels should be signed or explicitly player-owned.
 
 The UI should avoid normalized "probability mass" when the value being inspected is not a policy target.
@@ -212,6 +215,22 @@ The dashboard scale toggle is visual only:
 - `unit`: show `clamp(x / 1.5, -1, 1)`.
 
 These modes are for readability and tuning intuition. They should not be confused with a final training-target decision.
+
+The experimental `delta_fork` and `cross_axis_pivot` views use a best-window-plus-tail aggregation:
+
+```text
+axis_value = best_window + tail_weight * sum(other_positive_windows)
+```
+
+This intentionally reduces the old bias where positions that appeared in many shifted six-cell windows could outrank a tactically similar compact/gapped shape just because the window count was larger.
+
+`delta_fork` also subtracts only part of the pre-existing window value:
+
+```text
+placement_value = strength_after_placement - existing_credit * strength_before_placement
+```
+
+This avoids the bad edge case where 4-window and 5-window weights are both `1.0`, making a 4-to-5 placement look like zero marginal gain even though it is still strategically important.
 
 ## Training Guidance
 

@@ -100,11 +100,16 @@ def test_axis_policy_prototypes_are_python_tunable():
     results = evaluate_all(position, {"dual_axis_strength": {"w4": 1.0, "w5": 1.0}})
     assert {r["prototype_id"] for r in results} == {
         "dual_axis_strength",
+        "dual_axis_strength_tail",
+        "dual_axis_strength_legacy_weights",
+        "dual_axis_strength_hot",
         "legacy_axis_influence",
         "exp_delta_fork",
         "exp_cross_axis_pivot",
     }
     assert any(r["cells"] for r in results)
+    tail = next(r for r in results if r["prototype_id"] == "dual_axis_strength_tail")
+    assert tail["debug_terms"]["aggregation"] == "best_tail"
     delta = next(r for r in results if r["prototype_id"] == "exp_delta_fork")
     assert len(delta["axis_summaries"]) == 6
     assert delta["debug_terms"]["target_kind"] == "diagnostic_legal_delta_not_training_target"
