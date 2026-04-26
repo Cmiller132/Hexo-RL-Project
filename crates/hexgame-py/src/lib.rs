@@ -1,6 +1,5 @@
 pub mod engine;
 pub mod encode;
-pub mod buffer;
 
 use pyo3::prelude::*;
 
@@ -10,6 +9,5 @@ use pyo3::prelude::*;
 fn hexgame_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     engine::register_module(m)?;
     encode::register_module(m)?;
-    buffer::register_module(m)?;
     Ok(())
 }

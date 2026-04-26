@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from hexorl.buffer.ring import RingBuffer
-from hexorl.buffer.sampler import _py_decode_compact_record
+from hexorl.buffer.sampler import _py_decode_compact_record, _transform_dense_policy
 from hexorl.buffer.targets import process_game_record
 from hexorl.selfplay.records import GameRecord, PositionRecord, BOARD_SIZE, action_to_board_index
 from hexorl.train.losses import compute_losses
@@ -21,6 +21,20 @@ def test_python_decoder_returns_final_position_for_history():
     assert decoded.shape == (2, 13, BOARD_SIZE, BOARD_SIZE)
     assert decoded[0, 0].sum() == 0.0
     assert decoded[-1, 0, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
+
+
+def test_policy_symmetry_transform_tracks_dense_target():
+    policy = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
+    src_i = BOARD_SIZE // 2 + 1
+    src_j = BOARD_SIZE // 2
+    policy[src_i * BOARD_SIZE + src_j] = 1.0
+
+    transformed = _transform_dense_policy(policy, sym_idx=3)
+
+    dst_i = BOARD_SIZE // 2 - 1
+    dst_j = BOARD_SIZE // 2
+    assert transformed[dst_i * BOARD_SIZE + dst_j] == 1.0
+    assert transformed.sum() == 1.0
 
 
 def test_process_game_record_populates_auxiliary_targets():

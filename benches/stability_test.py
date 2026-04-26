@@ -8,7 +8,7 @@ Verifies:
 """
 
 import sys, os, time, torch, numpy as np, logging
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Python", "src"))
 
 from pathlib import Path
 from hexorl.train.trainer import Trainer
@@ -35,7 +35,7 @@ class StabilityDataset:
 
 
 def main():
-    cfg_path = Path(os.path.join(os.path.dirname(__file__), "..", "configs", "small_test.toml"))
+    cfg_path = Path(os.path.join(os.path.dirname(__file__), "..", "Configs", "small_test.toml"))
     cfg = load_config(cfg_path)
 
     logger.info(f"Stability test: {cfg.model.channels}ch, {cfg.model.blocks} blocks")

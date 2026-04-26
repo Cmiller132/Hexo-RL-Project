@@ -315,7 +315,6 @@ dependencies = [
 name = "hexgame-core"
 version = "0.2.0"
 dependencies = [
- "criterion",
  "proptest",
  "rustc-hash",
  "smallvec",

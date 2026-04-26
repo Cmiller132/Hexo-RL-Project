@@ -152,6 +152,31 @@ def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
     return result
 
 
+def _transform_dense_policy(policy: np.ndarray, sym_idx: int) -> np.ndarray:
+    """Apply the same D6 transform to a dense (33*33,) policy target."""
+    sym = sym_idx % 12
+    half = BOARD_SIZE // 2
+    result = np.zeros_like(policy)
+
+    for i in range(BOARD_SIZE):
+        for j in range(BOARD_SIZE):
+            value = policy[i * BOARD_SIZE + j]
+            if value == 0.0:
+                continue
+            qi = i - half
+            rj = j - half
+            qi_t, rj_t = _hex_transform(qi, rj, sym)
+            ti = qi_t + half
+            tj = rj_t + half
+            if 0 <= ti < BOARD_SIZE and 0 <= tj < BOARD_SIZE:
+                result[ti * BOARD_SIZE + tj] += value
+
+    total = result.sum()
+    if total > 0:
+        result /= total
+    return result
+
+
 class ReplayDataset(_IterableDataset):
     """Iterable dataset that samples from the ring buffer and decodes on-the-fly.
 
@@ -232,6 +257,8 @@ class ReplayDataset(_IterableDataset):
         ]
 
         for i, rec in enumerate(records):
+            policy = rec.to_dense_policy()
+            opp_policy = rec.to_dense_opp_policy()
             if HAS_ENGINE and hasattr(_engine, 'encode_compact_record'):
                 tensor = np.array(
                     _engine.encode_compact_record(rec.move_history, self.near_radius),
@@ -256,10 +283,12 @@ class ReplayDataset(_IterableDataset):
                     )
                 else:
                     tensors[i] = _py_apply_d6_symmetry(tensors[i], sym_idx)
+                policy = _transform_dense_policy(policy, sym_idx)
+                opp_policy = _transform_dense_policy(opp_policy, sym_idx)
 
-            policies[i] = rec.to_dense_policy()
+            policies[i] = policy
             values[i] = rec.to_value_target()
-            aux_targets["opp_policy"][i] = rec.to_dense_opp_policy()
+            aux_targets["opp_policy"][i] = opp_policy
             aux_targets["regret_rank"][i] = rec.regret_rank
             aux_targets["regret_value"][i] = rec.regret_value
             aux_targets["axis"][i] = rec.axis_label
