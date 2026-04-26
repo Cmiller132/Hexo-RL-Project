@@ -1,4 +1,4 @@
-//! Classical pattern-based feature extraction for Infinity Hexagonal Tic-Tac-Toe.
+//! Classical pattern-based feature extraction for Hexo.
 //!
 //! This module provides one complementary evaluation mechanism:
 //!

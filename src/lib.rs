@@ -1,9 +1,9 @@
 //! # Hexgame
 //!
-//! A high-performance game engine for **Infinity Hexagonal Tic-Tac-Toe**,
-//! a variant of Hex played on an infinite hexagonal grid.
+//! A high-performance game engine for **Hexo**, a game most similar to Connect 6
+//! played on an infinite hexagonal grid.
 //!
-//! ## Game Variant
+//! ## Game Rules
 //!
 //! - Two players (0 and 1) alternate turns on an infinite hexagonal board using
 //!   axial coordinates `(q, r)`.
@@ -15,9 +15,10 @@
 //!   line along any of the three hex axes wins.
 //! - The board is infinite — there is no draw condition.
 //!
-//! This variant is sometimes called "6-in-a-row Hex" or "Infinity Hex".
-//! The two-placements-per-turn rule dramatically changes tactical and strategic
-//! considerations compared to standard single-placement Hex.
+//! Hexo is a new game; it shares the hexagonal grid geometry with Hex but has
+//! no relation to Hex as a game. The two-placements-per-turn rule (like Connect 6)
+//! dramatically changes tactical and strategic considerations compared to
+//! single-placement games.
 //!
 //! ## Module Architecture
 //!

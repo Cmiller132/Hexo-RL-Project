@@ -1,7 +1,11 @@
-# Infinity Hexagonal Tic-Tac-Toe — Game Guide
+# Hexo — Game Guide
 
 This document explains the game rules, core strategies, and how key properties
-of this game shape the training pipeline.
+of Hexo shape the training pipeline.
+
+Hexo is a new game most similar to Connect 6. It is played on an infinite
+hexagonal grid, but it has no relation to Hex other than sharing the same
+board geometry.
 
 ## Rules
 

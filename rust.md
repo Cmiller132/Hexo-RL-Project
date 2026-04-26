@@ -1,6 +1,6 @@
 # Hexgame Rust Engine — Complete Architecture Reference
 
-**Project:** `hexgame` — Infinity Hexagonal Tic-Tac-Toe engine with PyO3 bindings  
+**Project:** `hexgame` — Hexo engine with PyO3 bindings  
 **Location:** `src/` (11 Rust modules, ~6,500 lines)  
 **Edition:** Rust 2021  
 **Key deps:** `rustc-hash = "2"`, `pyo3 = "0.24"`, `numpy = "0.24"`
@@ -27,7 +27,7 @@
 
 ## Game Rules
 
-- Two players (0 and 1) on an **infinite hexagonal grid** using axial coordinates `(q, r)`.
+- Two players (0 and 1) on an **infinite hexagonal grid** using axial coordinates `(q, r)`. Hexo is a new game most similar to Connect 6; it shares the hexagonal board geometry with Hex but has no relation to Hex as a game.
 - **Player 0** opens with **one** tile at the origin `(0, 0)`.
 - Every subsequent turn consists of **two** placements.
 - Each placement must land on an empty hex within `PLACEMENT_RADIUS = 8` of any existing tile.

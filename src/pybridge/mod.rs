@@ -123,7 +123,7 @@ fn epsilon_topk_sample(best: Hex, candidates: &[(Hex, i32)], noise_level: f32) -
 /// Python-facing wrapper around [`HexGameState`].
 ///
 /// Provides board manipulation, threat queries, legal-move generation, and
-/// neural-network encoding for a 6-in-a-row Hex variant on an infinite board.
+/// neural-network encoding for Hexo on an infinite board.
 #[pyclass(name = "HexGame")]
 pub struct PyHexGame {
     inner: HexGameState,

@@ -1,10 +1,10 @@
-//! Unified neural-network board encoder for Infinity Hex.
+//! Unified neural-network board encoder for Hexo.
 //!
-//! Infinity Hex is a variant of Hex played on an infinite hexagonal grid where
-//! the win condition is six stones in a straight line. Each turn (except the
-//! opening move) consists of **two** stone placements. This module converts a
-//! [`HexGameState`] into a fixed-size 13-channel 33×33 float32 tensor that
-//! feeds the neural-network policy and value heads.
+//! Hexo is a new game most similar to Connect 6, played on an infinite
+//! hexagonal grid where the win condition is six stones in a straight line.
+//! Each turn (except the opening move) consists of **two** stone placements.
+//! This module converts a [`HexGameState`] into a fixed-size 13-channel 33×33
+//! float32 tensor that feeds the neural-network policy and value heads.
 //!
 //! Both the MCTS search tree and the Python training pipeline call into here,
 //! eliminating the previous duplication between `pybridge.rs` and `mcts.rs`.

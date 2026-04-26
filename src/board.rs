@@ -1,4 +1,4 @@
-//! Core game state and rules engine for Infinity Hexagonal Tic-Tac-Toe.
+//! Core game state and rules engine for Hexo.
 //!
 //! # Rules
 //!

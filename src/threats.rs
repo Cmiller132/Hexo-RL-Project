@@ -1,4 +1,4 @@
-//! Threat analysis for Infinity Hexagonal Tic-Tac-Toe.
+//! Threat analysis for Hexo.
 //!
 //! This module provides free functions for classifying the tactical situation,
 //! checking whether a turn satisfies threat constraints, and enumerating live
@@ -6,7 +6,7 @@
 //!
 //! # Threat model
 //!
-//! In this 6-stone-per-turn variant, a "threat window" is a length-6 line
+//! In Hexo, a "threat window" is a length-6 line
 //! (one of the 3 axial directions) that contains 4 or 5 stones of the same
 //! player and only empty cells otherwise.  A 5-window can be completed in one
 //! placement; a 4-window can be completed in two placements.  Because the game

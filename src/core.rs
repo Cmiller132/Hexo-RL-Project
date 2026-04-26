@@ -1,4 +1,4 @@
-//! Axial hex coordinates and distance for a hexagonal tic-tac-toe engine.
+//! Axial hex coordinates and distance for the Hexo engine.
 //!
 //! This module provides the fundamental spatial primitive [`Hex`] using **axial
 //! coordinates** `(q, r)`.  Axial coordinates are a compact two-number
@@ -8,7 +8,7 @@
 //!
 //! # Principal axes for win detection
 //!
-//! In hexagonal tic-tac-toe a win is a straight line of stones.  On a hex grid
+//! In Hexo a win is a straight line of 6 stones.  On a hex grid
 //! there are exactly three unique directions through opposite sides of a hex,
 //! so we only need three principal vectors to detect every possible line:
 //!
@@ -101,9 +101,8 @@ impl Ord for Hex {
 
 /// A turn consists of 1 or 2 placements.
 ///
-/// In Infinity Hexagonal Tic-Tac-Toe the opening turn has exactly one
-/// placement; every subsequent turn has two.  [`Turn`] captures either case
-/// in a single compact value.
+/// In Hexo the opening turn has exactly one placement; every subsequent turn
+/// has two.  [`Turn`] captures either case in a single compact value.
 ///
 /// # Canonical ordering invariant
 ///

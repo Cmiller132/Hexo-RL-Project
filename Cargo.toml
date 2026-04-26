@@ -2,7 +2,7 @@
 name = "hexgame"
 version = "0.2.0"
 edition = "2021"
-description = "Infinity Hexagonal Tic-Tac-Toe — Rust game engine with Python ML pipeline"
+description = "Hexo — Rust game engine with Python ML pipeline"
 license = "MIT"
 
 [lib]
