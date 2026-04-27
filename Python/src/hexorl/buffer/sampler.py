@@ -17,6 +17,15 @@ from hexorl.buffer.ring import RingBuffer
 from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
 
 try:
+    from hexorl.axis_policy.core import AxisPolicyInput
+    from hexorl.axis_policy.registry import get_prototype
+    from hexorl.dashboard.replay import get_replay_position, position_payload
+
+    HAS_AXIS_POLICY = True
+except ImportError:  # pragma: no cover - optional dashboard/axis lab dependency path
+    HAS_AXIS_POLICY = False
+
+try:
     import _engine
     HAS_ENGINE = True
 except ImportError:
@@ -302,6 +311,7 @@ class ReplayDataset(_IterableDataset):
         lookahead_horizons: Optional[List[int]] = None,
         regret_fraction: float = 0.0,
         regret_temperature: float = 0.1,
+        include_axis_delta_norm: bool = False,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -312,6 +322,12 @@ class ReplayDataset(_IterableDataset):
         self.lookahead_horizons = lookahead_horizons or []
         self.regret_fraction = max(0.0, min(1.0, regret_fraction))
         self.regret_temperature = regret_temperature
+        self.include_axis_delta_norm = bool(include_axis_delta_norm)
+        self._axis_delta_norm_proto = (
+            get_prototype("exp_delta_norm")
+            if self.include_axis_delta_norm and HAS_AXIS_POLICY
+            else None
+        )
 
         self._rng = np.random.RandomState()
 
@@ -375,6 +391,11 @@ class ReplayDataset(_IterableDataset):
             "axis": np.full(self.batch_size, -1, dtype=np.int64),
             "moves_left": np.zeros(self.batch_size, dtype=np.float32),
         }
+        if self.include_axis_delta_norm:
+            aux_targets["axis_delta_norm"] = np.zeros(
+                (self.batch_size, 6, BOARD_SIZE, BOARD_SIZE),
+                dtype=np.float32,
+            )
 
         n_lookahead = len(self.lookahead_horizons)
         lookahead_arrays = [
@@ -421,6 +442,8 @@ class ReplayDataset(_IterableDataset):
             aux_targets["regret_value"][i] = rec.regret_value
             aux_targets["axis"][i] = axis_label
             aux_targets["moves_left"][i] = rec.moves_left
+            if self.include_axis_delta_norm:
+                aux_targets["axis_delta_norm"][i] = self._compute_axis_delta_norm(rec)
 
             for h_idx in range(n_lookahead):
                 if h_idx < len(rec.lookahead_values):
@@ -429,6 +452,25 @@ class ReplayDataset(_IterableDataset):
                     lookahead_arrays[h_idx][i] = values[i]  # fallback
 
         return tensors, policies, values, lookahead_arrays, aux_targets
+
+    def _compute_axis_delta_norm(self, rec) -> np.ndarray:
+        if self._axis_delta_norm_proto is None:
+            return np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        pos = position_payload(
+            get_replay_position(
+                rec.move_history,
+                near_radius=self.near_radius,
+                constrain_threats=False,
+            )
+        )
+        axis_input = AxisPolicyInput(
+            stones=pos["stones"],
+            legal_moves=pos["legal_moves"],
+            current_player=int(pos["current_player"]),
+            offset_q=int(pos["encoding"].get("offset_q", -16)),
+            offset_r=int(pos["encoding"].get("offset_r", -16)),
+        )
+        return self._axis_delta_norm_proto.compute(axis_input).axis_maps.astype(np.float32)
 
     def __len__(self) -> int:
         """Number of batches available."""

@@ -243,7 +243,15 @@ class RealMCTSEngine:
         seed: int,
         c_puct_init: float = 19652.0,
         constrain_threats: bool = True,
+        subtree_reuse: bool = False,
     ):
+        self._num_simulations = num_simulations
+        self._c_puct = c_puct
+        self._near_radius = near_radius
+        self._c_puct_init = c_puct_init
+        self._constrain_threats = constrain_threats
+        self._seed = seed
+        self._subtree_reuse = subtree_reuse
         self._engine = _engine.MCTSEngine(
             game=game,
             num_simulations=num_simulations,
@@ -293,8 +301,21 @@ class RealMCTSEngine:
         return self._engine.should_resign(threshold)
 
     def re_root(self, q, r, new_sims):
-        self._engine.re_root(q, r, new_sims)
+        if self._subtree_reuse:
+            self._engine.re_root(q, r, new_sims)
+            self._game.place(q, r)
+            return True
         self._game.place(q, r)
+        self._num_simulations = new_sims
+        self._engine = _engine.MCTSEngine(
+            game=self._game,
+            num_simulations=new_sims,
+            c_puct=self._c_puct,
+            near_radius=self._near_radius,
+            c_puct_init=self._c_puct_init,
+            constrain_threats=self._constrain_threats,
+            seed=self._seed,
+        )
         return True
 
     def root_child_priors(self):
@@ -338,6 +359,7 @@ class SelfPlayWorker:
 
         sp = cfg.selfplay
         self.num_simulations = sp.mcts_simulations
+        self.max_game_moves = sp.max_game_moves
         self.batch_size = sp.batch_size_per_worker
         self.c_puct = sp.c_puct
         self.c_puct_init = sp.c_puct_init
@@ -439,6 +461,7 @@ class SelfPlayWorker:
                 game_seed,
                 c_puct_init=self.c_puct_init,
                 constrain_threats=self.constrain_threats,
+                subtree_reuse=getattr(self.cfg.selfplay, "subtree_reuse", False),
             )
         else:
             engine = MockMCTSEngine(
@@ -453,6 +476,8 @@ class SelfPlayWorker:
         resign_enabled = np.random.random() > self.resign_disable_prob
 
         while True:
+            if move_idx >= self.max_game_moves:
+                break
             init = engine.init_root()
             if init is None:
                 break
@@ -519,6 +544,10 @@ class SelfPlayWorker:
                         self.batch_size
                     )
                     if count == 0:
+                        engine.expand_and_backprop(
+                            np.zeros(0, dtype=np.float32),
+                            np.zeros(0, dtype=np.float32),
+                        )
                         break
                     if isinstance(batch_tensor, np.ndarray):
                         batch_4d = batch_tensor

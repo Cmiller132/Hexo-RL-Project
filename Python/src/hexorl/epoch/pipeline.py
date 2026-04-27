@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -41,12 +41,14 @@ class EpochResult:
     buffer_stats: Dict[str, Any] = field(default_factory=dict)
     checkpoint_path: Optional[Path] = None
     elapsed_s: float = 0.0
+    trainer: Optional[Trainer] = None
 
 
 def run_epoch(
     cfg: Config,
     *,
     model: Optional[HexNet] = None,
+    trainer: Optional[Trainer] = None,
     buffer: Optional[RingBuffer] = None,
     output_dir: Optional[Path] = None,
     bootstrap_games: int = 0,
@@ -60,6 +62,8 @@ def run_epoch(
     Args:
         cfg: Validated runtime config.
         model: Optional model to continue training.
+        trainer: Optional persistent trainer to preserve optimizer, scheduler,
+            EMA, epoch, and global-step state across calls.
         buffer: Optional replay buffer to append to/reuse.
         output_dir: Run directory for checkpoints.
         bootstrap_games: Number of deterministic synthetic games to add before training.
@@ -81,10 +85,14 @@ def run_epoch(
         phase="epoch",
     )
 
-    replay = buffer or RingBuffer(
-        capacity=cfg.buffer.capacity,
-        recency_decay=cfg.buffer.recency_decay,
-        num_lookahead=len(cfg.buffer.lookahead_horizons),
+    replay = (
+        buffer
+        if buffer is not None
+        else RingBuffer(
+            capacity=cfg.buffer.capacity,
+            recency_decay=cfg.buffer.recency_decay,
+            num_lookahead=len(cfg.buffer.lookahead_horizons),
+        )
     )
 
     if bootstrap_games > 0:
@@ -99,7 +107,9 @@ def run_epoch(
             phase="bootstrap",
         )
 
-    if model is None:
+    if trainer is not None:
+        model = trainer.model
+    elif model is None:
         model = HexNet(
             channels=cfg.model.channels,
             blocks=cfg.model.blocks,
@@ -113,7 +123,16 @@ def run_epoch(
             initial_model_state=model.state_dict(),
             recorder=recorder,
         )
-        replay = orchestrator.buffer
+        if buffer is None:
+            replay = orchestrator.buffer
+        else:
+            base_game_id = replay.max_game_id + 1 if len(replay) else 0
+            replay.extend(
+                [
+                    replace(pos, game_id=pos.game_id + base_game_id)
+                    for pos in orchestrator.buffer.records()
+                ]
+            )
         recorder.metric(orchestrator.stats, phase="selfplay")
 
     train_stats: Dict[str, float] = {}
@@ -129,12 +148,17 @@ def run_epoch(
             batch_size=cfg.train.batch_size,
             recency_decay=cfg.buffer.recency_decay,
             pcr_weight=cfg.buffer.pcr_weight,
-            use_symmetry=True,
+            use_symmetry="axis_delta_norm" not in cfg.model.heads,
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             regret_fraction=cfg.buffer.regret_fraction,
+            include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
         )
         dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
-        trainer = Trainer(model, cfg, dataloader, device=device)
+        if trainer is None:
+            trainer = Trainer(model, cfg, dataloader, device=device)
+        else:
+            trainer.dataloader = dataloader
+            trainer.batches_per_epoch = cfg.train.batches_per_epoch
         train_stats = trainer.train_epoch()
 
         checkpoint_path = output_dir / f"epoch_{int(train_stats.get('epoch', 1)):04d}.pt"
@@ -161,6 +185,7 @@ def run_epoch(
         buffer_stats=replay.stats,
         checkpoint_path=checkpoint_path,
         elapsed_s=time.monotonic() - t0,
+        trainer=trainer,
     )
     recorder.event(
         "epoch_complete",

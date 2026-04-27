@@ -8,6 +8,7 @@ import {
   Eye,
   FileSearch,
   Gamepad2,
+  Pause,
   Play,
   RefreshCw,
   Swords,
@@ -156,7 +157,14 @@ function App() {
 
       {active === "charts" && <Charts metrics={metrics} />}
       {active === "games" && (
-        <Games games={games} selectedGame={selectedGame} setSelectedGame={setSelectedGame} />
+        <Games
+          games={games}
+          selectedGame={selectedGame}
+          openReplay={(id) => {
+            setSelectedGame(id);
+            setActive("replay");
+          }}
+        />
       )}
       {active === "replay" && (
         <Replay replay={replay} position={position} setPosition={setPosition} selectedGame={selectedGame} />
@@ -188,17 +196,17 @@ function Charts({ metrics }: { metrics: AnyRow[] }) {
   );
 }
 
-function Games({ games, selectedGame, setSelectedGame }: {
+function Games({ games, selectedGame, openReplay }: {
   games: AnyRow[];
   selectedGame: number | null;
-  setSelectedGame: (id: number) => void;
+  openReplay: (id: number) => void;
 }) {
   return (
     <Panel title="Game Browser">
       <Table
         rows={games}
         columns={["game_id", "run_id", "source", "epoch", "outcome", "move_count"]}
-        onRow={(row) => setSelectedGame(row.game_id)}
+        onRow={(row) => openReplay(row.game_id)}
         selected={(row) => row.game_id === selectedGame}
       />
     </Panel>
@@ -212,20 +220,58 @@ function Replay({ replay, position, setPosition, selectedGame }: {
   selectedGame: number | null;
 }) {
   const moves = replay?.moves || [];
+  const [turn, setTurn] = useState(0);
+  const [autoplay, setAutoplay] = useState(false);
   const loadTurn = (turn: number) => {
     if (!selectedGame) return;
-    api<AnyRow>(`/api/games/${selectedGame}/position/${turn}`).then(setPosition);
+    const nextTurn = clamp(Math.round(turn), 0, moves.length);
+    setTurn(nextTurn);
+    api<AnyRow>(`/api/games/${selectedGame}/position/${nextTurn}`).then(setPosition);
   };
+  useEffect(() => {
+    setAutoplay(false);
+    setTurn(0);
+  }, [selectedGame]);
+  useEffect(() => {
+    const nextTurn = Number(position?.turn_index ?? 0);
+    if (Number.isFinite(nextTurn)) setTurn(nextTurn);
+  }, [position?.turn_index]);
+  useEffect(() => {
+    if (!autoplay || !selectedGame) return;
+    const handle = window.setInterval(() => {
+      setTurn((current) => {
+        const next = current + 1;
+        if (next > moves.length) {
+          setAutoplay(false);
+          return current;
+        }
+        api<AnyRow>(`/api/games/${selectedGame}/position/${next}`)
+          .then(setPosition)
+          .catch(() => setAutoplay(false));
+        return next;
+      });
+    }, 650);
+    return () => window.clearInterval(handle);
+  }, [autoplay, selectedGame, moves.length, setPosition]);
   return (
     <section className="grid replay">
       <Panel title="Board">
         <Board position={position} />
       </Panel>
       <Panel title="Timeline">
+        <div className="toolbar compact">
+          <button onClick={() => setAutoplay((v) => !v)} disabled={!moves.length || !selectedGame}>
+            {autoplay ? <Pause size={15} /> : <Play size={15} />}
+            {autoplay ? "Pause" : "Autoplay"}
+          </button>
+          <button onClick={() => loadTurn(Math.max(0, turn - 1))} disabled={!selectedGame || turn <= 0}>Prev</button>
+          <button onClick={() => loadTurn(Math.min(moves.length, turn + 1))} disabled={!selectedGame || turn >= moves.length}>Next</button>
+          <span className="timelineStatus">Turn {turn}/{moves.length}</span>
+        </div>
         <div className="moveList">
-          <button onClick={() => loadTurn(0)}>Start</button>
+          <button className={turn === 0 ? "active" : ""} onClick={() => loadTurn(0)}>Start</button>
           {moves.map((m: AnyRow, i: number) => (
-            <button key={i} onClick={() => loadTurn(i + 1)}>
+            <button key={i} className={turn === i + 1 ? "active" : ""} onClick={() => loadTurn(i + 1)}>
               {i + 1}. P{m.player} ({m.q},{m.r})
             </button>
           ))}

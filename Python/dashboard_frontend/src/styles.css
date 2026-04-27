@@ -238,6 +238,10 @@ tr.clickable {
   cursor: pointer;
 }
 
+tr.selected {
+  cursor: pointer;
+}
+
 tr.clickable:hover,
 tr.selected {
   background: rgba(88, 166, 255, 0.12);
@@ -490,6 +494,18 @@ tr.selected {
   gap: 6px;
   max-height: 520px;
   overflow: auto;
+}
+
+.moveList button.active {
+  border-color: #58a6ff;
+  background: rgba(88, 166, 255, 0.18);
+  color: #dbeafe;
+}
+
+.timelineStatus {
+  color: #8b949e;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
 }
 
 pre {

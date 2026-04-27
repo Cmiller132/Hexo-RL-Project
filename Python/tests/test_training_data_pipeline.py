@@ -1,6 +1,7 @@
 import struct
 
 import numpy as np
+import pytest
 import torch
 
 from hexorl.buffer.ring import RingBuffer
@@ -9,8 +10,11 @@ from hexorl.buffer.sampler import (
     _py_decode_compact_record,
     _transform_axis_label,
     _transform_dense_policy,
+    ReplayDataset,
 )
 from hexorl.buffer.targets import process_game_record
+from hexorl.config import Config
+from hexorl.epoch import pipeline
 from hexorl.selfplay.records import GameRecord, PositionRecord, BOARD_SIZE, action_to_board_index
 from hexorl.train.losses import compute_losses
 from hexorl.model.network import HexNet
@@ -112,6 +116,61 @@ def test_ring_buffer_preserves_auxiliary_targets():
     assert out.moves_left == rec.moves_left
 
 
+def test_run_epoch_appends_selfplay_to_existing_replay(monkeypatch, tmp_path):
+    generated = RingBuffer(capacity=8)
+    generated.append(
+        PositionRecord(
+            move_history=_move(0, 0, 0),
+            policy_target={action_to_board_index(1, 0): 1.0},
+            root_value=0.0,
+            player=1,
+            game_id=0,
+        )
+    )
+
+    class FakeOrchestrator:
+        buffer = generated
+        stats = {"games_done": 1, "positions_done": 1}
+
+    monkeypatch.setattr(pipeline, "run_orchestrator", lambda *args, **kwargs: FakeOrchestrator())
+    cfg = Config()
+    cfg.model.channels = 4
+    cfg.model.blocks = 1
+
+    empty_existing = RingBuffer(capacity=8)
+    empty_result = pipeline.run_epoch(
+        cfg,
+        buffer=empty_existing,
+        output_dir=tmp_path / "empty",
+        use_selfplay=True,
+        train=False,
+    )
+
+    assert empty_result.buffer_stats["size"] == 1
+    assert len(empty_existing) == 1
+
+    existing = RingBuffer(capacity=8)
+    existing.append(
+        PositionRecord(
+            move_history=b"",
+            policy_target={action_to_board_index(0, 0): 1.0},
+            root_value=0.0,
+            player=0,
+            game_id=4,
+        )
+    )
+    result = pipeline.run_epoch(
+        cfg,
+        buffer=existing,
+        output_dir=tmp_path,
+        use_selfplay=True,
+        train=False,
+    )
+
+    assert result.buffer_stats["size"] == 2
+    assert [record.game_id for record in existing.records()] == [4, 5]
+
+
 def test_compute_losses_skips_missing_targets_and_handles_batch_one():
     predictions = {
         "policy": torch.zeros(1, 1089),
@@ -152,3 +211,27 @@ def test_axis_delta_norm_head_shape():
     model = HexNet(channels=4, blocks=1, heads=["axis_delta_norm"])
     out = model(torch.zeros(2, 13, 33, 33))
     assert out["axis_delta_norm"].shape == (2, 6, 33, 33)
+
+
+def test_replay_dataset_can_emit_axis_delta_norm_target():
+    pytest.importorskip("_engine")
+    buffer = RingBuffer(capacity=8)
+    buffer.append(
+        PositionRecord(
+            move_history=_move(0, 0, 0),
+            policy_target={action_to_board_index(1, 0): 1.0},
+            root_value=0.0,
+            player=1,
+        )
+    )
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_axis_delta_norm=True,
+    )
+
+    *_rest, aux_targets = next(iter(dataset))
+
+    assert aux_targets["axis_delta_norm"].shape == (1, 6, 33, 33)
+    assert aux_targets["axis_delta_norm"].sum() > 0.0

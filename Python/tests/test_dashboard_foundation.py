@@ -175,9 +175,20 @@ def test_fastapi_dashboard_smoke(tmp_path):
     from hexorl.dashboard.app import create_app
 
     app = create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing")
+    app.state.store.insert_game(
+        run_id="api-run",
+        game_id="game-with-bytes",
+        source="unit",
+        final_move_history=_move(0, 0, 0),
+        payload={"fixture": True},
+    )
     client = TestClient(app)
 
     assert client.get("/api/health").json()["ok"]
+    games = client.get("/api/games").json()
+    assert games[0]["move_count"] == 1
+    assert games[0]["payload"] == {"fixture": True}
+    assert "final_history_b64" not in games[0]
     assert client.get("/api/axis/prototypes").json()
     created = client.post("/api/session/create", json={}).json()
     assert created["session_id"]

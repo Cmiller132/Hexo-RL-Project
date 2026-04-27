@@ -91,6 +91,20 @@ class ArenaStartRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+def _game_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "game_id": row["game_id"],
+        "run_id": row["run_id"],
+        "external_game_id": row["external_game_id"],
+        "source": row["source"],
+        "epoch": row["epoch"],
+        "outcome": row["outcome"],
+        "move_count": row["move_count"],
+        "created_at": row["created_at"],
+        "payload": row.get("payload_json", {}),
+    }
+
+
 def create_app(
     db_path: Path | str = "runs/dashboard.sqlite3",
     *,
@@ -171,14 +185,16 @@ def create_app(
     @app.get("/api/games")
     def games(run_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         if run_id:
-            return store.rows(
+            rows = store.rows(
                 "SELECT * FROM games WHERE run_id=? ORDER BY created_at DESC LIMIT ?",
                 (run_id, max(1, min(limit, 2000))),
             )
-        return store.rows(
-            "SELECT * FROM games ORDER BY created_at DESC LIMIT ?",
-            (max(1, min(limit, 2000)),),
-        )
+        else:
+            rows = store.rows(
+                "SELECT * FROM games ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 2000)),),
+            )
+        return [_game_summary(row) for row in rows]
 
     @app.get("/api/games/{game_id}/replay")
     def game_replay(game_id: int) -> dict[str, Any]:

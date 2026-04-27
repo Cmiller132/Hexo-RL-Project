@@ -21,6 +21,7 @@ class SelfPlayConfig(BaseModel):
     num_workers: int = 24
     games_per_epoch: int = 4096
     states_per_epoch: int = 400_000
+    max_game_moves: int = 256
     batch_size_per_worker: int = 8
     mcts_simulations: int = 800
     c_puct: float = 1.5
@@ -34,6 +35,7 @@ class SelfPlayConfig(BaseModel):
     resign_disable_prob: float = 0.1
     near_radius: int = 8
     constrain_threats: bool = True
+    subtree_reuse: bool = False
 
 
 class InferenceConfig(BaseModel):

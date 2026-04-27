@@ -267,6 +267,12 @@ class RingBuffer:
                 records.append(rec)
         return records
 
+    def records(self) -> List[PositionRecord]:
+        """Return all records in oldest-to-newest logical order."""
+        with self._lock:
+            indices = [(self._tail + i) % self.capacity for i in range(self._size)]
+        return [rec for rec in (self[idx] for idx in indices) if rec is not None]
+
     @property
     def stats(self) -> dict:
         """Return buffer statistics."""
