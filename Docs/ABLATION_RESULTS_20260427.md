@@ -4,10 +4,18 @@ Suite root: `runs/ablations_priority_20260427_v2`
 
 This document is generated from the suite JSONL summaries while the run is in progress. Treat partially completed ablations as early signals, not final conclusions.
 
-## Current Status
+## Current Leaders
 
-No completed epoch summaries have been written yet.
+- Lowest latest loss: `model_64x8` at epoch 12 with loss `5.4717`.
+- Fastest latest self-play: `model_64x8` at `33.08` games/min.
 
+## Latest Metrics
+
+| ablation | epoch | loss | top1 | train_bps | games_min | pos_min | buffer | elapsed_min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline_128x16_noise025 | 12 | 6.6487 | 0.1136 | 3.19 | 12.66 | 1619.4 | 100000 | 10.66 |
+| model_64x8 | 12 | 5.4717 | 0.1219 | 2.32 | 33.08 | 4222.3 | 100000 | 4.6 |
+| model_96x12 | 12 | 5.8112 | 0.106 | 2.7 | 21.21 | 2708.9 | 100000 | 6.77 |
 
 ## Interpretation Notes
 
