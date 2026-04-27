@@ -22,24 +22,24 @@ def build_config() -> Config:
     cfg.selfplay.states_per_epoch = 2048
     cfg.selfplay.max_game_moves = 256
     cfg.selfplay.batch_size_per_worker = 2
-    cfg.selfplay.mcts_simulations = 16
-    cfg.selfplay.pcr_low_sims = 4
+    cfg.selfplay.mcts_simulations = 32
+    cfg.selfplay.pcr_low_sims = 8
     cfg.selfplay.pcr_low_sim_prob = 0.75
+    cfg.selfplay.policy_target_top_k = 64
+    cfg.selfplay.train_policy_on_full_search_only = True
     cfg.selfplay.subtree_reuse = True
     cfg.selfplay.near_radius = 6
     cfg.selfplay.constrain_threats = True
     cfg.selfplay.temperature_schedule = [[0, 1.0], [20, 0.5], [60, 0.15], [120, 0.05]]
     cfg.selfplay.dirichlet_alpha = 0.3
     cfg.selfplay.dirichlet_fraction = 0.25
-    cfg.selfplay.resign_threshold = -0.98
-    cfg.selfplay.resign_disable_prob = 0.25
     cfg.selfplay.train_on_truncated_games = False
 
     cfg.inference.max_batch_size = 32
     cfg.inference.max_wait_us = 500
     cfg.inference.fp16 = False
 
-    cfg.buffer.capacity = 16384
+    cfg.buffer.capacity = 131072
     cfg.buffer.lookahead_horizons = []
     cfg.buffer.lookahead_lambdas = []
     cfg.buffer.regret_fraction = 0.0
@@ -59,14 +59,18 @@ def build_config() -> Config:
 
 def main() -> None:
     cfg = build_config()
-    out = Path("runs/fresh_d6_noise_48x4")
+    out = Path("runs/fixed_d6_fullpolicy_48x4_mcts32")
     out.mkdir(parents=True, exist_ok=True)
     model = HexNet(
         channels=cfg.model.channels,
         blocks=cfg.model.blocks,
         heads=cfg.model.heads,
     )
-    buffer = RingBuffer(capacity=cfg.buffer.capacity, num_lookahead=0)
+    buffer = RingBuffer(
+        capacity=cfg.buffer.capacity,
+        max_policy_entries=cfg.selfplay.policy_target_top_k,
+        num_lookahead=0,
+    )
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"TRAIN_DEVICE {device}", flush=True)
     print(
@@ -82,6 +86,8 @@ def main() -> None:
             "mcts_simulations": cfg.selfplay.mcts_simulations,
             "pcr_low_sims": cfg.selfplay.pcr_low_sims,
             "pcr_low_sim_prob": cfg.selfplay.pcr_low_sim_prob,
+            "policy_target_top_k": cfg.selfplay.policy_target_top_k,
+            "train_policy_on_full_search_only": cfg.selfplay.train_policy_on_full_search_only,
             "subtree_reuse": cfg.selfplay.subtree_reuse,
             "dirichlet_alpha": cfg.selfplay.dirichlet_alpha,
             "dirichlet_fraction": cfg.selfplay.dirichlet_fraction,

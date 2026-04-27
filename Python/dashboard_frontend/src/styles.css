@@ -516,6 +516,11 @@ pre {
   font-size: 11px;
 }
 
+.chartWrap {
+  display: grid;
+  gap: 8px;
+}
+
 .chart {
   width: 100%;
   min-height: 240px;
@@ -527,6 +532,53 @@ pre {
   fill: none;
   stroke: #58a6ff;
   stroke-width: 2;
+}
+
+.chartGrid {
+  stroke: #30363d;
+  stroke-width: 1;
+}
+
+.chartTick,
+.chartLabel {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+}
+
+.chartTick {
+  fill: #8b949e;
+}
+
+.chartLabel {
+  paint-order: stroke;
+  stroke: #0d1117;
+  stroke-width: 3px;
+}
+
+.chartLegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  color: #8b949e;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.chartLegend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.chartLegend i {
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.chartLegend b {
+  color: #c9d1d9;
+  font-weight: 600;
 }
 
 .axisResults {

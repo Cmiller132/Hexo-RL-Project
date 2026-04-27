@@ -70,7 +70,7 @@ fn encode_compact_record<'py>(
 /// Apply one of 12 hex-grid symmetry transforms to a board tensor.
 ///
 /// `sym_idx` ∈ [0, 11] selects the transform:
-/// - 0..6: rotations by 0, 60, 120, 180, 240, 300 degrees
+/// - 0..5: rotations by 0, 60, 120, 180, 240, 300 degrees
 /// - 6..11: same rotations after a horizontal reflection
 ///
 /// The tensor must have shape `(13, 33, 33)` — transforms are applied to the
@@ -111,12 +111,12 @@ fn apply_d6_symmetry<'py>(
                         3 => (-qi, -rj),
                         4 => (rj, -qi - rj),
                         5 => (qi + rj, -qi),
-                        6 => (-qi, qi + rj),
-                        7 => (-qi - rj, -qi),
-                        8 => (-rj, -qi - rj),
-                        9 => (qi, -qi - rj),
-                        10 => (qi + rj, rj),
-                        11 => (rj, qi),
+                        6 => (rj, qi),
+                        7 => (-qi, qi + rj),
+                        8 => (-qi - rj, rj),
+                        9 => (-rj, -qi),
+                        10 => (qi, -qi - rj),
+                        11 => (qi + rj, -rj),
                         _ => unreachable!(),
                     };
                     let ti = (qi_t + half) as usize;

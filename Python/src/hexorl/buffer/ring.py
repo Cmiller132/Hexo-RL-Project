@@ -44,6 +44,7 @@ class RingBuffer:
         self._policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
         self._policy_counts = np.zeros(capacity, dtype=np.uint16)
         self._values = np.zeros(capacity, dtype=np.float32)
+        self._value_weights = np.ones(capacity, dtype=np.float32)
         self._regret_rank = np.zeros(capacity, dtype=np.float32)
         self._regret_value = np.zeros(capacity, dtype=np.float32)
         self._axis = np.full(capacity, -1, dtype=np.int16)
@@ -99,6 +100,7 @@ class RingBuffer:
                 self._policy_probs[idx, j] = prob
 
             self._values[idx] = record.to_value_target()
+            self._value_weights[idx] = record.value_weight
             self._write_aux_targets(idx, record)
             self._game_ids[idx] = record.game_id
             self._is_full[idx] = record.is_full_search
@@ -135,6 +137,7 @@ class RingBuffer:
             self._policies[idx, j] = action_idx
             self._policy_probs[idx, j] = prob
         self._values[idx] = record.to_value_target()
+        self._value_weights[idx] = record.value_weight
         self._write_aux_targets(idx, record)
         self._game_ids[idx] = record.game_id
         self._is_full[idx] = record.is_full_search
@@ -256,6 +259,7 @@ class RingBuffer:
                 regret_value=float(self._regret_value[idx]),
                 axis_label=int(self._axis[idx]),
                 moves_left=float(self._moves_left[idx]),
+                value_weight=float(self._value_weights[idx]),
             )
 
     def get_batch(self, indices: np.ndarray) -> List[PositionRecord]:
@@ -301,6 +305,7 @@ class RingBuffer:
             self._policy_probs.fill(0.0)
             self._policy_counts.fill(0)
             self._values.fill(0.0)
+            self._value_weights.fill(1.0)
             self._regret_rank.fill(0.0)
             self._regret_value.fill(0.0)
             self._axis.fill(-1)

@@ -31,8 +31,8 @@ class SelfPlayConfig(BaseModel):
     dirichlet_fraction: float = 0.25
     pcr_low_sim_prob: float = 0.75
     pcr_low_sims: int = 192
-    resign_threshold: float = -0.95
-    resign_disable_prob: float = 0.1
+    policy_target_top_k: int = 64
+    train_policy_on_full_search_only: bool = True
     near_radius: int = 8
     constrain_threats: bool = True
     subtree_reuse: bool = False

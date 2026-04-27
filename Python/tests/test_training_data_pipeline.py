@@ -17,7 +17,13 @@ from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 from hexorl.epoch import pipeline
 from hexorl.selfplay.orchestrator import SelfPlayOrchestrator
-from hexorl.selfplay.records import GameRecord, PositionRecord, BOARD_SIZE, action_to_board_index
+from hexorl.selfplay.records import (
+    GameRecord,
+    PositionRecord,
+    BOARD_SIZE,
+    action_to_board_index,
+    sparsify_policy,
+)
 from hexorl.train.losses import compute_losses
 from hexorl.model.network import HexNet
 
@@ -75,6 +81,12 @@ def test_axis_label_symmetry_transform_remains_valid():
             assert _transform_axis_label(axis, sym_idx) in {0, 1, 2}
 
 
+def test_each_symmetry_permutates_axes_one_to_one():
+    for sym_idx in range(12):
+        mapped = [_transform_axis_label(axis, sym_idx) for axis in range(3)]
+        assert sorted(mapped) == [0, 1, 2]
+
+
 def test_axis_delta_maps_symmetry_transforms_space_and_axis_planes():
     maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     src_i = BOARD_SIZE // 2 + 1
@@ -123,6 +135,7 @@ def test_ring_buffer_preserves_auxiliary_targets():
         regret_value=-0.5,
         axis_label=2,
         moves_left=7.0,
+        value_weight=0.0,
     )
     buffer = RingBuffer(capacity=4)
     buffer.append(rec)
@@ -133,6 +146,26 @@ def test_ring_buffer_preserves_auxiliary_targets():
     assert out.regret_rank == rec.regret_rank
     assert out.axis_label == rec.axis_label
     assert out.moves_left == rec.moves_left
+    assert out.value_weight == rec.value_weight
+
+
+def test_policy_target_top64_is_preserved_when_configured():
+    dense = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
+    dense[:80] = np.arange(80, 0, -1, dtype=np.float32)
+    policy = sparsify_policy(dense, top_k=64)
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target=policy,
+        root_value=0.0,
+        player=0,
+    )
+    buffer = RingBuffer(capacity=2, max_policy_entries=64)
+    buffer.append(rec)
+
+    out = buffer[0]
+    assert out is not None
+    assert len(out.policy_target) == 64
+    assert abs(sum(out.policy_target.values()) - 1.0) < 1e-6
 
 
 def test_run_epoch_appends_selfplay_to_existing_replay(monkeypatch, tmp_path):
@@ -216,7 +249,7 @@ def test_selfplay_epoch_completion_requires_games_and_states():
     assert orchestrator.progress == 1.0
 
 
-def test_orchestrator_records_but_skips_truncated_games_for_training(tmp_path):
+def test_orchestrator_masks_truncated_game_value_targets(tmp_path):
     from hexorl.dashboard.recorder import RunRecorder
     from hexorl.dashboard.db import DashboardStore
 
@@ -245,8 +278,9 @@ def test_orchestrator_records_but_skips_truncated_games_for_training(tmp_path):
 
     orchestrator._ingest_game(game)
 
-    assert len(orchestrator.buffer) == 0
-    assert orchestrator.stats["positions_done"] == 0
+    assert len(orchestrator.buffer) == 1
+    assert orchestrator.buffer[0].value_weight == 0.0
+    assert orchestrator.stats["positions_done"] == 1
     rows = store.rows("SELECT payload_json FROM games")
     assert rows[0]["payload_json"]["truncated"] is True
     assert rows[0]["payload_json"]["terminal_reason"] == "max_game_moves"
@@ -288,6 +322,35 @@ def test_compute_losses_skips_missing_targets_and_handles_batch_one():
     assert per_head["axis_delta_norm"].item() > 0.0
 
 
+def test_policy_loss_can_be_masked_to_full_search_samples():
+    predictions = {
+        "policy": torch.zeros(2, 1089, requires_grad=True),
+    }
+    targets = {
+        "policy": torch.nn.functional.one_hot(torch.tensor([0, 1]), 1089).float(),
+        "policy_weight": torch.tensor([1.0, 0.0]),
+    }
+
+    total, per_head = compute_losses(predictions, targets, {"policy": 1.0})
+
+    expected = torch.log(torch.tensor(1089.0))
+    assert torch.allclose(total.detach(), expected, atol=1e-5)
+    assert torch.allclose(per_head["policy"].detach(), expected, atol=1e-5)
+
+
+def test_value_loss_can_be_masked_for_truncated_games():
+    predictions = {"value": torch.zeros(2, 65, requires_grad=True)}
+    targets = {
+        "value": torch.tensor([1.0, -1.0]),
+        "value_weight": torch.tensor([0.0, 0.0]),
+    }
+
+    total, per_head = compute_losses(predictions, targets, {"value": 1.0})
+
+    assert total.item() == 0.0
+    assert per_head["value"].item() == 0.0
+
+
 def test_axis_delta_norm_head_shape():
     model = HexNet(channels=4, blocks=1, heads=["axis_delta_norm"])
     out = model(torch.zeros(2, 13, 33, 33))
@@ -316,3 +379,25 @@ def test_replay_dataset_can_emit_axis_delta_norm_target():
 
     assert aux_targets["axis_delta_norm"].shape == (1, 6, 33, 33)
     assert aux_targets["axis_delta_norm"].sum() > 0.0
+
+
+def test_replay_dataset_marks_low_sim_policy_weight_zero():
+    buffer = RingBuffer(capacity=2)
+    buffer.append(
+        PositionRecord(
+            move_history=b"",
+            policy_target={action_to_board_index(0, 0): 1.0},
+            root_value=0.0,
+            player=0,
+            is_full_search=False,
+        )
+    )
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+    )
+    *_rest, aux_targets = next(iter(dataset))
+
+    assert aux_targets["policy_weight"].shape == (1,)
+    assert aux_targets["policy_weight"][0].item() == 0.0

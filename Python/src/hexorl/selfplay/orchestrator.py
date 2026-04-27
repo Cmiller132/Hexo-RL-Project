@@ -33,6 +33,7 @@ class SelfPlayOrchestrator:
         buffer_capacity: int = 100_000,
         initial_model_state: Optional[dict] = None,
         recorder: Optional[RunRecorder] = None,
+        epoch: int | None = None,
     ):
         self.cfg = cfg
         self.num_workers = cfg.selfplay.num_workers
@@ -44,10 +45,12 @@ class SelfPlayOrchestrator:
         self._server: Optional[InferenceServer] = None
         self._initial_model_state = initial_model_state
         self._recorder = recorder
+        self._record_epoch = epoch
 
         # Ring buffer
         self._buffer = RingBuffer(
             capacity=buffer_capacity,
+            max_policy_entries=cfg.selfplay.policy_target_top_k,
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -193,17 +196,13 @@ class SelfPlayOrchestrator:
             # Do not reprocess — it overwrites correct EMA lookahead values.
 
             if self._recorder is not None:
-                self._recorder.game(game_record, source="selfplay")
+                self._recorder.game(game_record, source="selfplay", epoch=self._record_epoch)
 
-            # Push terminal/resigned games into the training buffer. Truncated
-            # games are useful for dashboard review but their fake draw outcome
-            # is a bad value target unless explicitly allowed.
             is_truncated = bool(getattr(game_record, "truncated", False))
-            valid_positions = (
-                list(game_record.positions)
-                if self.cfg.selfplay.train_on_truncated_games or not is_truncated
-                else []
-            )
+            valid_positions = list(game_record.positions)
+            if is_truncated and not self.cfg.selfplay.train_on_truncated_games:
+                for pos in valid_positions:
+                    pos.value_weight = 0.0
             if valid_positions:
                 self._buffer.extend(valid_positions)
 
@@ -264,6 +263,7 @@ def run_orchestrator(
     buffer_capacity: int = 100_000,
     initial_model_state: Optional[dict] = None,
     recorder: Optional[RunRecorder] = None,
+    epoch: int | None = None,
 ):
     """Run the orchestrator until interrupted, then clean up.
 
@@ -274,6 +274,7 @@ def run_orchestrator(
         buffer_capacity=buffer_capacity,
         initial_model_state=initial_model_state,
         recorder=recorder,
+        epoch=epoch,
     )
 
     # Handle SIGINT/SIGTERM gracefully

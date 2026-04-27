@@ -25,14 +25,13 @@ def main() -> None:
     cfg.selfplay.mcts_simulations = 16
     cfg.selfplay.pcr_low_sims = 4
     cfg.selfplay.pcr_low_sim_prob = 0.75
+    cfg.selfplay.policy_target_top_k = 64
     cfg.selfplay.subtree_reuse = True
     cfg.selfplay.near_radius = 6
     cfg.selfplay.constrain_threats = True
     cfg.selfplay.temperature_schedule = [[0, 1.0], [20, 0.5], [60, 0.15], [120, 0.05]]
     cfg.selfplay.dirichlet_alpha = 0.3
     cfg.selfplay.dirichlet_fraction = 0.25
-    cfg.selfplay.resign_threshold = -0.98
-    cfg.selfplay.resign_disable_prob = 0.25
     cfg.selfplay.train_on_truncated_games = False
     cfg.inference.max_batch_size = 32
     cfg.inference.max_wait_us = 500
@@ -59,7 +58,11 @@ def main() -> None:
         blocks=cfg.model.blocks,
         heads=cfg.model.heads,
     )
-    buffer = RingBuffer(capacity=cfg.buffer.capacity, num_lookahead=0)
+    buffer = RingBuffer(
+        capacity=cfg.buffer.capacity,
+        max_policy_entries=cfg.selfplay.policy_target_top_k,
+        num_lookahead=0,
+    )
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"TRAIN_DEVICE {device}", flush=True)
     trainer = None

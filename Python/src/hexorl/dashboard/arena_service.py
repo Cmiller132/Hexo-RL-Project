@@ -91,8 +91,8 @@ class ArenaManager:
                 q, r = fn(list(move_history), 100, player)
                 if q is None or r is None:
                     winner = 1 - player
-                    self._emit(match_id, {"type": "match_result", "winner": winner, "reason": "resign"})
-                    self._finish(match_id, "complete", {"winner": winner, "reason": "resign"})
+                    self._emit(match_id, {"type": "match_result", "winner": winner, "reason": "no_move"})
+                    self._finish(match_id, "complete", {"winner": winner, "reason": "no_move"})
                     return
                 try:
                     game.place(int(q), int(r))

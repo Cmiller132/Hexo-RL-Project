@@ -183,6 +183,8 @@ class Trainer:
             targets[key] = lv_arr.to(self.device, non_blocking=True)
         for key, value in aux_targets.items():
             targets[key] = value.to(self.device, non_blocking=True)
+        if not getattr(self.cfg.selfplay, "train_policy_on_full_search_only", True):
+            targets.pop("policy_weight", None)
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -214,6 +216,23 @@ class Trainer:
         for k, v in per_head.items():
             if isinstance(v, torch.Tensor):
                 result[k] = float(v.detach().cpu())
+        if "policy" in predictions and "policy" in targets:
+            with torch.no_grad():
+                policy_probs = torch.softmax(predictions["policy"], dim=-1)
+                target_top = targets["policy"].argmax(dim=-1)
+                pred_top = policy_probs.argmax(dim=-1)
+                top1_prob = policy_probs.gather(1, target_top.unsqueeze(1)).squeeze(1)
+                top1_acc = (pred_top == target_top).float()
+                policy_weight = targets.get("policy_weight")
+                if policy_weight is not None and torch.any(policy_weight > 0):
+                    policy_weight = policy_weight.to(device=top1_prob.device, dtype=top1_prob.dtype)
+                    denom = policy_weight.sum().clamp(min=1e-6)
+                    result["policy_top1_prob"] = float((top1_prob * policy_weight).sum().div(denom).detach().cpu())
+                    result["policy_top1_acc"] = float((top1_acc * policy_weight).sum().div(denom).detach().cpu())
+                    result["policy_full_search_frac"] = float((policy_weight > 0).float().mean().detach().cpu())
+                else:
+                    result["policy_top1_prob"] = float(top1_prob.mean().detach().cpu())
+                    result["policy_top1_acc"] = float(top1_acc.mean().detach().cpu())
 
         return result
 
@@ -227,6 +246,8 @@ class Trainer:
         total_loss = self._smooth("total")
         policy_loss = self._smooth("policy")
         value_loss = self._smooth("value")
+        top1_prob = self._smooth("policy_top1_prob")
+        top1_acc = self._smooth("policy_top1_acc")
 
         logger.info(
             f"[Epoch {self.epoch}] "
@@ -234,6 +255,7 @@ class Trainer:
             f"({batches_per_sec:.1f}/s) | "
             f"loss={total_loss:.4f} | "
             f"p={policy_loss:.4f} v={value_loss:.4f} | "
+            f"top1_p={top1_prob:.3f} top1_acc={top1_acc:.3f} | "
             f"lr={current_lr:.2e} | "
             f"eta={remaining:.0f}s"
         )
@@ -256,7 +278,10 @@ class Trainer:
         for key in self._epoch_losses:
             vals = self._epoch_losses[key]
             if vals:
-                stats[f"loss_{key}"] = sum(vals) / len(vals)
+                if key == "total" or key in self.train_cfg.loss_weights:
+                    stats[f"loss_{key}"] = sum(vals) / len(vals)
+                else:
+                    stats[key] = sum(vals) / len(vals)
         return stats
 
     def save_checkpoint(self, path: Path):

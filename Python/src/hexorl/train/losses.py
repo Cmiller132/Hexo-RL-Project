@@ -40,6 +40,7 @@ def binned_value_loss(
     pred_logits: torch.Tensor,
     target_values: torch.Tensor,
     n_bins: int = 65,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """KataGo-style soft cross-entropy on interpolated bin targets.
 
@@ -54,6 +55,12 @@ def binned_value_loss(
     target_bins = value_to_bins_torch(target_values, n_bins=n_bins)
     log_probs = F.log_softmax(pred_logits, dim=-1)
     loss = -(target_bins * log_probs).sum(dim=-1)
+    if weight is not None:
+        weight = weight.to(device=loss.device, dtype=loss.dtype)
+        valid = weight > 0
+        if not torch.any(valid):
+            return pred_logits.sum() * 0.0
+        return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
     return loss.mean()
 
 
@@ -108,6 +115,7 @@ def regret_value_loss(
 def policy_loss(
     pred_logits: torch.Tensor,
     target_probs: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy between policy logits and MCTS visit distribution (soft target).
 
@@ -120,6 +128,12 @@ def policy_loss(
     """
     log_probs = F.log_softmax(pred_logits, dim=-1)
     loss = -(target_probs * log_probs).sum(dim=-1)
+    if weight is not None:
+        weight = weight.to(device=loss.device, dtype=loss.dtype)
+        valid = weight > 0
+        if not torch.any(valid):
+            return pred_logits.sum() * 0.0
+        return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
     return loss.mean()
 
 
@@ -238,14 +252,14 @@ def compute_losses(
             continue
 
         if head_name == "policy":
-            loss = policy_loss(pred, targets["policy"])
+            loss = policy_loss(pred, targets["policy"], targets.get("policy_weight"))
         elif head_name == "opp_policy":
             target = targets.get("opp_policy", targets.get("policy"))
             if target is None:
                 continue
             loss = opp_policy_loss(pred, target)
         elif head_name == "value":
-            loss = binned_value_loss(pred, targets["value"], n_bins)
+            loss = binned_value_loss(pred, targets["value"], n_bins, targets.get("value_weight"))
         elif head_name.startswith("lookahead_"):
             loss = binned_value_loss(pred, targets[head_name], n_bins)
         elif head_name == "regret_rank":

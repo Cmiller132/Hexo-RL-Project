@@ -219,17 +219,17 @@ def _hex_transform(qi: int, rj: int, sym: int) -> Tuple[int, int]:
     elif sym == 5:
         return (qi + rj, -qi)
     elif sym == 6:
-        return (-qi, qi + rj)
-    elif sym == 7:
-        return (-qi - rj, -qi)
-    elif sym == 8:
-        return (-rj, -qi - rj)
-    elif sym == 9:
-        return (qi, -qi - rj)
-    elif sym == 10:
-        return (qi + rj, rj)
-    else:
         return (rj, qi)
+    elif sym == 7:
+        return (-qi, qi + rj)
+    elif sym == 8:
+        return (-qi - rj, rj)
+    elif sym == 9:
+        return (-rj, -qi)
+    elif sym == 10:
+        return (qi, -qi - rj)
+    else:
+        return (qi + rj, -rj)
 
 
 def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
@@ -417,6 +417,8 @@ class ReplayDataset(_IterableDataset):
             "regret_value": np.zeros(self.batch_size, dtype=np.float32),
             "axis": np.full(self.batch_size, -1, dtype=np.int64),
             "moves_left": np.zeros(self.batch_size, dtype=np.float32),
+            "value_weight": np.ones(self.batch_size, dtype=np.float32),
+            "policy_weight": np.ones(self.batch_size, dtype=np.float32),
         }
         if self.include_axis_delta_norm:
             aux_targets["axis_delta_norm"] = np.zeros(
@@ -457,6 +459,8 @@ class ReplayDataset(_IterableDataset):
             aux_targets["regret_value"][i] = rec.regret_value
             aux_targets["axis"][i] = axis_label
             aux_targets["moves_left"][i] = rec.moves_left
+            aux_targets["value_weight"][i] = rec.value_weight
+            aux_targets["policy_weight"][i] = 1.0 if rec.is_full_search else 0.0
             if self.include_axis_delta_norm:
                 axis_delta_norm = self._compute_axis_delta_norm(rec)
                 if self.use_symmetry:

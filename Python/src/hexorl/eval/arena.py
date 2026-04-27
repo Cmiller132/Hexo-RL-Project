@@ -223,7 +223,7 @@ def _play_engine_match(
 
         if q is None or r is None:
             winner = 1 if is_side_a else 0
-            reason = "resign"
+            reason = "no_move"
             break
 
         try:
@@ -284,7 +284,7 @@ def _play_fallback_match(
 
         if q is None or r is None:
             winner = 1 if is_side_a else 0
-            reason = "resign"
+            reason = "no_move"
             break
 
         move_history.append((player, q, r))

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from hexorl.dashboard.checkpoints import index_checkpoint
 from hexorl.dashboard.db import DashboardStore
 from hexorl.selfplay.records import GameRecord
 
@@ -108,13 +109,21 @@ class RunRecorder:
         epoch: int | None = None,
         global_step: int | None = None,
     ) -> int:
-        return self.event(
+        path = Path(path)
+        checkpoint_id: int | None = None
+        try:
+            checkpoint_id = index_checkpoint(path, self.store, run_id=self.run_id).checkpoint_id
+        except Exception as exc:
+            payload = {"checkpoint_index_error": str(exc), **dict(payload or {})}
+
+        event_id = self.event(
             "checkpoint",
-            {"path": str(path), **dict(payload or {})},
+            {"path": str(path), "checkpoint_id": checkpoint_id, **dict(payload or {})},
             phase="checkpoint",
             epoch=epoch,
             global_step=global_step,
         )
+        return checkpoint_id or event_id
 
     def game(
         self,
@@ -157,6 +166,7 @@ class RunRecorder:
                     "regret_value": pos.regret_value,
                     "axis_label": pos.axis_label,
                     "moves_left": pos.moves_left,
+                    "value_weight": pos.value_weight,
                 },
             )
         self.event(

@@ -30,7 +30,7 @@ class PositionRecord:
     move_history: bytes
 
     # Sparse policy target: maps action index (flat BOARD_AREA index: q*33 + r + offset)
-    # to visit probability. Top-K only (K ≤ 20) to save space.
+    # to visit probability. Top-K only to save space and prune low-visit noise.
     policy_target: Dict[int, float]
 
     # Root Q-value from MCTS (from current player's perspective).
@@ -60,6 +60,7 @@ class PositionRecord:
     regret_value: float = 0.0
     axis_label: int = -1
     moves_left: float = 0.0
+    value_weight: float = 1.0
 
     def to_value_target(self) -> float:
         """Compute the training value target for this position.
@@ -113,7 +114,7 @@ class GameRecord:
     final_move_history: bytes = b""
 
     # True when the game stopped because the move cap or another non-terminal
-    # guard fired before either player won or resigned.
+    # guard fired before either player won.
     truncated: bool = False
     terminal_reason: str = "unknown"
 

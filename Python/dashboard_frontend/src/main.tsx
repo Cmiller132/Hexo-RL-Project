@@ -53,26 +53,22 @@ function App() {
   const [axis, setAxis] = useState<AnyRow[]>([]);
   const [axisResults, setAxisResults] = useState<AnyRow[]>([]);
   const [error, setError] = useState<string>("");
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   const load = async () => {
     try {
       setError("");
-      const [h, r, c, g, a, p] = await Promise.all([
+      const [h, r, a, p] = await Promise.all([
         api<AnyRow>("/api/health"),
         api<AnyRow[]>("/api/runs"),
-        api<AnyRow[]>("/api/checkpoints"),
-        api<AnyRow[]>("/api/games"),
         api<AnyRow[]>("/api/arena/history"),
         api<AnyRow[]>("/api/axis/prototypes")
       ]);
       setHealth(h);
       setRuns(r);
-      setCheckpoints(c);
-      setGames(g);
       setArena(a);
       setAxis(p);
       if (!selectedRun && r.length) setSelectedRun(r[0].run_id);
-      if (!selectedGame && g.length) setSelectedGame(g[0].game_id);
     } catch (e: any) {
       setError(e.message);
     }
@@ -82,12 +78,30 @@ function App() {
     load();
   }, []);
 
+  const reload = () => {
+    load();
+    setRefreshNonce((n) => n + 1);
+  };
+
   useEffect(() => {
     if (!selectedRun) return;
-    api<AnyRow[]>(`/api/metrics/${encodeURIComponent(selectedRun)}`)
-      .then(setMetrics)
+    const run = encodeURIComponent(selectedRun);
+    Promise.all([
+      api<AnyRow[]>(`/api/metrics/${run}`),
+      api<AnyRow[]>(`/api/games?run_id=${run}`),
+      api<AnyRow[]>(`/api/checkpoints?run_id=${run}`)
+    ])
+      .then(([nextMetrics, nextGames, nextCheckpoints]) => {
+        setMetrics(nextMetrics);
+        setGames(nextGames);
+        setCheckpoints(nextCheckpoints);
+        setSelectedGame((current) => {
+          if (current && nextGames.some((game) => game.game_id === current)) return current;
+          return nextGames[0]?.game_id ?? null;
+        });
+      })
       .catch((e) => setError(e.message));
-  }, [selectedRun]);
+  }, [selectedRun, refreshNonce]);
 
   useEffect(() => {
     if (!selectedGame) return;
@@ -124,7 +138,7 @@ function App() {
               <option key={run.run_id} value={run.run_id}>{run.name || run.run_id}</option>
             ))}
           </select>
-          <button title="Refresh" onClick={load}><RefreshCw size={16} /></button>
+          <button title="Refresh" onClick={reload}><RefreshCw size={16} /></button>
         </div>
       </header>
 
@@ -170,8 +184,8 @@ function App() {
         <Replay replay={replay} position={position} setPosition={setPosition} selectedGame={selectedGame} />
       )}
       {active === "play" && <PlayPanel session={session} setSession={setSession} />}
-      {active === "arena" && <ArenaPanel arena={arena} reload={load} />}
-      {active === "checkpoints" && <CheckpointPanel checkpoints={checkpoints} reload={load} />}
+      {active === "arena" && <ArenaPanel arena={arena} reload={reload} />}
+      {active === "checkpoints" && <CheckpointPanel checkpoints={checkpoints} reload={reload} selectedRun={selectedRun} />}
       {active === "axis" && (
         <AxisPanel prototypes={axis} results={axisResults} setResults={setAxisResults} />
       )}
@@ -180,17 +194,23 @@ function App() {
 }
 
 function Charts({ metrics }: { metrics: AnyRow[] }) {
-  const points = metrics.map((m, i) => ({
-    x: i,
-    y: Number(m.metrics_json?.train?.loss_total ?? m.metrics_json?.loss_total ?? 0)
+  const lossKeys = collectLossKeys(metrics);
+  const policyKeys = collectMetricKeys(metrics, ["policy_top1_prob", "policy_top1_acc"]);
+  const lossRows = metrics.map((m) => ({
+    ...m,
+    ...lossValues(m.metrics_json),
+    ...metricValues(m.metrics_json)
   }));
   return (
     <section className="grid two">
-      <Panel title="Loss">
-        <Sparkline points={points} />
+      <Panel title="Losses">
+        <LossChart metrics={metrics} keys={lossKeys} />
       </Panel>
       <Panel title="Recent Metrics">
-        <Table rows={metrics.slice(-12).reverse()} columns={["phase", "epoch", "global_step", "created_at"]} />
+        <Table
+          rows={lossRows.slice(-12).reverse()}
+          columns={["phase", "epoch", "global_step", "created_at", ...lossKeys, ...policyKeys]}
+        />
       </Panel>
     </section>
   );
@@ -331,11 +351,11 @@ function ArenaPanel({ arena, reload }: { arena: AnyRow[]; reload: () => void }) 
   );
 }
 
-function CheckpointPanel({ checkpoints, reload }: { checkpoints: AnyRow[]; reload: () => void }) {
+function CheckpointPanel({ checkpoints, reload, selectedRun }: { checkpoints: AnyRow[]; reload: () => void; selectedRun: string }) {
   const [path, setPath] = useState("");
   const index = () => api<AnyRow>("/api/import/checkpoints", {
     method: "POST",
-    body: JSON.stringify({ path })
+    body: JSON.stringify({ path, run_id: selectedRun || undefined })
   }).then(reload);
   return (
     <Panel title="Checkpoint Index">
@@ -1087,6 +1107,116 @@ function Table({ rows, columns, onRow, selected }: {
       </table>
     </div>
   );
+}
+
+function LossChart({ metrics, keys }: { metrics: AnyRow[]; keys: string[] }) {
+  const width = 560;
+  const height = 220;
+  const pad = 24;
+  const series = keys.map((key, keyIdx) => ({
+    key,
+    color: lossColor(keyIdx),
+    points: metrics.map((m, i) => ({
+      x: i,
+      y: Number(lossValues(m.metrics_json)[key] ?? NaN)
+    })).filter((p) => Number.isFinite(p.y))
+  })).filter((s) => s.points.length > 0);
+  const ys = series.flatMap((s) => s.points.map((p) => p.y));
+  const min = Math.min(...ys, 0);
+  const max = Math.max(...ys, 1);
+  const xFor = (i: number) => pad + (metrics.length <= 1 ? 0 : (i / (metrics.length - 1)) * (width - pad * 2));
+  const yFor = (value: number) => height - pad - ((value - min) / Math.max(max - min, 1e-6)) * (height - pad * 2);
+  return (
+    <div className="chartWrap">
+      <svg className="chart" viewBox={`0 0 ${width} ${height}`}>
+        <line className="chartGrid" x1={pad} y1={pad} x2={pad} y2={height - pad} />
+        <line className="chartGrid" x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} />
+        <text className="chartTick" x={pad + 3} y={pad + 10}>{fmt(max)}</text>
+        <text className="chartTick" x={pad + 3} y={height - pad - 4}>{fmt(min)}</text>
+        {series.map((s) => {
+          const d = s.points.map((p, i) => {
+            const x = xFor(p.x);
+            const y = yFor(p.y);
+            return `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+          }).join(" ");
+          const last = s.points[s.points.length - 1];
+          return (
+            <g key={s.key}>
+              <path d={d} style={{ stroke: s.color }} />
+              <circle cx={xFor(last.x)} cy={yFor(last.y)} r="2.5" fill={s.color} />
+              <text className="chartLabel" x={xFor(last.x) + 5} y={yFor(last.y) + 4} fill={s.color}>
+                {shortLossLabel(s.key)} {fmt(last.y)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="chartLegend">
+        {series.map((s) => {
+          const last = s.points[s.points.length - 1]?.y;
+          return (
+            <span key={s.key}>
+              <i style={{ background: s.color }} />
+              {shortLossLabel(s.key)} <b>{fmt(last)}</b>
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function collectLossKeys(metrics: AnyRow[]) {
+  const found = new Set<string>();
+  for (const metric of metrics) {
+    for (const key of Object.keys(lossValues(metric.metrics_json))) found.add(key);
+  }
+  const preferred = ["loss_total", "loss_policy", "loss_value", "loss_axis_delta_norm", "loss_entropy"];
+  return Array.from(found).sort((a, b) => {
+    const ai = preferred.indexOf(a);
+    const bi = preferred.indexOf(b);
+    if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
+    return a.localeCompare(b);
+  });
+}
+
+function collectMetricKeys(metrics: AnyRow[], preferred: string[]) {
+  const found = new Set<string>();
+  for (const metric of metrics) {
+    for (const key of Object.keys(metricValues(metric.metrics_json))) found.add(key);
+  }
+  return Array.from(found).sort((a, b) => {
+    const ai = preferred.indexOf(a);
+    const bi = preferred.indexOf(b);
+    if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
+    return a.localeCompare(b);
+  });
+}
+
+function lossValues(metricsJson: AnyRow | undefined) {
+  const source = metricsJson?.train || metricsJson || {};
+  const result: AnyRow = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key.startsWith("loss_") && typeof value === "number") result[key] = value;
+  }
+  return result;
+}
+
+function metricValues(metricsJson: AnyRow | undefined) {
+  const source = metricsJson?.train || metricsJson || {};
+  const result: AnyRow = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!key.startsWith("loss_") && typeof value === "number") result[key] = value;
+  }
+  return result;
+}
+
+function shortLossLabel(key: string) {
+  return key.replace(/^loss_/, "").replace(/_/g, " ");
+}
+
+function lossColor(index: number) {
+  return ["#58a6ff", "#3fb950", "#ff7b72", "#d2a8ff", "#f2cc60", "#79c0ff", "#ffa657"][index % 7];
 }
 
 function Sparkline({ points }: { points: { x: number; y: number }[] }) {

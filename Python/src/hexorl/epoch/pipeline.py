@@ -90,6 +90,7 @@ def run_epoch(
         if buffer is not None
         else RingBuffer(
             capacity=cfg.buffer.capacity,
+            max_policy_entries=cfg.selfplay.policy_target_top_k,
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -117,11 +118,13 @@ def run_epoch(
         )
 
     if use_selfplay:
+        selfplay_epoch = int(getattr(trainer, "epoch", 0)) + 1 if trainer is not None else 1
         orchestrator = run_orchestrator(
             cfg,
             buffer_capacity=cfg.buffer.capacity,
             initial_model_state=model.state_dict(),
             recorder=recorder,
+            epoch=selfplay_epoch,
         )
         if buffer is None:
             replay = orchestrator.buffer

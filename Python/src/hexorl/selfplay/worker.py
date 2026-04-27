@@ -4,7 +4,7 @@ Each worker is a separate multiprocessing.Process. It:
   1. Connects to the inference server via SharedMemory.
   2. Plays games in a loop using the MCTS engine.
   3. Pushes completed game records to the buffer queue.
-  4. Handles temperature schedule and resign detection.
+  4. Handles temperature schedule and terminal detection.
   5. Falls back to MockMCTSEngine when the Rust extension is unavailable.
 """
 
@@ -179,10 +179,6 @@ class MockMCTSEngine:
         """Sample a mock action."""
         return int(self._rng.randint(-8, 9)), int(self._rng.randint(-8, 9))
 
-    def should_resign(self, threshold: float) -> bool:
-        """Mock resign check."""
-        return False
-
     def re_root(self, q: int, r: int, new_sims: int) -> bool:
         """Mock tree advancement."""
         self._move_count += 1
@@ -297,9 +293,6 @@ class RealMCTSEngine:
     def sample_action(self, temperature, rng_state=None):
         return self._engine.sample_action(temperature, rng_state)
 
-    def should_resign(self, threshold):
-        return self._engine.should_resign(threshold)
-
     def re_root(self, q, r, new_sims):
         if self._subtree_reuse:
             self._engine.re_root(q, r, new_sims)
@@ -366,10 +359,9 @@ class SelfPlayWorker:
         self.near_radius = sp.near_radius
         self.constrain_threats = sp.constrain_threats
         self.temperature_schedule = sp.temperature_schedule
-        self.resign_threshold = sp.resign_threshold
-        self.resign_disable_prob = sp.resign_disable_prob
         self.pcr_low_sim_prob = sp.pcr_low_sim_prob
         self.pcr_low_sims = sp.pcr_low_sims
+        self.policy_target_top_k = sp.policy_target_top_k
         self.dirichlet_alpha = sp.dirichlet_alpha
         self.dirichlet_fraction = sp.dirichlet_fraction
 
@@ -471,10 +463,7 @@ class SelfPlayWorker:
         positions: List[PositionRecord] = []
         move_history = bytearray()
         move_idx = 0
-        resigned_player: Optional[int] = None
         terminal_reason = "unknown"
-
-        resign_enabled = np.random.random() > self.resign_disable_prob
 
         while True:
             if move_idx >= self.max_game_moves:
@@ -602,7 +591,7 @@ class SelfPlayWorker:
                 flat_idx = action_to_board_index(q_coord, r_coord, offset_q, offset_r)
                 if flat_idx >= 0:
                     visit_arr[flat_idx] = float(v)
-            policy = sparsify_policy(visit_arr, top_k=20)
+            policy = sparsify_policy(visit_arr, top_k=self.policy_target_top_k)
 
             positions.append(
                 PositionRecord(
@@ -615,14 +604,6 @@ class SelfPlayWorker:
                     turn_index=move_idx,
                 )
             )
-
-            # Resignation is a terminal decision from this position, not an
-            # extra board move. Keep the searched position but do not append a
-            # sampled action to the final history.
-            if resign_enabled and engine.should_resign(self.resign_threshold):
-                resigned_player = player
-                terminal_reason = "resign"
-                break
 
             q, r = int(q), int(r)
             move_history.extend(player.to_bytes(4, "little", signed=True))
@@ -637,9 +618,7 @@ class SelfPlayWorker:
                 terminal_reason = "win"
                 break
 
-        if resigned_player is not None:
-            outcome = -1.0 if resigned_player == 0 else 1.0
-        elif HAS_ENGINE:
+        if HAS_ENGINE:
             outcome = (
                 1.0
                 if engine.winner == 0
@@ -657,7 +636,7 @@ class SelfPlayWorker:
                 outcome = -1.0
 
         full_history = bytes(move_history)
-        truncated = terminal_reason not in {"win", "resign"}
+        truncated = terminal_reason != "win"
         record = GameRecord.from_game_data(
             move_history_bytes=full_history,
             policy_targets=[p.policy_target for p in positions],
