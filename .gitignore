@@ -4,7 +4,6 @@
 
 # Build artifacts
 target/
-Cargo.lock
 
 # IDE / Editor
 *.rs.bk
@@ -28,6 +27,7 @@ perf.data*
 # Virtual environments
 venv/
 .venv/
+.venv-wsl/
 env/
 ENV/
 
