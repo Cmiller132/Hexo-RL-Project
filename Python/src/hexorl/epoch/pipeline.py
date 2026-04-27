@@ -120,10 +120,11 @@ def run_epoch(
 
     if use_selfplay:
         selfplay_epoch = int(getattr(trainer, "epoch", 0)) + 1 if trainer is not None else 1
+        inference_state = _model_state_for_inference(model)
         orchestrator = run_orchestrator(
             cfg,
             buffer_capacity=cfg.buffer.capacity,
-            initial_model_state=model.state_dict(),
+            initial_model_state=inference_state,
             recorder=recorder,
             epoch=selfplay_epoch,
         )
@@ -518,3 +519,8 @@ def _pack_moves(moves: Iterable[tuple[int, int, int]]) -> bytes:
     for player, q, r in moves:
         out.extend(struct.pack("<iii", player, q, r))
     return bytes(out)
+
+
+def _model_state_for_inference(model: torch.nn.Module) -> dict:
+    original = getattr(model, "_orig_mod", model)
+    return original.state_dict()

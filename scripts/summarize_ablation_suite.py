@@ -13,6 +13,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("suite_root", nargs="?", default="runs/ablations_priority_20260427")
     parser.add_argument("--csv", dest="csv_path", default="")
+    parser.add_argument("--md", dest="md_path", default="")
     args = parser.parse_args()
 
     suite_root = Path(args.suite_root)
@@ -20,12 +21,21 @@ def main() -> None:
     rows = _load_latest_rows(summary_path)
     if not rows:
         print(f"No epoch rows found in {summary_path}")
+        if args.md_path:
+            _write_markdown(
+                Path(args.md_path),
+                suite_root,
+                [],
+                note="No completed epoch summaries have been written yet.",
+            )
         return
 
     table = [_flatten(row) for row in sorted(rows.values(), key=lambda r: r["ablation"])]
     _print_table(table)
     if args.csv_path:
         _write_csv(Path(args.csv_path), table)
+    if args.md_path:
+        _write_markdown(Path(args.md_path), suite_root, table)
 
 
 def _load_latest_rows(path: Path) -> dict[str, dict[str, Any]]:
@@ -104,6 +114,83 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_markdown(
+    path: Path,
+    suite_root: Path,
+    rows: list[dict[str, Any]],
+    *,
+    note: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "ablation",
+        "epoch",
+        "loss",
+        "top1",
+        "train_bps",
+        "games_min",
+        "pos_min",
+        "buffer",
+        "elapsed_min",
+    ]
+    lines = [
+        "# Hexo-RL Long Ablation Results",
+        "",
+        f"Suite root: `{suite_root}`",
+        "",
+        "This document is generated from the suite JSONL summaries while the run is in progress. "
+        "Treat partially completed ablations as early signals, not final conclusions.",
+        "",
+    ]
+    if note:
+        lines.extend(["## Current Status", "", note, ""])
+    if rows:
+        best_loss = min(rows, key=lambda r: _numeric(r.get("loss"), float("inf")))
+        best_speed = max(rows, key=lambda r: _numeric(r.get("games_min"), float("-inf")))
+        lines.extend(
+            [
+                "## Current Leaders",
+                "",
+                f"- Lowest latest loss: `{best_loss['ablation']}` at epoch {best_loss['epoch']} with loss `{best_loss['loss']}`.",
+                f"- Fastest latest self-play: `{best_speed['ablation']}` at `{best_speed['games_min']}` games/min.",
+                "",
+                "## Latest Metrics",
+                "",
+                "| " + " | ".join(columns) + " |",
+                "| " + " | ".join("---" for _ in columns) + " |",
+            ]
+        )
+    for row in rows:
+        lines.append("| " + " | ".join(str(row.get(col, "")) for col in columns) + " |")
+    lines.extend(
+        [
+            "",
+            "## Interpretation Notes",
+            "",
+            "- Compare ablations primarily after they reach the same epoch count; early epochs are dominated by bootstrap and replay composition.",
+            "- Throughput should be judged alongside loss and evaluation, because faster search settings may produce weaker targets.",
+            "- Model-size variants are expected to change both training speed and MCTS/inference throughput, so wall-clock progress matters as much as per-epoch loss.",
+            "",
+            "## Improvement Ideas To Revisit",
+            "",
+            "- Add sparse policy transfer from inference to MCTS so workers receive priors only for legal moves rather than full 1089-logit vectors.",
+            "- Add optional bucketed inference batches for CUDA graph or compile-friendly static shapes, then ablate padding cost versus compile speedup.",
+            "- Keep train compile only if the multi-epoch ablation shows the warmup cost amortizes cleanly.",
+            "- Add checkpoint-vs-checkpoint arenas between ablations once several variants complete, not only model-vs-classical smoke eval.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _numeric(value: Any, default: float) -> float:
+    if value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 if __name__ == "__main__":

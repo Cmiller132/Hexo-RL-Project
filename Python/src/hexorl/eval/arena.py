@@ -189,6 +189,8 @@ def load_checkpoint_model(checkpoint_path, cfg, device: Optional[torch.device] =
     model = from_config(cfg, device=device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = checkpoint.get("model_state_dict", checkpoint)
+    if state and all(str(k).startswith("_orig_mod.") for k in state):
+        state = {str(k).removeprefix("_orig_mod."): v for k, v in state.items()}
     model.load_state_dict(state, strict=False)
     model.eval()
     return model

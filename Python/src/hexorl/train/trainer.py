@@ -321,7 +321,7 @@ class Trainer:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         checkpoint = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": _uncompiled_state_dict(self.model),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "ema_state_dict": self.ema.state_dict(),
@@ -403,3 +403,9 @@ class _PrefetchIterator:
                 self._queue.put(item)
         except BaseException as exc:
             self._queue.put(exc)
+
+
+def _uncompiled_state_dict(model: nn.Module) -> dict:
+    """Return stable checkpoint keys even when torch.compile wraps the model."""
+    original = getattr(model, "_orig_mod", model)
+    return original.state_dict()

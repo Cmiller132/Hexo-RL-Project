@@ -67,6 +67,11 @@ class InferenceServer:
     def _state_to_cpu(state_dict: Optional[dict]) -> Optional[dict]:
         if state_dict is None:
             return None
+        if state_dict and all(str(k).startswith("_orig_mod.") for k in state_dict):
+            state_dict = {
+                str(k).removeprefix("_orig_mod."): v
+                for k, v in state_dict.items()
+            }
         return {
             k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
             for k, v in state_dict.items()
