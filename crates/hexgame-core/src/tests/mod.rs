@@ -18,6 +18,8 @@
 //! builds.
 
 #[cfg(test)]
+pub mod board;
+#[cfg(test)]
 pub mod core;
 #[cfg(test)]
 pub mod eval_state;

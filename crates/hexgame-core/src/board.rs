@@ -602,34 +602,12 @@ impl HexGameState {
 
     // ── Legal moves ─────────────────────────────────────────────────────
 
-    /// Return all legal placements (exhaustive radius-8 scan — expensive).
+    /// Return all legal placements.
     ///
     /// Returns an empty vec if the game is over.  On an empty board returns
     /// only [`Hex::ORIGIN`].
     pub fn legal_moves(&self) -> Vec<Hex> {
-        if self.is_over() {
-            return Vec::new();
-        }
-        if self.stones.is_empty() {
-            return vec![Hex::ORIGIN];
-        }
-
-        let mut candidates = FxHashSet::default();
-        for &cell in self.stones.keys() {
-            for dq in -PLACEMENT_RADIUS..=PLACEMENT_RADIUS {
-                for dr in -PLACEMENT_RADIUS..=PLACEMENT_RADIUS {
-                    let cand = Hex::new(cell.q + dq, cell.r + dr);
-                    if !self.stones.contains_key(&cand)
-                        && hex_distance(cell, cand) <= PLACEMENT_RADIUS
-                    {
-                        candidates.insert(cand);
-                    }
-                }
-            }
-        }
-
-        let result: Vec<Hex> = candidates.into_iter().collect();
-        result
+        self.legal_moves_near(PLACEMENT_RADIUS)
     }
 
     /// Return legal placements within `radius` of any occupied cell.
@@ -638,20 +616,33 @@ impl HexGameState {
     /// generation since most interesting moves are near existing tiles.
     /// The radius is clamped to [`PLACEMENT_RADIUS`].
     pub fn legal_moves_near(&self, radius: i32) -> Vec<Hex> {
+        let mut out = Vec::new();
+        self.legal_moves_near_into(radius, &mut out);
+        out
+    }
+
+    /// Fill `out` with legal placements within `radius`, reusing caller storage.
+    pub fn legal_moves_near_into(&self, radius: i32, out: &mut Vec<Hex>) {
+        out.clear();
         if self.is_over() {
-            return Vec::new();
+            return;
         }
         if self.stones.is_empty() {
-            return vec![Hex::ORIGIN];
+            out.push(Hex::ORIGIN);
+            return;
         }
 
-        // Use incremental candidate set if radius matches (fast path).
-        if radius == self.candidates.radius && !self.candidates.rc.is_empty() {
-            return self.candidates.rc.keys().copied().collect();
+        let r = radius.clamp(0, PLACEMENT_RADIUS);
+        if r == self.candidates.radius && !self.candidates.rc.is_empty() {
+            out.extend(self.candidates.rc.keys().copied());
+            return;
+        }
+        if r == self.placement_candidates.radius && !self.placement_candidates.rc.is_empty() {
+            out.extend(self.placement_candidates.rc.keys().copied());
+            return;
         }
 
         // Fallback: full scan for different radius.
-        let r = radius.clamp(0, PLACEMENT_RADIUS);
         let mut candidates = FxHashSet::default();
         for &cell in self.stones.keys() {
             for dq in -r..=r {
@@ -663,9 +654,7 @@ impl HexGameState {
                 }
             }
         }
-
-        let result: Vec<Hex> = candidates.into_iter().collect();
-        result
+        out.extend(candidates);
     }
 
     /// Return the incremental radius-2 candidate set as a Vec.

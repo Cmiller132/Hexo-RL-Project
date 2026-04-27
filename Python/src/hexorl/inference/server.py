@@ -61,7 +61,14 @@ class InferenceServer:
 
         self.n_batches = 0
         self.n_positions = 0
+        self.total_build_ms = 0.0
         self.total_forward_ms = 0.0
+        self.total_model_ms = 0.0
+        self.total_postprocess_ms = 0.0
+        self.total_download_ms = 0.0
+        self.total_scatter_ms = 0.0
+        self.min_batch = 0
+        self.max_batch_seen = 0
 
     @staticmethod
     def _state_to_cpu(state_dict: Optional[dict]) -> Optional[dict]:
@@ -235,7 +242,9 @@ class InferenceServer:
             if not ready_workers:
                 continue
 
+            build_t0 = time.monotonic()
             batch_tensor, per_worker_counts, total_count = self._build_batch(ready_workers)
+            self.total_build_ms += (time.monotonic() - build_t0) * 1000.0
 
             if total_count > 0:
                 # Clear req_ready before the forward pass (P1-1 fix).
@@ -244,16 +253,40 @@ class InferenceServer:
 
                 policies, values = self._forward(batch_tensor)
 
+                scatter_t0 = time.monotonic()
                 self._scatter_results(ready_workers, per_worker_counts, policies, values)
+                self.total_scatter_ms += (time.monotonic() - scatter_t0) * 1000.0
 
                 for worker_id in ready_workers:
                     self._queue.get_slot(worker_id).res_ready.set()
 
                 self.n_batches += 1
                 self.n_positions += total_count
+                self.min_batch = (
+                    total_count
+                    if self.min_batch == 0
+                    else min(self.min_batch, total_count)
+                )
+                self.max_batch_seen = max(self.max_batch_seen, total_count)
 
-        print(f"[inference-server] Shutting down. "
-              f"Batches: {self.n_batches}, Positions: {self.n_positions}", flush=True)
+        avg_batch = self.n_positions / max(self.n_batches, 1)
+        print(
+            "[inference-server] Shutting down. "
+            f"Batches: {self.n_batches}, Positions: {self.n_positions}, "
+            f"Avg batch: {avg_batch:.1f}, Min batch: {self.min_batch}, "
+            f"Max batch: {self.max_batch_seen}",
+            flush=True,
+        )
+        print(
+            "[inference-server] Timing ms total: "
+            f"build={self.total_build_ms:.1f}, "
+            f"forward={self.total_forward_ms:.1f}, "
+            f"model={self.total_model_ms:.1f}, "
+            f"postprocess={self.total_postprocess_ms:.1f}, "
+            f"download={self.total_download_ms:.1f}, "
+            f"scatter={self.total_scatter_ms:.1f}",
+            flush=True,
+        )
 
     # ── Worker drain ──────────────────────────────────────────────────────
 
@@ -333,6 +366,7 @@ class InferenceServer:
         """
         t0 = time.monotonic()
 
+        model_t0 = time.monotonic()
         with torch.inference_mode():
             if self._device.type == "cuda" and self._forward_stream is not None:
                 with torch.cuda.stream(self._forward_stream):
@@ -347,7 +381,9 @@ class InferenceServer:
                     out = self._model(batch_tensor)
             else:
                 out = self._model(batch_tensor)
+        model_ms = (time.monotonic() - model_t0) * 1000.0
 
+        post_t0 = time.monotonic()
         p = self._sanitize_policy_logits(out["policy"])
         value_logits = self._sanitize_value_logits(out["value"])
         v = torch.nan_to_num(
@@ -356,12 +392,18 @@ class InferenceServer:
             posinf=1.0,
             neginf=-1.0,
         ).clamp_(-1.0, 1.0)
+        post_ms = (time.monotonic() - post_t0) * 1000.0
 
+        download_t0 = time.monotonic()
         policies = p.cpu().numpy()
         values = v.cpu().numpy()
+        download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
         self.total_forward_ms += elapsed
+        self.total_model_ms += model_ms
+        self.total_postprocess_ms += post_ms
+        self.total_download_ms += download_ms
 
         return policies, values
 

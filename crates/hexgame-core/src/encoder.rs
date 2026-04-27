@@ -247,8 +247,7 @@ pub fn encode_board_into(
     }
 
     // ── Channel 3: legal moves mask ──
-    legal_out.clear();
-    legal_out.extend(game.legal_moves_near(near_radius));
+    game.legal_moves_near_into(near_radius, legal_out);
     if constrain_threats {
         let maybe_constrained = match threat_status(game) {
             ThreatStatus::Quiet | ThreatStatus::Unblockable => None,

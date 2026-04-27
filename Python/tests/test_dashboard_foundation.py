@@ -12,6 +12,7 @@ from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
 from hexorl.dashboard.recorder import RunRecorder
 from hexorl.eval.players import NoisyModelPlayer, NoisyPolicyConfig
+from hexorl.eval.arena import ArenaStats, MatchResult
 from hexorl.model.network import HexNet
 from hexorl.selfplay.records import GameRecord, PositionRecord, action_to_board_index
 
@@ -278,3 +279,41 @@ def test_noisy_model_player_chooses_legal_origin_when_engine_available():
     model = HexNet(channels=4, blocks=1, heads=["policy", "value"])
     player = NoisyModelPlayer(model, config=NoisyPolicyConfig(seed=1))
     assert player([], 0, 0) == (0, 0)
+
+
+def test_eval_players_use_model_dtype(monkeypatch):
+    from hexorl.eval import arena as arena_mod
+    from hexorl.eval import players as players_mod
+
+    model = _DtypeCheckingPolicy(torch.float16)
+    monkeypatch.setattr(players_mod, "HAS_ENGINE", False)
+    assert players_mod.NoisyModelPlayer(model)([], 0, 0) is not None
+
+    monkeypatch.setattr(arena_mod, "HAS_ENGINE", False)
+    assert arena_mod.model_move_fn(model, temperature=0.0)([], 0, 0) is not None
+
+
+def test_arena_stats_reports_reason_counts():
+    stats = ArenaStats(
+        total_games=3,
+        results=[
+            MatchResult(0, 1.0, 0.0, 3, 0.0, True, "terminal"),
+            MatchResult(1, 0.0, 1.0, 0, 0.0, False, "crash:dtype"),
+            MatchResult(1, 0.0, 1.0, 1, 0.0, True, "illegal:occupied"),
+        ],
+    )
+    assert stats.reason_counts == {
+        "terminal": 1,
+        "crash:dtype": 1,
+        "illegal:occupied": 1,
+    }
+
+
+class _DtypeCheckingPolicy(torch.nn.Module):
+    def __init__(self, dtype: torch.dtype):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros((), dtype=dtype), requires_grad=False)
+
+    def forward(self, x):
+        assert x.dtype == self.weight.dtype
+        return {"policy": torch.zeros(x.shape[0], 33 * 33, device=x.device)}

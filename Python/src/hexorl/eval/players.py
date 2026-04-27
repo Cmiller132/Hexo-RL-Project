@@ -49,6 +49,7 @@ class NoisyModelPlayer:
     ):
         self.model = model
         self.device = device or next(model.parameters()).device
+        self.dtype = model_input_dtype(model)
         self.config = config or NoisyPolicyConfig()
         self.rng = np.random.default_rng(self.config.seed)
         self.model.eval()
@@ -75,7 +76,7 @@ class NoisyModelPlayer:
         tensor = (
             torch.from_numpy(np.array(tensor_3d, dtype=np.float32))
             .unsqueeze(0)
-            .to(self.device)
+            .to(device=self.device, dtype=self.dtype)
         )
         with torch.no_grad():
             logits = self.model(tensor)["policy"][0].detach().cpu().numpy()
@@ -115,7 +116,9 @@ class NoisyModelPlayer:
 
     def _fallback_move(self) -> tuple[int, int]:
         with torch.no_grad():
-            tensor = torch.zeros(1, 13, BOARD_SIZE, BOARD_SIZE, device=self.device)
+            tensor = torch.zeros(
+                1, 13, BOARD_SIZE, BOARD_SIZE, device=self.device, dtype=self.dtype
+            )
             logits = self.model(tensor)["policy"][0].detach().cpu().numpy()
         idx = int(np.argmax(logits + self.rng.normal(0.0, 1e-3, size=logits.shape)))
         return idx // BOARD_SIZE - 16, idx % BOARD_SIZE - 16
@@ -147,6 +150,15 @@ def noisy_model_player(
 def greedy_model_player(model: HexNet, *, device: Optional[torch.device] = None) -> PlayerFn:
     """Compatibility helper.  Eval defaults should use noisy_model_player."""
     return noisy_model_player(model, device=device, temperature=1e-4, top_p=1.0)
+
+
+def model_input_dtype(model: torch.nn.Module) -> torch.dtype:
+    """Return the floating dtype expected by a model's parameters."""
+    try:
+        dtype = next(model.parameters()).dtype
+    except StopIteration:
+        return torch.float32
+    return dtype if dtype.is_floating_point else torch.float32
 
 
 def _top_p_indices(probs: np.ndarray, top_p: float) -> np.ndarray:

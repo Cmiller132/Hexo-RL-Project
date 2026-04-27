@@ -305,12 +305,20 @@ def _run_eval(cfg: Config, checkpoint: Path, args: argparse.Namespace) -> dict[s
     model_player = model_move_fn(model, temperature=0.20, top_p=0.95, seed=cfg.run.seed)
     classical = classical_opponent_fn(time_ms=args.eval_time_ms, max_depth=args.eval_depth)
     stats = run_arena(model_player, classical, num_games=args.eval_games)
+    reason_counts = stats.reason_counts
     return {
         "games": stats.total_games,
         "model_win_rate": stats.win_rate_a,
+        "model_wins": stats.wins_a,
+        "opponent_wins": stats.wins_b,
+        "draws": stats.draws,
         "elo_diff": stats.elo_diff,
         "avg_moves": stats.avg_moves,
         "games_per_min": stats.games_per_min,
+        "reason_counts": reason_counts,
+        "crash_games": sum(v for k, v in reason_counts.items() if k.startswith("crash")),
+        "illegal_games": sum(v for k, v in reason_counts.items() if k.startswith("illegal")),
+        "no_move_games": reason_counts.get("no_move", 0),
     }
 
 

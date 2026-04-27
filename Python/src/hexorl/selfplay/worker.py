@@ -486,7 +486,7 @@ class SelfPlayWorker:
             if client is not None:
                 try:
                     p, v = client.submit(
-                        tensor_3d.reshape(1, 13, 33, 33).astype(np.float32),
+                        tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False),
                         1,
                     )
                     engine.expand_root(
@@ -551,7 +551,7 @@ class SelfPlayWorker:
 
                     if client is not None:
                         p, v = client.submit(
-                            batch_4d.astype(np.float32), count
+                            batch_4d.astype(np.float32, copy=False), count
                         )
                         engine.expand_and_backprop(p, v)
                     else:

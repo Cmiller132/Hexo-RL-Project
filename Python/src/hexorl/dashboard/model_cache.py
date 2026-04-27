@@ -12,6 +12,7 @@ import torch
 
 from hexorl.config import Config
 from hexorl.eval.arena import load_checkpoint_model
+from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
 from hexorl.model.network import HexNet
 
@@ -67,7 +68,11 @@ class ModelCache:
         # debugging only needs legal action indices from channel 3.
         legal_channel = tensor[3].reshape(-1)
         legal_mask = [int(i) for i in np.flatnonzero(legal_channel > 0.0)]
-        x = torch.from_numpy(tensor).unsqueeze(0).to(cached.device)
+        x = (
+            torch.from_numpy(tensor)
+            .unsqueeze(0)
+            .to(device=cached.device, dtype=model_input_dtype(cached.model))
+        )
         with torch.no_grad():
             out = cached.model(x)
         result: dict[str, Any] = {

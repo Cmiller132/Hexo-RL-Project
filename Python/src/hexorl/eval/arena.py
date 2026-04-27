@@ -8,11 +8,12 @@ import time
 import logging
 import numpy as np
 import torch
+from collections import Counter
 from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
 from hexorl.model.network import HexNet, from_config
-from hexorl.eval.players import noisy_model_player
+from hexorl.eval.players import model_input_dtype, noisy_model_player
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,10 @@ class ArenaStats:
     @property
     def games_per_min(self) -> float:
         return self.total_games / max(self.total_time_ms / 60000.0, 0.001)
+
+    @property
+    def reason_counts(self) -> dict[str, int]:
+        return dict(Counter(result.reason for result in self.results))
 
 
 def run_arena(
@@ -150,6 +155,7 @@ def model_move_fn(
 
     if device is None:
         device = next(model.parameters()).device
+    dtype = model_input_dtype(model)
     model.eval()
 
     def _fn(move_history, time_ms_override, player):
@@ -162,7 +168,11 @@ def model_move_fn(
             legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
             if len(legal) == 0:
                 return None, None
-            tensor = torch.from_numpy(np.array(tensor_3d, dtype=np.float32)).unsqueeze(0).to(device)
+            tensor = (
+                torch.from_numpy(np.array(tensor_3d, dtype=np.float32))
+                .unsqueeze(0)
+                .to(device=device, dtype=dtype)
+            )
             with torch.no_grad():
                 policy = model(tensor)["policy"][0].detach().cpu().numpy()
             best = max(
@@ -175,7 +185,7 @@ def model_move_fn(
 
         # Fallback for environments without _engine: choose the strongest centered action.
         with torch.no_grad():
-            tensor = torch.zeros(1, 13, 33, 33, device=device)
+            tensor = torch.zeros(1, 13, 33, 33, device=device, dtype=dtype)
             policy = model(tensor)["policy"][0].detach().cpu().numpy()
         idx = int(policy.argmax())
         return idx // 33 - 16, idx % 33 - 16

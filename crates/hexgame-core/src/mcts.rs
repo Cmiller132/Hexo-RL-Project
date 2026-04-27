@@ -596,8 +596,10 @@ impl MCTSEngine {
 
         let mut eval_idx = 0usize;
 
-        // Take pending out temporarily to avoid borrow issues with &mut self.
-        let leaves = std::mem::take(&mut self.pending);
+        // Move pending leaves out temporarily to avoid borrow issues with
+        // &mut self, then return the allocated storage for reuse next batch.
+        let mut leaves = Vec::new();
+        std::mem::swap(&mut leaves, &mut self.pending);
         self.sims_done += leaves.len() as u32;
 
         for leaf in &leaves {
@@ -651,7 +653,8 @@ impl MCTSEngine {
             }
         }
 
-        // `leaves` is dropped; `self.pending` is now empty.
+        leaves.clear();
+        std::mem::swap(&mut leaves, &mut self.pending);
     }
 
     // ── Tree management ────────────────────────────────────────────────

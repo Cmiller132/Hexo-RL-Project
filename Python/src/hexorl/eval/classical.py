@@ -88,9 +88,15 @@ class ClassicalOpponent:
 def classical_opponent_fn(
     time_ms: int = 100,
     max_depth: int = 6,
+    *,
+    near_radius: int = 2,
+    noise_level: float = 0.05,
 ) -> callable:
     opponent = ClassicalOpponent(
-        time_ms=time_ms, max_depth=max_depth, near_radius=2, noise_level=0.05,
+        time_ms=time_ms,
+        max_depth=max_depth,
+        near_radius=near_radius,
+        noise_level=noise_level,
     )
 
     def _fn(move_history, time_ms_override, player):
