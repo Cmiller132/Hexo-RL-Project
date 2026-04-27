@@ -127,12 +127,13 @@ def run_epoch(
             replay = orchestrator.buffer
         else:
             base_game_id = replay.max_game_id + 1 if len(replay) else 0
-            replay.extend(
-                [
-                    replace(pos, game_id=pos.game_id + base_game_id)
-                    for pos in orchestrator.buffer.records()
-                ]
-            )
+            game_id_map: dict[int, int] = {}
+            appended_positions: List[PositionRecord] = []
+            for pos in orchestrator.buffer.records():
+                if pos.game_id not in game_id_map:
+                    game_id_map[pos.game_id] = base_game_id + len(game_id_map)
+                appended_positions.append(replace(pos, game_id=game_id_map[pos.game_id]))
+            replay.extend(appended_positions)
         recorder.metric(orchestrator.stats, phase="selfplay")
 
     train_stats: Dict[str, float] = {}
@@ -148,7 +149,7 @@ def run_epoch(
             batch_size=cfg.train.batch_size,
             recency_decay=cfg.buffer.recency_decay,
             pcr_weight=cfg.buffer.pcr_weight,
-            use_symmetry="axis_delta_norm" not in cfg.model.heads,
+            use_symmetry=True,
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             regret_fraction=cfg.buffer.regret_fraction,
             include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,

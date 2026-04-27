@@ -83,6 +83,12 @@ models/
 checkpoints/
 data/
 logs/
+runs/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+events.jsonl
+*.jsonl
 
 # Local configuration overrides
 local_config.toml

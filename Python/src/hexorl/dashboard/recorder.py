@@ -136,6 +136,8 @@ class RunRecorder:
             payload={
                 "game_length": record.game_length,
                 "positions": len(record.positions),
+                "truncated": getattr(record, "truncated", False),
+                "terminal_reason": getattr(record, "terminal_reason", "unknown"),
                 **dict(payload or {}),
             },
         )

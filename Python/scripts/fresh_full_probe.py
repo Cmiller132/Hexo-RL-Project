@@ -1,22 +1,22 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
 
 from hexorl.buffer.ring import RingBuffer
-from hexorl.buffer.sampler import ReplayDataset
 from hexorl.config import Config
 from hexorl.epoch.pipeline import run_epoch
 from hexorl.model.network import HexNet
-from hexorl.train.trainer import Trainer
 
 
-def main() -> None:
+def build_config() -> Config:
     cfg = Config()
     cfg.run.output_dir = "./runs/{name}"
-    cfg.model.channels = 32
-    cfg.model.blocks = 3
+    cfg.model.channels = 48
+    cfg.model.blocks = 4
     cfg.model.heads = ["policy", "value", "axis_delta_norm"]
+
     cfg.selfplay.num_workers = 4
     cfg.selfplay.games_per_epoch = 28
     cfg.selfplay.states_per_epoch = 2048
@@ -34,25 +34,32 @@ def main() -> None:
     cfg.selfplay.resign_threshold = -0.98
     cfg.selfplay.resign_disable_prob = 0.25
     cfg.selfplay.train_on_truncated_games = False
+
     cfg.inference.max_batch_size = 32
     cfg.inference.max_wait_us = 500
     cfg.inference.fp16 = False
+
     cfg.buffer.capacity = 16384
     cfg.buffer.lookahead_horizons = []
     cfg.buffer.lookahead_lambdas = []
     cfg.buffer.regret_fraction = 0.0
+
     cfg.train.batch_size = 32
     cfg.train.batches_per_epoch = 64
     cfg.train.lr_schedule = "constant"
-    cfg.train.peak_lr = 1e-3
+    cfg.train.peak_lr = 8e-4
     cfg.train.loss_weights = {
         "policy": 1.0,
         "value": 1.0,
         "axis_delta_norm": 0.05,
         "entropy": 0.001,
     }
+    return cfg
 
-    out = Path("runs/axis_delta_prod_probe")
+
+def main() -> None:
+    cfg = build_config()
+    out = Path("runs/fresh_d6_noise_48x4")
     out.mkdir(parents=True, exist_ok=True)
     model = HexNet(
         channels=cfg.model.channels,
@@ -62,18 +69,30 @@ def main() -> None:
     buffer = RingBuffer(capacity=cfg.buffer.capacity, num_lookahead=0)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"TRAIN_DEVICE {device}", flush=True)
+    print(
+        "RUN_CONFIG",
+        {
+            "channels": cfg.model.channels,
+            "blocks": cfg.model.blocks,
+            "heads": cfg.model.heads,
+            "workers": cfg.selfplay.num_workers,
+            "games_per_epoch": cfg.selfplay.games_per_epoch,
+            "states_per_epoch": cfg.selfplay.states_per_epoch,
+            "max_game_moves": cfg.selfplay.max_game_moves,
+            "mcts_simulations": cfg.selfplay.mcts_simulations,
+            "pcr_low_sims": cfg.selfplay.pcr_low_sims,
+            "pcr_low_sim_prob": cfg.selfplay.pcr_low_sim_prob,
+            "subtree_reuse": cfg.selfplay.subtree_reuse,
+            "dirichlet_alpha": cfg.selfplay.dirichlet_alpha,
+            "dirichlet_fraction": cfg.selfplay.dirichlet_fraction,
+            "batch_size": cfg.train.batch_size,
+            "batches_per_epoch": cfg.train.batches_per_epoch,
+        },
+        flush=True,
+    )
+
     trainer = None
-    latest = sorted(out.glob("epoch_*.pt"))[-1:] or []
-    if latest:
-        # The real self-play dataloader is installed by run_epoch before training.
-        placeholder = ReplayDataset(buffer, batch_size=cfg.train.batch_size)
-        trainer = Trainer(model, cfg, DataLoader(placeholder, batch_size=None, num_workers=0), device=device)
-        trainer.load_checkpoint(latest[0])
-        print(
-            f"RESUME_CHECKPOINT {latest[0]} epoch={trainer.epoch} global_step={trainer.global_step}",
-            flush=True,
-        )
-    for epoch in range(1, 6):
+    for epoch in range(1, 31):
         result = run_epoch(
             cfg,
             model=model,
@@ -89,7 +108,7 @@ def main() -> None:
         if trainer is not None:
             model = trainer.model
         print(
-            "PROD_EPOCH",
+            "FRESH_EPOCH",
             epoch,
             result.train_stats,
             result.buffer_stats,

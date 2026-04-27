@@ -472,14 +472,17 @@ class SelfPlayWorker:
         move_history = bytearray()
         move_idx = 0
         resigned_player: Optional[int] = None
+        terminal_reason = "unknown"
 
         resign_enabled = np.random.random() > self.resign_disable_prob
 
         while True:
             if move_idx >= self.max_game_moves:
+                terminal_reason = "max_game_moves"
                 break
             init = engine.init_root()
             if init is None:
+                terminal_reason = "no_root"
                 break
 
             tensor, offset_q, offset_r, legal_bytes = init
@@ -618,6 +621,7 @@ class SelfPlayWorker:
             # sampled action to the final history.
             if resign_enabled and engine.should_resign(self.resign_threshold):
                 resigned_player = player
+                terminal_reason = "resign"
                 break
 
             q, r = int(q), int(r)
@@ -630,6 +634,7 @@ class SelfPlayWorker:
             engine.re_root(q, r, sims)
 
             if engine.is_over:
+                terminal_reason = "win"
                 break
 
         if resigned_player is not None:
@@ -652,6 +657,7 @@ class SelfPlayWorker:
                 outcome = -1.0
 
         full_history = bytes(move_history)
+        truncated = terminal_reason not in {"win", "resign"}
         record = GameRecord.from_game_data(
             move_history_bytes=full_history,
             policy_targets=[p.policy_target for p in positions],
@@ -662,6 +668,8 @@ class SelfPlayWorker:
             is_full_search=not use_pcr,
         )
         record.final_move_history = full_history
+        record.truncated = truncated
+        record.terminal_reason = terminal_reason
 
         record.assign_outcomes()
         return record

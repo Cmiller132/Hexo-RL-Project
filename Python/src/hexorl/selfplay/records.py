@@ -112,6 +112,11 @@ class GameRecord:
     # remain prefixes before each decision.
     final_move_history: bytes = b""
 
+    # True when the game stopped because the move cap or another non-terminal
+    # guard fired before either player won or resigned.
+    truncated: bool = False
+    terminal_reason: str = "unknown"
+
     def assign_outcomes(self):
         """Assign the game outcome to all positions."""
         for pos in self.positions:

@@ -5,6 +5,7 @@ On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 §7.4 of SYSTEM_DESIGN.md.
 """
 
+from collections import OrderedDict
 import numpy as np
 from typing import Dict, Iterator, Tuple, Optional, List
 
@@ -19,7 +20,11 @@ from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
 try:
     from hexorl.axis_policy.core import AxisPolicyInput
     from hexorl.axis_policy.registry import get_prototype
-    from hexorl.dashboard.replay import get_replay_position, position_payload
+    from hexorl.dashboard.replay import (
+        encode_tensor_for_history,
+        get_replay_position,
+        position_payload,
+    )
 
     HAS_AXIS_POLICY = True
 except ImportError:  # pragma: no cover - optional dashboard/axis lab dependency path
@@ -292,6 +297,24 @@ def _transform_dense_policy(policy: np.ndarray, sym_idx: int) -> np.ndarray:
     return result
 
 
+def _transform_axis_maps(axis_maps: np.ndarray, sym_idx: int) -> np.ndarray:
+    """Apply D6 spatial transform and axis-plane permutation to 6 axis maps.
+
+    Planes 0..2 are own strength by unoriented axis; planes 3..5 are opponent
+    strength by the same axes. A board symmetry moves both coordinates and the
+    meaning of each axis plane.
+    """
+    if axis_maps.shape != (6, BOARD_SIZE, BOARD_SIZE):
+        raise ValueError(f"Expected axis maps shape (6,{BOARD_SIZE},{BOARD_SIZE}), got {axis_maps.shape}")
+    spatial = _py_apply_d6_symmetry(axis_maps, sym_idx)
+    result = np.zeros_like(spatial)
+    for src_axis in range(3):
+        dst_axis = _transform_axis_label(src_axis, sym_idx)
+        result[dst_axis] += spatial[src_axis]
+        result[dst_axis + 3] += spatial[src_axis + 3]
+    return result
+
+
 class ReplayDataset(_IterableDataset):
     """Iterable dataset that samples from the ring buffer and decodes on-the-fly.
 
@@ -328,6 +351,10 @@ class ReplayDataset(_IterableDataset):
             if self.include_axis_delta_norm and HAS_AXIS_POLICY
             else None
         )
+        self._axis_delta_norm_cache: OrderedDict[bytes, np.ndarray] = OrderedDict()
+        self._axis_delta_norm_cache_max = 4096
+        self._tensor_cache: OrderedDict[bytes, np.ndarray] = OrderedDict()
+        self._tensor_cache_max = 4096
 
         self._rng = np.random.RandomState()
 
@@ -405,20 +432,8 @@ class ReplayDataset(_IterableDataset):
         for i, rec in enumerate(records):
             policy = rec.to_dense_policy()
             opp_policy = rec.to_dense_opp_policy()
-            if HAS_ENGINE and hasattr(_engine, 'encode_compact_record'):
-                tensor = np.array(
-                    _engine.encode_compact_record(rec.move_history, self.near_radius),
-                    dtype=np.float32,
-                )
-                if tensor.ndim == 4:
-                    tensor = tensor[-1]
-                tensors[i] = tensor
-            else:
-                decoded = _py_decode_compact_record(rec.move_history, self.near_radius)
-                if decoded.ndim == 4:
-                    tensors[i] = decoded[-1]
-                else:
-                    tensors[i] = decoded
+            sym_idx = 0
+            tensors[i] = self._encode_tensor(rec.move_history)
 
             if self.use_symmetry:
                 sym_idx = self._rng.randint(0, 12)
@@ -443,7 +458,10 @@ class ReplayDataset(_IterableDataset):
             aux_targets["axis"][i] = axis_label
             aux_targets["moves_left"][i] = rec.moves_left
             if self.include_axis_delta_norm:
-                aux_targets["axis_delta_norm"][i] = self._compute_axis_delta_norm(rec)
+                axis_delta_norm = self._compute_axis_delta_norm(rec)
+                if self.use_symmetry:
+                    axis_delta_norm = _transform_axis_maps(axis_delta_norm, sym_idx)
+                aux_targets["axis_delta_norm"][i] = axis_delta_norm
 
             for h_idx in range(n_lookahead):
                 if h_idx < len(rec.lookahead_values):
@@ -453,9 +471,33 @@ class ReplayDataset(_IterableDataset):
 
         return tensors, policies, values, lookahead_arrays, aux_targets
 
+    def _encode_tensor(self, history: bytes) -> np.ndarray:
+        cached = self._tensor_cache.get(history)
+        if cached is not None:
+            self._tensor_cache.move_to_end(history)
+            return cached
+        if HAS_ENGINE:
+            tensor, _offset_q, _offset_r, _legal_bytes = encode_tensor_for_history(
+                history,
+                near_radius=self.near_radius,
+                constrain_threats=False,
+            )
+        else:
+            decoded = _py_decode_compact_record(history, self.near_radius)
+            tensor = decoded[-1] if decoded.ndim == 4 else decoded
+        tensor = np.asarray(tensor, dtype=np.float32)
+        self._tensor_cache[history] = tensor
+        if len(self._tensor_cache) > self._tensor_cache_max:
+            self._tensor_cache.popitem(last=False)
+        return tensor
+
     def _compute_axis_delta_norm(self, rec) -> np.ndarray:
         if self._axis_delta_norm_proto is None:
             return np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        cached = self._axis_delta_norm_cache.get(rec.move_history)
+        if cached is not None:
+            self._axis_delta_norm_cache.move_to_end(rec.move_history)
+            return cached
         pos = position_payload(
             get_replay_position(
                 rec.move_history,
@@ -470,7 +512,11 @@ class ReplayDataset(_IterableDataset):
             offset_q=int(pos["encoding"].get("offset_q", -16)),
             offset_r=int(pos["encoding"].get("offset_r", -16)),
         )
-        return self._axis_delta_norm_proto.compute(axis_input).axis_maps.astype(np.float32)
+        target = self._axis_delta_norm_proto.compute(axis_input).axis_maps.astype(np.float32)
+        self._axis_delta_norm_cache[rec.move_history] = target
+        if len(self._axis_delta_norm_cache) > self._axis_delta_norm_cache_max:
+            self._axis_delta_norm_cache.popitem(last=False)
+        return target
 
     def __len__(self) -> int:
         """Number of batches available."""

@@ -287,9 +287,7 @@ def _compute_delta_variant(
     prototype_id: str,
 ) -> AxisPolicyResult:
     strength = _strength_array(params)
-    maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-    own = position.own_stones
-    opp = position.opp_stones
+    maps = _placement_delta_base_maps(position, strength, params)
     debug = {
         "legal_cells_scored": 0,
         "own_multi_axis_cells": 0,
@@ -304,16 +302,8 @@ def _compute_delta_variant(
         ij = board_index(q, r, position.offset_q, position.offset_r)
         if ij is None:
             continue
-        own_axes, opp_axes = _placement_delta_axes(
-            q,
-            r,
-            own,
-            opp,
-            strength,
-            params,
-            position.offset_q,
-            position.offset_r,
-        )
+        own_axes = [float(maps[axis, ij[0], ij[1]]) for axis in range(3)]
+        opp_axes = [float(maps[axis + 3, ij[0], ij[1]]) for axis in range(3)]
         if _active_count(own_axes, float(params.get("strong_threshold", 0.75))) >= 2:
             debug["own_multi_axis_cells"] += 1
         if _active_count(opp_axes, float(params.get("strong_threshold", 0.75))) >= 2:
@@ -348,6 +338,102 @@ def _compute_delta_variant(
         position.offset_r,
         position.current_player,
     )
+
+
+def _placement_delta_base_maps(
+    position: AxisPolicyInput,
+    strength: np.ndarray,
+    params: Mapping[str, float],
+) -> np.ndarray:
+    """Compute unshaped legal-cell placement deltas by scanning windows once.
+
+    This is equivalent to calling ``_placement_delta_axes`` for every legal
+    cell, but avoids rebuilding the same six windows for every candidate.
+    """
+    own = position.own_stones
+    opp = position.opp_stones
+    maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    for axis, (dq, dr) in enumerate(AXES):
+        maps[axis] = _side_delta_axis_map(
+            own,
+            opp,
+            dq,
+            dr,
+            strength,
+            float(params["existing_credit"]),
+            float(params["tail_weight"]),
+            position.offset_q,
+            position.offset_r,
+        )
+        maps[axis + 3] = _side_delta_axis_map(
+            opp,
+            own,
+            dq,
+            dr,
+            strength,
+            float(params["existing_credit"]),
+            float(params["tail_weight"]),
+            position.offset_q,
+            position.offset_r,
+        ) * float(params["opp_weight"])
+
+    legal_mask = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    for q, r in position.legal_set:
+        ij = board_index(q, r, position.offset_q, position.offset_r)
+        if ij is not None:
+            legal_mask[ij] = 1.0
+    maps *= legal_mask[None, :, :]
+    return maps
+
+
+def _side_delta_axis_map(
+    side: set[tuple[int, int]],
+    blockers: set[tuple[int, int]],
+    dq: int,
+    dr: int,
+    strength: np.ndarray,
+    existing_credit: float,
+    tail_weight: float,
+    offset_q: int,
+    offset_r: int,
+) -> np.ndarray:
+    side_board = _stones_to_board(side, offset_q, offset_r)
+    blocker_board = _stones_to_board(blockers, offset_q, offset_r)
+    gain_sum = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    gain_max = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+
+    for start_i in range(BOARD_SIZE):
+        for start_j in range(BOARD_SIZE):
+            end_i = start_i + dq * (WIN_LENGTH - 1)
+            end_j = start_j + dr * (WIN_LENGTH - 1)
+            if not (0 <= end_i < BOARD_SIZE and 0 <= end_j < BOARD_SIZE):
+                continue
+            ii = [start_i + dq * step for step in range(WIN_LENGTH)]
+            jj = [start_j + dr * step for step in range(WIN_LENGTH)]
+            if blocker_board[ii, jj].any():
+                continue
+            before = int(side_board[ii, jj].sum())
+            after = min(before + 1, WIN_LENGTH)
+            gain = max(float(strength[after] - existing_credit * strength[before]), 0.0)
+            if gain <= 0.0:
+                continue
+            gain_sum[ii, jj] += gain
+            gain_max[ii, jj] = np.maximum(gain_max[ii, jj], gain)
+
+    return gain_max + float(tail_weight) * np.maximum(gain_sum - gain_max, 0.0)
+
+
+def _stones_to_board(
+    stones: set[tuple[int, int]],
+    offset_q: int,
+    offset_r: int,
+) -> np.ndarray:
+    board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.uint8)
+    for q, r in stones:
+        ij = board_index(q, r, offset_q, offset_r)
+        if ij is not None:
+            board[ij] = 1
+    return board
 
 
 def _placement_delta_axes(

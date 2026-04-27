@@ -36,6 +36,7 @@ class SelfPlayConfig(BaseModel):
     near_radius: int = 8
     constrain_threats: bool = True
     subtree_reuse: bool = False
+    train_on_truncated_games: bool = False
 
 
 class InferenceConfig(BaseModel):

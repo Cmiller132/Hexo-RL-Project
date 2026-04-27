@@ -38,6 +38,7 @@ class SelfPlayOrchestrator:
         self.num_workers = cfg.selfplay.num_workers
         self.max_batch = cfg.inference.max_batch_size
         self.games_per_epoch = cfg.selfplay.games_per_epoch
+        self.states_per_epoch = cfg.selfplay.states_per_epoch
 
         # Inference server
         self._server: Optional[InferenceServer] = None
@@ -191,11 +192,20 @@ class SelfPlayOrchestrator:
             # Targets are already computed by the worker before pushing.
             # Do not reprocess — it overwrites correct EMA lookahead values.
 
-            # Push all positions into the ring buffer
-            valid_positions = list(game_record.positions)
-            self._buffer.extend(valid_positions)
             if self._recorder is not None:
                 self._recorder.game(game_record, source="selfplay")
+
+            # Push terminal/resigned games into the training buffer. Truncated
+            # games are useful for dashboard review but their fake draw outcome
+            # is a bad value target unless explicitly allowed.
+            is_truncated = bool(getattr(game_record, "truncated", False))
+            valid_positions = (
+                list(game_record.positions)
+                if self.cfg.selfplay.train_on_truncated_games or not is_truncated
+                else []
+            )
+            if valid_positions:
+                self._buffer.extend(valid_positions)
 
             with self._stats_lock:
                 self._games_done += 1
@@ -230,9 +240,23 @@ class SelfPlayOrchestrator:
     @property
     def progress(self) -> float:
         """Fraction of epoch completed (0.0 to 1.0)."""
-        if self.games_per_epoch <= 0:
+        targets = []
+        with self._stats_lock:
+            if self.games_per_epoch > 0:
+                targets.append(self._games_done / self.games_per_epoch)
+            if self.states_per_epoch > 0:
+                targets.append(self._positions_done / self.states_per_epoch)
+        if not targets:
             return 0.0
-        return min(1.0, self._games_done / self.games_per_epoch)
+        return min(1.0, min(targets))
+
+    @property
+    def epoch_complete(self) -> bool:
+        """Whether every configured epoch quota has been met."""
+        with self._stats_lock:
+            games_done = self.games_per_epoch <= 0 or self._games_done >= self.games_per_epoch
+            states_done = self.states_per_epoch <= 0 or self._positions_done >= self.states_per_epoch
+        return games_done and states_done
 
 
 def run_orchestrator(
@@ -278,7 +302,7 @@ def run_orchestrator(
             )
 
             # Check epoch completion
-            if orchestrator.progress >= 1.0:
+            if orchestrator.epoch_complete:
                 logger.info("Epoch complete!")
                 break
 

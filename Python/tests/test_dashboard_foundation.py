@@ -1,5 +1,6 @@
 import struct
 
+import numpy as np
 import pytest
 import torch
 
@@ -165,6 +166,50 @@ def test_axis_strength_requires_feasible_six_cell_window():
     assert result.axis_maps[0, 0, 0] > 0.0
     assert result.axis_maps[1, 0, 0] > 0.0
     assert result.axis_maps[2, 0, 0] == 0.0
+
+
+def test_delta_norm_fast_window_scan_matches_cell_reference():
+    from hexorl.axis_policy.experiments import (
+        _placement_delta_axes,
+        _placement_delta_base_maps,
+        _strength_array,
+    )
+
+    position = AxisPolicyInput(
+        stones=[
+            {"player": 0, "q": 0, "r": 0},
+            {"player": 0, "q": 1, "r": 0},
+            {"player": 1, "q": 0, "r": 1},
+        ],
+        legal_moves=[
+            {"q": 2, "r": 0},
+            {"q": 1, "r": -1},
+            {"q": -1, "r": 1},
+        ],
+        current_player=0,
+        offset_q=-16,
+        offset_r=-16,
+    )
+    proto = get_prototype("exp_delta_norm")
+    params = {spec.name: spec.default for spec in proto.parameters}
+    strength = _strength_array(params)
+    maps = _placement_delta_base_maps(position, strength, params)
+
+    for move in position.legal_moves:
+        q, r = int(move["q"]), int(move["r"])
+        ij = (q - position.offset_q, r - position.offset_r)
+        own, opp = _placement_delta_axes(
+            q,
+            r,
+            position.own_stones,
+            position.opp_stones,
+            strength,
+            params,
+            position.offset_q,
+            position.offset_r,
+        )
+        assert np.allclose(maps[:3, ij[0], ij[1]], own)
+        assert np.allclose(maps[3:, ij[0], ij[1]], opp)
 
 
 def test_fastapi_dashboard_smoke(tmp_path):

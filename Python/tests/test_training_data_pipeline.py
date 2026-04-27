@@ -8,6 +8,7 @@ from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.sampler import (
     _py_apply_d6_symmetry,
     _py_decode_compact_record,
+    _transform_axis_maps,
     _transform_axis_label,
     _transform_dense_policy,
     ReplayDataset,
@@ -15,6 +16,7 @@ from hexorl.buffer.sampler import (
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 from hexorl.epoch import pipeline
+from hexorl.selfplay.orchestrator import SelfPlayOrchestrator
 from hexorl.selfplay.records import GameRecord, PositionRecord, BOARD_SIZE, action_to_board_index
 from hexorl.train.losses import compute_losses
 from hexorl.model.network import HexNet
@@ -73,6 +75,23 @@ def test_axis_label_symmetry_transform_remains_valid():
             assert _transform_axis_label(axis, sym_idx) in {0, 1, 2}
 
 
+def test_axis_delta_maps_symmetry_transforms_space_and_axis_planes():
+    maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    src_i = BOARD_SIZE // 2 + 1
+    src_j = BOARD_SIZE // 2
+    maps[0, src_i, src_j] = 2.0
+    maps[3, src_i, src_j] = 3.0
+
+    transformed = _transform_axis_maps(maps, sym_idx=1)
+
+    dst_axis = _transform_axis_label(0, 1)
+    dst_i = BOARD_SIZE // 2
+    dst_j = BOARD_SIZE // 2 + 1
+    assert transformed[dst_axis, dst_i, dst_j] == 2.0
+    assert transformed[dst_axis + 3, dst_i, dst_j] == 3.0
+    assert transformed.sum() == 5.0
+
+
 def test_process_game_record_populates_auxiliary_targets():
     game = GameRecord(
         positions=[
@@ -124,7 +143,16 @@ def test_run_epoch_appends_selfplay_to_existing_replay(monkeypatch, tmp_path):
             policy_target={action_to_board_index(1, 0): 1.0},
             root_value=0.0,
             player=1,
-            game_id=0,
+            game_id=1 << 24,
+        )
+    )
+    generated.append(
+        PositionRecord(
+            move_history=_move(0, 0, 0) + _move(1, 1, 0),
+            policy_target={action_to_board_index(2, 0): 1.0},
+            root_value=0.0,
+            player=0,
+            game_id=1 << 24,
         )
     )
 
@@ -146,8 +174,9 @@ def test_run_epoch_appends_selfplay_to_existing_replay(monkeypatch, tmp_path):
         train=False,
     )
 
-    assert empty_result.buffer_stats["size"] == 1
-    assert len(empty_existing) == 1
+    assert empty_result.buffer_stats["size"] == 2
+    assert len(empty_existing) == 2
+    assert [record.game_id for record in empty_existing.records()] == [0, 0]
 
     existing = RingBuffer(capacity=8)
     existing.append(
@@ -167,8 +196,60 @@ def test_run_epoch_appends_selfplay_to_existing_replay(monkeypatch, tmp_path):
         train=False,
     )
 
-    assert result.buffer_stats["size"] == 2
-    assert [record.game_id for record in existing.records()] == [4, 5]
+    assert result.buffer_stats["size"] == 3
+    assert [record.game_id for record in existing.records()] == [4, 5, 5]
+
+
+def test_selfplay_epoch_completion_requires_games_and_states():
+    cfg = Config()
+    cfg.selfplay.games_per_epoch = 2
+    cfg.selfplay.states_per_epoch = 10
+    orchestrator = SelfPlayOrchestrator(cfg, buffer_capacity=16)
+
+    orchestrator._games_done = 2
+    orchestrator._positions_done = 9
+    assert not orchestrator.epoch_complete
+    assert orchestrator.progress == pytest.approx(0.9)
+
+    orchestrator._positions_done = 10
+    assert orchestrator.epoch_complete
+    assert orchestrator.progress == 1.0
+
+
+def test_orchestrator_records_but_skips_truncated_games_for_training(tmp_path):
+    from hexorl.dashboard.recorder import RunRecorder
+    from hexorl.dashboard.db import DashboardStore
+
+    cfg = Config()
+    cfg.selfplay.train_on_truncated_games = False
+    store = DashboardStore(tmp_path / "dashboard.sqlite3")
+    recorder = RunRecorder(store, "trunc-test")
+    orchestrator = SelfPlayOrchestrator(cfg, buffer_capacity=16, recorder=recorder)
+    game = GameRecord(
+        positions=[
+            PositionRecord(
+                move_history=b"",
+                policy_target={action_to_board_index(0, 0): 1.0},
+                root_value=0.0,
+                player=0,
+                outcome=0.0,
+            )
+        ],
+        outcome=0.0,
+        game_id=9,
+        game_length=1,
+        final_move_history=b"",
+        truncated=True,
+        terminal_reason="max_game_moves",
+    )
+
+    orchestrator._ingest_game(game)
+
+    assert len(orchestrator.buffer) == 0
+    assert orchestrator.stats["positions_done"] == 0
+    rows = store.rows("SELECT payload_json FROM games")
+    assert rows[0]["payload_json"]["truncated"] is True
+    assert rows[0]["payload_json"]["terminal_reason"] == "max_game_moves"
 
 
 def test_compute_losses_skips_missing_targets_and_handles_batch_one():
