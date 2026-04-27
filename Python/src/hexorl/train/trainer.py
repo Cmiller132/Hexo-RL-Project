@@ -7,6 +7,8 @@ and periodic logging.
 
 import time
 import logging
+import queue
+import threading
 import torch
 import torch.nn as nn
 from typing import Dict, Optional
@@ -47,6 +49,20 @@ class Trainer:
         self.device = device
 
         self.model = self.model.to(self.device)
+        self._channels_last = (
+            bool(getattr(cfg.runtime, "channels_last", True))
+            and self.device.type == "cuda"
+        )
+        if self._channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+        if bool(getattr(cfg.runtime, "compile_model", False)) and self.device.type == "cuda":
+            try:
+                self.model = torch.compile(
+                    self.model,
+                    mode=getattr(cfg.runtime, "compile_mode", "reduce-overhead"),
+                )
+            except Exception as exc:
+                logger.warning("torch.compile disabled after failure: %s", exc)
         self.model.train()
 
         self.ema = ema or ModelEMA(self.model, decay=0.9999)
@@ -138,26 +154,36 @@ class Trainer:
         self._start_time = time.monotonic()
         self.model.train()
 
-        batch_iter = iter(self.dataloader)
+        batch_iter = _PrefetchIterator(
+            iter(self.dataloader),
+            max_prefetch=max(0, int(getattr(self.train_cfg, "prefetch_batches", 0))),
+        )
 
-        for batch_idx in range(self.batches_per_epoch):
-            try:
-                batch = next(batch_iter)
-            except StopIteration:
-                batch_iter = iter(self.dataloader)
-                batch = next(batch_iter)
+        try:
+            for batch_idx in range(self.batches_per_epoch):
+                try:
+                    batch = next(batch_iter)
+                except StopIteration:
+                    batch_iter.close()
+                    batch_iter = _PrefetchIterator(
+                        iter(self.dataloader),
+                        max_prefetch=max(0, int(getattr(self.train_cfg, "prefetch_batches", 0))),
+                    )
+                    batch = next(batch_iter)
 
-            loss_dict = self._train_step(batch, batch_idx)
+                loss_dict = self._train_step(batch, batch_idx)
 
-            for k, v in loss_dict.items():
-                if k not in self._epoch_losses:
-                    self._epoch_losses[k] = []
-                self._epoch_losses[k].append(v)
+                for k, v in loss_dict.items():
+                    if k not in self._epoch_losses:
+                        self._epoch_losses[k] = []
+                    self._epoch_losses[k].append(v)
 
-            self.global_step += 1
+                self.global_step += 1
 
-            if (batch_idx + 1) % 20 == 0 or batch_idx == 0:
-                self._log_step(batch_idx)
+                if (batch_idx + 1) % 20 == 0 or batch_idx == 0:
+                    self._log_step(batch_idx)
+        finally:
+            batch_iter.close()
 
         return self._epoch_stats()
 
@@ -174,6 +200,8 @@ class Trainer:
             lookahead_list = []
 
         tensors = tensors.to(self.device, non_blocking=True)
+        if self._channels_last:
+            tensors = tensors.contiguous(memory_format=torch.channels_last)
         policies = policies.to(self.device, non_blocking=True)
         values = values.to(self.device, non_blocking=True)
 
@@ -196,21 +224,25 @@ class Trainer:
                 n_bins=self._n_bins,
             )
 
+        stepped = True
         if self.use_amp:
+            scale_before = self.scaler.get_scale()
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            stepped = self.scaler.get_scale() >= scale_before
         else:
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        if self.scheduler is not None:
+        if stepped and self.scheduler is not None:
             self.scheduler.step()
 
-        self.ema.update()
+        if stepped:
+            self.ema.update()
 
         result = {"total": float(total_loss.detach().cpu())}
         for k, v in per_head.items():
@@ -325,3 +357,49 @@ class Trainer:
 
     def restore_training_weights(self):
         self.ema.restore()
+
+
+class _PrefetchIterator:
+    """Small thread-backed prefetcher for a single in-memory DataLoader."""
+
+    _STOP = object()
+
+    def __init__(self, iterator, max_prefetch: int = 0):
+        self._iterator = iterator
+        self._enabled = max_prefetch > 0
+        self._closed = threading.Event()
+        self._queue: queue.Queue = queue.Queue(maxsize=max_prefetch) if self._enabled else queue.Queue()
+        self._thread: threading.Thread | None = None
+        if self._enabled:
+            self._thread = threading.Thread(target=self._run, name="train-prefetch", daemon=True)
+            self._thread.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._enabled:
+            return next(self._iterator)
+        item = self._queue.get()
+        if item is self._STOP:
+            raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self):
+        self._closed.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _run(self):
+        try:
+            while not self._closed.is_set():
+                try:
+                    item = next(self._iterator)
+                except StopIteration:
+                    self._queue.put(self._STOP)
+                    return
+                self._queue.put(item)
+        except BaseException as exc:
+            self._queue.put(exc)

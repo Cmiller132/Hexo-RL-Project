@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 from hexorl.config import Config
 from hexorl.model.network import from_config, HexNet
+from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
     create_inference_queue,
     connect_inference_queue,
@@ -46,14 +47,17 @@ class InferenceServer:
         self.max_wait_us = cfg.inference.max_wait_us
         self.fp16 = cfg.inference.fp16
 
+        self._mp_ctx = mp.get_context("spawn")
         self._process: Optional[mp.Process] = None
-        self._stop_event = mp.Event()
-        self._ready_event = mp.Event()
-        self._weight_queue = mp.Queue(maxsize=2)
+        self._stop_event = self._mp_ctx.Event()
+        self._ready_event = self._mp_ctx.Event()
+        self._weight_queue = self._mp_ctx.Queue(maxsize=2)
         self._initial_state_dict = self._state_to_cpu(initial_state_dict)
         self._model: Optional[torch.nn.Module] = None
         self._device: Optional[torch.device] = None
         self._forward_stream = None
+        self._host_batch_tensor: Optional[torch.Tensor] = None
+        self._host_batch_np: Optional[np.ndarray] = None
 
         self.n_batches = 0
         self.n_positions = 0
@@ -71,7 +75,7 @@ class InferenceServer:
     def __getstate__(self):
         """Exclude non-picklable attributes for spawn-mode transport."""
         state = self.__dict__.copy()
-        for key in ("_owned_queue", "_queue", "_model", "_device", "_process"):
+        for key in ("_owned_queue", "_queue", "_model", "_device", "_process", "_mp_ctx"):
             state.pop(key, None)
         return state
 
@@ -92,7 +96,7 @@ class InferenceServer:
         _queue = create_inference_queue(self.num_workers, self.max_batch)
         self._owned_queue = _queue
 
-        self._process = mp.Process(
+        self._process = self._mp_ctx.Process(
             target=self._run,
             name="hexorl-inference-server",
             daemon=False,
@@ -144,6 +148,7 @@ class InferenceServer:
     def _run(self):
         """Server entry point — called in the spawned process."""
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+        configure_torch_runtime(self.cfg)
 
         if torch.cuda.is_available():
             self._device = torch.device("cuda")
@@ -153,6 +158,16 @@ class InferenceServer:
             self._device = torch.device("cpu")
 
         self._model = from_config(self.cfg, device=self._device)
+        if self._device.type == "cuda" and getattr(self.cfg.runtime, "channels_last", True):
+            self._model = self._model.to(memory_format=torch.channels_last)
+        if self._device.type == "cuda" and getattr(self.cfg.runtime, "compile_model", False):
+            try:
+                self._model = torch.compile(
+                    self._model,
+                    mode=getattr(self.cfg.runtime, "compile_mode", "reduce-overhead"),
+                )
+            except Exception as exc:
+                print(f"[inference-server] torch.compile disabled: {exc}", flush=True)
         if self._initial_state_dict is not None:
             initial = {
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
@@ -165,6 +180,7 @@ class InferenceServer:
 
         # Reconnect to the queue created in start().
         self._queue = connect_inference_queue(self.num_workers, self.max_batch)
+        self._prepare_host_batch()
 
         self._ready_event.set()
 
@@ -275,22 +291,24 @@ class InferenceServer:
             per_worker_counts: list of counts per ready worker.
             total_count: sum of all counts.
         """
-        tensors = []
         counts = []
+        total = 0
         for worker_id in ready_workers:
             slot = self._queue.get_slot(worker_id)
             c = int(slot.req_count[0])
             if c > 0:
-                worker_tensor = np.array(slot.req_tensor[:c], copy=True)
-                tensors.append(worker_tensor)
+                if self._host_batch_np is None:
+                    raise RuntimeError("host batch buffer was not initialized")
+                np.copyto(self._host_batch_np[total:total + c], slot.req_tensor[:c])
+                total += c
                 counts.append(c)
 
-        if not tensors:
+        if total == 0:
             return torch.empty(0), [], 0
 
-        batch = np.concatenate(tensors, axis=0)
-        total = batch.shape[0]
-        batch_tensor = torch.from_numpy(batch).to(self._device, non_blocking=True)
+        batch_tensor = self._host_batch_tensor[:total].to(self._device, non_blocking=True)
+        if self._device.type == "cuda" and getattr(self.cfg.runtime, "channels_last", True):
+            batch_tensor = batch_tensor.contiguous(memory_format=torch.channels_last)
 
         return batch_tensor, counts, total
 
@@ -310,7 +328,7 @@ class InferenceServer:
         """
         t0 = time.monotonic()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if self._device.type == "cuda" and self._forward_stream is not None:
                 with torch.cuda.stream(self._forward_stream):
                     if self.fp16:
@@ -325,8 +343,14 @@ class InferenceServer:
             else:
                 out = self._model(batch_tensor)
 
-        p = out["policy"].float()
-        v = HexNet.bins_to_value(out["value"]).float()
+        p = self._sanitize_policy_logits(out["policy"])
+        value_logits = self._sanitize_value_logits(out["value"])
+        v = torch.nan_to_num(
+            HexNet.bins_to_value(value_logits).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp_(-1.0, 1.0)
 
         policies = p.cpu().numpy()
         values = v.cpu().numpy()
@@ -335,6 +359,40 @@ class InferenceServer:
         self.total_forward_ms += elapsed
 
         return policies, values
+
+    @staticmethod
+    def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
+        """Keep policy logits finite before handing them to Rust MCTS."""
+        return torch.nan_to_num(
+            logits.float(),
+            nan=0.0,
+            posinf=80.0,
+            neginf=-80.0,
+        ).clamp_(-80.0, 80.0)
+
+    @staticmethod
+    def _sanitize_value_logits(logits: torch.Tensor) -> torch.Tensor:
+        """Keep value logits finite so softmax cannot produce NaNs."""
+        return torch.nan_to_num(
+            logits.float(),
+            nan=0.0,
+            posinf=80.0,
+            neginf=-80.0,
+        ).clamp_(-80.0, 80.0)
+
+    def _prepare_host_batch(self):
+        """Allocate a reusable staging buffer for request gathering."""
+        pin = self._device is not None and self._device.type == "cuda"
+        try:
+            self._host_batch_tensor = torch.empty(
+                (self.max_batch, 13, 33, 33),
+                dtype=torch.float32,
+                pin_memory=pin,
+            )
+            self._host_batch_np = self._host_batch_tensor.numpy()
+        except Exception:
+            self._host_batch_np = np.empty((self.max_batch, 13, 33, 33), dtype=np.float32)
+            self._host_batch_tensor = torch.from_numpy(self._host_batch_np)
 
     # ── Result scattering ─────────────────────────────────────────────────
 

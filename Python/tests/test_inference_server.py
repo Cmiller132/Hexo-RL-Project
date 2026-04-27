@@ -9,6 +9,7 @@ import sys
 import os
 import unittest
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -105,6 +106,19 @@ class TestInferenceServer(unittest.TestCase):
         server.stop()
         server.join(timeout=5.0)
         server_q.close()
+
+    def test_non_finite_outputs_are_sanitized_before_mcts(self):
+        policy = torch.tensor([[float("nan"), float("inf"), -float("inf"), 5.0]])
+        value = torch.tensor([[float("nan"), float("inf"), -float("inf"), 0.0]])
+
+        clean_policy = InferenceServer._sanitize_policy_logits(policy)
+        clean_value = InferenceServer._sanitize_value_logits(value)
+
+        self.assertTrue(torch.isfinite(clean_policy).all())
+        self.assertTrue(torch.isfinite(clean_value).all())
+        self.assertEqual(clean_policy[0, 0].item(), 0.0)
+        self.assertEqual(clean_policy[0, 1].item(), 80.0)
+        self.assertEqual(clean_policy[0, 2].item(), -80.0)
 
 
 @unittest.skipUnless(HAS_ENGINE, "Rust _engine extension not available")

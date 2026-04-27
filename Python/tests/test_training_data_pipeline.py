@@ -401,3 +401,17 @@ def test_replay_dataset_marks_low_sim_policy_weight_zero():
 
     assert aux_targets["policy_weight"].shape == (1,)
     assert aux_targets["policy_weight"][0].item() == 0.0
+
+
+def test_bootstrap_games_are_diverse_and_legal():
+    cfg = Config()
+    cfg.run.seed = 123
+    cfg.selfplay.max_game_moves = 24
+
+    games = pipeline._make_bootstrap_game_records(cfg, 8)
+    histories = {game.final_move_history for game in games}
+
+    assert len(histories) > 1
+    assert all(game.positions for game in games)
+    assert all(pos.policy_target for game in games for pos in game.positions)
+    assert all(len(pos.move_history) % 12 == 0 for game in games for pos in game.positions)

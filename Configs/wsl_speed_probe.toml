@@ -1,6 +1,6 @@
 [run]
-seed = 0
-output_dir = "./runs/production"
+seed = 7
+output_dir = "./runs/wsl_speed_probe"
 log_level = "INFO"
 
 [model]
@@ -10,17 +10,19 @@ heads = ["policy", "value", "lookahead_4", "lookahead_12", "lookahead_36", "axis
 
 [selfplay]
 num_workers = 0
-games_per_epoch = 8192
-states_per_epoch = 800000
+games_per_epoch = 128
+states_per_epoch = 1024
 batch_size_per_worker = 0
-mcts_simulations = 800
+max_game_moves = 128
+mcts_simulations = 128
 c_puct = 1.5
 c_puct_init = 19652.0
 temperature_schedule = [[0, 1.0], [30, 0.0]]
 dirichlet_alpha = 0.3
 dirichlet_fraction = 0.25
-pcr_low_sim_prob = 0.75
-pcr_low_sims = 192
+pcr_low_sim_prob = 0.5
+pcr_low_sims = 64
+train_on_truncated_games = true
 resign_threshold = -0.95
 resign_disable_prob = 0.1
 
@@ -31,7 +33,7 @@ fp16 = true
 ema_update_every = 100
 
 [buffer]
-capacity = 2000000
+capacity = 100000
 recency_decay = 0.99
 pcr_weight = 0.25
 regret_fraction = 0.08
@@ -40,12 +42,12 @@ lookahead_lambdas = [0.75, 0.90, 0.97]
 
 [train]
 batch_size = 0
-batches_per_epoch = 2000
+batches_per_epoch = 100
 prefetch_batches = 2
 optimizer = "adamw"
 lr_schedule = "cosine"
 peak_lr = 0.003
-loss_weights = { policy = 1.0, value = 1.5, lookahead_4 = 0.2, lookahead_12 = 0.2, lookahead_36 = 0.1 }
+loss_weights = { policy = 1.0, value = 1.5, lookahead_4 = 0.2, lookahead_12 = 0.2, lookahead_36 = 0.1, axis = 0.05 }
 
 [runtime]
 autotune = true

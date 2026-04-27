@@ -134,7 +134,7 @@ class RunRecorder:
         checkpoint_id: int | None = None,
         payload: Mapping[str, Any] | None = None,
     ) -> int:
-        game_row_id = self.store.insert_game(
+        game_row_id = self.store.insert_game_with_positions(
             run_id=self.run_id,
             game_id=record.game_id,
             source=source,
@@ -149,26 +149,27 @@ class RunRecorder:
                 "terminal_reason": getattr(record, "terminal_reason", "unknown"),
                 **dict(payload or {}),
             },
+            positions=[
+                {
+                    "turn_index": pos.turn_index,
+                    "player": pos.player,
+                    "move_history": pos.move_history,
+                    "root_value": pos.root_value,
+                    "policy_target": pos.policy_target,
+                    "debug": {
+                        "outcome": pos.outcome,
+                        "is_full_search": pos.is_full_search,
+                        "lookahead_values": pos.lookahead_values,
+                        "regret_rank": pos.regret_rank,
+                        "regret_value": pos.regret_value,
+                        "axis_label": pos.axis_label,
+                        "moves_left": pos.moves_left,
+                        "value_weight": pos.value_weight,
+                    },
+                }
+                for pos in record.positions
+            ],
         )
-        for pos in record.positions:
-            self.store.insert_position(
-                game_row_id,
-                turn_index=pos.turn_index,
-                player=pos.player,
-                move_history=pos.move_history,
-                root_value=pos.root_value,
-                policy_target=pos.policy_target,
-                debug={
-                    "outcome": pos.outcome,
-                    "is_full_search": pos.is_full_search,
-                    "lookahead_values": pos.lookahead_values,
-                    "regret_rank": pos.regret_rank,
-                    "regret_value": pos.regret_value,
-                    "axis_label": pos.axis_label,
-                    "moves_left": pos.moves_left,
-                    "value_weight": pos.value_weight,
-                },
-            )
         self.event(
             "game_recorded",
             {"game_id": record.game_id, "game_row_id": game_row_id, "source": source},

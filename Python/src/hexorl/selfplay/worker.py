@@ -12,6 +12,7 @@ import time
 import queue
 import logging
 import multiprocessing as mp
+import signal
 import numpy as np
 from typing import Optional, List, Tuple
 
@@ -371,6 +372,8 @@ class SelfPlayWorker:
 
     def run(self):
         """Main worker loop — runs in a separate multiprocessing.Process."""
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         logger.info(
             f"Worker {self.worker_id} starting (engine={'rust' if HAS_ENGINE else 'mock'})"
         )

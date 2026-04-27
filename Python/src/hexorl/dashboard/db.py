@@ -309,6 +309,68 @@ class DashboardStore:
             )
             return int(cur.lastrowid)
 
+    def insert_game_with_positions(
+        self,
+        *,
+        run_id: str,
+        game_id: int | str,
+        source: str,
+        final_move_history: bytes,
+        outcome: float = 0.0,
+        epoch: int | None = None,
+        checkpoint_id: int | None = None,
+        payload: Mapping[str, Any] | None = None,
+        positions: list[Mapping[str, Any]] | None = None,
+    ) -> int:
+        """Insert one game and all position rows in a single transaction."""
+        self.upsert_run(run_id)
+        move_count = len(final_move_history) // 12
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO games(
+                    run_id, external_game_id, source, epoch, checkpoint_id,
+                    outcome, move_count, final_history_b64, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    str(game_id),
+                    source,
+                    epoch,
+                    checkpoint_id,
+                    outcome,
+                    move_count,
+                    encode_bytes(final_move_history),
+                    _json_dumps(payload),
+                    time.time(),
+                ),
+            )
+            game_row_id = int(cur.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO positions(
+                    game_id, turn_index, player, move_history_b64,
+                    root_value, policy_json, debug_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        game_row_id,
+                        int(pos["turn_index"]),
+                        int(pos["player"]),
+                        encode_bytes(pos["move_history"]),
+                        float(pos.get("root_value", 0.0)),
+                        _json_dumps({str(k): v for k, v in pos.get("policy_target", {}).items()}),
+                        _json_dumps(pos.get("debug", {})),
+                    )
+                    for pos in (positions or [])
+                ],
+            )
+            return game_row_id
+
     def save_axis_preset(
         self,
         *,

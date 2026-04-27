@@ -11,6 +11,7 @@ from hexorl.epoch import run_epoch, run_tiny_training_smoke
 from hexorl.eval.arena import run_arena
 from hexorl.eval.arena import load_checkpoint_model, model_move_fn
 from hexorl.eval.classical import classical_opponent_fn
+from hexorl.runtime import autotune_config, configure_torch_runtime
 
 
 def main():
@@ -66,6 +67,9 @@ def main():
 
     if args.command == "epoch":
         cfg = load_config(args.config)
+        host = autotune_config(cfg)
+        runtime = configure_torch_runtime(cfg, host)
+        logging.info("Runtime: %s", runtime)
         result = run_epoch(
             cfg,
             output_dir=args.output_dir,
@@ -76,11 +80,19 @@ def main():
         print(_format_result(result))
     elif args.command == "smoke-train":
         cfg = load_config(args.config) if args.config else None
+        if cfg is not None:
+            host = autotune_config(cfg)
+            runtime = configure_torch_runtime(cfg, host)
+            logging.info("Runtime: %s", runtime)
         results = run_tiny_training_smoke(cfg, epochs=args.epochs, output_dir=args.output_dir)
         for result in results:
             print(_format_result(result))
     elif args.command == "bench":
-        results = run_tiny_training_smoke(epochs=1, output_dir=Path("./runs/bench_smoke"))
+        cfg = load_config()
+        host = autotune_config(cfg)
+        runtime = configure_torch_runtime(cfg, host)
+        logging.info("Runtime: %s", runtime)
+        results = run_tiny_training_smoke(cfg, epochs=1, output_dir=Path("./runs/bench_smoke"))
         print(_format_result(results[-1]))
     elif args.command == "arena":
         side_a = classical_opponent_fn(time_ms=args.time_ms, max_depth=args.depth)

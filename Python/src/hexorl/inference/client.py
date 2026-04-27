@@ -109,8 +109,8 @@ class InferenceClient:
         self._slot.res_ready.clear()
 
         # 5. Read results from shared memory.
-        policies = np.array(self._slot.res_policy[:count], copy=True)   # (count, 1089)
-        values = np.array(self._slot.res_value[:count], copy=True)      # (count,)
+        policies = self._slot.res_policy[:count]   # (count, 1089)
+        values = self._slot.res_value[:count]      # (count,)
 
         # Flatten policies to 1D — expand_and_backprop expects flat array.
         policies = policies.ravel()  # (count * 1089,)

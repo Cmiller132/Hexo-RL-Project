@@ -25,6 +25,7 @@ from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 from hexorl.model.network import HexNet
+from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import GameRecord, PositionRecord, action_to_board_index
 from hexorl.train.trainer import Trainer
@@ -157,7 +158,14 @@ def run_epoch(
             regret_fraction=cfg.buffer.regret_fraction,
             include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
         )
-        dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
+        num_workers = dataloader_worker_count(cfg)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+        )
         if trainer is None:
             trainer = Trainer(model, cfg, dataloader, device=device)
         else:
@@ -271,7 +279,14 @@ def run_tiny_training_smoke(
         lookahead_horizons=cfg.buffer.lookahead_horizons,
         regret_fraction=cfg.buffer.regret_fraction,
     )
-    dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
+    num_workers = dataloader_worker_count(cfg)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=False,
+        persistent_workers=num_workers > 0,
+    )
     model = HexNet(channels=cfg.model.channels, blocks=cfg.model.blocks, heads=cfg.model.heads)
     trainer = Trainer(model, cfg, dataloader, device=torch.device("cpu"))
 
@@ -323,42 +338,179 @@ def _make_bootstrap_game_records(
 
 
 def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
-    moves = [
-        (0, 0, 0),
-        (1, 1, 0),
-        (1, 0, 1),
-        (0, -1, 0),
-        (0, 0, -1),
-        (1, 2, 0),
-    ]
-    outcome = 1.0 if game_id % 2 == 0 else -1.0
+    rng = np.random.default_rng(int(cfg.run.seed) ^ (game_id * 0x9E3779B1))
+    max_moves = max(6, min(int(cfg.selfplay.max_game_moves), 96))
+    moves: List[tuple[int, int, int]] = []
     positions: List[PositionRecord] = []
 
-    for i, (player, q, r) in enumerate(moves):
-        idx = action_to_board_index(q, r)
-        alt_idx = action_to_board_index(q + 1, r)
-        policy = {idx: 1.0}
-        if alt_idx >= 0 and alt_idx != idx:
-            policy = {idx: 0.8, alt_idx: 0.2}
-        positions.append(
-            PositionRecord(
-                move_history=_pack_moves(moves[:i]),
-                policy_target=policy,
-                root_value=float(np.tanh((i - 2) / 3.0)),
-                player=player,
-                game_id=game_id,
-                is_full_search=(game_id % 3 != 0),
-                turn_index=i,
+    try:
+        import _engine
+
+        game = _engine.HexGame()
+        for move_idx in range(max_moves):
+            player = int(game.current_player)
+            legal = game.threat_constrained_moves(cfg.selfplay.near_radius)
+            if legal is None:
+                legal = game.legal_moves_near(cfg.selfplay.near_radius)
+            legal = [(int(q), int(r)) for q, r in legal]
+            if not legal:
+                break
+
+            q, r = _sample_bootstrap_move(legal, rng)
+            policy = _bootstrap_policy_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
+            value_hint = float(np.tanh(float(game.window_eval) / 600.0))
+            if player == 1:
+                value_hint = -value_hint
+
+            positions.append(
+                PositionRecord(
+                    move_history=_pack_moves(moves),
+                    policy_target=policy,
+                    root_value=value_hint,
+                    player=player,
+                    game_id=game_id,
+                    is_full_search=(game_id % 3 != 0),
+                    turn_index=move_idx,
+                )
             )
+
+            game.place(q, r)
+            moves.append((player, q, r))
+            if game.is_over:
+                break
+
+        winner = game.winner
+        if winner == 0:
+            outcome = 1.0
+        elif winner == 1:
+            outcome = -1.0
+        else:
+            score = float(game.window_eval)
+            if abs(score) < 1e-6:
+                outcome = 1.0 if game_id % 2 == 0 else -1.0
+            else:
+                outcome = 1.0 if score > 0.0 else -1.0
+        terminal_reason = "win" if game.is_over else "bootstrap_cap"
+    except Exception:
+        outcome, terminal_reason = _make_fallback_bootstrap_game(
+            cfg,
+            game_id,
+            rng,
+            max_moves,
+            moves,
+            positions,
         )
 
-    return GameRecord(
+    game = GameRecord(
         positions=positions,
         outcome=outcome,
         game_id=game_id,
         game_length=len(positions),
         final_move_history=_pack_moves(moves),
+        truncated=(terminal_reason != "win"),
+        terminal_reason=terminal_reason,
     )
+    game.assign_outcomes()
+    return game
+
+
+def _make_fallback_bootstrap_game(
+    cfg: Config,
+    game_id: int,
+    rng: np.random.Generator,
+    max_moves: int,
+    moves: List[tuple[int, int, int]],
+    positions: List[PositionRecord],
+) -> tuple[float, str]:
+    occupied: set[tuple[int, int]] = set()
+    current_player = 0
+    placements_remaining = 1
+
+    for move_idx in range(max_moves):
+        legal = _fallback_bootstrap_legal_moves(occupied, cfg.selfplay.near_radius)
+        if not legal:
+            break
+        q, r = _sample_bootstrap_move(legal, rng)
+        policy = _bootstrap_policy_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
+        positions.append(
+            PositionRecord(
+                move_history=_pack_moves(moves),
+                policy_target=policy,
+                root_value=float(rng.uniform(-0.25, 0.25)),
+                player=current_player,
+                game_id=game_id,
+                is_full_search=(game_id % 3 != 0),
+                turn_index=move_idx,
+            )
+        )
+        occupied.add((q, r))
+        moves.append((current_player, q, r))
+        if placements_remaining > 1:
+            placements_remaining -= 1
+        else:
+            current_player = 1 - current_player
+            placements_remaining = 2
+
+    return (1.0 if game_id % 2 == 0 else -1.0), "bootstrap_cap"
+
+
+def _fallback_bootstrap_legal_moves(
+    occupied: set[tuple[int, int]],
+    near_radius: int,
+) -> List[tuple[int, int]]:
+    if not occupied:
+        return [(0, 0)]
+    radius = max(1, min(int(near_radius), 8))
+    legal: set[tuple[int, int]] = set()
+    for q, r in occupied:
+        for dq in range(-radius, radius + 1):
+            for dr in range(-radius, radius + 1):
+                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
+                    candidate = (q + dq, r + dr)
+                    if candidate not in occupied and action_to_board_index(*candidate) >= 0:
+                        legal.add(candidate)
+    return sorted(legal)
+
+
+def _sample_bootstrap_move(
+    legal: List[tuple[int, int]],
+    rng: np.random.Generator,
+) -> tuple[int, int]:
+    weights = np.array(
+        [1.0 / (1.0 + max(abs(q), abs(r), abs(q + r))) for q, r in legal],
+        dtype=np.float64,
+    )
+    weights /= weights.sum()
+    idx = int(rng.choice(len(legal), p=weights))
+    return legal[idx]
+
+
+def _bootstrap_policy_for_move(
+    q: int,
+    r: int,
+    legal: List[tuple[int, int]],
+    rng: np.random.Generator,
+    top_k: int,
+) -> dict[int, float]:
+    dense = np.zeros(33 * 33, dtype=np.float32)
+    chosen_idx = action_to_board_index(q, r)
+    if chosen_idx >= 0:
+        dense[chosen_idx] = 1.0
+    if len(legal) > 1:
+        alt_count = min(max(1, top_k - 1), len(legal) - 1, 7)
+        alt_indices = rng.choice(len(legal), size=alt_count, replace=False)
+        for legal_idx in alt_indices:
+            aq, ar = legal[int(legal_idx)]
+            if (aq, ar) == (q, r):
+                continue
+            flat = action_to_board_index(aq, ar)
+            if flat >= 0:
+                dense[flat] += float(rng.uniform(0.02, 0.12))
+    total = dense.sum()
+    if total > 0:
+        dense /= total
+    nonzero = np.flatnonzero(dense)
+    return {int(idx): float(dense[idx]) for idx in nonzero}
 
 
 def _pack_moves(moves: Iterable[tuple[int, int, int]]) -> bytes:

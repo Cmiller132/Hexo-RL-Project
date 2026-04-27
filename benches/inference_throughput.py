@@ -21,6 +21,7 @@ from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 from hexorl.inference.shm_queue import connect_inference_queue
 from hexorl.inference.client import InferenceClient
+from hexorl.runtime import autotune_config
 
 
 def mock_worker(worker_id: int, num_workers: int, max_batch: int,
@@ -54,7 +55,7 @@ def mock_worker(worker_id: int, num_workers: int, max_batch: int,
     results_queue.put((n_submits, n_positions))
 
 
-def run_benchmark(batch_sizes=None, duration_s=10.0, num_workers=8):
+def run_benchmark(batch_sizes=None, duration_s=10.0, num_workers=8, config_path=None):
     """Run throughput benchmark at each batch size.
 
     Args:
@@ -67,11 +68,16 @@ def run_benchmark(batch_sizes=None, duration_s=10.0, num_workers=8):
     if batch_sizes is None:
         batch_sizes = [1, 2, 4, 8, 16, 32, 64]
 
-    cfg = load_config()
-    cfg.model.channels = 32
-    cfg.model.blocks = 4
-    cfg.inference.max_batch_size = max(batch_sizes) * num_workers
-    cfg.inference.fp16 = False  # CPU/MPS test; set true for CUDA benchmarks
+    cfg = load_config(config_path) if config_path else load_config()
+    if config_path:
+        autotune_config(cfg)
+        num_workers = cfg.selfplay.num_workers if num_workers <= 0 else num_workers
+    else:
+        num_workers = 4 if num_workers <= 0 else num_workers
+        cfg.model.channels = 32
+        cfg.model.blocks = 4
+        cfg.inference.max_batch_size = max(batch_sizes) * num_workers
+        cfg.inference.fp16 = False  # CPU/MPS test; set true for CUDA benchmarks
 
     device_name = "cpu"
     try:
@@ -89,7 +95,7 @@ def run_benchmark(batch_sizes=None, duration_s=10.0, num_workers=8):
 
     for batch_size in batch_sizes:
         max_batch = batch_size * num_workers + 64  # headroom
-        cfg.inference.max_batch_size = max_batch
+        cfg.inference.max_batch_size = max(cfg.inference.max_batch_size, max_batch)
 
         server = InferenceServer(cfg, num_workers=num_workers)
         server.start()
@@ -151,13 +157,15 @@ def main():
                         help="Per-worker batch size (single test)")
     parser.add_argument("--duration", type=float, default=10.0,
                         help="Test duration in seconds per batch size")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="Number of mock workers")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of mock workers; 0 uses config autotune")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Optional config file; when set, benchmark that model shape")
     args = parser.parse_args()
 
     batch_sizes = [args.batch_size] if args.batch_size else None
     run_benchmark(batch_sizes=batch_sizes, duration_s=args.duration,
-                   num_workers=args.workers)
+                   num_workers=args.workers, config_path=args.config)
 
 
 if __name__ == "__main__":

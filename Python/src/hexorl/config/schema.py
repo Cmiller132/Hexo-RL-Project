@@ -58,6 +58,7 @@ class BufferConfig(BaseModel):
 class TrainConfig(BaseModel):
     batch_size: int = 256
     batches_per_epoch: int = 2000
+    prefetch_batches: int = 2
     optimizer: str = "adamw"
     lr_schedule: str = "cosine"
     peak_lr: float = 3e-3
@@ -84,6 +85,7 @@ class Config(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     buffer: BufferConfig = Field(default_factory=BufferConfig)
     train: TrainConfig = Field(default_factory=TrainConfig)
+    runtime: "RuntimeConfig" = Field(default_factory=lambda: RuntimeConfig())
 
     @model_validator(mode="after")
     def validate_cross_section_consistency(self) -> "Config":
@@ -104,3 +106,27 @@ class Config(BaseModel):
             )
 
         return self
+
+
+class RuntimeConfig(BaseModel):
+    """Host-aware performance knobs.
+
+    Values left as ``None`` are filled in by the runtime autotuner. This keeps
+    production configs portable across the 4070 Ti workstation and smaller CI
+    machines while still allowing an experiment config to pin exact values.
+    """
+
+    autotune: bool = True
+    cpu_threads: int | None = None
+    interop_threads: int | None = None
+    dataloader_workers: int | None = None
+    selfplay_cpu_reserve: int = 4
+    channels_last: bool = True
+    allow_tf32: bool = True
+    cudnn_benchmark: bool = True
+    compile_model: bool | None = None
+    compile_mode: str = "reduce-overhead"
+    train_memory_fraction: float = 0.62
+
+
+Config.model_rebuild()

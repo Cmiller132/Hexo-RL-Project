@@ -3,6 +3,7 @@ import torch
 
 from hexorl.buffer import RingBuffer
 from hexorl.config import Config
+from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
@@ -74,3 +75,43 @@ def test_selfplay_worker_game_ids_are_unique_across_workers():
     worker1 = SelfPlayWorker(1, cfg, record_queue=None)
 
     assert worker0._game_id() != worker1._game_id()
+
+
+def test_autotune_train_batch_avoids_memory_cliff_for_production_model():
+    cfg = Config()
+    cfg.model.channels = 128
+    cfg.model.blocks = 16
+    cfg.model.heads = ["policy", "value", "lookahead_4", "lookahead_12", "lookahead_36", "axis"]
+    cfg.train.batch_size = 0
+    cfg.train.batches_per_epoch = 100
+    host = HostProfile(
+        logical_cpus=32,
+        physical_cpus=16,
+        system="linux",
+        cuda_available=True,
+        cuda_name="test-gpu",
+        cuda_memory_gb=12.0,
+    )
+
+    autotune_config(cfg, host)
+
+    assert cfg.train.batch_size < 384
+    assert _estimate_train_peak_gb(cfg, cfg.train.batch_size) <= 12.0 * cfg.runtime.train_memory_fraction
+    assert cfg.runtime.compile_model is False
+
+
+def test_autotune_compile_model_for_long_cuda_training():
+    cfg = Config()
+    cfg.train.batches_per_epoch = 1000
+    host = HostProfile(
+        logical_cpus=32,
+        physical_cpus=16,
+        system="linux",
+        cuda_available=True,
+        cuda_name="test-gpu",
+        cuda_memory_gb=12.0,
+    )
+
+    autotune_config(cfg, host)
+
+    assert cfg.runtime.compile_model is True
