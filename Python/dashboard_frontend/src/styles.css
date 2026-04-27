@@ -37,6 +37,11 @@ button:hover {
   border-color: #58a6ff;
 }
 
+button:disabled {
+  cursor: progress;
+  opacity: 0.62;
+}
+
 input,
 select {
   min-height: 32px;
@@ -94,6 +99,14 @@ h1 {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin-left: 4px;
+}
+
+.toolbarSelect {
+  max-width: 240px;
+}
+
+.fixtureSelect {
+  min-width: 210px;
 }
 
 .error {

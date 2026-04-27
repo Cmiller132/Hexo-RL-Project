@@ -11,7 +11,13 @@ from hexorl.axis_policy.dual_strength import (
     DualAxisStrengthPrototype,
     DualAxisStrengthTailPrototype,
 )
-from hexorl.axis_policy.experiments import CrossAxisPivotPrototype, DeltaForkPrototype
+from hexorl.axis_policy.experiments import (
+    CrossAxisPivotPrototype,
+    DeltaBalancePrototype,
+    DeltaForkPrototype,
+    DeltaNormPrototype,
+    DeltaSoftStrongPrototype,
+)
 from hexorl.axis_policy.legacy_influence import LegacyAxisInfluencePrototype
 
 
@@ -23,6 +29,9 @@ def builtins() -> list[AxisPolicyPrototype]:
         DualAxisStrengthHotPrototype(),
         LegacyAxisInfluencePrototype(),
         DeltaForkPrototype(),
+        DeltaNormPrototype(),
+        DeltaSoftStrongPrototype(),
+        DeltaBalancePrototype(),
         CrossAxisPivotPrototype(),
     ]
 

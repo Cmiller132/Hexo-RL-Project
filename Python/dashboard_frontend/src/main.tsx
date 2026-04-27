@@ -312,6 +312,9 @@ function AxisPanel({ prototypes, results, setResults }: {
   const [axisView, setAxisView] = useState<string>("own");
   const [axisScale, setAxisScale] = useState<string>("raw");
   const [params, setParams] = useState<Record<string, number>>({});
+  const [fixtures, setFixtures] = useState<AnyRow[]>([]);
+  const [fixtureId, setFixtureId] = useState<string>("");
+  const [fixtureBusy, setFixtureBusy] = useState(false);
   const selected = results.find((r) => r.prototype_id === selectedPrototype) || results[0];
   const selectedSpec = prototypes.find((p) => p.id === (selectedPrototype || prototypes[0]?.id));
   const paramsKey = JSON.stringify(params);
@@ -319,6 +322,10 @@ function AxisPanel({ prototypes, results, setResults }: {
     if (!selectedPrototype && prototypes.length) setSelectedPrototype(prototypes[0].id);
   }, [prototypes, selectedPrototype]);
   const create = () => api<AnyRow>("/api/session/create", { method: "POST", body: JSON.stringify({ payload: { mode: "axis_lab" } }) }).then(setAxisSession);
+  const refreshFixtures = () => api<AnyRow[]>("/api/axis/fixtures").then(setFixtures);
+  useEffect(() => {
+    refreshFixtures().catch(() => setFixtures([]));
+  }, []);
   useEffect(() => {
     if (!axisSession) create();
   }, [axisSession]);
@@ -339,6 +346,49 @@ function AxisPanel({ prototypes, results, setResults }: {
   };
   const undo = () => axisSession && api<AnyRow>(`/api/session/${axisSession.session_id}/undo`, { method: "POST", body: "{}" }).then((s) => { setAxisSession(s); setResults([]); });
   const reset = () => axisSession && api<AnyRow>(`/api/session/${axisSession.session_id}/reset`, { method: "POST", body: "{}" }).then((s) => { setAxisSession(s); setResults([]); });
+  const loadFixture = async (sessionId: string) => {
+    setFixtureId(sessionId);
+    if (!sessionId) return;
+    const fixture = await api<AnyRow>(`/api/session/${sessionId}`);
+    setAxisSession(fixture);
+    setResults([]);
+  };
+  const shuffleFixture = async () => {
+    const pool = fixtures.filter((fixture) => fixture.session_id !== axisSession?.session_id);
+    const next = pool.length ? pool[Math.floor(Math.random() * pool.length)] : fixtures[Math.floor(Math.random() * fixtures.length)];
+    if (next?.session_id) await loadFixture(next.session_id);
+  };
+  const generateFixtures = async () => {
+    setFixtureBusy(true);
+    try {
+      const seed = Math.floor(Date.now() / 1000);
+      const data = await api<AnyRow>("/api/axis/fixtures/generate", {
+        method: "POST",
+        body: JSON.stringify({
+          examples_per_move_count: 3,
+          move_counts: [8, 16, 24, 32, 40],
+          time_ms: 2,
+          max_depth: 1,
+          near_radius: 6,
+          noise_level: 0.08,
+          random_move_prob: 0.04,
+          opening_random_moves: 2,
+          workers: 4,
+          seed
+        })
+      });
+      const nextFixtures = await api<AnyRow[]>("/api/axis/fixtures");
+      setFixtures(nextFixtures);
+      const first = data.fixtures?.[0];
+      if (first?.session_id) {
+        setFixtureId(first.session_id);
+        setAxisSession(first);
+        setResults([]);
+      }
+    } finally {
+      setFixtureBusy(false);
+    }
+  };
   const evaluate = () => {
     const body = axisSession?.session_id
       ? {
@@ -378,6 +428,23 @@ function AxisPanel({ prototypes, results, setResults }: {
           <button onClick={undo}>Undo</button>
           <button onClick={reset}>Reset</button>
           <button onClick={evaluate}><Target size={15} /> Evaluate</button>
+          <button onClick={generateFixtures} disabled={fixtureBusy}>
+            <Bot size={15} /> {fixtureBusy ? "Generating" : "Generate"}
+          </button>
+          <button onClick={() => refreshFixtures()}><RefreshCw size={14} /> Fixtures</button>
+          <button onClick={shuffleFixture} disabled={!fixtures.length}>Shuffle</button>
+          <select
+            className="toolbarSelect fixtureSelect"
+            value={fixtureId}
+            onChange={(e) => loadFixture(e.target.value)}
+          >
+            <option value="">Load fixture</option>
+            {fixtures.map((fixture) => (
+              <option key={fixture.session_id} value={fixture.session_id}>
+                {fixtureLabel(fixture)}
+              </option>
+            ))}
+          </select>
           {["own", "opp", "net", "max", "both"].map((mode) => (
             <button
               key={mode}
@@ -406,6 +473,7 @@ function AxisPanel({ prototypes, results, setResults }: {
           interactive
           onCellClick={playMove}
           overlayMoves={overlayMoves}
+          viewKey={axisSession?.session_id}
         />
       </Panel>
       <Panel title="Prototype Controls">
@@ -447,16 +515,25 @@ function AxisPanel({ prototypes, results, setResults }: {
   );
 }
 
+function fixtureLabel(fixture: AnyRow) {
+  const payload = fixture.payload || {};
+  const label = payload.label || "Classical fixture";
+  const moves = fixture.move_count ?? payload.actual_moves ?? 0;
+  return `${label} (${moves}m)`;
+}
+
 function Board({
   position,
   interactive = false,
   onCellClick,
-  overlayMoves = []
+  overlayMoves = [],
+  viewKey
 }: {
   position: AnyRow | null | undefined;
   interactive?: boolean;
   onCellClick?: (q: number, r: number) => void;
   overlayMoves?: AnyRow[];
+  viewKey?: string | number | null;
 }) {
   const [hover, setHover] = useState<AnyRow | null>(null);
   const [view, setView] = useState({ x: 0, y: 0, z: 1 });
@@ -483,7 +560,11 @@ function Board({
   const stoneMap = new Map<string, AnyRow>(stones.map((s: AnyRow) => [`${s.q},${s.r}`, s]));
   const currentPlayer = position?.current_player ?? 0;
   const last = position?.overlays?.last_move;
-  const resetView = () => setView({ x: 0, y: 0, z: 1 });
+  const resetView = () => setView(fitPlayedView(geometry));
+  useEffect(() => {
+    setView(fitPlayedView(geometry));
+    setHover(null);
+  }, [viewKey, geometry.focusKey]);
   const zoomBy = (factor: number) => setView((v) => ({ ...v, z: clamp(v.z * factor, 0.45, 2.8) }));
   const zoomAt = (clientX: number, clientY: number, factor: number) => {
     const svg = svgRef.current;
@@ -696,10 +777,46 @@ function buildBoardGeometry(position: AnyRow | null | undefined, overlayMoves: A
   return {
     width,
     height,
+    focusKey: focusKeyFor(position),
+    focus: buildFocusBounds(stones.length ? stones : moves, minX, minY),
     cells: parsed
       .map((c) => ({ q: c.q, r: c.r, x: c.rawX - minX + 22, y: c.rawY - minY + 22 }))
       .sort((a, b) => a.r - b.r || a.q - b.q)
   };
+}
+
+function fitPlayedView(geometry: AnyRow) {
+  const focus = geometry.focus;
+  if (!focus) return { x: 0, y: 0, z: 1 };
+  const focusWidth = Math.max(120, focus.maxX - focus.minX + HEX_SIZE * 3.5);
+  const focusHeight = Math.max(120, focus.maxY - focus.minY + HEX_SIZE * 3.5);
+  const z = clamp(Math.min((geometry.width - 72) / focusWidth, (geometry.height - 72) / focusHeight), 1, 2.25);
+  const cx = (focus.minX + focus.maxX) / 2;
+  const cy = (focus.minY + focus.maxY) / 2;
+  return {
+    x: geometry.width / 2 - cx * z,
+    y: geometry.height / 2 - cy * z,
+    z
+  };
+}
+
+function buildFocusBounds(items: AnyRow[], minX: number, minY: number) {
+  if (!items.length) return null;
+  const pts = items.map((item) => {
+    const c = hexCenter(Number(item.q), Number(item.r));
+    return { x: c.x - minX + 22, y: c.y - minY + 22 };
+  });
+  return {
+    minX: Math.min(...pts.map((p) => p.x)),
+    maxX: Math.max(...pts.map((p) => p.x)),
+    minY: Math.min(...pts.map((p) => p.y)),
+    maxY: Math.max(...pts.map((p) => p.y))
+  };
+}
+
+function focusKeyFor(position: AnyRow | null | undefined) {
+  const moves = position?.moves || [];
+  return moves.map((m: AnyRow) => `${m.q},${m.r}`).join("|");
 }
 
 function hexCenter(q: number, r: number) {

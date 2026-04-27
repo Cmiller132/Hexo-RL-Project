@@ -14,10 +14,21 @@ from hexorl.axis_policy.core import (
     board_index,
     merge_parameters,
     normalize_policy,
+    window_in_bounds,
 )
 from hexorl.selfplay.records import BOARD_SIZE
 
 WIN_LENGTH = 6
+DELTA_CORE_PARAMETERS = (
+    ParameterSpec("w1", 0.02, 0.0, 0.2, 0.005, "Strength after placing into an empty pure window."),
+    ParameterSpec("w2", 0.06, 0.0, 0.4, 0.005, "Strength after reaching two stones in a pure window."),
+    ParameterSpec("w3", 0.15, 0.0, 0.8, 0.01, "Strength after reaching three stones in a pure window."),
+    ParameterSpec("w4", 1.0, 0.0, 3.0, 0.01, "Strength after reaching four stones in a pure window."),
+    ParameterSpec("w5", 1.0, 0.0, 3.0, 0.01, "Strength after reaching five stones in a pure window."),
+    ParameterSpec("opp_weight", 1.0, 0.0, 2.0, 0.05, "Opponent delta multiplier."),
+    ParameterSpec("existing_credit", 0.25, 0.0, 1.0, 0.01, "How much pre-existing window strength is subtracted."),
+    ParameterSpec("tail_weight", 0.18, 0.0, 1.0, 0.01, "How much overlapping non-best windows contribute."),
+)
 
 
 class DeltaForkPrototype:
@@ -46,9 +57,16 @@ class DeltaForkPrototype:
         maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
         own = position.own_stones
         opp = position.opp_stones
-        debug = {"own_fork_cells": 0, "opp_fork_cells": 0, "legal_cells_scored": 0}
+        candidates, candidate_source = _delta_candidate_cells(position)
+        debug = {
+            "own_fork_cells": 0,
+            "opp_fork_cells": 0,
+            "legal_cells_scored": 0,
+            "candidate_source": candidate_source,
+            "candidate_cells": len(candidates),
+        }
 
-        for q, r in position.legal_set:
+        for q, r in candidates:
             ij = board_index(q, r, position.offset_q, position.offset_r)
             if ij is None:
                 continue
@@ -66,6 +84,8 @@ class DeltaForkPrototype:
                         strength,
                         params["existing_credit"],
                         params["tail_weight"],
+                        position.offset_q,
+                        position.offset_r,
                     )
                 )
                 opp_axes.append(
@@ -79,6 +99,8 @@ class DeltaForkPrototype:
                         strength,
                         params["existing_credit"],
                         params["tail_weight"],
+                        position.offset_q,
+                        position.offset_r,
                     )
                     * params["opp_weight"]
                 )
@@ -98,7 +120,7 @@ class DeltaForkPrototype:
         display = np.maximum(maps[:3].max(axis=0), maps[3:].max(axis=0))
         combined = normalize_policy(
             display,
-            position.legal_set,
+            candidates,
             position.offset_q,
             position.offset_r,
             fallback_uniform=False,
@@ -118,6 +140,62 @@ class DeltaForkPrototype:
             position.offset_r,
             position.current_player,
         )
+
+
+class DeltaNormPrototype:
+    prototype_id = "exp_delta_norm"
+    label = "Experiment: Delta Norm"
+    description = "Legal-cell placement delta scored by vector norm, so multiple strong axes raise the displayed value smoothly."
+    parameters = (
+        *DELTA_CORE_PARAMETERS,
+        ParameterSpec("p_norm", 2.0, 1.0, 4.0, 0.1, "Norm exponent. 2 is Euclidean; larger values move toward max-axis."),
+    )
+
+    def compute(
+        self,
+        position: AxisPolicyInput,
+        parameters: Mapping[str, float] | None = None,
+    ) -> AxisPolicyResult:
+        params = merge_parameters(self.parameters, parameters)
+        return _compute_delta_variant(position, params, "norm", self.prototype_id)
+
+
+class DeltaSoftStrongPrototype:
+    prototype_id = "exp_delta_soft_strong"
+    label = "Experiment: Delta Soft Strong"
+    description = "Legal-cell placement delta with a smooth strong-axis gate; tiny incidental axes do not count as full forks."
+    parameters = (
+        *DELTA_CORE_PARAMETERS,
+        ParameterSpec("strong_threshold", 0.75, 0.0, 3.0, 0.01, "Axis value where the smooth strong-axis gate is half active."),
+        ParameterSpec("fork_bonus", 0.65, 0.0, 3.0, 0.05, "Multiplier added as multiple axes become strongly active."),
+    )
+
+    def compute(
+        self,
+        position: AxisPolicyInput,
+        parameters: Mapping[str, float] | None = None,
+    ) -> AxisPolicyResult:
+        params = merge_parameters(self.parameters, parameters)
+        return _compute_delta_variant(position, params, "soft_strong", self.prototype_id)
+
+
+class DeltaBalancePrototype:
+    prototype_id = "exp_delta_balance"
+    label = "Experiment: Delta Balance"
+    description = "Legal-cell placement delta with a smooth ratio bonus when the second and third axes are comparable to the best axis."
+    parameters = (
+        *DELTA_CORE_PARAMETERS,
+        ParameterSpec("balance_bonus", 0.75, 0.0, 3.0, 0.05, "Bonus when the second-best axis approaches the best axis."),
+        ParameterSpec("third_axis_bonus", 0.25, 0.0, 2.0, 0.05, "Smaller bonus when the third axis also has meaningful strength."),
+    )
+
+    def compute(
+        self,
+        position: AxisPolicyInput,
+        parameters: Mapping[str, float] | None = None,
+    ) -> AxisPolicyResult:
+        params = merge_parameters(self.parameters, parameters)
+        return _compute_delta_variant(position, params, "balance", self.prototype_id)
 
 
 class CrossAxisPivotPrototype:
@@ -202,6 +280,175 @@ def _strength_array(params: Mapping[str, float]) -> np.ndarray:
     )
 
 
+def _compute_delta_variant(
+    position: AxisPolicyInput,
+    params: Mapping[str, float],
+    mode: str,
+    prototype_id: str,
+) -> AxisPolicyResult:
+    strength = _strength_array(params)
+    maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    own = position.own_stones
+    opp = position.opp_stones
+    debug = {
+        "legal_cells_scored": 0,
+        "own_multi_axis_cells": 0,
+        "opp_multi_axis_cells": 0,
+        "variant": mode,
+    }
+    candidates, candidate_source = _delta_candidate_cells(position)
+    debug["candidate_source"] = candidate_source
+    debug["candidate_cells"] = len(candidates)
+
+    for q, r in candidates:
+        ij = board_index(q, r, position.offset_q, position.offset_r)
+        if ij is None:
+            continue
+        own_axes, opp_axes = _placement_delta_axes(
+            q,
+            r,
+            own,
+            opp,
+            strength,
+            params,
+            position.offset_q,
+            position.offset_r,
+        )
+        if _active_count(own_axes, float(params.get("strong_threshold", 0.75))) >= 2:
+            debug["own_multi_axis_cells"] += 1
+        if _active_count(opp_axes, float(params.get("strong_threshold", 0.75))) >= 2:
+            debug["opp_multi_axis_cells"] += 1
+        own_shaped = _shape_delta_axes(own_axes, params, mode)
+        opp_shaped = _shape_delta_axes(opp_axes, params, mode)
+        for axis in range(3):
+            maps[axis, ij[0], ij[1]] = own_shaped[axis]
+            maps[axis + 3, ij[0], ij[1]] = opp_shaped[axis]
+        debug["legal_cells_scored"] += 1
+
+    display = np.maximum(maps[:3].max(axis=0), maps[3:].max(axis=0))
+    combined = normalize_policy(
+        display,
+        candidates,
+        position.offset_q,
+        position.offset_r,
+        fallback_uniform=False,
+    )
+    return AxisPolicyResult(
+        prototype_id,
+        dict(params),
+        maps,
+        combined,
+        {
+            **debug,
+            "target_kind": "diagnostic_legal_delta_variant_not_training_target",
+            "reading": "value is placement-created pure-window strength, shaped to expose multi-axis structure",
+            "strength_weights": strength.tolist(),
+        },
+        position.offset_q,
+        position.offset_r,
+        position.current_player,
+    )
+
+
+def _placement_delta_axes(
+    q: int,
+    r: int,
+    own: set[tuple[int, int]],
+    opp: set[tuple[int, int]],
+    strength: np.ndarray,
+    params: Mapping[str, float],
+    offset_q: int,
+    offset_r: int,
+) -> tuple[list[float], list[float]]:
+    own_axes: list[float] = []
+    opp_axes: list[float] = []
+    for dq, dr in AXES:
+        own_axes.append(
+            _marginal_axis_gain(
+                q,
+                r,
+                dq,
+                dr,
+                own,
+                opp,
+                strength,
+                params["existing_credit"],
+                params["tail_weight"],
+                offset_q,
+                offset_r,
+            )
+        )
+        opp_axes.append(
+            _marginal_axis_gain(
+                q,
+                r,
+                dq,
+                dr,
+                opp,
+                own,
+                strength,
+                params["existing_credit"],
+                params["tail_weight"],
+                offset_q,
+                offset_r,
+            )
+            * params["opp_weight"]
+        )
+    return own_axes, opp_axes
+
+
+def _delta_candidate_cells(position: AxisPolicyInput) -> tuple[set[tuple[int, int]], str]:
+    legal = position.legal_set
+    if legal:
+        return legal, "legal_moves"
+    occupied = position.own_stones | position.opp_stones
+    candidates: set[tuple[int, int]] = set()
+    for q, r in occupied:
+        for dq, dr in AXES:
+            for step in range(-(WIN_LENGTH - 1), WIN_LENGTH):
+                cell = (q + dq * step, r + dr * step)
+                if cell not in occupied:
+                    candidates.add(cell)
+    return candidates, "terminal_hypothetical_line_cells"
+
+
+def _shape_delta_axes(
+    axes: Sequence[float],
+    params: Mapping[str, float],
+    mode: str,
+) -> list[float]:
+    values = [max(float(value), 0.0) for value in axes[:3]]
+    best = max(values, default=0.0)
+    if best <= 0.0:
+        return values
+    if mode == "norm":
+        p_norm = max(float(params["p_norm"]), 1.0)
+        scalar = sum(value**p_norm for value in values) ** (1.0 / p_norm)
+        return _scale_max_to(values, scalar)
+    if mode == "soft_strong":
+        threshold = max(float(params["strong_threshold"]), 1e-6)
+        gates = [value / (value + threshold) if value > 0.0 else 0.0 for value in values]
+        active_mass = sum(gates)
+        multiplier = 1.0 + float(params["fork_bonus"]) * max(0.0, active_mass - 1.0)
+        return [value * multiplier for value in values]
+    if mode == "balance":
+        ordered = sorted(values, reverse=True)
+        second_ratio = ordered[1] / best if len(ordered) > 1 else 0.0
+        third_ratio = ordered[2] / best if len(ordered) > 2 else 0.0
+        multiplier = 1.0 + float(params["balance_bonus"]) * second_ratio
+        multiplier += float(params["third_axis_bonus"]) * third_ratio
+        return [value * multiplier for value in values]
+    return values
+
+
+def _scale_max_to(values: Sequence[float], scalar: float) -> list[float]:
+    best = max(values, default=0.0)
+    if best <= 0.0:
+        return [float(value) for value in values]
+    scale = float(scalar) / best
+    return [float(value) * scale for value in values]
+
+
 def _dense_axis_maps(position: AxisPolicyInput, strength: np.ndarray, tail_weight: float) -> np.ndarray:
     maps = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     own = position.own_stones
@@ -214,6 +461,8 @@ def _dense_axis_maps(position: AxisPolicyInput, strength: np.ndarray, tail_weigh
                 own_values: list[float] = []
                 opp_values: list[float] = []
                 for cells in _windows_containing(q, r, dq, dr):
+                    if not window_in_bounds(cells, position.offset_q, position.offset_r):
+                        continue
                     own_count = _count(cells, own)
                     opp_count = _count(cells, opp)
                     if own_count and opp_count:
@@ -235,9 +484,13 @@ def _marginal_axis_gain(
     strength: np.ndarray,
     existing_credit: float,
     tail_weight: float,
+    offset_q: int,
+    offset_r: int,
 ) -> float:
     gains: list[float] = []
     for cells in _windows_containing(q, r, dq, dr):
+        if not window_in_bounds(cells, offset_q, offset_r):
+            continue
         if any(cell in blockers for cell in cells):
             continue
         before = min(_count(cells, side), WIN_LENGTH)

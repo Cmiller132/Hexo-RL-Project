@@ -23,6 +23,9 @@ The main candidate is deliberately not a policy-ranked overlay. It shows the flo
 There are also `exp_*` prototypes. These are deliberately dashboard experiments, not dashboard targets and not training targets:
 
 - `exp_delta_fork`: legal-cell marginal gain. It asks how much pure-axis strength a move would add, with a bonus for moves that improve several axes at once.
+- `exp_delta_norm`: legal-cell marginal gain scored by vector norm, so two strong axes smoothly outrank one strong axis.
+- `exp_delta_soft_strong`: legal-cell marginal gain with a smooth strong-axis gate, reducing noise from tiny incidental axes.
+- `exp_delta_balance`: legal-cell marginal gain with a ratio bonus when the second and third axes are comparable to the best axis.
 - `exp_cross_axis_pivot`: dense field with cross-axis boosting. It asks where existing line geometry is structurally rich across more than one axis.
 
 These are useful angles for thinking about long-term planning, but they should remain exploratory until they are tested against actual games and visually inspected in many normal positions.

@@ -4,7 +4,8 @@ Input: (B, 13, 33, 33) f32 tensor
 Output: dict of head_name → tensor
 
 Supports heads: policy, value (binned), lookahead_* (binned), opp_policy,
-axis (3-class), regret_rank (scalar), regret_value (binned), moves_left (scalar).
+axis (3-class), axis_delta_norm (6-plane map), regret_rank (scalar),
+regret_value (binned), moves_left (scalar).
 """
 
 import torch
@@ -94,6 +95,19 @@ class AxisHead(nn.Module):
         return self.fc(x)
 
 
+class AxisMapHead(nn.Module):
+    """Dense axis-map regression head: (B, C, 33, 33) -> (B, 6, 33, 33)."""
+
+    def __init__(self, channels: int, planes: int = 6):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, max(8, channels // 2), kernel_size=1)
+        self.conv2 = nn.Conv2d(max(8, channels // 2), planes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.conv1(x))
+        return F.softplus(self.conv2(x))
+
+
 class RegretRankHead(nn.Module):
     """Regret ranking head: global avg pool → Linear → ReLU → Linear → scalar φ(s)."""
 
@@ -134,6 +148,7 @@ class HexNet(nn.Module):
         lookahead_* — (B, N_BINS) binned lookahead value logits
         opp_policy  — (B, 1089) opponent policy logits
         axis        — (B, 3) hex axis classification logits
+        axis_delta_norm — (B, 6, 33, 33) delta-norm axis-map regression
         regret_rank — (B, 1) ranking score scalar
         regret_value— (B, N_BINS) binned regret value logits
         moves_left  — (B, 1) moves-left scalar (softplus)
@@ -171,6 +186,8 @@ class HexNet(nn.Module):
                 head_modules[name] = ValueBinnedHead(channels, n_bins)
             elif name == "axis":
                 head_modules[name] = AxisHead(channels)
+            elif name == "axis_delta_norm":
+                head_modules[name] = AxisMapHead(channels, planes=6)
             elif name == "regret_rank":
                 head_modules[name] = RegretRankHead(channels)
             elif name == "moves_left":

@@ -14,6 +14,7 @@ from hexorl.axis_policy.core import (
     ParameterSpec,
     merge_parameters,
     normalize_policy,
+    window_in_bounds,
 )
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -168,6 +169,12 @@ def _compute_maps(
                         cell = (wq + dq * step, wr + dr * step)
                         own_count += int(cell in own)
                         opp_count += int(cell in opp)
+                    if not window_in_bounds(
+                        [(wq + dq * step, wr + dr * step) for step in range(WIN_LENGTH)],
+                        position.offset_q,
+                        position.offset_r,
+                    ):
+                        continue
                     if own_count and opp_count:
                         debug["contested_skipped"] += 1
                         continue

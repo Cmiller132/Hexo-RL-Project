@@ -14,6 +14,7 @@ from hexorl.axis_policy.core import (
     empty_axis_maps,
     merge_parameters,
     normalize_policy,
+    window_in_bounds,
 )
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -59,6 +60,12 @@ class LegacyAxisInfluencePrototype:
                             cell = (wq + dq * step, wr + dr * step)
                             own_count += int(cell in own)
                             opp_count += int(cell in opp)
+                        if not window_in_bounds(
+                            [(wq + dq * step, wr + dr * step) for step in range(6)],
+                            position.offset_q,
+                            position.offset_r,
+                        ):
+                            continue
                         if own_count and opp_count:
                             continue
                         total += float(urgency[own_count] - urgency[opp_count])

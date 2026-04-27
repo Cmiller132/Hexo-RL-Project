@@ -4,9 +4,10 @@ import pytest
 import torch
 
 from hexorl.axis_policy.core import AxisPolicyInput
-from hexorl.axis_policy.registry import evaluate_all
+from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint
 from hexorl.dashboard.db import DashboardStore
+from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical_fixtures
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
 from hexorl.dashboard.recorder import RunRecorder
 from hexorl.eval.players import NoisyModelPlayer, NoisyPolicyConfig
@@ -45,7 +46,7 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
 
 def test_checkpoint_indexing_extracts_current_hexorl_metadata(tmp_path):
     store = DashboardStore(tmp_path / "dashboard.sqlite3")
-    model = HexNet(channels=4, blocks=1, heads=["policy", "value", "axis"])
+    model = HexNet(channels=4, blocks=1, heads=["policy", "value", "axis", "axis_delta_norm"])
     path = tmp_path / "epoch_0003.pt"
     torch.save(
         {
@@ -61,7 +62,7 @@ def test_checkpoint_indexing_extracts_current_hexorl_metadata(tmp_path):
     assert result.is_loadable
     assert result.epoch == 3
     assert result.global_step == 12
-    assert result.model_heads == ["axis", "policy", "value"]
+    assert result.model_heads == ["axis", "axis_delta_norm", "policy", "value"]
     rows = store.rows("SELECT * FROM checkpoints WHERE checkpoint_id=?", (result.checkpoint_id,))
     assert rows[0]["sha256"] == result.sha256
 
@@ -90,6 +91,34 @@ def test_replay_and_play_session_roundtrip(tmp_path):
     assert undone["position"]["turn_index"] == 1
 
 
+def test_classical_axis_fixture_generation(tmp_path):
+    pytest.importorskip("_engine")
+    store = DashboardStore(tmp_path / "dashboard.sqlite3")
+
+    fixtures = generate_classical_fixtures(
+        store,
+        ClassicalFixtureConfig(
+            count=2,
+            examples_per_move_count=2,
+            move_counts=(2, 4),
+            time_ms=1,
+            max_depth=1,
+            near_radius=2,
+            noise_level=0.05,
+            seed=11,
+        ),
+    )
+
+    assert len(fixtures) == 4
+    assert fixtures[0]["session_id"]
+    assert fixtures[0]["move_count"] == 2
+    assert [fixture["payload"]["target_moves"] for fixture in fixtures] == [2, 2, 4, 4]
+    assert fixtures[0]["payload"]["source"] == "rust_classical_selfplay"
+    loaded = session_payload(store, fixtures[0]["session_id"])
+    assert loaded["position"]["moves"]
+    assert loaded["payload"]["mode"] == "axis_fixture"
+
+
 def test_axis_policy_prototypes_are_python_tunable():
     position = AxisPolicyInput(
         stones=[{"player": 0, "q": 0, "r": 0}, {"player": 1, "q": 1, "r": 0}],
@@ -105,6 +134,9 @@ def test_axis_policy_prototypes_are_python_tunable():
         "dual_axis_strength_hot",
         "legacy_axis_influence",
         "exp_delta_fork",
+        "exp_delta_norm",
+        "exp_delta_soft_strong",
+        "exp_delta_balance",
         "exp_cross_axis_pivot",
     }
     assert any(r["cells"] for r in results)
@@ -113,8 +145,26 @@ def test_axis_policy_prototypes_are_python_tunable():
     delta = next(r for r in results if r["prototype_id"] == "exp_delta_fork")
     assert len(delta["axis_summaries"]) == 6
     assert delta["debug_terms"]["target_kind"] == "diagnostic_legal_delta_not_training_target"
+    delta_norm = next(r for r in results if r["prototype_id"] == "exp_delta_norm")
+    assert delta_norm["debug_terms"]["variant"] == "norm"
     first_cell = next(r["cells"][0] for r in results if r["cells"])
     assert {"q", "r", "score", "axes", "own_axes", "opp_axes", "net_axes", "owner"} <= set(first_cell)
+
+
+def test_axis_strength_requires_feasible_six_cell_window():
+    position = AxisPolicyInput(
+        stones=[{"player": 0, "q": -16, "r": -16}],
+        legal_moves=[{"q": -16, "r": -16}],
+        current_player=0,
+        offset_q=-16,
+        offset_r=-16,
+    )
+
+    result = get_prototype("dual_axis_strength").compute(position)
+
+    assert result.axis_maps[0, 0, 0] > 0.0
+    assert result.axis_maps[1, 0, 0] > 0.0
+    assert result.axis_maps[2, 0, 0] == 0.0
 
 
 def test_fastapi_dashboard_smoke(tmp_path):
@@ -133,6 +183,31 @@ def test_fastapi_dashboard_smoke(tmp_path):
     assert created["session_id"]
     axis = client.post("/api/axis/evaluate", json={"session_id": created["session_id"]}).json()
     assert axis["results"]
+    assert client.get("/api/axis/fixtures").json() == []
+
+    spread = client.post(
+        "/api/axis/evaluate",
+        json={
+            "prototype_id": "exp_delta_fork",
+            "position": {
+                "current_player": 0,
+                "offset_q": -16,
+                "offset_r": -16,
+                "stones": [
+                    {"player": 0, "q": 40, "r": -40},
+                    {"player": 1, "q": -40, "r": 40},
+                ],
+                "legal_moves": [
+                    {"q": 41, "r": -40},
+                    {"q": 39, "r": -40},
+                    {"q": -41, "r": 40},
+                    {"q": -39, "r": 40},
+                ],
+            },
+        },
+    ).json()
+    assert spread["cells"]
+    assert spread["debug_terms"]["legal_cells_scored"] > 0
 
 
 def test_noisy_model_player_reproducible_without_engine():

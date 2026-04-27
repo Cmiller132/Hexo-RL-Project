@@ -161,6 +161,14 @@ def axis_loss(
     return F.cross_entropy(pred_logits[valid], target_axis[valid])
 
 
+def axis_map_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """MSE for dense six-plane axis-map regression targets."""
+    return F.mse_loss(pred, target.to(device=pred.device, dtype=pred.dtype))
+
+
 def moves_left_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -246,6 +254,11 @@ def compute_losses(
             loss = regret_value_loss(pred, targets["regret_value"], n_bins)
         elif head_name == "axis":
             loss = axis_loss(pred, targets.get("axis"))
+        elif head_name == "axis_delta_norm":
+            target = targets.get("axis_delta_norm")
+            if target is None:
+                continue
+            loss = axis_map_loss(pred, target)
         elif head_name == "moves_left":
             loss = moves_left_loss(pred, targets["moves_left"])
         else:

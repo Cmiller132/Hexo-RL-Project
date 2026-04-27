@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
@@ -192,6 +193,18 @@ def board_index(q: int, r: int, offset_q: int, offset_r: int) -> tuple[int, int]
     if 0 <= i < BOARD_SIZE and 0 <= j < BOARD_SIZE:
         return i, j
     return None
+
+
+def cell_in_bounds(q: int, r: int, offset_q: int, offset_r: int) -> bool:
+    return board_index(q, r, offset_q, offset_r) is not None
+
+
+def window_in_bounds(
+    cells: Iterable[tuple[int, int]],
+    offset_q: int,
+    offset_r: int,
+) -> bool:
+    return all(cell_in_bounds(q, r, offset_q, offset_r) for q, r in cells)
 
 
 def line_count(stones: set[tuple[int, int]], q: int, r: int, dq: int, dr: int) -> int:

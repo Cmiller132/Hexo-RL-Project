@@ -35,9 +35,12 @@ def create_session(
     *,
     run_id: str | None = None,
     payload: Mapping[str, Any] | None = None,
+    move_history: bytes = b"",
+    status: str = "active",
 ) -> PlaySession:
     session_id = uuid.uuid4().hex
     now = time.time()
+    current_player = len(decode_move_history(move_history)) % 2
     with store.connect() as conn:
         conn.execute(
             """
@@ -50,9 +53,9 @@ def create_session(
             (
                 session_id,
                 run_id,
-                "active",
-                0,
-                "",
+                status,
+                current_player,
+                encode_bytes(move_history),
                 _json(payload or {}),
                 now,
                 now,

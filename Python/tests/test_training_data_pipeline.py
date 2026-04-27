@@ -13,6 +13,7 @@ from hexorl.buffer.sampler import (
 from hexorl.buffer.targets import process_game_record
 from hexorl.selfplay.records import GameRecord, PositionRecord, BOARD_SIZE, action_to_board_index
 from hexorl.train.losses import compute_losses
+from hexorl.model.network import HexNet
 
 
 def _move(player: int, q: int, r: int) -> bytes:
@@ -117,21 +118,37 @@ def test_compute_losses_skips_missing_targets_and_handles_batch_one():
         "value": torch.zeros(1, 65),
         "regret_rank": torch.zeros(1, 1),
         "axis": torch.zeros(1, 3),
+        "axis_delta_norm": torch.zeros(1, 6, 33, 33),
         "moves_left": torch.ones(1, 1),
     }
     targets = {
         "policy": torch.nn.functional.one_hot(torch.tensor([0]), 1089).float(),
         "value": torch.tensor([1.0]),
         "axis": torch.tensor([-1]),
+        "axis_delta_norm": torch.ones(1, 6, 33, 33),
     }
 
     total, per_head = compute_losses(
         predictions,
         targets,
-        {"policy": 1.0, "value": 1.0, "regret_rank": 1.0, "axis": 1.0, "moves_left": 1.0},
+        {
+            "policy": 1.0,
+            "value": 1.0,
+            "regret_rank": 1.0,
+            "axis": 1.0,
+            "axis_delta_norm": 1.0,
+            "moves_left": 1.0,
+        },
     )
 
     assert torch.isfinite(total)
     assert "regret_rank" not in per_head
     assert "moves_left" not in per_head
     assert per_head["axis"].item() == 0.0
+    assert per_head["axis_delta_norm"].item() > 0.0
+
+
+def test_axis_delta_norm_head_shape():
+    model = HexNet(channels=4, blocks=1, heads=["axis_delta_norm"])
+    out = model(torch.zeros(2, 13, 33, 33))
+    assert out["axis_delta_norm"].shape == (2, 6, 33, 33)
