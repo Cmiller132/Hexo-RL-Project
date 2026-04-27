@@ -160,7 +160,10 @@ class InferenceServer:
         self._model = from_config(self.cfg, device=self._device)
         if self._device.type == "cuda" and getattr(self.cfg.runtime, "channels_last", True):
             self._model = self._model.to(memory_format=torch.channels_last)
-        if self._device.type == "cuda" and getattr(self.cfg.runtime, "compile_model", False):
+        compile_inference = getattr(self.cfg.runtime, "compile_inference", None)
+        if compile_inference is None:
+            compile_inference = getattr(self.cfg.runtime, "compile_model", False)
+        if self._device.type == "cuda" and compile_inference:
             try:
                 self._model = torch.compile(
                     self._model,
@@ -211,7 +214,6 @@ class InferenceServer:
               f"fp16={self.fp16}, max_batch={self.max_batch}, "
               f"workers={self.num_workers}", flush=True)
 
-        loop = asyncio.get_running_loop()
         wait_s = self.max_wait_us / 1_000_000.0
 
         while not self._stop_event.is_set():
@@ -235,9 +237,7 @@ class InferenceServer:
                 for worker_id in ready_workers:
                     self._queue.get_slot(worker_id).req_ready.clear()
 
-                policies, values = await loop.run_in_executor(
-                    None, self._forward, batch_tensor
-                )
+                policies, values = self._forward(batch_tensor)
 
                 self._scatter_results(ready_workers, per_worker_counts, policies, values)
 

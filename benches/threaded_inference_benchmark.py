@@ -54,7 +54,7 @@ def _worker(worker_id: int, num_workers: int, max_batch: int, batch_size: int, d
 
 def run(config: Path, workers: int, batch_size: int, duration_s: float) -> None:
     cfg = load_config(config)
-    host = autotune_config(cfg)
+    host = autotune_config(cfg, selfplay_enabled=True)
     runtime = configure_torch_runtime(cfg, host)
     cfg.selfplay.num_workers = workers
     cfg.inference.max_batch_size = max(cfg.inference.max_batch_size, workers * batch_size)

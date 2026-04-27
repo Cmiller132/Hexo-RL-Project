@@ -67,7 +67,7 @@ def main():
 
     if args.command == "epoch":
         cfg = load_config(args.config)
-        host = autotune_config(cfg)
+        host = autotune_config(cfg, selfplay_enabled=args.selfplay)
         runtime = configure_torch_runtime(cfg, host)
         logging.info("Runtime: %s", runtime)
         result = run_epoch(
@@ -81,7 +81,7 @@ def main():
     elif args.command == "smoke-train":
         cfg = load_config(args.config) if args.config else None
         if cfg is not None:
-            host = autotune_config(cfg)
+            host = autotune_config(cfg, selfplay_enabled=False)
             runtime = configure_torch_runtime(cfg, host)
             logging.info("Runtime: %s", runtime)
         results = run_tiny_training_smoke(cfg, epochs=args.epochs, output_dir=args.output_dir)
@@ -89,7 +89,7 @@ def main():
             print(_format_result(result))
     elif args.command == "bench":
         cfg = load_config()
-        host = autotune_config(cfg)
+        host = autotune_config(cfg, selfplay_enabled=False)
         runtime = configure_torch_runtime(cfg, host)
         logging.info("Runtime: %s", runtime)
         results = run_tiny_training_smoke(cfg, epochs=1, output_dir=Path("./runs/bench_smoke"))

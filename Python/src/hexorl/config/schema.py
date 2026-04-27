@@ -120,11 +120,13 @@ class RuntimeConfig(BaseModel):
     cpu_threads: int | None = None
     interop_threads: int | None = None
     dataloader_workers: int | None = None
+    selfplay_workers: int | None = None
     selfplay_cpu_reserve: int = 4
     channels_last: bool = True
     allow_tf32: bool = True
     cudnn_benchmark: bool = True
     compile_model: bool | None = None
+    compile_inference: bool | None = None
     compile_mode: str = "reduce-overhead"
     train_memory_fraction: float = 0.62
 

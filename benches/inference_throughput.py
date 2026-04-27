@@ -70,7 +70,7 @@ def run_benchmark(batch_sizes=None, duration_s=10.0, num_workers=8, config_path=
 
     cfg = load_config(config_path) if config_path else load_config()
     if config_path:
-        autotune_config(cfg)
+        autotune_config(cfg, selfplay_enabled=True)
         num_workers = cfg.selfplay.num_workers if num_workers <= 0 else num_workers
     else:
         num_workers = 4 if num_workers <= 0 else num_workers

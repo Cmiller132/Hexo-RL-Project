@@ -42,7 +42,12 @@ def detect_host() -> HostProfile:
     )
 
 
-def autotune_config(cfg: Config, host: HostProfile | None = None) -> HostProfile:
+def autotune_config(
+    cfg: Config,
+    host: HostProfile | None = None,
+    *,
+    selfplay_enabled: bool | None = None,
+) -> HostProfile:
     """Fill host-derived performance values in-place.
 
     The tuner deliberately changes only operational throughput knobs. Model
@@ -53,32 +58,39 @@ def autotune_config(cfg: Config, host: HostProfile | None = None) -> HostProfile
     if not rt.autotune:
         return host
 
+    tune_selfplay = True if selfplay_enabled is None else bool(selfplay_enabled)
     reserve = max(1, min(rt.selfplay_cpu_reserve, host.logical_cpus - 1))
     worker_budget = max(1, host.logical_cpus - reserve)
-    if cfg.selfplay.num_workers <= 0:
-        cfg.selfplay.num_workers = worker_budget
-    else:
-        cfg.selfplay.num_workers = min(cfg.selfplay.num_workers, worker_budget)
+    if tune_selfplay:
+        if cfg.selfplay.num_workers <= 0:
+            cfg.selfplay.num_workers = _selfplay_worker_target(cfg, host, worker_budget)
+        else:
+            cfg.selfplay.num_workers = min(cfg.selfplay.num_workers, worker_budget)
+    elif cfg.selfplay.num_workers <= 0:
+        cfg.selfplay.num_workers = 0
 
     if host.cuda_available:
         if cfg.inference.max_batch_size <= 0:
             cfg.inference.max_batch_size = _cuda_batch_target(cfg, host)
-        if cfg.selfplay.batch_size_per_worker <= 0:
+        if tune_selfplay and cfg.selfplay.batch_size_per_worker <= 0:
             if host.cuda_memory_gb >= 11.0:
                 cfg.selfplay.batch_size_per_worker = 16
             elif host.cuda_memory_gb >= 8.0:
                 cfg.selfplay.batch_size_per_worker = 8
             else:
                 cfg.selfplay.batch_size_per_worker = 4
-        cfg.inference.max_batch_size = max(
-            cfg.inference.max_batch_size,
-            cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64,
-        )
+        if tune_selfplay:
+            cfg.inference.max_batch_size = max(
+                cfg.inference.max_batch_size,
+                cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64,
+            )
         if cfg.train.batch_size <= 0:
             cfg.train.batch_size = _train_batch_target(cfg, host)
         cfg.inference.fp16 = True
         if rt.compile_model is None:
             rt.compile_model = bool(cfg.train.batches_per_epoch >= 500)
+        if rt.compile_inference is None:
+            rt.compile_inference = False
 
     if cfg.train.prefetch_batches <= 0:
         cfg.train.prefetch_batches = 2 if host.cuda_available else 1
@@ -120,6 +132,7 @@ def configure_torch_runtime(cfg: Config, host: HostProfile | None = None) -> dic
         "cuda_memory_gb": round(host.cuda_memory_gb, 2),
         "channels_last": bool(rt.channels_last and host.cuda_available),
         "compile_model": bool(rt.compile_model and host.cuda_available),
+        "compile_inference": bool(rt.compile_inference and host.cuda_available),
     }
 
 
@@ -148,6 +161,20 @@ def _cuda_batch_target(cfg: Config, host: HostProfile) -> int:
     if host.cuda_memory_gb >= 8.0:
         return 128
     return 64
+
+
+def _selfplay_worker_target(cfg: Config, host: HostProfile, worker_budget: int) -> int:
+    if cfg.runtime.selfplay_workers is not None:
+        return max(1, min(int(cfg.runtime.selfplay_workers), worker_budget))
+    if not host.cuda_available:
+        return worker_budget
+
+    model_scale = max(
+        0.0625,
+        (cfg.model.channels / 128.0) * (cfg.model.blocks / 16.0),
+    )
+    target = int(round(8.0 / (model_scale ** 0.5)))
+    return max(4, min(worker_budget, target))
 
 
 def _train_batch_target(cfg: Config, host: HostProfile) -> int:

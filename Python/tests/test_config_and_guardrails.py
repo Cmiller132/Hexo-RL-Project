@@ -82,6 +82,7 @@ def test_autotune_train_batch_avoids_memory_cliff_for_production_model():
     cfg.model.channels = 128
     cfg.model.blocks = 16
     cfg.model.heads = ["policy", "value", "lookahead_4", "lookahead_12", "lookahead_36", "axis"]
+    cfg.selfplay.num_workers = 0
     cfg.train.batch_size = 0
     cfg.train.batches_per_epoch = 100
     host = HostProfile(
@@ -95,9 +96,11 @@ def test_autotune_train_batch_avoids_memory_cliff_for_production_model():
 
     autotune_config(cfg, host)
 
+    assert cfg.selfplay.num_workers == 8
     assert cfg.train.batch_size < 384
     assert _estimate_train_peak_gb(cfg, cfg.train.batch_size) <= 12.0 * cfg.runtime.train_memory_fraction
     assert cfg.runtime.compile_model is False
+    assert cfg.runtime.compile_inference is False
 
 
 def test_autotune_compile_model_for_long_cuda_training():
@@ -112,6 +115,7 @@ def test_autotune_compile_model_for_long_cuda_training():
         cuda_memory_gb=12.0,
     )
 
-    autotune_config(cfg, host)
+    autotune_config(cfg, host, selfplay_enabled=False)
 
     assert cfg.runtime.compile_model is True
+    assert cfg.runtime.compile_inference is False

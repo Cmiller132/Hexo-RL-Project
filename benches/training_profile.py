@@ -151,7 +151,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    autotune_config(cfg)
+    autotune_config(cfg, selfplay_enabled=False)
     if args.compile:
         cfg.runtime.compile_model = True
     if args.compile_mode:

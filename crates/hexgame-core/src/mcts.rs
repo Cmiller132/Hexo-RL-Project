@@ -192,7 +192,7 @@ struct PendingLeaf {
 ///
 /// For each legal move, looks up the corresponding logit in the flat
 /// `policy_logits` array (shape BOARD_AREA) using the board-to-tensor
-/// offset, then applies numerically-stable softmax in f64 space.
+/// offset, then applies numerically-stable softmax.
 ///
 /// Moves that fall outside the tensor window receive a default logit of -10.0.
 ///
@@ -203,32 +203,31 @@ fn gather_policy(
     policy_logits: &[f32],
     offset_q: i32,
     offset_r: i32,
-    raw: &mut Vec<f64>,
+    raw: &mut Vec<f32>,
     priors: &mut Vec<f32>,
 ) {
     let n = moves.len();
     raw.clear();
-    raw.resize(n, -10.0f64);
+    raw.resize(n, -10.0f32);
 
     for (i, h) in moves.iter().enumerate() {
         let gi = h.q - offset_q;
         let gj = h.r - offset_r;
         if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
             let flat = (gi as usize) * (BOARD_SIZE as usize) + gj as usize;
-            raw[i] = policy_logits[flat] as f64;
+            raw[i] = policy_logits[flat];
         }
     }
 
-    // Softmax in f64 for numerical stability, then convert to f32 priors.
-    let max_val = raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let max_val = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for v in raw.iter_mut() {
         *v = (*v - max_val).exp();
     }
-    let sum: f64 = raw.iter().sum();
+    let sum: f32 = raw.iter().sum();
 
     priors.clear();
     if sum > 0.0 {
-        priors.extend(raw.iter().map(|&e| (e / sum) as f32));
+        priors.extend(raw.iter().map(|&e| e / sum));
     } else {
         // Uniform fallback if all logits are identical or invalid.
         priors.extend(std::iter::repeat_n(1.0 / moves.len() as f32, moves.len()));
@@ -277,7 +276,7 @@ pub struct MCTSEngine {
     /// the next `expand_and_backprop` call.
     pending: Vec<PendingLeaf>,
     /// Reusable scratch buffer for `gather_policy` (raw logits before softmax).
-    scratch_raw: Vec<f64>,
+    scratch_raw: Vec<f32>,
     /// Reusable scratch buffer for `gather_policy` (normalized priors).
     scratch_priors: Vec<f32>,
     /// Reusable buffer for `encode_board_into` live-cells channels.

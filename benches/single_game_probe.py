@@ -38,7 +38,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    autotune_config(cfg)
+    autotune_config(cfg, selfplay_enabled=False)
     cfg.selfplay.num_workers = 1
     cfg.selfplay.mcts_simulations = args.sims
     cfg.selfplay.pcr_low_sim_prob = 0.0

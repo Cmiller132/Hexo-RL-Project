@@ -266,7 +266,7 @@ class RealMCTSEngine:
             return None
         tensor_3d, oq, or_, legal_bytes = init
         return (
-            np.array(tensor_3d).astype(np.float32),
+            np.asarray(tensor_3d, dtype=np.float32),
             oq,
             or_,
             legal_bytes,
@@ -283,7 +283,7 @@ class RealMCTSEngine:
 
     def select_leaves(self, batch_size):
         tensor_4d, count = self._engine.select_leaves(batch_size)
-        return np.array(tensor_4d).astype(np.float32), count
+        return np.asarray(tensor_4d, dtype=np.float32), count
 
     def expand_and_backprop(self, policies, values):
         self._engine.expand_and_backprop(policies, values)
