@@ -8,6 +8,7 @@ Runs CPU-side on completed game records. Computes:
     opponent policy, regret rank/value, dominant axis, and moves-left.
 """
 
+from bisect import bisect_right
 import numpy as np
 from typing import List, Tuple, Optional
 from hexorl.selfplay.records import GameRecord, PositionRecord, pair_policy_v2_from_place_target
@@ -36,15 +37,15 @@ def compute_value_targets(
 def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
     """Return indices of positions that are turn boundaries.
 
-    In Hexo, a turn boundary is a position where a new full turn starts.
-    Since players alternate every placement, boundaries occur every 2
-    placements: indices 0, 2, 4, ...
+    In Hexo, the opening turn has one placement and later turns have two
+    placements by the same player. Boundaries are therefore player-run starts,
+    e.g. players [0, 1, 1, 0, 0] -> indices [0, 1, 3].
     """
-    boundaries = []
-    for i, pos in enumerate(positions):
-        if pos.turn_index % 2 == 0:
-            boundaries.append(i)
-    return boundaries
+    return [
+        i
+        for i, pos in enumerate(positions)
+        if i == 0 or pos.player != positions[i - 1].player
+    ]
 
 
 def compute_ema_lookahead(
@@ -80,21 +81,13 @@ def compute_ema_lookahead(
     result = np.copy(mcts_values)
 
     for i in range(n - 1, -1, -1):
-        try:
-            bi = boundaries.index(i)
-        except ValueError:
-            bi = 0
-            for b in boundaries:
-                if b >= i:
-                    bi = boundaries.index(b)
-                    break
-            else:
-                bi = len(boundaries) - 1
-
-        target_bi = bi + horizon
+        target_bi = bisect_right(boundaries, i) + horizon - 1
         if target_bi < len(boundaries):
             j = boundaries[target_bi]
-            result[i] = (1.0 - lambda_) * mcts_values[i] + lambda_ * result[j]
+            future = result[j]
+            if positions[j].player != positions[i].player:
+                future = -future
+            result[i] = (1.0 - lambda_) * mcts_values[i] + lambda_ * future
         else:
             result[i] = mcts_values[i]
 
@@ -178,25 +171,33 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
         return
 
     for i, pos in enumerate(positions):
-        if i + 1 < total:
-            pos.opp_policy_target = dict(positions[i + 1].policy_target)
-            pos.opp_policy_target_v2 = list(getattr(positions[i + 1], "policy_target_v2", []))
+        opp_idx = _next_full_search_opponent_turn_start(positions, i)
+        if opp_idx is not None:
+            opp = positions[opp_idx]
+            pos.opp_policy_target = dict(opp.policy_target)
+            pos.opp_policy_target_v2 = list(getattr(opp, "policy_target_v2", []))
+            pos.opp_policy_weight = 1.0
         else:
             pos.opp_policy_target = {}
             pos.opp_policy_target_v2 = []
+            pos.opp_policy_weight = 0.0
         if not pos.pair_policy_target_v2 and pos.policy_target_v2:
             pos.pair_policy_target_v2 = pair_policy_v2_from_place_target(pos.policy_target_v2)
         perspective_outcome = record.outcome if pos.player == 0 else -record.outcome
         tail = positions[i:]
         regret = sum(
             (
-                p.root_value
+                (
+                    p.selected_action_value
+                    if p.selected_action_value is not None
+                    else p.root_value
+                )
                 - (record.outcome if p.player == 0 else -record.outcome)
             ) ** 2
             for p in tail
         ) / max(len(tail), 1)
         pos.regret_rank = float(regret)
-        pos.regret_value = float(max(-1.0, min(1.0, 2.0 * regret - 1.0)))
+        pos.regret_value = float(regret)
         pos.moves_left = float(max(total - pos.turn_index, 0))
         if pos.outcome is None:
             pos.outcome = perspective_outcome if pos.player == 0 else -perspective_outcome
@@ -206,6 +207,22 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
     axis = _dominant_axis_label(axis_history, winner)
     for pos in positions:
         pos.axis_label = axis
+
+
+def _next_full_search_opponent_turn_start(
+    positions: List[PositionRecord],
+    i: int,
+) -> int | None:
+    """Return the next opponent turn-start index with a full-search target."""
+    player = positions[i].player
+    for j in range(i + 1, len(positions)):
+        if positions[j].player == player:
+            continue
+        if j > 0 and positions[j - 1].player == positions[j].player:
+            continue
+        if positions[j].is_full_search:
+            return j
+    return None
 
 
 def _dominant_axis_label(history_bytes: bytes, winner: int | None) -> int:

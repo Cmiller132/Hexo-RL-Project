@@ -30,7 +30,22 @@ logger = logging.getLogger(__name__)
 
 def _shm_name(base: str, worker_id: int) -> str:
     """Generate a unique shared-memory name per worker."""
-    return f"hexorl_{base}_{worker_id}"
+    # macOS POSIX shared-memory names are very short in practice. Keep these
+    # names compact; server and clients share this mapping.
+    aliases = {
+        "req_tensor": "rt",
+        "req_count": "rc",
+        "res_policy": "rp",
+        "res_value": "rv",
+        "req_candidate_count": "qcc",
+        "req_candidate_indices": "qci",
+        "req_candidate_features": "qcf",
+        "req_candidate_mask": "qcm",
+        "res_sparse_logits": "rsl",
+        "req_ready": "qr",
+        "res_ready": "rr",
+    }
+    return f"hx_{aliases.get(base, base)}_{worker_id}"
 
 
 def _create_shm(name: str, size: int) -> SharedMemory:

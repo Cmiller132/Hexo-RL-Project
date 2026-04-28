@@ -231,6 +231,13 @@ def test_sparse_policy_config_adds_default_loss_weight():
     assert cfg.train.loss_weights["sparse_policy"] == pytest.approx(0.25)
 
 
+def test_sparse_policy_head_enables_sparse_data_contract():
+    cfg = Config.model_validate({"model": {"heads": ["policy", "value", "sparse_policy"]}})
+
+    assert cfg.model.sparse_policy is True
+    assert cfg.train.loss_weights["sparse_policy"] == pytest.approx(0.25)
+
+
 def test_cnn_config_does_not_require_attention_head_divisibility():
     cfg = Config.model_validate({"model": {"channels": 10, "blocks": 1}})
     model = build_model_from_config(cfg, device=torch.device("cpu"))

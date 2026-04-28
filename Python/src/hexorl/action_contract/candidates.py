@@ -201,11 +201,24 @@ def build_pair_candidate_batch(
     pair_policy_target_v2: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
     *,
     budget: int,
+    candidate_mask: Sequence[bool] | None = None,
 ) -> PairCandidateBatch:
     """Build a bounded pair-action target over candidate row indices."""
     budget = max(1, int(budget))
-    candidate_list = _unique_qr((int(q), int(r)) for q, r in candidate_qr)
-    candidate_index = {qr: i for i, qr in enumerate(candidate_list)}
+    if candidate_mask is None:
+        mask_iter = [True] * len(candidate_qr)
+    else:
+        mask_iter = [bool(x) for x in candidate_mask]
+    candidate_list: list[tuple[int, int]] = []
+    candidate_index: dict[tuple[int, int], int] = {}
+    for row, (qr_raw, keep) in enumerate(zip(candidate_qr, mask_iter)):
+        if not keep:
+            continue
+        qr = (int(qr_raw[0]), int(qr_raw[1]))
+        if qr in candidate_index:
+            continue
+        candidate_index[qr] = row
+        candidate_list.append(qr)
 
     target_map: dict[tuple[tuple[int, int], tuple[int, int]], float] = {}
     protected: list[tuple[tuple[int, int], tuple[int, int]]] = []

@@ -68,6 +68,7 @@ class RingBuffer:
         self._candidate_recall_forced_block = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_cover = np.zeros(capacity, dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
+        self._selected_action_values = np.zeros(capacity, dtype=np.float32)
         self._value_weights = np.ones(capacity, dtype=np.float32)
         self._regret_rank = np.zeros(capacity, dtype=np.float32)
         self._regret_value = np.zeros(capacity, dtype=np.float32)
@@ -76,6 +77,7 @@ class RingBuffer:
         self._opp_policies = np.zeros((capacity, max_policy_entries), dtype=np.uint16)
         self._opp_policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
         self._opp_policy_counts = np.zeros(capacity, dtype=np.uint16)
+        self._opp_policy_weights = np.zeros(capacity, dtype=np.float32)
         self._game_ids = np.zeros(capacity, dtype=np.uint32)
         self._is_full = np.zeros(capacity, dtype=np.bool_)
         self._players = np.zeros(capacity, dtype=np.uint8)
@@ -126,6 +128,11 @@ class RingBuffer:
                 self._policy_probs[idx, j] = prob
 
             self._values[idx] = record.to_value_target()
+            self._selected_action_values[idx] = (
+                record.root_value
+                if record.selected_action_value is None
+                else float(record.selected_action_value)
+            )
             self._value_weights[idx] = record.value_weight
             self._write_aux_targets(idx, record)
             self._write_v2_targets(idx, record)
@@ -166,6 +173,11 @@ class RingBuffer:
             self._policies[idx, j] = action_idx
             self._policy_probs[idx, j] = prob
         self._values[idx] = record.to_value_target()
+        self._selected_action_values[idx] = (
+            record.root_value
+            if record.selected_action_value is None
+            else float(record.selected_action_value)
+        )
         self._value_weights[idx] = record.value_weight
         self._write_aux_targets(idx, record)
         self._write_v2_targets(idx, record)
@@ -310,11 +322,13 @@ class RingBuffer:
                 policy_target=policy,
                 root_value=0.0,
                 player=player,
+                selected_action_value=float(self._selected_action_values[idx]),
                 game_id=int(self._game_ids[idx]),
                 is_full_search=bool(self._is_full[idx]),
                 outcome=outcome,
                 lookahead_values=lv,
                 opp_policy_target=opp_policy,
+                opp_policy_weight=float(self._opp_policy_weights[idx]),
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
                 pair_policy_target_v2=pair_policy_v2,
@@ -438,6 +452,7 @@ class RingBuffer:
             self._candidate_recall_forced_block.fill(0.0)
             self._candidate_recall_cover.fill(0.0)
             self._values.fill(0.0)
+            self._selected_action_values.fill(0.0)
             self._value_weights.fill(1.0)
             self._regret_rank.fill(0.0)
             self._regret_value.fill(0.0)
@@ -446,6 +461,7 @@ class RingBuffer:
             self._opp_policies.fill(0)
             self._opp_policy_probs.fill(0.0)
             self._opp_policy_counts.fill(0)
+            self._opp_policy_weights.fill(0.0)
             self._game_ids.fill(0)
             self._is_full.fill(False)
             self._players.fill(0)
@@ -462,6 +478,7 @@ class RingBuffer:
         self._regret_value[idx] = record.regret_value
         self._axis[idx] = record.axis_label
         self._moves_left[idx] = record.moves_left
+        self._opp_policy_weights[idx] = record.opp_policy_weight
 
         opp_entries = list(record.opp_policy_target.items())
         n_opp = min(len(opp_entries), self.max_policy_entries)

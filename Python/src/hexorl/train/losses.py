@@ -36,6 +36,27 @@ def value_to_bins_torch(t: torch.Tensor, n_bins: int = 65) -> torch.Tensor:
     return target
 
 
+def scalar_to_bins_torch(
+    t: torch.Tensor,
+    *,
+    n_bins: int = 65,
+    min_value: float,
+    max_value: float,
+) -> torch.Tensor:
+    """Convert continuous scalar targets to soft bins over a fixed range."""
+    values = t.clamp(min_value, max_value)
+    bin_width = (max_value - min_value) / (n_bins - 1)
+    idx = (values - min_value) / bin_width
+    lo = idx.floor().long().clamp(0, n_bins - 1)
+    hi = (lo + 1).clamp(0, n_bins - 1)
+    w_hi = (idx - lo.float()).clamp(0.0, 1.0)
+    w_lo = 1.0 - w_hi
+    target = torch.zeros(t.shape[0], n_bins, device=t.device, dtype=torch.float32)
+    target.scatter_add_(1, lo.unsqueeze(1), w_lo.unsqueeze(1))
+    target.scatter_add_(1, hi.unsqueeze(1), w_hi.unsqueeze(1))
+    return target
+
+
 def binned_value_loss(
     pred_logits: torch.Tensor,
     target_values: torch.Tensor,
@@ -84,14 +105,8 @@ def regret_rank_loss(
     Returns:
         Scalar loss.
     """
-    # Normalize regrets to [0, 1] so they are comparable to log-probabilities.
-    r_min = regrets.min()
-    r_max = regrets.max()
-    r_range = (r_max - r_min).clamp(min=1e-6)
-    regrets_norm = (regrets - r_min) / r_range
-
     log_softmax_scores = F.log_softmax(scores, dim=0)
-    combined = log_softmax_scores + regrets_norm
+    combined = log_softmax_scores + regrets.to(device=scores.device, dtype=scores.dtype)
     loss = -torch.logsumexp(combined, dim=0)
     return loss
 
@@ -111,7 +126,11 @@ def regret_value_loss(
     Returns:
         Scalar loss.
     """
-    return binned_value_loss(pred_logits, target_regret, n_bins)
+    logits = pred_logits.float()
+    regret = target_regret.to(device=logits.device, dtype=logits.dtype)
+    target_bins = scalar_to_bins_torch(regret, n_bins=n_bins, min_value=0.0, max_value=4.0)
+    log_probs = F.log_softmax(logits, dim=-1)
+    return -(target_bins * log_probs).sum(dim=-1).mean()
 
 
 def policy_loss(
@@ -183,6 +202,7 @@ def pair_policy_loss(
 def opp_policy_loss(
     pred_logits: torch.Tensor,
     target_probs: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy for opponent policy head (same as policy_loss).
 
@@ -193,7 +213,15 @@ def opp_policy_loss(
     Returns:
         Scalar loss.
     """
-    return policy_loss(pred_logits, target_probs)
+    target = target_probs.to(device=pred_logits.device, dtype=torch.float32)
+    valid = target.sum(dim=-1) > 0
+    if weight is None:
+        row_weight = valid.to(dtype=torch.float32, device=pred_logits.device)
+    else:
+        row_weight = weight.to(device=pred_logits.device, dtype=torch.float32) * valid.to(dtype=torch.float32)
+    if not torch.any(row_weight > 0):
+        return pred_logits.sum() * 0.0
+    return policy_loss(pred_logits, target, row_weight)
 
 
 def axis_loss(
@@ -326,7 +354,7 @@ def compute_losses(
             target = targets.get("opp_policy", targets.get("policy"))
             if target is None:
                 continue
-            loss = opp_policy_loss(pred, target)
+            loss = opp_policy_loss(pred, target, targets.get("opp_policy_weight"))
         elif head_name == "value":
             loss = binned_value_loss(pred, targets["value"], n_bins, targets.get("value_weight"))
         elif head_name.startswith("lookahead_"):

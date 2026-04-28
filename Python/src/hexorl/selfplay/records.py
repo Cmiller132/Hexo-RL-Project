@@ -19,7 +19,7 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 3
+COMPACT_VERSION_V2 = 4
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
@@ -57,9 +57,14 @@ class PositionRecord:
     # Turn index within the game (0-based). Used for temperature schedule lookup.
     turn_index: int = 0
 
+    # MCTS value of the selected action from the acting player's perspective.
+    # Used by RGSC Eq. 2; older records fall back to root_value.
+    selected_action_value: Optional[float] = None
+
     # Lookahead value targets at multiple horizons (KataGo-style).
     lookahead_values: List[float] = field(default_factory=list)
     opp_policy_target: Dict[int, float] = field(default_factory=dict)
+    opp_policy_weight: float = 0.0
     policy_target_v2: PolicyTargetV2 = field(default_factory=list)
     opp_policy_target_v2: PolicyTargetV2 = field(default_factory=list)
     pair_policy_target_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = field(default_factory=list)
@@ -160,6 +165,12 @@ class GameRecord:
 
             # Root value
             parts.extend(struct.pack("<f", pos.root_value))
+            parts.extend(struct.pack(
+                "<f",
+                pos.root_value
+                if pos.selected_action_value is None
+                else float(pos.selected_action_value),
+            ))
 
             # Policy target (legacy dense-crop sparse)
             entries = list(pos.policy_target.items())
@@ -207,6 +218,7 @@ class GameRecord:
                 pos.axis_label,
                 pos.moves_left,
             ))
+            parts.extend(struct.pack("<f", float(pos.opp_policy_weight)))
 
         return bytes(parts)
 
@@ -247,6 +259,10 @@ class GameRecord:
             # Root value
             root_value = struct.unpack_from("<f", data, offset)[0]
             offset += 4
+            selected_action_value: Optional[float] = None
+            if is_v2 and version >= 4:
+                selected_action_value = struct.unpack_from("<f", data, offset)[0]
+                offset += 4
 
             # Policy target
             num_entries = struct.unpack_from("<H", data, offset)[0]
@@ -278,6 +294,7 @@ class GameRecord:
             regret_value = 0.0
             axis_label = -1
             moves_left = 0.0
+            opp_policy_weight = 0.0
             if offset < len(data):
                 num_opp_entries = struct.unpack_from("<H", data, offset)[0]
                 offset += 2
@@ -331,17 +348,24 @@ class GameRecord:
                     "<ffhf", data, offset
                 )
                 offset += struct.calcsize("<ffhf")
+                if is_v2 and version >= 4:
+                    opp_policy_weight = struct.unpack_from("<f", data, offset)[0]
+                    offset += 4
+                elif opp_policy or opp_policy_v2:
+                    opp_policy_weight = 1.0
 
             positions.append(PositionRecord(
                 move_history=move_history,
                 policy_target=policy,
                 root_value=root_value,
+                selected_action_value=selected_action_value,
                 player=player,
                 outcome=outcome,
                 game_id=game_id,
                 is_full_search=is_full,
                 turn_index=turn_idx,
                 opp_policy_target=opp_policy,
+                opp_policy_weight=opp_policy_weight,
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
                 pair_policy_target_v2=pair_policy_v2,
@@ -414,6 +438,7 @@ class GameRecord:
                 policy_target_v2=policy_targets_v2[i] if i < len(policy_targets_v2) else [],
                 pair_policy_target_v2=pair_policy_targets_v2[i] if i < len(pair_policy_targets_v2) else [],
                 root_value=rv,
+                selected_action_value=rv,
                 player=player,
                 outcome=outcome,
                 game_id=game_id,

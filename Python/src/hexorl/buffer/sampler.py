@@ -15,7 +15,14 @@ except ImportError:
     _IterableDataset = object  # type: ignore
 
 from hexorl.buffer.ring import RingBuffer
-from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE, action_to_board_index
+from hexorl.selfplay.records import (
+    BOARD_AREA,
+    NUM_CHANNELS,
+    BOARD_SIZE,
+    PolicyTargetV2,
+    action_to_board_index,
+    dense_policy_from_v2,
+)
 from hexorl.action_contract.candidates import (
     CANDIDATE_FEATURES,
     build_candidate_batch,
@@ -279,6 +286,46 @@ def _hex_transform(qi: int, rj: int, sym: int) -> Tuple[int, int]:
         return (qi + rj, -rj)
 
 
+def _transform_policy_v2(policy: PolicyTargetV2, sym_idx: int) -> PolicyTargetV2:
+    """Transform global action-keyed policy entries under D6."""
+    transformed: dict[tuple[int, int], float] = {}
+    for q, r, prob in policy:
+        tq, tr = _hex_transform(int(q), int(r), sym_idx % 12)
+        transformed[(int(tq), int(tr))] = transformed.get((int(tq), int(tr)), 0.0) + float(prob)
+    return [(q, r, prob) for (q, r), prob in transformed.items()]
+
+
+def _transform_pair_policy_v2(
+    pairs: List[Tuple[Tuple[int, int], Tuple[int, int], float]],
+    sym_idx: int,
+) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
+    """Transform pair-action policy entries under D6."""
+    transformed = []
+    for first, second, prob in pairs:
+        q1, r1 = _hex_transform(int(first[0]), int(first[1]), sym_idx % 12)
+        q2, r2 = _hex_transform(int(second[0]), int(second[1]), sym_idx % 12)
+        transformed.append(((int(q1), int(r1)), (int(q2), int(r2)), float(prob)))
+    return transformed
+
+
+def _transform_history_bytes(history_bytes: bytes, sym_idx: int) -> bytes:
+    """Transform compact move-history coordinates under D6, preserving players."""
+    if sym_idx % 12 == 0:
+        return history_bytes
+    if len(history_bytes) % 12 != 0:
+        raise ValueError(f"history_bytes length {len(history_bytes)} is not a multiple of 12")
+    out = bytearray(len(history_bytes))
+    for offset in range(0, len(history_bytes), 12):
+        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
+        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
+        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
+        tq, tr = _hex_transform(q, r, sym_idx % 12)
+        out[offset:offset + 4] = int(player).to_bytes(4, "little", signed=True)
+        out[offset + 4:offset + 8] = int(tq).to_bytes(4, "little", signed=True)
+        out[offset + 8:offset + 12] = int(tr).to_bytes(4, "little", signed=True)
+    return bytes(out)
+
+
 def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
     """Pure Python fallback for apply_d6_symmetry.
 
@@ -344,6 +391,14 @@ def _transform_dense_policy(policy: np.ndarray, sym_idx: int) -> np.ndarray:
     return result
 
 
+def _dense_from_sparse_policy(policy: Dict[int, float]) -> np.ndarray:
+    dense = np.zeros(BOARD_AREA, dtype=np.float32)
+    for idx, prob in policy.items():
+        if 0 <= int(idx) < BOARD_AREA:
+            dense[int(idx)] = float(prob)
+    return dense
+
+
 def _transform_axis_maps(axis_maps: np.ndarray, sym_idx: int) -> np.ndarray:
     """Apply D6 spatial transform and axis-plane permutation to 6 axis maps.
 
@@ -397,9 +452,7 @@ class ReplayDataset(_IterableDataset):
             int(candidate_budget),
             int(getattr(buffer, "max_policy_v2_entries", int(candidate_budget))),
         )
-        # Sparse candidate coordinates are global action identities. Keep D6
-        # augmentation off until candidate transforms are enabled and tested.
-        self.use_symmetry = bool(use_symmetry) and not self.include_sparse_policy
+        self.use_symmetry = bool(use_symmetry)
         self.near_radius = near_radius
         self.lookahead_horizons = lookahead_horizons or []
         self.regret_fraction = max(0.0, min(1.0, regret_fraction))
@@ -481,6 +534,7 @@ class ReplayDataset(_IterableDataset):
             "moves_left_weight": np.ones(self.batch_size, dtype=np.float32),
             "value_weight": np.ones(self.batch_size, dtype=np.float32),
             "policy_weight": np.ones(self.batch_size, dtype=np.float32),
+            "opp_policy_weight": np.zeros(self.batch_size, dtype=np.float32),
         }
         if self.include_sparse_policy:
             budget = max(1, self.candidate_budget)
@@ -514,30 +568,58 @@ class ReplayDataset(_IterableDataset):
         ]
 
         for i, rec in enumerate(records):
-            policy = rec.to_dense_policy()
-            opp_policy = rec.to_dense_opp_policy()
             sym_idx = 0
-            tensor_i, offset_q, offset_r, legal_bytes = self._encode_tensor_meta(rec.move_history)
-            tensors[i] = tensor_i
-
+            sample_history = rec.move_history
+            policy_v2 = list(rec.policy_target_v2)
+            opp_policy_v2 = list(rec.opp_policy_target_v2)
+            pair_policy_v2 = list(rec.pair_policy_target_v2)
             if self.use_symmetry:
                 sym_idx = self._rng.randint(0, 12)
-                if HAS_ENGINE and hasattr(_engine, 'apply_d6_symmetry'):
-                    tensors[i] = np.array(
-                        _engine.apply_d6_symmetry(tensors[i], sym_idx),
-                        dtype=np.float32,
-                    )
-                else:
-                    tensors[i] = _py_apply_d6_symmetry(tensors[i], sym_idx)
-                policy = _transform_dense_policy(policy, sym_idx)
-                opp_policy = _transform_dense_policy(opp_policy, sym_idx)
+                sample_history = _transform_history_bytes(rec.move_history, sym_idx)
+                policy_v2 = _transform_policy_v2(policy_v2, sym_idx)
+                opp_policy_v2 = _transform_policy_v2(opp_policy_v2, sym_idx)
+                pair_policy_v2 = _transform_pair_policy_v2(pair_policy_v2, sym_idx)
                 axis_label = _transform_axis_label(rec.axis_label, sym_idx)
             else:
                 axis_label = rec.axis_label
 
+            tensor_i, offset_q, offset_r, legal_bytes = self._encode_tensor_meta(sample_history)
+            tensors[i] = tensor_i
+
+            if policy_v2:
+                policy_dict, _outside = dense_policy_from_v2(
+                    policy_v2,
+                    int(offset_q),
+                    int(offset_r),
+                    top_k=max(1, len(rec.policy_target)),
+                )
+                policy = _dense_from_sparse_policy(policy_dict)
+            else:
+                policy = rec.to_dense_policy()
+                if self.use_symmetry:
+                    policy = _transform_dense_policy(policy, sym_idx)
+
+            if opp_policy_v2:
+                opp_policy_dict, _outside = dense_policy_from_v2(
+                    opp_policy_v2,
+                    int(offset_q),
+                    int(offset_r),
+                    top_k=max(1, len(rec.opp_policy_target)),
+                )
+                opp_policy = _dense_from_sparse_policy(opp_policy_dict)
+            else:
+                opp_policy = rec.to_dense_opp_policy()
+                if self.use_symmetry:
+                    opp_policy = _transform_dense_policy(opp_policy, sym_idx)
+
             policies[i] = policy
             values[i] = rec.to_value_target()
             aux_targets["opp_policy"][i] = opp_policy
+            aux_targets["opp_policy_weight"][i] = (
+                rec.opp_policy_weight
+                if rec.opp_policy_weight > 0.0
+                else (1.0 if float(opp_policy.sum()) > 0.0 else 0.0)
+            )
             aux_targets["regret_rank"][i] = rec.regret_rank
             aux_targets["regret_value"][i] = rec.regret_value
             aux_targets["axis"][i] = axis_label
@@ -559,7 +641,7 @@ class ReplayDataset(_IterableDataset):
                 )
                 cand = build_candidate_batch(
                     [(int(q), int(r)) for q, r in legal],
-                    rec.policy_target_v2,
+                    policy_v2,
                     offset_q=int(offset_q),
                     offset_r=int(offset_r),
                     budget=self.candidate_budget,
@@ -577,8 +659,9 @@ class ReplayDataset(_IterableDataset):
                 if self.include_pair_policy:
                     pair = build_pair_candidate_batch(
                         [(int(q), int(r)) for q, r in cand.qr[:width]],
-                        rec.pair_policy_target_v2,
+                        pair_policy_v2,
                         budget=self.candidate_budget,
+                        candidate_mask=cand.mask[:width],
                     )
                     pair_width = min(pair.pair_indices.shape[0], aux_targets["pair_candidate_indices"].shape[1])
                     aux_targets["pair_candidate_indices"][i, :pair_width] = pair.pair_indices[:pair_width]
@@ -586,9 +669,7 @@ class ReplayDataset(_IterableDataset):
                     aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
                     aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
             if self.include_axis_delta_norm:
-                axis_delta_norm = self._compute_axis_delta_norm(rec)
-                if self.use_symmetry:
-                    axis_delta_norm = _transform_axis_maps(axis_delta_norm, sym_idx)
+                axis_delta_norm = self._compute_axis_delta_norm(sample_history)
                 aux_targets["axis_delta_norm"][i] = axis_delta_norm
 
             for h_idx in range(n_lookahead):
@@ -638,16 +719,16 @@ class ReplayDataset(_IterableDataset):
             self._meta_cache.popitem(last=False)
         return result
 
-    def _compute_axis_delta_norm(self, rec) -> np.ndarray:
+    def _compute_axis_delta_norm(self, history: bytes) -> np.ndarray:
         if self._axis_delta_norm_proto is None:
             return np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-        cached = self._axis_delta_norm_cache.get(rec.move_history)
+        cached = self._axis_delta_norm_cache.get(history)
         if cached is not None:
-            self._axis_delta_norm_cache.move_to_end(rec.move_history)
+            self._axis_delta_norm_cache.move_to_end(history)
             return cached
         pos = position_payload(
             get_replay_position(
-                rec.move_history,
+                history,
                 near_radius=self.near_radius,
                 constrain_threats=False,
             )
@@ -660,7 +741,7 @@ class ReplayDataset(_IterableDataset):
             offset_r=int(pos["encoding"].get("offset_r", -16)),
         )
         target = self._axis_delta_norm_proto.compute(axis_input).axis_maps.astype(np.float32)
-        self._axis_delta_norm_cache[rec.move_history] = target
+        self._axis_delta_norm_cache[history] = target
         if len(self._axis_delta_norm_cache) > self._axis_delta_norm_cache_max:
             self._axis_delta_norm_cache.popitem(last=False)
         return target

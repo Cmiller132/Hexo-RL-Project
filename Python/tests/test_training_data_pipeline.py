@@ -8,12 +8,18 @@ from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.sampler import (
     _py_apply_d6_symmetry,
     _py_decode_compact_record,
+    _hex_transform,
     _transform_axis_maps,
     _transform_axis_label,
     _transform_dense_policy,
+    _transform_history_bytes,
     ReplayDataset,
 )
-from hexorl.buffer.targets import process_game_record
+from hexorl.buffer.targets import (
+    _turn_boundary_indices,
+    compute_ema_lookahead,
+    process_game_record,
+)
 from hexorl.config import Config
 from hexorl.epoch import pipeline
 from hexorl.selfplay.orchestrator import SelfPlayOrchestrator
@@ -33,6 +39,17 @@ from hexorl.model.network import HexNet
 
 def _move(player: int, q: int, r: int) -> bytes:
     return struct.pack("<iii", player, q, r)
+
+
+class _FixedSymmetryRng:
+    def __init__(self, sym_idx: int):
+        self.sym_idx = sym_idx
+
+    def randint(self, _low, _high=None):
+        return self.sym_idx
+
+    def shuffle(self, values):
+        return None
 
 
 def test_python_decoder_returns_final_position_for_history():
@@ -107,6 +124,79 @@ def test_axis_delta_maps_symmetry_transforms_space_and_axis_planes():
     assert transformed.sum() == 5.0
 
 
+def test_hexo_turn_boundaries_follow_player_runs():
+    positions = [
+        PositionRecord(b"", {1: 1.0}, 0.1, player=0),
+        PositionRecord(b"", {2: 1.0}, 0.2, player=1),
+        PositionRecord(b"", {3: 1.0}, 0.3, player=1),
+        PositionRecord(b"", {4: 1.0}, 0.4, player=0),
+        PositionRecord(b"", {5: 1.0}, 0.5, player=0),
+    ]
+
+    assert _turn_boundary_indices(positions) == [0, 1, 3]
+
+
+def test_lookahead_flips_future_player_perspective():
+    positions = [
+        PositionRecord(b"", {1: 1.0}, 0.2, player=0),
+        PositionRecord(_move(0, 0, 0), {2: 1.0}, 0.6, player=1),
+    ]
+
+    lookahead = compute_ema_lookahead(positions, horizon=1, lambda_=1.0)
+
+    assert lookahead[0] == pytest.approx(-0.6)
+    assert lookahead[1] == pytest.approx(0.6)
+
+
+def test_mid_turn_lookahead_targets_next_turn_start():
+    positions = [
+        PositionRecord(b"", {1: 1.0}, 0.1, player=0),
+        PositionRecord(b"", {2: 1.0}, 0.2, player=1),
+        PositionRecord(b"", {3: 1.0}, 0.3, player=1),
+        PositionRecord(b"", {4: 1.0}, 0.7, player=0),
+    ]
+
+    lookahead = compute_ema_lookahead(positions, horizon=1, lambda_=1.0)
+
+    assert lookahead[2] == pytest.approx(-0.7)
+
+
+def test_opponent_policy_uses_next_full_search_opponent_turn_start():
+    game = GameRecord(
+        positions=[
+            PositionRecord(b"", {1: 1.0}, 0.0, player=0, is_full_search=False),
+            PositionRecord(b"", {2: 1.0}, 0.0, player=1, is_full_search=False),
+            PositionRecord(b"", {3: 1.0}, 0.0, player=1, is_full_search=False),
+            PositionRecord(b"", {4: 1.0}, 0.0, player=0, is_full_search=True),
+            PositionRecord(b"", {5: 1.0}, 0.0, player=0, is_full_search=True),
+            PositionRecord(b"", {6: 1.0}, 0.0, player=1, is_full_search=True),
+        ],
+        outcome=1.0,
+    )
+
+    process_game_record(game)
+
+    assert game.positions[1].opp_policy_target == {4: 1.0}
+    assert game.positions[1].opp_policy_weight == pytest.approx(1.0)
+    assert game.positions[0].opp_policy_target == {6: 1.0}
+    assert game.positions[3].opp_policy_target == {6: 1.0}
+
+
+def test_regret_uses_selected_action_value_and_raw_scale():
+    game = GameRecord(
+        positions=[
+            PositionRecord(b"", {1: 1.0}, 0.9, player=0, selected_action_value=-1.0),
+            PositionRecord(b"", {2: 1.0}, 0.2, player=1, selected_action_value=1.0),
+        ],
+        outcome=1.0,
+    )
+
+    process_game_record(game)
+
+    assert game.positions[0].regret_rank == pytest.approx(4.0)
+    assert game.positions[0].regret_value == pytest.approx(4.0)
+
+
 def test_process_game_record_populates_auxiliary_targets():
     game = GameRecord(
         positions=[
@@ -131,9 +221,11 @@ def test_ring_buffer_preserves_auxiliary_targets():
         move_history=b"",
         policy_target={action_to_board_index(0, 0): 1.0},
         root_value=0.0,
+        selected_action_value=0.4,
         player=0,
         outcome=1.0,
         opp_policy_target={action_to_board_index(1, 0): 1.0},
+        opp_policy_weight=1.0,
         regret_rank=0.25,
         regret_value=-0.5,
         axis_label=2,
@@ -146,6 +238,8 @@ def test_ring_buffer_preserves_auxiliary_targets():
     out = buffer[0]
     assert out is not None
     assert out.opp_policy_target == rec.opp_policy_target
+    assert out.opp_policy_weight == pytest.approx(1.0)
+    assert out.selected_action_value == pytest.approx(0.4)
     assert out.regret_rank == rec.regret_rank
     assert out.axis_label == rec.axis_label
     assert out.moves_left == rec.moves_left
@@ -175,9 +269,11 @@ def test_compact_record_v2_roundtrip_preserves_global_targets():
         candidate_recall_forced_block=0.75,
         candidate_recall_two_placement_cover=0.5,
         root_value=0.25,
+        selected_action_value=-0.5,
         player=1,
         outcome=-1.0,
         opp_policy_target_v2=[(1, 0, 1.0)],
+        opp_policy_weight=1.0,
     )
     game = GameRecord(positions=[rec], outcome=-1.0, game_id=9, final_move_history=_move(0, 0, 0))
 
@@ -189,6 +285,8 @@ def test_compact_record_v2_roundtrip_preserves_global_targets():
     assert [(q, r) for q, r, _ in out.positions[0].opp_policy_target_v2] == [(1, 0)]
     assert [prob for _q, _r, prob in out.positions[0].opp_policy_target_v2] == pytest.approx([1.0])
     assert out.positions[0].pair_policy_target_v2 == pair_target
+    assert out.positions[0].selected_action_value == pytest.approx(-0.5)
+    assert out.positions[0].opp_policy_weight == pytest.approx(1.0)
     assert out.positions[0].target_policy_mass_outside_window == pytest.approx(0.6)
     assert out.positions[0].candidate_recall_mcts_top4 == pytest.approx(0.5)
     assert out.positions[0].candidate_recall_winning_move == pytest.approx(1.0)
@@ -277,6 +375,99 @@ def test_sparse_sampler_outputs_candidate_targets():
     assert aux["sparse_policy_target"][0].sum() == pytest.approx(1.0)
 
 
+def test_sparse_sampler_keeps_d6_enabled_and_transforms_candidates():
+    pytest.importorskip("_engine")
+    history = _move(0, 0, 0)
+    target = (1, 0)
+    target_t = _hex_transform(*target, 1)
+    rec = PositionRecord(
+        move_history=history,
+        policy_target={action_to_board_index(*target): 1.0},
+        policy_target_v2=[(target[0], target[1], 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=True,
+        include_sparse_policy=True,
+        candidate_budget=8,
+    )
+    dataset._rng = _FixedSymmetryRng(1)
+
+    _tensors, policies, _values, _lookahead, aux = next(iter(dataset))
+
+    represented = {tuple(qr) for qr in aux["candidate_qr"][0][aux["candidate_mask"][0]]}
+    assert tuple(target_t) in represented
+    row = np.where((aux["candidate_qr"][0] == np.array(target_t)).all(axis=1))[0][0]
+    idx = int(aux["candidate_indices"][0, row])
+    assert idx >= 0
+    assert policies[0, idx] == pytest.approx(1.0)
+    assert aux["sparse_policy_target"][0, row] == pytest.approx(1.0)
+    assert dataset.use_symmetry is True
+
+
+@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph"])
+def test_sparse_d6_batch_trains_for_all_model_architectures(architecture):
+    pytest.importorskip("_engine")
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=True,
+        include_sparse_policy=True,
+        candidate_budget=8,
+    )
+    dataset._rng = _FixedSymmetryRng(1)
+    tensors, policies, values, _lookahead, aux = next(iter(dataset))
+
+    model = HexNet(
+        channels=8,
+        blocks=2,
+        heads=["policy", "value", "sparse_policy"],
+        architecture=architecture,
+        attention_heads=4,
+        graph_token_budget=32,
+        graph_layers=1,
+        sparse_policy=True,
+    )
+    out = model(
+        torch.from_numpy(tensors),
+        candidate_indices=torch.from_numpy(aux["candidate_indices"]),
+        candidate_features=torch.from_numpy(aux["candidate_features"]),
+        candidate_mask=torch.from_numpy(aux["candidate_mask"]),
+    )
+    targets = {
+        "policy": torch.from_numpy(policies),
+        "value": torch.from_numpy(values),
+        "sparse_policy_target": torch.from_numpy(aux["sparse_policy_target"]),
+        "candidate_mask": torch.from_numpy(aux["candidate_mask"]),
+        "policy_weight": torch.from_numpy(aux["policy_weight"]),
+    }
+
+    total, per_head = compute_losses(
+        out,
+        targets,
+        {"policy": 1.0, "value": 1.0, "sparse_policy": 1.0},
+    )
+
+    assert torch.isfinite(total)
+    assert "sparse_policy" in per_head
+
+
 def test_replay_dataset_can_emit_pair_policy_target():
     policy_v2 = [(0, 0, 0.75), (1, 0, 0.25)]
     rec = PositionRecord(
@@ -304,6 +495,20 @@ def test_replay_dataset_can_emit_pair_policy_target():
     assert aux["pair_candidate_indices"].shape == (1, 8, 2)
     assert aux["pair_candidate_mask"][0].any()
     assert aux["pair_policy_target"][0].sum() == pytest.approx(1.0)
+
+
+def test_pair_candidate_builder_ignores_padded_candidate_rows():
+    from hexorl.action_contract.candidates import build_pair_candidate_batch
+
+    pair = build_pair_candidate_batch(
+        [(1, 0), (0, 0), (0, 0)],
+        [((1, 0), (0, 0), 1.0)],
+        budget=3,
+        candidate_mask=[True, False, False],
+    )
+
+    assert not pair.mask.any()
+    assert pair.target.sum() == pytest.approx(0.0)
 
 
 def test_candidate_builder_accepts_list_legal_moves():
@@ -567,6 +772,41 @@ def test_policy_loss_can_be_masked_to_full_search_samples():
     expected = torch.log(torch.tensor(1089.0))
     assert torch.allclose(total.detach(), expected, atol=1e-5)
     assert torch.allclose(per_head["policy"].detach(), expected, atol=1e-5)
+
+
+def test_opp_policy_loss_uses_opponent_policy_weight():
+    predictions = {
+        "opp_policy": torch.zeros(2, 1089, requires_grad=True),
+    }
+    targets = {
+        "opp_policy": torch.nn.functional.one_hot(torch.tensor([0, 1]), 1089).float(),
+        "opp_policy_weight": torch.tensor([1.0, 0.0]),
+    }
+
+    total, per_head = compute_losses(predictions, targets, {"opp_policy": 1.0})
+
+    expected = torch.log(torch.tensor(1089.0))
+    assert torch.allclose(total.detach(), expected, atol=1e-5)
+    assert torch.allclose(per_head["opp_policy"].detach(), expected, atol=1e-5)
+
+
+def test_opp_policy_loss_skips_empty_targets():
+    predictions = {"opp_policy": torch.zeros(2, 1089, requires_grad=True)}
+    targets = {
+        "opp_policy": torch.stack(
+            [
+                torch.nn.functional.one_hot(torch.tensor(0), 1089).float(),
+                torch.zeros(1089),
+            ]
+        ),
+        "opp_policy_weight": torch.ones(2),
+    }
+
+    total, per_head = compute_losses(predictions, targets, {"opp_policy": 1.0})
+
+    expected = torch.log(torch.tensor(1089.0))
+    assert torch.allclose(total.detach(), expected, atol=1e-5)
+    assert torch.allclose(per_head["opp_policy"].detach(), expected, atol=1e-5)
 
 
 def test_value_loss_can_be_masked_for_truncated_games():

@@ -772,6 +772,16 @@ class SelfPlayWorker:
             q, r = engine.sample_action(temp)
             if q is None:
                 q, r = 0, 0
+            q, r = int(q), int(r)
+            selected_action_value = root_value
+            try:
+                q_values = list(engine.root_child_q_values())
+                for child_q, child_r, child_value in zip(moves_q, moves_r, q_values):
+                    if int(child_q) == q and int(child_r) == r:
+                        selected_action_value = float(child_value)
+                        break
+            except Exception:
+                selected_action_value = root_value
 
             if HAS_ENGINE:
                 player = engine._game.current_player
@@ -832,6 +842,7 @@ class SelfPlayWorker:
                     candidate_recall_forced_block=candidate_probe.recall_forced_block,
                     candidate_recall_two_placement_cover=candidate_probe.recall_two_placement_cover,
                     root_value=root_value,
+                    selected_action_value=selected_action_value,
                     player=player,
                     game_id=game_id,
                     is_full_search=not use_pcr,
@@ -839,7 +850,6 @@ class SelfPlayWorker:
                 )
             )
 
-            q, r = int(q), int(r)
             move_history.extend(player.to_bytes(4, "little", signed=True))
             move_history.extend(q.to_bytes(4, "little", signed=True))
             move_history.extend(r.to_bytes(4, "little", signed=True))

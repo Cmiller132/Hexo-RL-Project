@@ -177,7 +177,10 @@ class Config(BaseModel):
                 "model lookahead heads must match buffer.lookahead_horizons; "
                 f"missing horizons for heads: {missing_horizons}"
             )
-        if "pair_policy" in self.model.heads and not self.model.sparse_policy:
+        if (
+            ("sparse_policy" in self.model.heads or "pair_policy" in self.model.heads)
+            and not self.model.sparse_policy
+        ):
             self.model.sparse_policy = True
         if self.model.sparse_policy and max(
             self.model.candidate_budget,

@@ -157,11 +157,15 @@ def run_epoch(
             batch_size=cfg.train.batch_size,
             recency_decay=cfg.buffer.recency_decay,
             pcr_weight=cfg.buffer.pcr_weight,
-            use_symmetry=not bool(getattr(cfg.model, "sparse_policy", False)),
+            use_symmetry=True,
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             regret_fraction=cfg.buffer.regret_fraction,
             include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
-            include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False) or "pair_policy" in cfg.model.heads),
+            include_sparse_policy=bool(
+                getattr(cfg.model, "sparse_policy", False)
+                or "sparse_policy" in cfg.model.heads
+                or "pair_policy" in cfg.model.heads
+            ),
             include_pair_policy="pair_policy" in cfg.model.heads,
             candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
             max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
@@ -284,10 +288,14 @@ def run_tiny_training_smoke(
         batch_size=cfg.train.batch_size,
         recency_decay=cfg.buffer.recency_decay,
         pcr_weight=cfg.buffer.pcr_weight,
-        use_symmetry=not bool(getattr(cfg.model, "sparse_policy", False)),
+        use_symmetry=True,
         lookahead_horizons=cfg.buffer.lookahead_horizons,
         regret_fraction=cfg.buffer.regret_fraction,
-        include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False) or "pair_policy" in cfg.model.heads),
+        include_sparse_policy=bool(
+            getattr(cfg.model, "sparse_policy", False)
+            or "sparse_policy" in cfg.model.heads
+            or "pair_policy" in cfg.model.heads
+        ),
         include_pair_policy="pair_policy" in cfg.model.heads,
         candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
     )
