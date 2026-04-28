@@ -24,10 +24,15 @@ from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
-from hexorl.model.network import HexNet
+from hexorl.model.network import HexNet, build_model_from_config
 from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
-from hexorl.selfplay.records import GameRecord, PositionRecord, action_to_board_index
+from hexorl.selfplay.records import (
+    GameRecord,
+    PositionRecord,
+    action_to_board_index,
+    dense_policy_from_v2,
+)
 from hexorl.train.trainer import Trainer
 from hexorl.dashboard.recorder import RunRecorder
 
@@ -92,6 +97,7 @@ def run_epoch(
         else RingBuffer(
             capacity=cfg.buffer.capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
+            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -112,11 +118,7 @@ def run_epoch(
     if trainer is not None:
         model = trainer.model
     elif model is None:
-        model = HexNet(
-            channels=cfg.model.channels,
-            blocks=cfg.model.blocks,
-            heads=cfg.model.heads,
-        )
+        model = build_model_from_config(cfg, device=device, inference=False)
 
     if use_selfplay:
         selfplay_epoch = int(getattr(trainer, "epoch", 0)) + 1 if trainer is not None else 1
@@ -154,10 +156,12 @@ def run_epoch(
             batch_size=cfg.train.batch_size,
             recency_decay=cfg.buffer.recency_decay,
             pcr_weight=cfg.buffer.pcr_weight,
-            use_symmetry=True,
+            use_symmetry=not bool(getattr(cfg.model, "sparse_policy", False)),
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             regret_fraction=cfg.buffer.regret_fraction,
             include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
+            include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False)),
+            candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
         )
         num_workers = dataloader_worker_count(cfg)
         dataloader = DataLoader(
@@ -268,6 +272,7 @@ def run_tiny_training_smoke(
         capacity=cfg.buffer.capacity,
         recency_decay=cfg.buffer.recency_decay,
         num_lookahead=1,
+        max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
     )
     replay.extend(_make_bootstrap_positions(cfg, 16))
 
@@ -276,9 +281,11 @@ def run_tiny_training_smoke(
         batch_size=cfg.train.batch_size,
         recency_decay=cfg.buffer.recency_decay,
         pcr_weight=cfg.buffer.pcr_weight,
-        use_symmetry=True,
+        use_symmetry=not bool(getattr(cfg.model, "sparse_policy", False)),
         lookahead_horizons=cfg.buffer.lookahead_horizons,
         regret_fraction=cfg.buffer.regret_fraction,
+        include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False)),
+        candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
     )
     num_workers = dataloader_worker_count(cfg)
     dataloader = DataLoader(
@@ -288,7 +295,7 @@ def run_tiny_training_smoke(
         pin_memory=False,
         persistent_workers=num_workers > 0,
     )
-    model = HexNet(channels=cfg.model.channels, blocks=cfg.model.blocks, heads=cfg.model.heads)
+    model = build_model_from_config(cfg, device=torch.device("cpu"), inference=False)
     trainer = Trainer(model, cfg, dataloader, device=torch.device("cpu"))
 
     results = []
@@ -358,7 +365,13 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
                 break
 
             q, r = _sample_bootstrap_move(legal, rng)
-            policy = _bootstrap_policy_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
+            policy_v2 = _bootstrap_policy_v2_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
+            policy, outside_mass = dense_policy_from_v2(
+                policy_v2,
+                -16,
+                -16,
+                top_k=cfg.selfplay.policy_target_top_k,
+            )
             value_hint = float(np.tanh(float(game.window_eval) / 600.0))
             if player == 1:
                 value_hint = -value_hint
@@ -367,6 +380,8 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
                 PositionRecord(
                     move_history=_pack_moves(moves),
                     policy_target=policy,
+                    policy_target_v2=policy_v2,
+                    target_policy_mass_outside_window=outside_mass,
                     root_value=value_hint,
                     player=player,
                     game_id=game_id,
@@ -432,11 +447,19 @@ def _make_fallback_bootstrap_game(
         if not legal:
             break
         q, r = _sample_bootstrap_move(legal, rng)
-        policy = _bootstrap_policy_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
+        policy_v2 = _bootstrap_policy_v2_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
+        policy, outside_mass = dense_policy_from_v2(
+            policy_v2,
+            -16,
+            -16,
+            top_k=cfg.selfplay.policy_target_top_k,
+        )
         positions.append(
             PositionRecord(
                 move_history=_pack_moves(moves),
                 policy_target=policy,
+                policy_target_v2=policy_v2,
+                target_policy_mass_outside_window=outside_mass,
                 root_value=float(rng.uniform(-0.25, 0.25)),
                 player=current_player,
                 game_id=game_id,
@@ -512,6 +535,30 @@ def _bootstrap_policy_for_move(
         dense /= total
     nonzero = np.flatnonzero(dense)
     return {int(idx): float(dense[idx]) for idx in nonzero}
+
+
+def _bootstrap_policy_v2_for_move(
+    q: int,
+    r: int,
+    legal: List[tuple[int, int]],
+    rng: np.random.Generator,
+    top_k: int,
+) -> List[tuple[int, int, float]]:
+    weights: dict[tuple[int, int], float] = {(int(q), int(r)): 1.0}
+    if len(legal) > 1:
+        alt_count = min(max(1, top_k - 1), len(legal) - 1, 7)
+        alt_indices = rng.choice(len(legal), size=alt_count, replace=False)
+        for legal_idx in alt_indices:
+            aq, ar = legal[int(legal_idx)]
+            if (aq, ar) == (q, r):
+                continue
+            weights[(int(aq), int(ar))] = weights.get((int(aq), int(ar)), 0.0) + float(
+                rng.uniform(0.02, 0.12)
+            )
+    items = sorted(weights.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+    items = items[:max(1, int(top_k))]
+    total = sum(v for _, v in items)
+    return [(qr[0], qr[1], float(v / total)) for qr, v in items]
 
 
 def _pack_moves(moves: Iterable[tuple[int, int, int]]) -> bytes:

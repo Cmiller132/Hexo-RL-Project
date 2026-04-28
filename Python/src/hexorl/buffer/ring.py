@@ -25,6 +25,7 @@ class RingBuffer:
         max_policy_entries: int = 20,
         recency_decay: float = 0.99,
         num_lookahead: int = 0,
+        max_policy_v2_entries: int | None = None,
     ):
         if capacity <= 0:
             raise ValueError("RingBuffer capacity must be positive")
@@ -35,6 +36,7 @@ class RingBuffer:
 
         self.capacity = capacity
         self.max_policy_entries = max_policy_entries
+        self.max_policy_v2_entries = int(max_policy_v2_entries or max_policy_entries)
         self.recency_decay = recency_decay
         self.num_lookahead = num_lookahead
 
@@ -43,6 +45,19 @@ class RingBuffer:
         self._policies = np.zeros((capacity, max_policy_entries), dtype=np.uint16)
         self._policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
         self._policy_counts = np.zeros(capacity, dtype=np.uint16)
+        self._policy_v2_q = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+        self._policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._opp_policy_v2_q = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+        self._opp_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._outside_policy_mass = np.zeros(capacity, dtype=np.float32)
+        self._missing_policy_mass = np.zeros(capacity, dtype=np.float32)
+        self._candidate_recall_top1 = np.zeros(capacity, dtype=np.float32)
+        self._candidate_recall_top4 = np.zeros(capacity, dtype=np.float32)
+        self._candidate_recall_top8 = np.zeros(capacity, dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
         self._value_weights = np.ones(capacity, dtype=np.float32)
         self._regret_rank = np.zeros(capacity, dtype=np.float32)
@@ -95,6 +110,8 @@ class RingBuffer:
             entries = list(record.policy_target.items())
             n = min(len(entries), self.max_policy_entries)
             self._policy_counts[idx] = n
+            self._policies[idx].fill(0)
+            self._policy_probs[idx].fill(0.0)
             for j, (action_idx, prob) in enumerate(entries[:n]):
                 self._policies[idx, j] = action_idx
                 self._policy_probs[idx, j] = prob
@@ -102,6 +119,7 @@ class RingBuffer:
             self._values[idx] = record.to_value_target()
             self._value_weights[idx] = record.value_weight
             self._write_aux_targets(idx, record)
+            self._write_v2_targets(idx, record)
             self._game_ids[idx] = record.game_id
             self._is_full[idx] = record.is_full_search
             self._players[idx] = record.player
@@ -133,12 +151,15 @@ class RingBuffer:
         entries = list(record.policy_target.items())
         n = min(len(entries), self.max_policy_entries)
         self._policy_counts[idx] = n
+        self._policies[idx].fill(0)
+        self._policy_probs[idx].fill(0.0)
         for j, (action_idx, prob) in enumerate(entries[:n]):
             self._policies[idx, j] = action_idx
             self._policy_probs[idx, j] = prob
         self._values[idx] = record.to_value_target()
         self._value_weights[idx] = record.value_weight
         self._write_aux_targets(idx, record)
+        self._write_v2_targets(idx, record)
         self._game_ids[idx] = record.game_id
         self._is_full[idx] = record.is_full_search
         self._players[idx] = record.player
@@ -244,6 +265,26 @@ class RingBuffer:
                 prob = float(self._opp_policy_probs[idx, j])
                 if prob > 0:
                     opp_policy[action_idx] = prob
+            policy_v2 = []
+            n_v2 = int(self._policy_v2_counts[idx])
+            for j in range(n_v2):
+                prob = float(self._policy_v2_probs[idx, j])
+                if prob > 0:
+                    policy_v2.append((
+                        int(self._policy_v2_q[idx, j]),
+                        int(self._policy_v2_r[idx, j]),
+                        prob,
+                    ))
+            opp_policy_v2 = []
+            n_opp_v2 = int(self._opp_policy_v2_counts[idx])
+            for j in range(n_opp_v2):
+                prob = float(self._opp_policy_v2_probs[idx, j])
+                if prob > 0:
+                    opp_policy_v2.append((
+                        int(self._opp_policy_v2_q[idx, j]),
+                        int(self._opp_policy_v2_r[idx, j]),
+                        prob,
+                    ))
 
             return PositionRecord(
                 move_history=self._histories[idx],
@@ -255,6 +296,13 @@ class RingBuffer:
                 outcome=outcome,
                 lookahead_values=lv,
                 opp_policy_target=opp_policy,
+                policy_target_v2=policy_v2,
+                opp_policy_target_v2=opp_policy_v2,
+                target_policy_mass_outside_window=float(self._outside_policy_mass[idx]),
+                missing_target_policy_mass=float(self._missing_policy_mass[idx]),
+                candidate_recall_mcts_top1=float(self._candidate_recall_top1[idx]),
+                candidate_recall_mcts_top4=float(self._candidate_recall_top4[idx]),
+                candidate_recall_mcts_top8=float(self._candidate_recall_top8[idx]),
                 regret_rank=float(self._regret_rank[idx]),
                 regret_value=float(self._regret_value[idx]),
                 axis_label=int(self._axis[idx]),
@@ -295,6 +343,16 @@ class RingBuffer:
                 "capacity": self.capacity,
                 "max_game_id": self._max_game_id,
                 "full_search_pct": full_count / self._size * 100.0 if self._size > 0 else 0.0,
+                "avg_target_policy_mass_outside_window": float(
+                    self._outside_policy_mass[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "avg_missing_target_policy_mass": float(
+                    self._missing_policy_mass[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
             }
 
     def clear(self):
@@ -304,6 +362,19 @@ class RingBuffer:
             self._policies.fill(0)
             self._policy_probs.fill(0.0)
             self._policy_counts.fill(0)
+            self._policy_v2_q.fill(0)
+            self._policy_v2_r.fill(0)
+            self._policy_v2_probs.fill(0.0)
+            self._policy_v2_counts.fill(0)
+            self._opp_policy_v2_q.fill(0)
+            self._opp_policy_v2_r.fill(0)
+            self._opp_policy_v2_probs.fill(0.0)
+            self._opp_policy_v2_counts.fill(0)
+            self._outside_policy_mass.fill(0.0)
+            self._missing_policy_mass.fill(0.0)
+            self._candidate_recall_top1.fill(0.0)
+            self._candidate_recall_top4.fill(0.0)
+            self._candidate_recall_top8.fill(0.0)
             self._values.fill(0.0)
             self._value_weights.fill(1.0)
             self._regret_rank.fill(0.0)
@@ -338,3 +409,34 @@ class RingBuffer:
         for j, (action_idx, prob) in enumerate(opp_entries[:n_opp]):
             self._opp_policies[idx, j] = action_idx
             self._opp_policy_probs[idx, j] = prob
+
+    def _write_v2_targets(self, idx: int, record: PositionRecord):
+        """Write action-keyed global policy targets and diagnostics."""
+        entries = list(record.policy_target_v2)
+        n = min(len(entries), self.max_policy_v2_entries)
+        self._policy_v2_counts[idx] = n
+        self._policy_v2_q[idx].fill(0)
+        self._policy_v2_r[idx].fill(0)
+        self._policy_v2_probs[idx].fill(0.0)
+        for j, (q, r, prob) in enumerate(entries[:n]):
+            self._policy_v2_q[idx, j] = int(q)
+            self._policy_v2_r[idx, j] = int(r)
+            self._policy_v2_probs[idx, j] = float(prob)
+
+        opp_entries = list(record.opp_policy_target_v2)
+        n_opp = min(len(opp_entries), self.max_policy_v2_entries)
+        self._opp_policy_v2_counts[idx] = n_opp
+        self._opp_policy_v2_q[idx].fill(0)
+        self._opp_policy_v2_r[idx].fill(0)
+        self._opp_policy_v2_probs[idx].fill(0.0)
+        for j, (q, r, prob) in enumerate(opp_entries[:n_opp]):
+            self._opp_policy_v2_q[idx, j] = int(q)
+            self._opp_policy_v2_r[idx, j] = int(r)
+            self._opp_policy_v2_probs[idx, j] = float(prob)
+
+        dropped_mass = sum(float(prob) for _q, _r, prob in entries[n:])
+        self._outside_policy_mass[idx] = float(record.target_policy_mass_outside_window)
+        self._missing_policy_mass[idx] = float(record.missing_target_policy_mass) + float(dropped_mass)
+        self._candidate_recall_top1[idx] = float(record.candidate_recall_mcts_top1)
+        self._candidate_recall_top4[idx] = float(record.candidate_recall_mcts_top4)
+        self._candidate_recall_top8[idx] = float(record.candidate_recall_mcts_top8)

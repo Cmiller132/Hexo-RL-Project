@@ -16,9 +16,10 @@ import torch
 from typing import List, Optional, Tuple
 
 from hexorl.config import Config
-from hexorl.model.network import from_config, HexNet
+from hexorl.model.network import from_config, HexNet, load_model_state
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
+    CANDIDATE_FEATURES,
     create_inference_queue,
     connect_inference_queue,
 )
@@ -188,7 +189,7 @@ class InferenceServer:
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
                 for k, v in self._initial_state_dict.items()
             }
-            self._model.load_state_dict(initial, strict=False)
+            load_model_state(self._model, initial, allow_partial=False)
             self._model.eval()
         if self._device.type == "cuda":
             self._forward_stream = torch.cuda.Stream(priority=-1)
@@ -244,6 +245,7 @@ class InferenceServer:
 
             build_t0 = time.monotonic()
             batch_tensor, per_worker_counts, total_count = self._build_batch(ready_workers)
+            sparse_inputs = self._build_sparse_inputs(ready_workers, per_worker_counts, total_count)
             self.total_build_ms += (time.monotonic() - build_t0) * 1000.0
 
             if total_count > 0:
@@ -251,10 +253,10 @@ class InferenceServer:
                 for worker_id in ready_workers:
                     self._queue.get_slot(worker_id).req_ready.clear()
 
-                policies, values = self._forward(batch_tensor)
+                policies, values, sparse_logits = self._forward(batch_tensor, sparse_inputs)
 
                 scatter_t0 = time.monotonic()
-                self._scatter_results(ready_workers, per_worker_counts, policies, values)
+                self._scatter_results(ready_workers, per_worker_counts, policies, values, sparse_logits)
                 self.total_scatter_ms += (time.monotonic() - scatter_t0) * 1000.0
 
                 for worker_id in ready_workers:
@@ -350,11 +352,51 @@ class InferenceServer:
 
         return batch_tensor, counts, total
 
+    def _build_sparse_inputs(
+        self,
+        ready_workers: List[int],
+        per_worker_counts: List[int],
+        total_count: int,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        if total_count <= 0:
+            return None
+        max_k = 0
+        for worker_id, count in zip(ready_workers, per_worker_counts):
+            slot = self._queue.get_slot(worker_id)
+            if count > 0:
+                counts = slot.req_candidate_count[:count]
+                max_k = max(max_k, int(counts.max()) if counts.size else 0)
+        if max_k <= 0:
+            return None
+
+        indices = np.full((total_count, max_k), -1, dtype=np.int64)
+        features = np.zeros((total_count, max_k, CANDIDATE_FEATURES), dtype=np.float32)
+        mask = np.zeros((total_count, max_k), dtype=np.bool_)
+        offset = 0
+        for worker_id, count in zip(ready_workers, per_worker_counts):
+            slot = self._queue.get_slot(worker_id)
+            for row in range(count):
+                k = int(slot.req_candidate_count[row])
+                if k <= 0:
+                    continue
+                kk = min(k, max_k)
+                indices[offset + row, :kk] = slot.req_candidate_indices[row, :kk]
+                features[offset + row, :kk] = slot.req_candidate_features[row, :kk]
+                mask[offset + row, :kk] = slot.req_candidate_mask[row, :kk].astype(bool)
+            offset += count
+        return {
+            "candidate_indices": torch.from_numpy(indices).to(self._device, non_blocking=True),
+            "candidate_features": torch.from_numpy(features).to(self._device, non_blocking=True),
+            "candidate_mask": torch.from_numpy(mask).to(self._device, non_blocking=True),
+        }
+
     # ── Forward pass ──────────────────────────────────────────────────────
 
     def _forward(
-        self, batch_tensor: torch.Tensor
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        self,
+        batch_tensor: torch.Tensor,
+        sparse_inputs: Optional[dict[str, torch.Tensor]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """Run the model forward pass on a batch.
 
         Args:
@@ -372,15 +414,15 @@ class InferenceServer:
                 with torch.cuda.stream(self._forward_stream):
                     if self.fp16:
                         with torch.amp.autocast("cuda", dtype=torch.float16):
-                            out = self._model(batch_tensor)
+                            out = self._model(batch_tensor, **sparse_inputs) if sparse_inputs else self._model(batch_tensor)
                     else:
-                        out = self._model(batch_tensor)
+                        out = self._model(batch_tensor, **sparse_inputs) if sparse_inputs else self._model(batch_tensor)
                 self._forward_stream.synchronize()
             elif self.fp16 and self._device.type == "cuda":
                 with torch.amp.autocast("cuda", dtype=torch.float16):
-                    out = self._model(batch_tensor)
+                    out = self._model(batch_tensor, **sparse_inputs) if sparse_inputs else self._model(batch_tensor)
             else:
-                out = self._model(batch_tensor)
+                out = self._model(batch_tensor, **sparse_inputs) if sparse_inputs else self._model(batch_tensor)
         model_ms = (time.monotonic() - model_t0) * 1000.0
 
         post_t0 = time.monotonic()
@@ -397,6 +439,9 @@ class InferenceServer:
         download_t0 = time.monotonic()
         policies = p.cpu().numpy()
         values = v.cpu().numpy()
+        sparse = None
+        if sparse_inputs is not None and "sparse_policy" in out:
+            sparse = self._sanitize_policy_logits(out["sparse_policy"]).cpu().numpy()
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -405,7 +450,7 @@ class InferenceServer:
         self.total_postprocess_ms += post_ms
         self.total_download_ms += download_ms
 
-        return policies, values
+        return policies, values, sparse
 
     @staticmethod
     def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -449,6 +494,7 @@ class InferenceServer:
         per_worker_counts: List[int],
         policies: np.ndarray,
         values: np.ndarray,
+        sparse_logits: Optional[np.ndarray] = None,
     ):
         """Distribute flat policy/value arrays back to per-worker slots."""
         offset = 0
@@ -456,6 +502,9 @@ class InferenceServer:
             slot = self._queue.get_slot(worker_id)
             slot.res_policy[:count] = policies[offset:offset + count]
             slot.res_value[:count] = values[offset:offset + count]
+            if sparse_logits is not None:
+                k = sparse_logits.shape[1]
+                slot.res_sparse_logits[:count, :k] = sparse_logits[offset:offset + count]
             offset += count
 
     # ── Stats ─────────────────────────────────────────────────────────────
@@ -480,7 +529,7 @@ class InferenceServer:
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
                 for k, v in latest.items()
             }
-            self._model.load_state_dict(latest, strict=False)
+            load_model_state(self._model, latest, allow_partial=False)
             self._model.eval()
 
     @property

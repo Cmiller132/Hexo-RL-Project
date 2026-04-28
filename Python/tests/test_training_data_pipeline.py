@@ -22,9 +22,11 @@ from hexorl.selfplay.records import (
     PositionRecord,
     BOARD_SIZE,
     action_to_board_index,
+    dense_policy_from_v2,
+    policy_v2_from_visits,
     sparsify_policy,
 )
-from hexorl.train.losses import compute_losses
+from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
 from hexorl.model.network import HexNet
 
 
@@ -147,6 +149,171 @@ def test_ring_buffer_preserves_auxiliary_targets():
     assert out.axis_label == rec.axis_label
     assert out.moves_left == rec.moves_left
     assert out.value_weight == rec.value_weight
+
+
+def test_policy_target_v2_preserves_outside_window_mass():
+    target_v2 = policy_v2_from_visits([0, 50], [0, 50], [3, 7], top_k=8)
+    policy, outside = dense_policy_from_v2(target_v2, -16, -16, top_k=8)
+
+    assert sum(prob for _q, _r, prob in target_v2) == pytest.approx(1.0)
+    assert outside == pytest.approx(0.7)
+    assert policy[action_to_board_index(0, 0)] == pytest.approx(1.0)
+
+
+def test_compact_record_v2_roundtrip_preserves_global_targets():
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=[(0, 0, 0.4), (-40, 10, 0.6)],
+        target_policy_mass_outside_window=0.6,
+        missing_target_policy_mass=0.0,
+        candidate_recall_mcts_top4=0.5,
+        root_value=0.25,
+        player=1,
+        outcome=-1.0,
+        opp_policy_target_v2=[(1, 0, 1.0)],
+    )
+    game = GameRecord(positions=[rec], outcome=-1.0, game_id=9, final_move_history=_move(0, 0, 0))
+
+    out = GameRecord.from_compact_bytes(game.to_compact_bytes())
+
+    assert out.game_id == 9
+    assert [(q, r) for q, r, _ in out.positions[0].policy_target_v2] == [(0, 0), (-40, 10)]
+    assert [prob for _q, _r, prob in out.positions[0].policy_target_v2] == pytest.approx([0.4, 0.6])
+    assert [(q, r) for q, r, _ in out.positions[0].opp_policy_target_v2] == [(1, 0)]
+    assert [prob for _q, _r, prob in out.positions[0].opp_policy_target_v2] == pytest.approx([1.0])
+    assert out.positions[0].target_policy_mass_outside_window == pytest.approx(0.6)
+    assert out.positions[0].candidate_recall_mcts_top4 == pytest.approx(0.5)
+
+
+def test_ring_buffer_preserves_policy_target_v2():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=[(0, 0, 0.5), (30, -12, 0.5)],
+        target_policy_mass_outside_window=0.5,
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+
+    out = buffer[0]
+    assert out is not None
+    assert out.policy_target_v2 == rec.policy_target_v2
+    assert out.target_policy_mass_outside_window == pytest.approx(0.5)
+
+
+def test_dense_projection_uses_all_v2_visits_before_topk():
+    moves_q = [100, 0, 1]
+    moves_r = [100, 0, 0]
+    visits = [100, 20, 10]
+    target_v2 = policy_v2_from_visits(moves_q, moves_r, visits)
+    policy, outside = dense_policy_from_v2(target_v2, -16, -16, top_k=2)
+
+    assert outside == pytest.approx(100 / 130)
+    assert set(policy) == {action_to_board_index(0, 0), action_to_board_index(1, 0)}
+    assert policy[action_to_board_index(0, 0)] == pytest.approx(2 / 3)
+    assert policy[action_to_board_index(1, 0)] == pytest.approx(1 / 3)
+
+
+def test_ring_buffer_reports_v2_truncation_as_missing_mass():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=[(0, 0, 0.5), (1, 0, 0.3), (2, 0, 0.2)],
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=2, max_policy_v2_entries=2)
+    buffer.append(rec)
+
+    out = buffer[0]
+    assert out is not None
+    assert len(out.policy_target_v2) == 2
+    assert out.missing_target_policy_mass == pytest.approx(0.2)
+
+
+def test_sparse_sampler_outputs_candidate_targets():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=[(0, 0, 0.75), (1, 0, 0.25)],
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=True,
+        include_sparse_policy=True,
+        candidate_budget=4,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["candidate_qr"].shape == (1, 8, 2)
+    assert aux["candidate_features"].shape[2] == 12
+    assert aux["candidate_mask"][0].any()
+    assert aux["sparse_policy_target"][0].sum() == pytest.approx(1.0)
+
+
+def test_candidate_builder_accepts_list_legal_moves():
+    from hexorl.action_contract.candidates import build_candidate_batch
+
+    cand = build_candidate_batch(
+        [[0, 0], [1, 0]],
+        [(0, 0, 1.0)],
+        offset_q=-16,
+        offset_r=-16,
+        budget=4,
+    )
+
+    assert cand.mask.sum() == 2
+    assert cand.target.sum() == pytest.approx(1.0)
+
+
+def test_sparse_policy_loss_masks_invalid_candidates():
+    logits = torch.tensor([[0.0, 2.0, -5.0], [1.0, 0.0, 0.0]])
+    target = torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    mask = torch.tensor([[True, True, False], [False, False, False]])
+
+    loss = sparse_policy_loss(logits, target, mask)
+
+    assert torch.isfinite(loss)
+    assert loss.item() >= 0.0
+
+
+def test_sparse_policy_loss_accepts_half_logits_float_targets():
+    logits = torch.tensor([[0.0, 2.0, -5.0]], dtype=torch.float16)
+    target = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+    mask = torch.tensor([[True, True, False]])
+
+    loss = sparse_policy_loss(logits, target, mask)
+
+    assert torch.isfinite(loss)
+    assert loss.dtype == torch.float32
+
+
+def test_policy_and_value_losses_accept_half_logits():
+    policy = policy_loss(
+        torch.tensor([[0.0, 2.0, -5.0]], dtype=torch.float16),
+        torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32),
+    )
+    value = binned_value_loss(
+        torch.zeros((1, 65), dtype=torch.float16),
+        torch.tensor([0.0], dtype=torch.float32),
+    )
+
+    assert torch.isfinite(policy)
+    assert torch.isfinite(value)
+    assert policy.dtype == torch.float32
+    assert value.dtype == torch.float32
 
 
 def test_policy_target_top64_is_preserved_when_configured():

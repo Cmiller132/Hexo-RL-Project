@@ -16,6 +16,7 @@ except ImportError:
 
 from hexorl.buffer.ring import RingBuffer
 from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
+from hexorl.action_contract.candidates import CANDIDATE_FEATURES, build_candidate_batch
 
 try:
     from hexorl.axis_policy.core import AxisPolicyInput
@@ -180,6 +181,18 @@ def _fallback_legal_moves(
     return sorted(legal)
 
 
+def _history_stones(history_bytes: bytes) -> dict[Tuple[int, int], int]:
+    stones: dict[Tuple[int, int], int] = {}
+    if len(history_bytes) % 12 != 0:
+        return stones
+    for offset in range(0, len(history_bytes), 12):
+        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
+        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
+        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
+        stones[(q, r)] = player
+    return stones
+
+
 def _py_decode_compact_record(
     history_bytes: bytes,
     near_radius: int = 8,
@@ -335,12 +348,21 @@ class ReplayDataset(_IterableDataset):
         regret_fraction: float = 0.0,
         regret_temperature: float = 0.1,
         include_axis_delta_norm: bool = False,
+        include_sparse_policy: bool = False,
+        candidate_budget: int = 256,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
         self.recency_decay = recency_decay
         self.pcr_weight = pcr_weight
-        self.use_symmetry = use_symmetry
+        self.include_sparse_policy = bool(include_sparse_policy)
+        self.candidate_budget = max(
+            int(candidate_budget),
+            int(getattr(buffer, "max_policy_v2_entries", int(candidate_budget))),
+        )
+        # Sparse candidate coordinates are global action identities. Keep D6
+        # augmentation off until candidate transforms are enabled and tested.
+        self.use_symmetry = bool(use_symmetry) and not self.include_sparse_policy
         self.near_radius = near_radius
         self.lookahead_horizons = lookahead_horizons or []
         self.regret_fraction = max(0.0, min(1.0, regret_fraction))
@@ -355,6 +377,7 @@ class ReplayDataset(_IterableDataset):
         self._axis_delta_norm_cache_max = 4096
         self._tensor_cache: OrderedDict[bytes, np.ndarray] = OrderedDict()
         self._tensor_cache_max = 4096
+        self._meta_cache: OrderedDict[bytes, tuple[np.ndarray, int, int, bytes]] = OrderedDict()
 
         self._rng = np.random.RandomState()
 
@@ -420,6 +443,17 @@ class ReplayDataset(_IterableDataset):
             "value_weight": np.ones(self.batch_size, dtype=np.float32),
             "policy_weight": np.ones(self.batch_size, dtype=np.float32),
         }
+        if self.include_sparse_policy:
+            budget = max(1, self.candidate_budget)
+            aux_targets["candidate_qr"] = np.zeros((self.batch_size, budget, 2), dtype=np.int32)
+            aux_targets["candidate_indices"] = np.full((self.batch_size, budget), -1, dtype=np.int64)
+            aux_targets["candidate_features"] = np.zeros(
+                (self.batch_size, budget, CANDIDATE_FEATURES),
+                dtype=np.float32,
+            )
+            aux_targets["candidate_mask"] = np.zeros((self.batch_size, budget), dtype=np.bool_)
+            aux_targets["sparse_policy_target"] = np.zeros((self.batch_size, budget), dtype=np.float32)
+            aux_targets["candidate_missing_mass"] = np.zeros(self.batch_size, dtype=np.float32)
         if self.include_axis_delta_norm:
             aux_targets["axis_delta_norm"] = np.zeros(
                 (self.batch_size, 6, BOARD_SIZE, BOARD_SIZE),
@@ -435,7 +469,8 @@ class ReplayDataset(_IterableDataset):
             policy = rec.to_dense_policy()
             opp_policy = rec.to_dense_opp_policy()
             sym_idx = 0
-            tensors[i] = self._encode_tensor(rec.move_history)
+            tensor_i, offset_q, offset_r, legal_bytes = self._encode_tensor_meta(rec.move_history)
+            tensors[i] = tensor_i
 
             if self.use_symmetry:
                 sym_idx = self._rng.randint(0, 12)
@@ -461,6 +496,26 @@ class ReplayDataset(_IterableDataset):
             aux_targets["moves_left"][i] = rec.moves_left
             aux_targets["value_weight"][i] = rec.value_weight
             aux_targets["policy_weight"][i] = 1.0 if rec.is_full_search else 0.0
+            if self.include_sparse_policy:
+                legal = (
+                    np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                    if legal_bytes
+                    else np.empty((0, 2), dtype=np.int32)
+                )
+                cand = build_candidate_batch(
+                    [(int(q), int(r)) for q, r in legal],
+                    rec.policy_target_v2,
+                    offset_q=int(offset_q),
+                    offset_r=int(offset_r),
+                    budget=self.candidate_budget,
+                )
+                width = min(cand.qr.shape[0], aux_targets["candidate_qr"].shape[1])
+                aux_targets["candidate_qr"][i, :width] = cand.qr[:width]
+                aux_targets["candidate_indices"][i, :width] = cand.indices[:width]
+                aux_targets["candidate_features"][i, :width] = cand.features[:width]
+                aux_targets["candidate_mask"][i, :width] = cand.mask[:width]
+                aux_targets["sparse_policy_target"][i, :width] = cand.target[:width]
+                aux_targets["candidate_missing_mass"][i] = cand.missing_mass
             if self.include_axis_delta_norm:
                 axis_delta_norm = self._compute_axis_delta_norm(rec)
                 if self.use_symmetry:
@@ -476,12 +531,20 @@ class ReplayDataset(_IterableDataset):
         return tensors, policies, values, lookahead_arrays, aux_targets
 
     def _encode_tensor(self, history: bytes) -> np.ndarray:
+        tensor, _offset_q, _offset_r, _legal_bytes = self._encode_tensor_meta(history)
+        return tensor
+
+    def _encode_tensor_meta(self, history: bytes) -> tuple[np.ndarray, int, int, bytes]:
+        cached = self._meta_cache.get(history)
+        if cached is not None:
+            self._meta_cache.move_to_end(history)
+            return cached
         cached = self._tensor_cache.get(history)
         if cached is not None:
             self._tensor_cache.move_to_end(history)
-            return cached
+            return cached, -16, -16, b""
         if HAS_ENGINE:
-            tensor, _offset_q, _offset_r, _legal_bytes = encode_tensor_for_history(
+            tensor, offset_q, offset_r, legal_bytes = encode_tensor_for_history(
                 history,
                 near_radius=self.near_radius,
                 constrain_threats=False,
@@ -489,11 +552,22 @@ class ReplayDataset(_IterableDataset):
         else:
             decoded = _py_decode_compact_record(history, self.near_radius)
             tensor = decoded[-1] if decoded.ndim == 4 else decoded
+            offset_q, offset_r = -16, -16
+            legal = _fallback_legal_moves(_history_stones(history), self.near_radius)
+            buf = bytearray()
+            for q, r in legal:
+                buf.extend(int(q).to_bytes(4, "little", signed=True))
+                buf.extend(int(r).to_bytes(4, "little", signed=True))
+            legal_bytes = bytes(buf)
         tensor = np.asarray(tensor, dtype=np.float32)
         self._tensor_cache[history] = tensor
         if len(self._tensor_cache) > self._tensor_cache_max:
             self._tensor_cache.popitem(last=False)
-        return tensor
+        result = (tensor, int(offset_q), int(offset_r), bytes(legal_bytes))
+        self._meta_cache[history] = result
+        if len(self._meta_cache) > self._tensor_cache_max:
+            self._meta_cache.popitem(last=False)
+        return result
 
     def _compute_axis_delta_norm(self, rec) -> np.ndarray:
         if self._axis_delta_norm_proto is None:

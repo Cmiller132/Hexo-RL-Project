@@ -15,6 +15,59 @@ class ModelConfig(BaseModel):
     channels: int = 128
     blocks: int = 16
     heads: List[str] = Field(default_factory=lambda: ["policy", "value"])
+    architecture: str = "cnn"
+    attention_positions: List[int] = Field(default_factory=list)
+    attention_heads: int = 8
+    attention_mlp_ratio: float = 2.0
+    attention_dropout: float = 0.0
+    dropout: float = 0.0
+    relative_bias: bool = False
+    sparse_policy: bool = False
+    candidate_budget: int = 256
+    sparse_prior_stage: int = 0
+    sparse_prior_mix: float = 0.25
+
+    @model_validator(mode="after")
+    def validate_model_config(self) -> "ModelConfig":
+        arch = self.architecture.lower()
+        if arch not in {"cnn", "restnet"}:
+            raise ValueError("model.architecture must be 'cnn' or 'restnet'")
+        self.architecture = arch
+        if self.blocks <= 0:
+            raise ValueError("model.blocks must be positive")
+        if self.channels <= 0:
+            raise ValueError("model.channels must be positive")
+        if self.attention_heads <= 0:
+            raise ValueError("model.attention_heads must be positive")
+        if (arch == "restnet" or self.attention_positions) and self.channels % self.attention_heads != 0:
+            raise ValueError("model.channels must be divisible by model.attention_heads")
+        if self.attention_mlp_ratio <= 0.0:
+            raise ValueError("model.attention_mlp_ratio must be positive")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("model.dropout must be in [0, 1)")
+        if not 0.0 <= self.attention_dropout < 1.0:
+            raise ValueError("model.attention_dropout must be in [0, 1)")
+        if self.relative_bias:
+            raise ValueError("model.relative_bias is reserved and must remain false")
+        if self.candidate_budget <= 0:
+            raise ValueError("model.candidate_budget must be positive")
+        if self.candidate_budget > 512:
+            raise ValueError("model.candidate_budget must be <= 512 for the shared-memory protocol")
+        if self.sparse_prior_stage not in {0, 1, 2}:
+            raise ValueError("model.sparse_prior_stage must be 0, 1, or 2")
+        if not 0.0 <= self.sparse_prior_mix <= 1.0:
+            raise ValueError("model.sparse_prior_mix must be in [0, 1]")
+        invalid_positions = [
+            pos for pos in self.attention_positions if pos < 1 or pos > self.blocks
+        ]
+        if invalid_positions:
+            raise ValueError(
+                "model.attention_positions must be 1-based block positions within "
+                f"1..{self.blocks}; got {invalid_positions}"
+            )
+        if arch == "cnn" and self.attention_positions:
+            raise ValueError("model.attention_positions require architecture='restnet'")
+        return self
 
 
 class SelfPlayConfig(BaseModel):
@@ -104,6 +157,16 @@ class Config(BaseModel):
                 "model lookahead heads must match buffer.lookahead_horizons; "
                 f"missing horizons for heads: {missing_horizons}"
             )
+        if self.model.sparse_policy and max(
+            self.model.candidate_budget,
+            self.selfplay.policy_target_top_k,
+        ) > 512:
+            raise ValueError(
+                "sparse policy effective candidate width must be <= 512 "
+                "(max(model.candidate_budget, selfplay.policy_target_top_k))"
+            )
+        if self.model.sparse_policy and "sparse_policy" not in self.train.loss_weights:
+            self.train.loss_weights["sparse_policy"] = 0.25
 
         return self
 

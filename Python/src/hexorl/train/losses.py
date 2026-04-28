@@ -52,8 +52,10 @@ def binned_value_loss(
     Returns:
         Scalar loss.
     """
-    target_bins = value_to_bins_torch(target_values, n_bins=n_bins)
-    log_probs = F.log_softmax(pred_logits, dim=-1)
+    logits = pred_logits.float()
+    values = target_values.to(device=logits.device, dtype=logits.dtype).clamp(-1.0, 1.0)
+    target_bins = value_to_bins_torch(values, n_bins=n_bins)
+    log_probs = F.log_softmax(logits, dim=-1)
     loss = -(target_bins * log_probs).sum(dim=-1)
     if weight is not None:
         weight = weight.to(device=loss.device, dtype=loss.dtype)
@@ -126,8 +128,10 @@ def policy_loss(
     Returns:
         Scalar loss.
     """
-    log_probs = F.log_softmax(pred_logits, dim=-1)
-    loss = -(target_probs * log_probs).sum(dim=-1)
+    logits = pred_logits.float()
+    target = target_probs.to(device=logits.device, dtype=logits.dtype)
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(target * log_probs).sum(dim=-1)
     if weight is not None:
         weight = weight.to(device=loss.device, dtype=loss.dtype)
         valid = weight > 0
@@ -135,6 +139,35 @@ def policy_loss(
             return pred_logits.sum() * 0.0
         return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
     return loss.mean()
+
+
+def sparse_policy_loss(
+    pred_logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masked cross-entropy for candidate/action-keyed policy logits."""
+    logits = pred_logits.float()
+    mask = candidate_mask.to(device=logits.device, dtype=torch.bool)
+    target = target_probs.to(device=logits.device, dtype=logits.dtype)
+    target_mass = (target * mask.to(dtype=target.dtype)).sum(dim=-1)
+    valid_rows = mask.any(dim=-1) & (target_mass > 0)
+    if not torch.any(valid_rows):
+        return pred_logits.sum() * 0.0
+
+    logits = logits.masked_fill(~mask, -80.0)
+    norm_target = torch.zeros_like(target)
+    norm_target[valid_rows] = target[valid_rows] / target_mass[valid_rows].unsqueeze(-1).clamp(min=1e-6)
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(norm_target * log_probs).sum(dim=-1)
+    if weight is not None:
+        w = weight.to(device=loss.device, dtype=loss.dtype)
+        w = w * valid_rows.to(dtype=w.dtype)
+        if not torch.any(w > 0):
+            return pred_logits.sum() * 0.0
+        return (loss * w).sum() / w.sum().clamp(min=1e-6)
+    return loss[valid_rows].mean()
 
 
 def opp_policy_loss(
@@ -208,8 +241,9 @@ def entropy_loss(policy_logits: torch.Tensor) -> torch.Tensor:
     Returns:
         Scalar loss (negative entropy mean — minimize to maximize entropy).
     """
-    probs = F.softmax(policy_logits, dim=-1)
-    log_probs = F.log_softmax(policy_logits, dim=-1)
+    logits = policy_logits.float()
+    probs = F.softmax(logits, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
     entropy = -(probs * log_probs).sum(dim=-1)
     return -entropy.mean()
 
@@ -253,6 +287,15 @@ def compute_losses(
 
         if head_name == "policy":
             loss = policy_loss(pred, targets["policy"], targets.get("policy_weight"))
+        elif head_name == "sparse_policy":
+            if "sparse_policy_target" not in targets or "candidate_mask" not in targets:
+                continue
+            loss = sparse_policy_loss(
+                pred,
+                targets["sparse_policy_target"],
+                targets["candidate_mask"],
+                targets.get("policy_weight"),
+            )
         elif head_name == "opp_policy":
             target = targets.get("opp_policy", targets.get("policy"))
             if target is None:

@@ -10,7 +10,7 @@ Each record represents one position from a self-play game:
 
 import struct
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -18,6 +18,9 @@ from dataclasses import dataclass, field
 NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
+COMPACT_MAGIC_V2 = b"HXG2"
+COMPACT_VERSION_V2 = 2
+PolicyTargetV2 = List[Tuple[int, int, float]]
 
 
 @dataclass
@@ -56,6 +59,14 @@ class PositionRecord:
     # Lookahead value targets at multiple horizons (KataGo-style).
     lookahead_values: List[float] = field(default_factory=list)
     opp_policy_target: Dict[int, float] = field(default_factory=dict)
+    policy_target_v2: PolicyTargetV2 = field(default_factory=list)
+    opp_policy_target_v2: PolicyTargetV2 = field(default_factory=list)
+    pair_policy_target_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = field(default_factory=list)
+    target_policy_mass_outside_window: float = 0.0
+    missing_target_policy_mass: float = 0.0
+    candidate_recall_mcts_top1: float = 0.0
+    candidate_recall_mcts_top4: float = 0.0
+    candidate_recall_mcts_top8: float = 0.0
     regret_rank: float = 0.0
     regret_value: float = 0.0
     axis_label: int = -1
@@ -126,24 +137,14 @@ class GameRecord:
     def to_compact_bytes(self) -> bytes:
         """Serialize the game record into compact bytes for buffer storage.
 
-        Format:
-          Header (12 bytes):
-            - game_id:   u32 LE
-            - outcome:   f32 LE  
-            - num_pos:   u32 LE
-          Per position (variable):
-            - move_history_len: u32 LE
-            - move_history: bytes (move_history_len bytes)
-            - player: u8
-            - is_full_search: u8
-            - root_value: f32 LE
-            - num_policy_entries: u16 LE
-            - per policy entry: (u16 LE action_idx, f32 LE prob)
+        V2 records start with a magic/version prefix. from_compact_bytes still
+        accepts legacy records that started directly with game_id/outcome.
         """
         parts = bytearray()
 
         # Header
-        parts.extend(struct.pack("<IfI", self.game_id, self.outcome, len(self.positions)))
+        parts.extend(COMPACT_MAGIC_V2)
+        parts.extend(struct.pack("<HIfI", COMPACT_VERSION_V2, self.game_id, self.outcome, len(self.positions)))
 
         for pos in self.positions:
             # Move history
@@ -156,7 +157,7 @@ class GameRecord:
             # Root value
             parts.extend(struct.pack("<f", pos.root_value))
 
-            # Policy target (sparse)
+            # Policy target (legacy dense-crop sparse)
             entries = list(pos.policy_target.items())
             parts.extend(struct.pack("<H", len(entries)))
             for idx, prob in entries:
@@ -170,6 +171,22 @@ class GameRecord:
             parts.extend(struct.pack("<H", len(opp_entries)))
             for idx, prob in opp_entries:
                 parts.extend(struct.pack("<Hf", idx, prob))
+            v2_entries = list(pos.policy_target_v2)
+            parts.extend(struct.pack("<H", len(v2_entries)))
+            for q, r, prob in v2_entries:
+                parts.extend(struct.pack("<iif", int(q), int(r), float(prob)))
+            opp_v2_entries = list(pos.opp_policy_target_v2)
+            parts.extend(struct.pack("<H", len(opp_v2_entries)))
+            for q, r, prob in opp_v2_entries:
+                parts.extend(struct.pack("<iif", int(q), int(r), float(prob)))
+            parts.extend(struct.pack(
+                "<fffff",
+                float(pos.target_policy_mass_outside_window),
+                float(pos.missing_target_policy_mass),
+                float(pos.candidate_recall_mcts_top1),
+                float(pos.candidate_recall_mcts_top4),
+                float(pos.candidate_recall_mcts_top8),
+            ))
             parts.extend(struct.pack(
                 "<ffhf",
                 pos.regret_rank,
@@ -185,12 +202,20 @@ class GameRecord:
         """Deserialize a game record from compact bytes."""
         offset = 0
 
-        game_id = struct.unpack_from("<I", data, offset)[0]
-        offset += 4
-        outcome = struct.unpack_from("<f", data, offset)[0]
-        offset += 4
-        num_pos = struct.unpack_from("<I", data, offset)[0]
-        offset += 4
+        is_v2 = data[:4] == COMPACT_MAGIC_V2
+        if is_v2:
+            offset += 4
+            version, game_id, outcome, num_pos = struct.unpack_from("<HIfI", data, offset)
+            offset += struct.calcsize("<HIfI")
+            if version != COMPACT_VERSION_V2:
+                raise ValueError(f"Unsupported compact GameRecord version {version}")
+        else:
+            game_id = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
+            outcome = struct.unpack_from("<f", data, offset)[0]
+            offset += 4
+            num_pos = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
 
         positions = []
         for _ in range(num_pos):
@@ -225,6 +250,12 @@ class GameRecord:
             turn_idx = struct.unpack_from("<I", data, offset)[0]
             offset += 4
             opp_policy = {}
+            policy_v2: PolicyTargetV2 = []
+            opp_policy_v2: PolicyTargetV2 = []
+            target_policy_mass_outside_window = 0.0
+            missing_target_policy_mass = 0.0
+            candidate_recall_mcts_top1 = 0.0
+            candidate_recall_mcts_top8 = 0.0
             regret_rank = 0.0
             regret_value = 0.0
             axis_label = -1
@@ -238,6 +269,27 @@ class GameRecord:
                     prob = struct.unpack_from("<f", data, offset)[0]
                     offset += 4
                     opp_policy[idx] = prob
+                if is_v2:
+                    num_v2_entries = struct.unpack_from("<H", data, offset)[0]
+                    offset += 2
+                    for _ in range(num_v2_entries):
+                        q, r, prob = struct.unpack_from("<iif", data, offset)
+                        offset += struct.calcsize("<iif")
+                        policy_v2.append((int(q), int(r), float(prob)))
+                    num_opp_v2_entries = struct.unpack_from("<H", data, offset)[0]
+                    offset += 2
+                    for _ in range(num_opp_v2_entries):
+                        q, r, prob = struct.unpack_from("<iif", data, offset)
+                        offset += struct.calcsize("<iif")
+                        opp_policy_v2.append((int(q), int(r), float(prob)))
+                    (
+                        target_policy_mass_outside_window,
+                        missing_target_policy_mass,
+                        candidate_recall_mcts_top1,
+                        candidate_recall_mcts_top4,
+                        candidate_recall_mcts_top8,
+                    ) = struct.unpack_from("<fffff", data, offset)
+                    offset += struct.calcsize("<fffff")
                 regret_rank, regret_value, axis_label, moves_left = struct.unpack_from(
                     "<ffhf", data, offset
                 )
@@ -253,6 +305,13 @@ class GameRecord:
                 is_full_search=is_full,
                 turn_index=turn_idx,
                 opp_policy_target=opp_policy,
+                policy_target_v2=policy_v2,
+                opp_policy_target_v2=opp_policy_v2,
+                target_policy_mass_outside_window=target_policy_mass_outside_window,
+                missing_target_policy_mass=missing_target_policy_mass,
+                candidate_recall_mcts_top1=candidate_recall_mcts_top1,
+                candidate_recall_mcts_top4=candidate_recall_mcts_top4,
+                candidate_recall_mcts_top8=candidate_recall_mcts_top8,
                 regret_rank=regret_rank,
                 regret_value=regret_value,
                 axis_label=axis_label,
@@ -276,6 +335,7 @@ class GameRecord:
         outcome: float,
         game_id: int,
         is_full_search: bool = True,
+        policy_targets_v2: Optional[List[PolicyTargetV2]] = None,
     ) -> "GameRecord":
         """Construct a GameRecord from raw game data.
 
@@ -300,12 +360,15 @@ class GameRecord:
         else:
             pos_histories = move_history_bytes
 
+        policy_targets_v2 = policy_targets_v2 or [[] for _ in policy_targets]
+
         for i, (history, policy, rv, player) in enumerate(
             zip(pos_histories, policy_targets, root_values, players)
         ):
             positions.append(PositionRecord(
                 move_history=history,
                 policy_target=policy,
+                policy_target_v2=policy_targets_v2[i] if i < len(policy_targets_v2) else [],
                 root_value=rv,
                 player=player,
                 outcome=outcome,
@@ -360,6 +423,50 @@ def sparsify_policy(
     else:
         values = np.full_like(values, 1.0 / max(len(values), 1), dtype=np.float32)
     return {int(idx): float(val) for idx, val in zip(indices, values)}
+
+
+def policy_v2_from_visits(
+    moves_q: List[int],
+    moves_r: List[int],
+    visits: List[int],
+    top_k: Optional[int] = None,
+) -> PolicyTargetV2:
+    """Build normalized global action targets directly from MCTS root visits."""
+    entries = [
+        (int(q), int(r), float(v))
+        for q, r, v in zip(moves_q, moves_r, visits)
+        if float(v) > 0.0
+    ]
+    if not entries:
+        return []
+    entries.sort(key=lambda item: (-item[2], item[0], item[1]))
+    total_all = sum(v for _, _, v in entries)
+    if top_k is not None and int(top_k) > 0:
+        entries = entries[:max(1, int(top_k))]
+    total = total_all
+    if total <= 0.0:
+        p = 1.0 / len(entries)
+        return [(q, r, p) for q, r, _ in entries]
+    return [(q, r, v / total) for q, r, v in entries]
+
+
+def dense_policy_from_v2(
+    policy_v2: PolicyTargetV2,
+    offset_q: int,
+    offset_r: int,
+    top_k: int = 64,
+) -> tuple[Dict[int, float], float]:
+    """Project global V2 targets into the legacy crop-local sparse target."""
+    dense = np.zeros(BOARD_AREA, dtype=np.float32)
+    outside_mass = 0.0
+    for q, r, prob in policy_v2:
+        idx = action_to_board_index(q, r, offset_q, offset_r)
+        if idx >= 0:
+            dense[idx] += float(prob)
+        else:
+            outside_mass += float(prob)
+    policy = sparsify_policy(dense, top_k=top_k) if dense.sum() > 0.0 else {}
+    return policy, outside_mass
 
 
 def action_to_board_index(q: int, r: int, offset_q: int = -16, offset_r: int = -16) -> int:

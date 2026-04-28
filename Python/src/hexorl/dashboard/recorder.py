@@ -165,6 +165,13 @@ class RunRecorder:
                         "axis_label": pos.axis_label,
                         "moves_left": pos.moves_left,
                         "value_weight": pos.value_weight,
+                        "policy_target_v2": pos.policy_target_v2,
+                        "opp_policy_target_v2": pos.opp_policy_target_v2,
+                        "target_policy_mass_outside_window": pos.target_policy_mass_outside_window,
+                        "missing_target_policy_mass": pos.missing_target_policy_mass,
+                        "candidate_recall_mcts_top1": pos.candidate_recall_mcts_top1,
+                        "candidate_recall_mcts_top4": pos.candidate_recall_mcts_top4,
+                        "candidate_recall_mcts_top8": pos.candidate_recall_mcts_top8,
                     },
                 }
                 for pos in record.positions

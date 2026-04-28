@@ -24,12 +24,13 @@ except ImportError:
     HAS_ENGINE = False
 
 from hexorl.config import Config
+from hexorl.action_contract.candidates import build_candidate_batch
 from hexorl.inference.client import InferenceClient
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
-    sparsify_policy,
-    action_to_board_index,
+    dense_policy_from_v2,
+    policy_v2_from_visits,
     BOARD_AREA,
 )
 from hexorl.buffer.targets import process_game_record
@@ -132,6 +133,21 @@ class MockMCTSEngine:
         self._root_value = value
         self._visits = np.zeros(n, dtype=np.uint32)
 
+    def expand_root_with_sparse_priors(
+        self,
+        policy: np.ndarray,
+        value: float,
+        offset_q: int,
+        offset_r: int,
+        legal_bytes: bytes,
+        sparse_qr: np.ndarray,
+        sparse_logits: np.ndarray,
+        stage: int,
+        sparse_mix: float,
+    ):
+        """Mock sparse root expansion by preserving dense mock semantics."""
+        self.expand_root(policy, value, offset_q, offset_r, legal_bytes)
+
     def add_dirichlet_noise(self, noise: np.ndarray, fraction: float):
         """Mock Dirichlet noise (no-op in mock)."""
         pass
@@ -157,6 +173,23 @@ class MockMCTSEngine:
     def expand_and_backprop(self, policies: np.ndarray, values: np.ndarray):
         """Mock backpropagation."""
         pass
+
+    def pending_leaf_metadata(self) -> List[Tuple[int, int, bytes]]:
+        """Mock leaf metadata; dense fallback remains valid for mock tests."""
+        return []
+
+    def expand_and_backprop_with_sparse(
+        self,
+        policies: np.ndarray,
+        values: np.ndarray,
+        sparse_qr: np.ndarray,
+        sparse_logits: np.ndarray,
+        sparse_counts: np.ndarray,
+        stage: int,
+        sparse_mix: float,
+    ):
+        """Mock sparse backpropagation by preserving dense mock semantics."""
+        self.expand_and_backprop(policies, values)
 
     def get_results(self) -> Tuple[List[int], List[int], List[int], float]:
         """Return mock (moves_q, moves_r, visits, root_value)."""
@@ -275,6 +308,33 @@ class RealMCTSEngine:
     def expand_root(self, policy, value, oq, or_, legal_bytes):
         self._engine.expand_root(policy, value, oq, or_, legal_bytes)
 
+    def expand_root_with_sparse_priors(
+        self,
+        policy,
+        value,
+        oq,
+        or_,
+        legal_bytes,
+        sparse_qr,
+        sparse_logits,
+        stage,
+        sparse_mix,
+    ):
+        if hasattr(self._engine, "expand_root_with_sparse_priors"):
+            self._engine.expand_root_with_sparse_priors(
+                policy,
+                value,
+                oq,
+                or_,
+                legal_bytes,
+                np.asarray(sparse_qr, dtype=np.int32),
+                np.asarray(sparse_logits, dtype=np.float32),
+                int(stage),
+                float(sparse_mix),
+            )
+        else:
+            self._engine.expand_root(policy, value, oq, or_, legal_bytes)
+
     def add_dirichlet_noise(self, noise, fraction):
         self._engine.add_dirichlet_noise(noise, fraction)
 
@@ -285,8 +345,36 @@ class RealMCTSEngine:
         tensor_4d, count = self._engine.select_leaves(batch_size)
         return np.asarray(tensor_4d, dtype=np.float32), count
 
+    def pending_leaf_metadata(self):
+        if hasattr(self._engine, "pending_leaf_metadata"):
+            return self._engine.pending_leaf_metadata()
+        return []
+
     def expand_and_backprop(self, policies, values):
         self._engine.expand_and_backprop(policies, values)
+
+    def expand_and_backprop_with_sparse(
+        self,
+        policies,
+        values,
+        sparse_qr,
+        sparse_logits,
+        sparse_counts,
+        stage,
+        sparse_mix,
+    ):
+        if hasattr(self._engine, "expand_and_backprop_with_sparse"):
+            self._engine.expand_and_backprop_with_sparse(
+                policies,
+                values,
+                np.asarray(sparse_qr, dtype=np.int32),
+                np.asarray(sparse_logits, dtype=np.float32),
+                np.asarray(sparse_counts, dtype=np.uint16),
+                int(stage),
+                float(sparse_mix),
+            )
+        else:
+            self._engine.expand_and_backprop(policies, values)
 
     def get_results(self):
         return self._engine.get_results()
@@ -365,6 +453,13 @@ class SelfPlayWorker:
         self.policy_target_top_k = sp.policy_target_top_k
         self.dirichlet_alpha = sp.dirichlet_alpha
         self.dirichlet_fraction = sp.dirichlet_fraction
+        self.sparse_prior_stage = int(getattr(cfg.model, "sparse_prior_stage", 0))
+        self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
+        self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
+        self.candidate_budget = max(
+            int(getattr(cfg.model, "candidate_budget", 256)),
+            int(sp.policy_target_top_k),
+        )
 
         self._engine_factory = MockMCTSEngine if not HAS_ENGINE else RealMCTSEngine
         self._game_counter = 0
@@ -485,13 +580,39 @@ class SelfPlayWorker:
 
             if client is not None:
                 try:
-                    p, v = client.submit(
-                        tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False),
-                        1,
-                    )
-                    engine.expand_root(
-                        p, v[0], offset_q, offset_r, legal_bytes
-                    )
+                    root_tensor = tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False)
+                    if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
+                        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                        cand = build_candidate_batch(
+                            [(int(q), int(r)) for q, r in legal],
+                            [],
+                            offset_q=int(offset_q),
+                            offset_r=int(offset_r),
+                            budget=self.candidate_budget,
+                        )
+                        p, v, sparse = client.submit_sparse(
+                            root_tensor,
+                            1,
+                            cand.indices.reshape(1, -1),
+                            cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1]),
+                            cand.mask.reshape(1, -1),
+                        )
+                        engine.expand_root_with_sparse_priors(
+                            p,
+                            v[0],
+                            offset_q,
+                            offset_r,
+                            legal_bytes,
+                            cand.qr,
+                            sparse[0],
+                            self.sparse_prior_stage,
+                            self.sparse_prior_mix,
+                        )
+                    else:
+                        p, v = client.submit(root_tensor, 1)
+                        engine.expand_root(
+                            p, v[0], offset_q, offset_r, legal_bytes
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Worker %s: root inference failed at move %s: %s",
@@ -550,10 +671,55 @@ class SelfPlayWorker:
                         batch_4d = np.array(batch_tensor)
 
                     if client is not None:
-                        p, v = client.submit(
-                            batch_4d.astype(np.float32, copy=False), count
-                        )
-                        engine.expand_and_backprop(p, v)
+                        if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
+                            meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
+                            if len(meta) == count:
+                                cand_qr = np.zeros((count, self.candidate_budget, 2), dtype=np.int32)
+                                cand_indices = np.full((count, self.candidate_budget), -1, dtype=np.int64)
+                                cand_features = np.zeros((count, self.candidate_budget, 12), dtype=np.float32)
+                                cand_mask = np.zeros((count, self.candidate_budget), dtype=np.bool_)
+                                cand_counts = np.zeros(count, dtype=np.uint16)
+                                for row, (leaf_oq, leaf_or, leaf_legal_bytes) in enumerate(meta):
+                                    legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
+                                    cand = build_candidate_batch(
+                                        [(int(q), int(r)) for q, r in legal],
+                                        [],
+                                        offset_q=int(leaf_oq),
+                                        offset_r=int(leaf_or),
+                                        budget=self.candidate_budget,
+                                    )
+                                    width = min(self.candidate_budget, cand.qr.shape[0])
+                                    cand_qr[row, :width] = cand.qr[:width]
+                                    cand_indices[row, :width] = cand.indices[:width]
+                                    cand_features[row, :width] = cand.features[:width]
+                                    cand_mask[row, :width] = cand.mask[:width]
+                                    cand_counts[row] = width
+                                p, v, sparse = client.submit_sparse(
+                                    batch_4d.astype(np.float32, copy=False),
+                                    count,
+                                    cand_indices,
+                                    cand_features,
+                                    cand_mask,
+                                )
+                                engine.expand_and_backprop_with_sparse(
+                                    p,
+                                    v,
+                                    cand_qr,
+                                    sparse,
+                                    cand_counts,
+                                    self.sparse_prior_stage,
+                                    self.sparse_prior_mix,
+                                )
+                            else:
+                                p, v = client.submit(
+                                    batch_4d.astype(np.float32, copy=False), count
+                                )
+                                engine.expand_and_backprop(p, v)
+                        else:
+                            p, v = client.submit(
+                                batch_4d.astype(np.float32, copy=False), count
+                            )
+                            engine.expand_and_backprop(p, v)
                     else:
                         uniform_policy = np.full(
                             count * 1089,
@@ -587,19 +753,39 @@ class SelfPlayWorker:
 
             record_history = bytes(move_history)
 
-            # Build visit distribution over the full board (MCTS-improved policy).
-            # offset_q/offset_r come from init_root() above — still in scope.
-            visit_arr = np.zeros(BOARD_AREA, dtype=np.float32)
-            for q_coord, r_coord, v in zip(moves_q, moves_r, visits):
-                flat_idx = action_to_board_index(q_coord, r_coord, offset_q, offset_r)
-                if flat_idx >= 0:
-                    visit_arr[flat_idx] = float(v)
-            policy = sparsify_policy(visit_arr, top_k=self.policy_target_top_k)
+            # Preserve global action identity first, then project to the legacy
+            # 33x33 crop target. This keeps outside-window MCTS mass measurable.
+            policy_v2 = policy_v2_from_visits(
+                moves_q,
+                moves_r,
+                visits,
+            )
+            policy, outside_mass = dense_policy_from_v2(
+                policy_v2,
+                offset_q,
+                offset_r,
+                top_k=self.policy_target_top_k,
+            )
+            target_mass = sum(prob for _q, _r, prob in policy_v2)
+            missing_mass = max(0.0, 1.0 - target_mass) if policy_v2 else 1.0
+            candidate_probe = build_candidate_batch(
+                np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2).tolist(),
+                policy_v2[: max(8, min(len(policy_v2), self.candidate_budget))],
+                offset_q=int(offset_q),
+                offset_r=int(offset_r),
+                budget=self.candidate_budget,
+            )
 
             positions.append(
                 PositionRecord(
                     move_history=record_history,
                     policy_target=policy,
+                    policy_target_v2=policy_v2,
+                    target_policy_mass_outside_window=outside_mass,
+                    missing_target_policy_mass=missing_mass,
+                    candidate_recall_mcts_top1=candidate_probe.recall_top1,
+                    candidate_recall_mcts_top4=candidate_probe.recall_top4,
+                    candidate_recall_mcts_top8=candidate_probe.recall_top8,
                     root_value=root_value,
                     player=player,
                     game_id=game_id,
@@ -640,14 +826,11 @@ class SelfPlayWorker:
 
         full_history = bytes(move_history)
         truncated = terminal_reason != "win"
-        record = GameRecord.from_game_data(
-            move_history_bytes=full_history,
-            policy_targets=[p.policy_target for p in positions],
-            root_values=[p.root_value for p in positions],
-            players=[p.player for p in positions],
+        record = GameRecord(
+            positions=positions,
             outcome=outcome,
             game_id=game_id,
-            is_full_search=not use_pcr,
+            game_length=len(positions),
         )
         record.final_move_history = full_history
         record.truncated = truncated

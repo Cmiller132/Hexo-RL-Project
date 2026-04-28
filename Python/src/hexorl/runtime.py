@@ -204,6 +204,11 @@ def _estimate_train_peak_gb(cfg: Config, batch_size: int) -> float:
     channels_scale = max(0.25, cfg.model.channels / 128.0)
     blocks_scale = max(0.25, cfg.model.blocks / 16.0)
     head_scale = max(0.75, len(cfg.model.heads) / 6.0)
-    per_sample_gb = 0.0327 * channels_scale * blocks_scale * head_scale
-    model_overhead_gb = 0.35 * (channels_scale ** 2) * blocks_scale
+    attention_blocks = len(getattr(cfg.model, "attention_positions", []))
+    attention_scale = 1.0 + 0.22 * attention_blocks
+    if getattr(cfg.model, "architecture", "cnn") == "restnet":
+        attention_scale = max(attention_scale, 1.15)
+    sparse_scale = 1.0 + (0.04 if getattr(cfg.model, "sparse_policy", False) else 0.0)
+    per_sample_gb = 0.0327 * channels_scale * blocks_scale * head_scale * attention_scale * sparse_scale
+    model_overhead_gb = 0.35 * (channels_scale ** 2) * blocks_scale * attention_scale
     return model_overhead_gb + batch_size * per_sample_gb

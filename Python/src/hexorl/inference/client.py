@@ -8,7 +8,7 @@ only Python call in the MCTS inner loop.
 import time
 import numpy as np
 from typing import Optional
-from hexorl.inference.shm_queue import InferenceQueue, connect_inference_queue
+from hexorl.inference.shm_queue import MAX_CANDIDATES, InferenceQueue, connect_inference_queue
 
 
 class InferenceClient:
@@ -91,6 +91,8 @@ class InferenceClient:
         np.copyto(req_view, tensor.reshape(count, 13, 33, 33))
 
         # 2. Set the batch count.
+        if getattr(self._slot, "req_candidate_count", None) is not None:
+            self._slot.req_candidate_count[:count] = 0
         self._slot.req_count[0] = count
 
         # 3. Signal the server.
@@ -116,6 +118,57 @@ class InferenceClient:
         policies = policies.ravel()  # (count * 1089,)
 
         return policies, values
+
+    def submit_sparse(
+        self,
+        tensor: np.ndarray,
+        count: int,
+        candidate_indices: np.ndarray,
+        candidate_features: np.ndarray,
+        candidate_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Submit a batch with optional candidate/action-keyed sparse inputs."""
+        if not self._connected:
+            raise RuntimeError("InferenceClient not connected. Call connect() first.")
+        if count > self.max_batch:
+            raise ValueError(f"Batch count {count} exceeds max_batch {self.max_batch}")
+        if count <= 0:
+            return (
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+                np.empty((0, 0), dtype=np.float32),
+            )
+        k = int(candidate_indices.shape[1])
+        if k > MAX_CANDIDATES:
+            raise ValueError(f"Candidate count {k} exceeds MAX_CANDIDATES {MAX_CANDIDATES}")
+
+        self._slot.res_ready.clear()
+        np.copyto(self._slot.req_tensor[:count], tensor.reshape(count, 13, 33, 33))
+        self._slot.req_candidate_count[:count] = k
+        self._slot.req_candidate_indices[:count, :k] = candidate_indices[:count, :k]
+        self._slot.req_candidate_features[:count, :k] = candidate_features[:count, :k]
+        self._slot.req_candidate_mask[:count, :k] = candidate_mask[:count, :k].astype(np.uint8)
+        if k < MAX_CANDIDATES:
+            self._slot.req_candidate_count[count:] = 0
+            self._slot.req_candidate_mask[:count, k:] = 0
+        self._slot.req_count[0] = count
+        self._slot.req_ready.set()
+
+        t0 = time.monotonic()
+        if not self._slot.res_ready.wait(timeout=self.timeout_ms / 1000.0):
+            raise TimeoutError(
+                f"Inference server did not respond within {self.timeout_ms:.0f}ms"
+            )
+        elapsed = (time.monotonic() - t0) * 1000.0
+        self.total_wait_ms += elapsed
+        self.n_submits += 1
+        self._slot.res_ready.clear()
+
+        policies = self._slot.res_policy[:count].ravel()
+        values = self._slot.res_value[:count]
+        sparse = np.array(self._slot.res_sparse_logits[:count, :k], copy=True)
+        self._slot.req_candidate_count[:count] = 0
+        return policies, values, sparse
 
     @property
     def avg_wait_ms(self) -> float:

@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1};
+use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 
 use hexgame_core::board::{GameError, HexGameState};
 use hexgame_core::core::HEX_DIRECTIONS;
@@ -661,6 +661,73 @@ impl PyMCTSEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn expand_root_with_sparse_priors<'py>(
+        &mut self,
+        policy: PyReadonlyArray1<'py, f32>,
+        value: f32,
+        offset_q: i32,
+        offset_r: i32,
+        legal_bytes: &[u8],
+        sparse_qr: PyReadonlyArray2<'py, i32>,
+        sparse_logits: PyReadonlyArray1<'py, f32>,
+        stage: u8,
+        sparse_mix: f32,
+    ) -> PyResult<()> {
+        let policy_slice = policy
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("policy array must be contiguous"))?;
+        if policy_slice.len() != BOARD_AREA {
+            return Err(PyValueError::new_err(format!(
+                "policy length {} must equal BOARD_AREA {}",
+                policy_slice.len(),
+                BOARD_AREA
+            )));
+        }
+        if !legal_bytes.len().is_multiple_of(8) {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "legal_bytes length {} is not a multiple of 8",
+                legal_bytes.len()
+            )));
+        }
+        let qr = sparse_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 2 {
+            return Err(PyValueError::new_err("sparse_qr must have shape (N, 2)"));
+        }
+        let sparse_logits_slice = sparse_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("sparse_logits array must be contiguous"))?;
+        if sparse_logits_slice.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "sparse_logits length {} is smaller than sparse_qr rows {}",
+                sparse_logits_slice.len(),
+                qr.shape()[0]
+            )));
+        }
+        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
+        for chunk in legal_bytes.chunks_exact(8) {
+            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            legal.push(Hex::new(q, r));
+        }
+        let sparse_actions: Vec<(i32, i32)> = qr
+            .outer_iter()
+            .map(|row| (row[0], row[1]))
+            .collect();
+        self.inner.expand_root_with_sparse_priors(
+            policy_slice,
+            value,
+            offset_q,
+            offset_r,
+            &legal,
+            &sparse_actions,
+            sparse_logits_slice,
+            stage,
+            sparse_mix,
+        );
+        Ok(())
+    }
+
     #[pyo3(signature = (noise, noise_fraction))]
     fn add_dirichlet_noise<'py>(
         &mut self,
@@ -710,6 +777,24 @@ impl PyMCTSEngine {
         Ok((arr, count))
     }
 
+    fn pending_leaf_metadata<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Vec<(i32, i32, Bound<'py, PyBytes>)> {
+        self.inner
+            .pending_leaf_metadata()
+            .into_iter()
+            .map(|(oq, or_, legal)| {
+                let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
+                for h in &legal {
+                    legal_buf.extend_from_slice(&h.q.to_le_bytes());
+                    legal_buf.extend_from_slice(&h.r.to_le_bytes());
+                }
+                (oq, or_, PyBytes::new(py, &legal_buf))
+            })
+            .collect()
+    }
+
     fn expand_and_backprop<'py>(
         &mut self,
         policies: PyReadonlyArray1<'py, f32>,
@@ -742,6 +827,84 @@ impl PyMCTSEngine {
         let v = values_slice.to_vec();
         py.allow_threads(|| {
             self.inner.expand_and_backprop(&p, &v);
+        });
+        self.last_non_terminal_count = 0;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_and_backprop_with_sparse<'py>(
+        &mut self,
+        policies: PyReadonlyArray1<'py, f32>,
+        values: PyReadonlyArray1<'py, f32>,
+        sparse_qr: PyReadonlyArray3<'py, i32>,
+        sparse_logits: PyReadonlyArray2<'py, f32>,
+        sparse_counts: PyReadonlyArray1<'py, u16>,
+        stage: u8,
+        sparse_mix: f32,
+        py: Python<'py>,
+    ) -> PyResult<()> {
+        let policies_slice = policies
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("policies array must be contiguous"))?;
+        let values_slice = values
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
+        let expected_policies = self.last_non_terminal_count as usize * BOARD_AREA;
+        if policies_slice.len() != expected_policies {
+            return Err(PyValueError::new_err(format!(
+                "policies length {} must equal {}",
+                policies_slice.len(),
+                expected_policies
+            )));
+        }
+        if values_slice.len() != self.last_non_terminal_count as usize {
+            return Err(PyValueError::new_err(format!(
+                "values length {} must equal selected non-terminal leaf count {}",
+                values_slice.len(),
+                self.last_non_terminal_count
+            )));
+        }
+        let qr = sparse_qr.as_array();
+        let logits = sparse_logits.as_array();
+        let counts = sparse_counts
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("sparse_counts array must be contiguous"))?;
+        let n = self.last_non_terminal_count as usize;
+        if qr.shape().len() != 3 || qr.shape()[0] < n || qr.shape()[2] != 2 {
+            return Err(PyValueError::new_err("sparse_qr must have shape (N, K, 2)"));
+        }
+        if logits.shape().len() != 2 || logits.shape()[0] < n {
+            return Err(PyValueError::new_err("sparse_logits must have shape (N, K)"));
+        }
+        if counts.len() < n {
+            return Err(PyValueError::new_err("sparse_counts length must be >= N"));
+        }
+        let k = qr.shape()[1].min(logits.shape()[1]);
+        let mut sparse_actions: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+        let mut sparse_values: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let count = (counts[row] as usize).min(k);
+            let mut actions = Vec::with_capacity(count);
+            let mut vals = Vec::with_capacity(count);
+            for col in 0..count {
+                actions.push((qr[[row, col, 0]], qr[[row, col, 1]]));
+                vals.push(logits[[row, col]]);
+            }
+            sparse_actions.push(actions);
+            sparse_values.push(vals);
+        }
+        let p = policies_slice.to_vec();
+        let v = values_slice.to_vec();
+        py.allow_threads(|| {
+            self.inner.expand_and_backprop_with_sparse(
+                &p,
+                &v,
+                &sparse_actions,
+                &sparse_values,
+                stage,
+                sparse_mix,
+            );
         });
         self.last_non_terminal_count = 0;
         Ok(())

@@ -7,6 +7,7 @@ from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
+from hexorl.model.network import build_model_from_config
 
 
 def test_config_rejects_lookahead_head_without_matching_horizon():
@@ -119,3 +120,67 @@ def test_autotune_compile_model_for_long_cuda_training():
 
     assert cfg.runtime.compile_model is True
     assert cfg.runtime.compile_inference is False
+
+
+def test_restnet_config_validation_and_forward_shapes():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 16,
+                "blocks": 3,
+                "architecture": "restnet",
+                "attention_positions": [2],
+                "attention_heads": 4,
+                "heads": ["policy", "value"],
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    out = model(torch.zeros(2, 13, 33, 33))
+    assert out["policy"].shape == (2, 1089)
+    assert out["value"].shape == (2, 65)
+
+
+def test_restnet_config_rejects_invalid_attention_position():
+    with pytest.raises(ValueError, match="attention_positions"):
+        Config.model_validate(
+            {
+                "model": {
+                    "blocks": 2,
+                    "architecture": "restnet",
+                    "attention_positions": [3],
+                }
+            }
+        )
+
+
+def test_sparse_policy_config_adds_default_loss_weight():
+    cfg = Config.model_validate({"model": {"sparse_policy": True}})
+    assert cfg.train.loss_weights["sparse_policy"] == pytest.approx(0.25)
+
+
+def test_cnn_config_does_not_require_attention_head_divisibility():
+    cfg = Config.model_validate({"model": {"channels": 10, "blocks": 1}})
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    out = model(torch.zeros(1, 13, 33, 33))
+    assert out["policy"].shape == (1, 1089)
+
+
+def test_config_rejects_reserved_or_invalid_attention_options():
+    with pytest.raises(ValueError, match="relative_bias"):
+        Config.model_validate({"model": {"architecture": "restnet", "relative_bias": True}})
+    with pytest.raises(ValueError, match="dropout"):
+        Config.model_validate({"model": {"dropout": 1.0}})
+    with pytest.raises(ValueError, match="attention_dropout"):
+        Config.model_validate({"model": {"attention_dropout": -0.1}})
+
+
+def test_sparse_policy_effective_candidate_width_capped_by_shm():
+    with pytest.raises(ValueError, match="candidate width"):
+        Config.model_validate(
+            {
+                "model": {"sparse_policy": True, "candidate_budget": 128},
+                "selfplay": {"policy_target_top_k": 513},
+            }
+        )

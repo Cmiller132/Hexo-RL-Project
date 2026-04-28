@@ -12,7 +12,8 @@ from collections import Counter
 from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
-from hexorl.model.network import HexNet, from_config
+from hexorl.config import Config
+from hexorl.model.network import HexNet, from_config, load_model_state
 from hexorl.eval.players import model_input_dtype, noisy_model_player
 
 logger = logging.getLogger(__name__)
@@ -193,15 +194,23 @@ def model_move_fn(
     return _fn
 
 
-def load_checkpoint_model(checkpoint_path, cfg, device: Optional[torch.device] = None) -> HexNet:
+def load_checkpoint_model(
+    checkpoint_path,
+    cfg,
+    device: Optional[torch.device] = None,
+    *,
+    allow_partial: bool = False,
+) -> HexNet:
     """Load a HexNet checkpoint for arena evaluation."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = from_config(cfg, device=device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    ckpt_cfg = checkpoint.get("cfg")
+    if not isinstance(ckpt_cfg, Config) and checkpoint.get("cfg_json") is not None:
+        ckpt_cfg = Config.model_validate(checkpoint["cfg_json"])
+    model_cfg = ckpt_cfg if isinstance(ckpt_cfg, Config) else cfg
+    model = from_config(model_cfg, device=device)
     state = checkpoint.get("model_state_dict", checkpoint)
-    if state and all(str(k).startswith("_orig_mod.") for k in state):
-        state = {str(k).removeprefix("_orig_mod."): v for k, v in state.items()}
-    model.load_state_dict(state, strict=False)
+    load_model_state(model, state, allow_partial=allow_partial)
     model.eval()
     return model
 

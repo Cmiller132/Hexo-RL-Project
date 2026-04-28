@@ -180,8 +180,10 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
     for i, pos in enumerate(positions):
         if i + 1 < total:
             pos.opp_policy_target = dict(positions[i + 1].policy_target)
+            pos.opp_policy_target_v2 = list(getattr(positions[i + 1], "policy_target_v2", []))
         else:
             pos.opp_policy_target = {}
+            pos.opp_policy_target_v2 = []
         perspective_outcome = record.outcome if pos.player == 0 else -record.outcome
         tail = positions[i:]
         regret = sum(

@@ -61,13 +61,17 @@ class ModelCache:
 
     def infer_history(self, model_id: str, history: bytes) -> dict[str, Any]:
         cached = self._models[model_id]
-        tensor, _oq, _or, legal_bytes = encode_tensor_for_history(history)
+        tensor, offset_q, offset_r, legal_bytes = encode_tensor_for_history(history)
         arr = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
         legal_mask = []
-        # encode_tensor_for_history uses the Rust offsets internally but policy
-        # debugging only needs legal action indices from channel 3.
-        legal_channel = tensor[3].reshape(-1)
-        legal_mask = [int(i) for i in np.flatnonzero(legal_channel > 0.0)]
+        outside_legal = []
+        for q, r in arr:
+            gi = int(q) - int(offset_q)
+            gj = int(r) - int(offset_r)
+            if 0 <= gi < 33 and 0 <= gj < 33:
+                legal_mask.append(gi * 33 + gj)
+            else:
+                outside_legal.append({"q": int(q), "r": int(r)})
         x = (
             torch.from_numpy(tensor)
             .unsqueeze(0)
@@ -78,6 +82,8 @@ class ModelCache:
         result: dict[str, Any] = {
             "model_id": model_id,
             "legal_moves": [{"q": int(q), "r": int(r)} for q, r in arr],
+            "outside_window_legal_count": len(outside_legal),
+            "outside_window_legal_moves": outside_legal[:32],
             "heads": {},
         }
         if "policy" in out:

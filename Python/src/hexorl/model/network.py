@@ -8,10 +8,16 @@ axis (3-class), axis_delta_norm (6-plane map), regret_rank (scalar),
 regret_value (binned), moves_left (scalar).
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
+
+
+BOARD_SIZE = 33
+BOARD_AREA = BOARD_SIZE * BOARD_SIZE
+DEFAULT_CANDIDATE_FEATURES = 12
 
 
 class GatedResBlock(nn.Module):
@@ -35,13 +41,74 @@ class GatedResBlock(nn.Module):
         return x + residual
 
 
+class SpatialTransformerBlock(nn.Module):
+    """PreNorm spatial attention block over the 33x33 crop."""
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 8,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        relative_bias: bool = False,
+    ):
+        super().__init__()
+        if channels % heads != 0:
+            raise ValueError("channels must be divisible by attention heads")
+        if relative_bias:
+            raise ValueError("relative_bias is reserved for a later ablation")
+        hidden = max(channels, int(math.ceil(channels * mlp_ratio)))
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(
+            channels,
+            heads,
+            dropout=attention_dropout,
+            batch_first=True,
+        )
+        self.drop1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(channels)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden * 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * 2, channels),
+            nn.Dropout(dropout),
+        )
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(2, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+        )
+        coords = torch.linspace(-1.0, 1.0, BOARD_SIZE)
+        q, r = torch.meshgrid(coords, coords, indexing="ij")
+        self.register_buffer(
+            "coords",
+            torch.stack([q.reshape(-1), r.reshape(-1)], dim=-1).unsqueeze(0),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if h != BOARD_SIZE or w != BOARD_SIZE:
+            raise ValueError(f"SpatialTransformerBlock expects {BOARD_SIZE}x{BOARD_SIZE}, got {h}x{w}")
+        tokens = x.flatten(2).transpose(1, 2).contiguous()
+        coord = self.coord_mlp(self.coords.to(device=tokens.device, dtype=tokens.dtype))
+        y = tokens + coord
+        attn_in = self.norm1(y)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        tokens = tokens + self.drop1(attn_out)
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(b, c, h, w).contiguous()
+
+
 class PolicyHead(nn.Module):
-    """Policy head: (B, C, 33, 33) → (B, 1089) logits."""
+    """Policy head: (B, C, 33, 33) -> (B, 1089) logits."""
 
     def __init__(self, channels: int, policy_filters: int = 2):
         super().__init__()
         self.conv = nn.Conv2d(channels, policy_filters, kernel_size=1)
-        self.fc = nn.Linear(policy_filters * 33 * 33, 1089)
+        self.fc = nn.Linear(policy_filters * BOARD_AREA, BOARD_AREA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.relu(self.conv(x))
@@ -50,7 +117,7 @@ class PolicyHead(nn.Module):
 
 
 class ValueBinnedHead(nn.Module):
-    """Binned value head: (B, C, 33, 33) → (B, N_BINS) logits.
+    """Binned value head: (B, C, 33, 33) -> (B, N_BINS) logits.
 
     Used for: value, lookahead_*, regret_value.
     """
@@ -59,7 +126,7 @@ class ValueBinnedHead(nn.Module):
         super().__init__()
         self.n_bins = n_bins
         self.conv = nn.Conv2d(channels, 1, kernel_size=1)
-        self.fc1 = nn.Linear(33 * 33, hidden)
+        self.fc1 = nn.Linear(BOARD_AREA, hidden)
         self.fc2 = nn.Linear(hidden, n_bins)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -70,12 +137,12 @@ class ValueBinnedHead(nn.Module):
 
 
 class AuxPolicyHead(nn.Module):
-    """Auxiliary policy head — same structure as PolicyHead. Used for opp_policy."""
+    """Auxiliary policy head - same structure as PolicyHead. Used for opp_policy."""
 
     def __init__(self, channels: int, policy_filters: int = 2):
         super().__init__()
         self.conv = nn.Conv2d(channels, policy_filters, kernel_size=1)
-        self.fc = nn.Linear(policy_filters * 33 * 33, 1089)
+        self.fc = nn.Linear(policy_filters * BOARD_AREA, BOARD_AREA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.relu(self.conv(x))
@@ -136,6 +203,59 @@ class MovesLeftHead(nn.Module):
         return F.softplus(self.fc2(x))
 
 
+class SparsePolicyHead(nn.Module):
+    """Candidate/action-keyed policy head.
+
+    The head consumes reusable trunk features, candidate features, optional
+    in-crop dense logits, and optional in-crop trunk samples. Invalid
+    candidates are masked by the loss, not by this module.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        candidate_feature_dim: int = DEFAULT_CANDIDATE_FEATURES,
+        hidden: int = 128,
+    ):
+        super().__init__()
+        self.candidate_feature_dim = candidate_feature_dim
+        self.net = nn.Sequential(
+            nn.Linear(channels + candidate_feature_dim + 1, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        dense_policy_logits: Optional[torch.Tensor],
+        candidate_features: torch.Tensor,
+        candidate_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        b, c, h, w = features.shape
+        k = candidate_features.shape[1]
+        flat_features = features.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        idx = candidate_indices.to(device=features.device, dtype=torch.long)
+        valid = (idx >= 0) & (idx < h * w)
+        idx_clamped = idx.clamp(0, h * w - 1)
+        gather_idx = idx_clamped.unsqueeze(-1).expand(-1, -1, c)
+        sampled = flat_features.gather(1, gather_idx)
+        sampled = sampled * valid.unsqueeze(-1).to(dtype=sampled.dtype)
+
+        if dense_policy_logits is None:
+            dense = torch.zeros(b, k, 1, device=features.device, dtype=features.dtype)
+        else:
+            dense_vals = dense_policy_logits.gather(1, idx_clamped)
+            dense_vals = dense_vals * valid.to(dtype=dense_vals.dtype)
+            dense = dense_vals.unsqueeze(-1)
+
+        cand = candidate_features.to(device=features.device, dtype=features.dtype)
+        x = torch.cat([sampled, cand, dense], dim=-1)
+        return self.net(x).squeeze(-1)
+
+
 class HexNet(nn.Module):
     """KataGo-style network for Hex with configurable multi-head architecture.
 
@@ -160,11 +280,24 @@ class HexNet(nn.Module):
         blocks: int = 16,
         heads: Optional[List[str]] = None,
         n_bins: int = 65,
+        architecture: str = "cnn",
+        attention_positions: Optional[List[int]] = None,
+        attention_heads: int = 8,
+        attention_mlp_ratio: float = 2.0,
+        attention_dropout: float = 0.0,
+        dropout: float = 0.0,
+        relative_bias: bool = False,
+        sparse_policy: bool = False,
+        candidate_feature_dim: int = DEFAULT_CANDIDATE_FEATURES,
     ):
         super().__init__()
         self.channels = channels
         self.blocks = blocks
         self.n_bins = n_bins
+        self.architecture = architecture.lower()
+        self.attention_positions = sorted(set(attention_positions or []))
+        self.sparse_policy_enabled = bool(sparse_policy)
+        self.candidate_feature_dim = candidate_feature_dim
 
         if heads is None:
             heads = ["policy", "value"]
@@ -172,9 +305,22 @@ class HexNet(nn.Module):
 
         self.conv_in = nn.Conv2d(13, channels, kernel_size=3, padding=1)
 
-        self.res_blocks = nn.ModuleList(
-            [GatedResBlock(channels) for _ in range(blocks)]
-        )
+        self.res_blocks = nn.ModuleList()
+        attention_set = set(self.attention_positions)
+        for idx in range(1, blocks + 1):
+            if self.architecture == "restnet" and idx in attention_set:
+                self.res_blocks.append(
+                    SpatialTransformerBlock(
+                        channels,
+                        heads=attention_heads,
+                        mlp_ratio=attention_mlp_ratio,
+                        dropout=dropout,
+                        attention_dropout=attention_dropout,
+                        relative_bias=relative_bias,
+                    )
+                )
+            else:
+                self.res_blocks.append(GatedResBlock(channels))
 
         head_modules: Dict[str, nn.Module] = {}
         for name in self.head_names:
@@ -192,9 +338,21 @@ class HexNet(nn.Module):
                 head_modules[name] = RegretRankHead(channels)
             elif name == "moves_left":
                 head_modules[name] = MovesLeftHead(channels)
+            elif name == "sparse_policy":
+                # Built separately below because it is not a dense trunk head.
+                continue
             else:
                 raise ValueError(f"Unknown head: {name}")
         self.heads = nn.ModuleDict(head_modules)
+        self.sparse_policy_head = (
+            SparsePolicyHead(
+                channels,
+                candidate_feature_dim=candidate_feature_dim,
+                hidden=max(64, min(256, channels * 2)),
+            )
+            if self.sparse_policy_enabled or "sparse_policy" in self.head_names
+            else None
+        )
 
         self._init_weights()
 
@@ -213,7 +371,19 @@ class HexNet(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.conv_in(x))
+        for block in self.res_blocks:
+            x = block(x)
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        candidate_features: Optional[torch.Tensor] = None,
+        candidate_indices: Optional[torch.Tensor] = None,
+        candidate_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -222,14 +392,26 @@ class HexNet(nn.Module):
         Returns:
             Dict mapping head name to output tensor.
         """
-        x = torch.relu(self.conv_in(x))
-
-        for block in self.res_blocks:
-            x = block(x)
+        x = self.forward_features(x)
 
         out: Dict[str, torch.Tensor] = {}
         for name in self.head_names:
+            if name == "sparse_policy":
+                continue
             out[name] = self.heads[name](x)
+        if self.sparse_policy_head is not None and candidate_features is not None:
+            if candidate_indices is None:
+                raise ValueError("candidate_indices are required for sparse_policy")
+            dense_logits = out.get("policy")
+            sparse = self.sparse_policy_head(
+                x,
+                dense_logits,
+                candidate_features,
+                candidate_indices,
+            )
+            if candidate_mask is not None:
+                sparse = sparse.masked_fill(~candidate_mask.to(device=sparse.device, dtype=torch.bool), -80.0)
+            out["sparse_policy"] = sparse
 
         return out
 
@@ -323,13 +505,35 @@ def from_config(cfg, device: Optional[torch.device] = None) -> HexNet:
     Returns:
         HexNet instance on the requested device, optionally in FP16.
     """
+    model = build_model_from_config(cfg, device=device, inference=True)
+    model.eval()
+    return model
+
+
+def build_model_from_config(
+    cfg,
+    device: Optional[torch.device] = None,
+    inference: bool = False,
+) -> HexNet:
+    """Create a HexNet from config while preserving default CNN compatibility."""
     model_cfg = cfg.model
     inference_cfg = cfg.inference
+    heads = list(model_cfg.heads)
+    if getattr(model_cfg, "sparse_policy", False) and "sparse_policy" not in heads:
+        heads.append("sparse_policy")
 
     model = HexNet(
         channels=model_cfg.channels,
         blocks=model_cfg.blocks,
-        heads=model_cfg.heads,
+        heads=heads,
+        architecture=getattr(model_cfg, "architecture", "cnn"),
+        attention_positions=list(getattr(model_cfg, "attention_positions", [])),
+        attention_heads=getattr(model_cfg, "attention_heads", 8),
+        attention_mlp_ratio=getattr(model_cfg, "attention_mlp_ratio", 2.0),
+        attention_dropout=getattr(model_cfg, "attention_dropout", 0.0),
+        dropout=getattr(model_cfg, "dropout", 0.0),
+        relative_bias=getattr(model_cfg, "relative_bias", False),
+        sparse_policy=getattr(model_cfg, "sparse_policy", False),
     )
 
     if device is None:
@@ -342,8 +546,25 @@ def from_config(cfg, device: Optional[torch.device] = None) -> HexNet:
 
     model = model.to(device)
 
-    if inference_cfg.fp16 and device.type == "cuda":
+    if inference and inference_cfg.fp16 and device.type == "cuda":
         model = model.half()
 
-    model.eval()
+    if inference:
+        model.eval()
     return model
+
+
+def strip_compiled_prefix(state_dict: dict) -> dict:
+    """Remove torch.compile's _orig_mod prefix when present."""
+    if state_dict and all(str(k).startswith("_orig_mod.") for k in state_dict):
+        return {str(k).removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    return state_dict
+
+
+def load_model_state(model: nn.Module, state_dict: dict, *, allow_partial: bool = False):
+    target = getattr(model, "_orig_mod", None)
+    if target is not None:
+        state_dict = strip_compiled_prefix(state_dict)
+        return target.load_state_dict(state_dict, strict=not allow_partial)
+    state_dict = strip_compiled_prefix(state_dict)
+    return model.load_state_dict(state_dict, strict=not allow_partial)

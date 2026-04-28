@@ -234,6 +234,120 @@ fn gather_policy(
     }
 }
 
+fn softmax_in_place(raw: &mut Vec<f32>, priors: &mut Vec<f32>) {
+    let max_val = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    for v in raw.iter_mut() {
+        *v = (*v - max_val).exp();
+    }
+    let sum: f32 = raw.iter().sum();
+    priors.clear();
+    if sum > 0.0 && sum.is_finite() {
+        priors.extend(raw.iter().map(|&e| e / sum));
+    } else if !raw.is_empty() {
+        priors.extend(std::iter::repeat_n(1.0 / raw.len() as f32, raw.len()));
+    }
+}
+
+fn sparse_logit_for(
+    q: i32,
+    r: i32,
+    sparse_actions: &[(i32, i32)],
+    sparse_logits: &[f32],
+) -> Option<f32> {
+    sparse_actions
+        .iter()
+        .position(|&(sq, sr)| sq == q && sr == r)
+        .and_then(|idx| sparse_logits.get(idx).copied())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gather_policy_with_sparse(
+    moves: &[Hex],
+    policy_logits: &[f32],
+    offset_q: i32,
+    offset_r: i32,
+    sparse_actions: &[(i32, i32)],
+    sparse_logits: &[f32],
+    stage: u8,
+    sparse_mix: f32,
+    raw: &mut Vec<f32>,
+    priors: &mut Vec<f32>,
+) {
+    if stage == 0 || sparse_actions.is_empty() || sparse_logits.is_empty() {
+        gather_policy(moves, policy_logits, offset_q, offset_r, raw, priors);
+        return;
+    }
+
+    raw.clear();
+    raw.resize(moves.len(), -10.0f32);
+    if stage == 2 {
+        for (i, h) in moves.iter().enumerate() {
+            if let Some(logit) = sparse_logit_for(h.q, h.r, sparse_actions, sparse_logits) {
+                raw[i] = logit;
+            } else {
+                let gi = h.q - offset_q;
+                let gj = h.r - offset_r;
+                if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
+                    let flat = (gi as usize) * (BOARD_SIZE as usize) + gj as usize;
+                    raw[i] = policy_logits[flat];
+                }
+            }
+        }
+        softmax_in_place(raw, priors);
+        return;
+    }
+
+    let mut dense_priors = Vec::new();
+    gather_policy(moves, policy_logits, offset_q, offset_r, raw, &mut dense_priors);
+
+    raw.clear();
+    raw.resize(moves.len(), f32::NEG_INFINITY);
+    for (i, h) in moves.iter().enumerate() {
+        if let Some(logit) = sparse_logit_for(h.q, h.r, sparse_actions, sparse_logits) {
+            raw[i] = logit;
+        }
+    }
+    let mut sparse_priors = Vec::new();
+    if raw.iter().any(|v| v.is_finite()) {
+        let max_val = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        for v in raw.iter_mut() {
+            if v.is_finite() {
+                *v = (*v - max_val).exp();
+            } else {
+                *v = 0.0;
+            }
+        }
+        let sum: f32 = raw.iter().sum();
+        if sum > 0.0 {
+            sparse_priors.extend(raw.iter().map(|&e| e / sum));
+        }
+    }
+    if sparse_priors.len() != moves.len() {
+        sparse_priors.resize(moves.len(), 0.0);
+    }
+    let sparse_total: f32 = sparse_priors.iter().sum();
+    if sparse_total <= 0.0 {
+        priors.clear();
+        priors.extend(dense_priors);
+        return;
+    }
+
+    let mix = sparse_mix.clamp(0.0, 1.0);
+    priors.clear();
+    priors.extend(
+        dense_priors
+            .iter()
+            .zip(sparse_priors.iter())
+            .map(|(&d, &s)| (1.0 - mix) * d + mix * s),
+    );
+    let total: f32 = priors.iter().sum();
+    if total > 0.0 {
+        for p in priors.iter_mut() {
+            *p /= total;
+        }
+    }
+}
+
 // ── MCTSEngine ─────────────────────────────────────────────────────────
 
 pub struct MCTSEngine {
@@ -410,6 +524,39 @@ impl MCTSEngine {
             offset_q,
             offset_r,
         );
+        self.arena[self.root_idx as usize].player = player;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn expand_root_with_sparse_priors(
+        &mut self,
+        policy_logits: &[f32],
+        _value: f32,
+        offset_q: i32,
+        offset_r: i32,
+        legal: &[Hex],
+        sparse_actions: &[(i32, i32)],
+        sparse_logits: &[f32],
+        stage: u8,
+        sparse_mix: f32,
+    ) {
+        if legal.is_empty() {
+            return;
+        }
+        let player = self.game.current_player();
+        gather_policy_with_sparse(
+            legal,
+            policy_logits,
+            offset_q,
+            offset_r,
+            sparse_actions,
+            sparse_logits,
+            stage,
+            sparse_mix,
+            &mut self.scratch_raw,
+            &mut self.scratch_priors,
+        );
+        self.expand_node_with_priors(self.root_idx, legal, player);
         self.arena[self.root_idx as usize].player = player;
     }
 
@@ -655,6 +802,99 @@ impl MCTSEngine {
 
         leaves.clear();
         std::mem::swap(&mut leaves, &mut self.pending);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn expand_and_backprop_with_sparse(
+        &mut self,
+        policies: &[f32],
+        values: &[f32],
+        sparse_actions: &[Vec<(i32, i32)>],
+        sparse_logits: &[Vec<f32>],
+        stage: u8,
+        sparse_mix: f32,
+    ) {
+        let non_terminal_count = self.pending.iter().filter(|l| !l.is_terminal).count();
+        assert!(
+            policies.len() == non_terminal_count * BOARD_AREA,
+            "expand_and_backprop_with_sparse: policies length {} != {}",
+            policies.len(),
+            non_terminal_count * BOARD_AREA,
+        );
+        assert!(
+            values.len() == non_terminal_count,
+            "expand_and_backprop_with_sparse: values length {} != non_terminal_count {}",
+            values.len(),
+            non_terminal_count,
+        );
+        assert!(
+            sparse_actions.len() == non_terminal_count && sparse_logits.len() == non_terminal_count,
+            "expand_and_backprop_with_sparse: sparse metadata length must equal non-terminal count"
+        );
+
+        let mut eval_idx = 0usize;
+        let mut leaves = Vec::new();
+        std::mem::swap(&mut leaves, &mut self.pending);
+        self.sims_done += leaves.len() as u32;
+
+        for leaf in &leaves {
+            for &ni in &leaf.search_path {
+                let n = &mut self.arena[ni as usize];
+                n.visit_count -= VIRTUAL_LOSS_VISITS;
+                n.total_value += VIRTUAL_LOSS_VISITS as f32;
+            }
+
+            let value;
+            if leaf.is_terminal {
+                value = leaf.terminal_value;
+            } else {
+                let policy_start = eval_idx * BOARD_AREA;
+                let policy_slice = &policies[policy_start..policy_start + BOARD_AREA];
+                let v = values[eval_idx];
+                assert!(
+                    v.is_finite(),
+                    "expand_and_backprop_with_sparse: NN returned non-finite value at leaf {}",
+                    leaf.node_idx,
+                );
+                self.expand_node_with_sparse(
+                    leaf.node_idx,
+                    &leaf.legal_moves,
+                    self.arena[leaf.node_idx as usize].player,
+                    policy_slice,
+                    leaf.offset_q,
+                    leaf.offset_r,
+                    &sparse_actions[eval_idx],
+                    &sparse_logits[eval_idx],
+                    stage,
+                    sparse_mix,
+                );
+                value = v;
+                eval_idx += 1;
+            }
+
+            let mut parity_value = value;
+            let mut value_player = self.arena[leaf.node_idx as usize].player;
+            for &ni in leaf.search_path.iter().rev() {
+                let n = &mut self.arena[ni as usize];
+                if n.player != 255 && value_player != 255 && n.player != value_player {
+                    parity_value = -parity_value;
+                    value_player = n.player;
+                }
+                n.visit_count += 1;
+                n.total_value += parity_value;
+            }
+        }
+
+        leaves.clear();
+        std::mem::swap(&mut leaves, &mut self.pending);
+    }
+
+    pub fn pending_leaf_metadata(&self) -> Vec<(i32, i32, Vec<Hex>)> {
+        self.pending
+            .iter()
+            .filter(|leaf| !leaf.is_terminal)
+            .map(|leaf| (leaf.offset_q, leaf.offset_r, leaf.legal_moves.clone()))
+            .collect()
     }
 
     // ── Tree management ────────────────────────────────────────────────
@@ -1054,7 +1294,42 @@ impl MCTSEngine {
             &mut self.scratch_raw,
             &mut self.scratch_priors,
         );
+        self.expand_node_with_priors(node_idx, legal_moves, player);
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn expand_node_with_sparse(
+        &mut self,
+        node_idx: u32,
+        legal_moves: &[Hex],
+        player: u8,
+        policy_logits: &[f32],
+        offset_q: i32,
+        offset_r: i32,
+        sparse_actions: &[(i32, i32)],
+        sparse_logits: &[f32],
+        stage: u8,
+        sparse_mix: f32,
+    ) {
+        if legal_moves.is_empty() {
+            return;
+        }
+        gather_policy_with_sparse(
+            legal_moves,
+            policy_logits,
+            offset_q,
+            offset_r,
+            sparse_actions,
+            sparse_logits,
+            stage,
+            sparse_mix,
+            &mut self.scratch_raw,
+            &mut self.scratch_priors,
+        );
+        self.expand_node_with_priors(node_idx, legal_moves, player);
+    }
+
+    fn expand_node_with_priors(&mut self, node_idx: u32, legal_moves: &[Hex], player: u8) {
         // Allocate children contiguously in arena.
         let children_start = self.arena.len() as u32;
         let child_count = legal_moves.len();

@@ -15,7 +15,7 @@ from typing import Dict, Optional
 from pathlib import Path
 
 from hexorl.config import Config
-from hexorl.model.network import HexNet
+from hexorl.model.network import HexNet, load_model_state
 from hexorl.train.losses import compute_losses
 from hexorl.train.ema import ModelEMA
 
@@ -217,12 +217,28 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            predictions = self.model(tensors)
+            predictions = self.model(
+                tensors,
+                candidate_features=targets.get("candidate_features"),
+                candidate_indices=targets.get("candidate_indices"),
+                candidate_mask=targets.get("candidate_mask"),
+            )
             total_loss, per_head = compute_losses(
                 predictions, targets,
                 loss_weights=self._loss_weights,
                 n_bins=self._n_bins,
             )
+            if not torch.isfinite(total_loss):
+                details = {
+                    name: float(value.detach().float().cpu())
+                    for name, value in per_head.items()
+                    if isinstance(value, torch.Tensor)
+                }
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch={self.epoch} "
+                    f"batch={batch_idx}: total={float(total_loss.detach().float().cpu())} "
+                    f"per_head={details}"
+                )
 
         stepped = True
         if self.use_amp:
@@ -265,6 +281,24 @@ class Trainer:
                 else:
                     result["policy_top1_prob"] = float(top1_prob.mean().detach().cpu())
                     result["policy_top1_acc"] = float(top1_acc.mean().detach().cpu())
+        if "sparse_policy" in predictions and "sparse_policy_target" in targets:
+            with torch.no_grad():
+                mask = targets.get("candidate_mask")
+                sparse_target = targets["sparse_policy_target"]
+                sparse_logits = predictions["sparse_policy"]
+                if mask is not None and torch.any(mask):
+                    masked_logits = sparse_logits.masked_fill(~mask.to(dtype=torch.bool), -80.0)
+                    pred_top = masked_logits.argmax(dim=-1)
+                    target_top = sparse_target.argmax(dim=-1)
+                    valid = mask.any(dim=-1) & (sparse_target.sum(dim=-1) > 0)
+                    if torch.any(valid):
+                        result["sparse_policy_top1_acc"] = float(
+                            (pred_top[valid] == target_top[valid]).float().mean().detach().cpu()
+                        )
+                    if "candidate_missing_mass" in targets:
+                        result["candidate_missing_mass"] = float(
+                            targets["candidate_missing_mass"].float().mean().detach().cpu()
+                        )
 
         return result
 
@@ -329,6 +363,8 @@ class Trainer:
             "epoch": self.epoch,
             "global_step": self.global_step,
             "cfg": self.cfg,
+            "cfg_json": self.cfg.model_dump(mode="json"),
+            "model_metadata": self.cfg.model.model_dump(mode="json"),
         }
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved to {path}")
@@ -339,7 +375,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        load_model_state(self.model, checkpoint["model_state_dict"], allow_partial=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if self.scheduler and checkpoint.get("scheduler_state_dict"):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])

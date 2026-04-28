@@ -278,8 +278,8 @@ def _encoding_summary(
         "player_color",
         "own_recent",
         "opp_recent",
-        "own_hot",
         "opp_hot",
+        "own_hot",
         "centroid_distance",
         "opp_last_turn",
     ]

@@ -22,6 +22,8 @@ from typing import List, Optional
 NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
+MAX_CANDIDATES = 512
+CANDIDATE_FEATURES = 12
 TENSOR_ELEMENTS = NUM_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 13 * 33 * 33 = 14157
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,16 @@ class WorkerSlots:
 
         self.res_value_shm: Optional[SharedMemory] = None
         self.res_value: Optional[np.ndarray] = None
+        self.req_candidate_count_shm: Optional[SharedMemory] = None
+        self.req_candidate_count: Optional[np.ndarray] = None
+        self.req_candidate_indices_shm: Optional[SharedMemory] = None
+        self.req_candidate_indices: Optional[np.ndarray] = None
+        self.req_candidate_features_shm: Optional[SharedMemory] = None
+        self.req_candidate_features: Optional[np.ndarray] = None
+        self.req_candidate_mask_shm: Optional[SharedMemory] = None
+        self.req_candidate_mask: Optional[np.ndarray] = None
+        self.res_sparse_logits_shm: Optional[SharedMemory] = None
+        self.res_sparse_logits: Optional[np.ndarray] = None
 
         self.req_ready: Optional[SharedEvent] = None
         self.res_ready: Optional[SharedEvent] = None
@@ -160,6 +172,50 @@ class WorkerSlots:
             (self.max_batch,), dtype=np.float32, buffer=self.res_value_shm.buf
         )
 
+        self.req_candidate_count_shm = _create_shm(
+            _shm_name("req_candidate_count", self.worker_id), self.max_batch * 2
+        )
+        self.req_candidate_count = np.ndarray(
+            (self.max_batch,), dtype=np.uint16, buffer=self.req_candidate_count_shm.buf
+        )
+        self.req_candidate_count.fill(0)
+        self.req_candidate_indices_shm = _create_shm(
+            _shm_name("req_candidate_indices", self.worker_id),
+            self.max_batch * MAX_CANDIDATES * 8,
+        )
+        self.req_candidate_indices = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES),
+            dtype=np.int64,
+            buffer=self.req_candidate_indices_shm.buf,
+        )
+        self.req_candidate_features_shm = _create_shm(
+            _shm_name("req_candidate_features", self.worker_id),
+            self.max_batch * MAX_CANDIDATES * CANDIDATE_FEATURES * 4,
+        )
+        self.req_candidate_features = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES, CANDIDATE_FEATURES),
+            dtype=np.float32,
+            buffer=self.req_candidate_features_shm.buf,
+        )
+        self.req_candidate_mask_shm = _create_shm(
+            _shm_name("req_candidate_mask", self.worker_id),
+            self.max_batch * MAX_CANDIDATES,
+        )
+        self.req_candidate_mask = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES),
+            dtype=np.uint8,
+            buffer=self.req_candidate_mask_shm.buf,
+        )
+        self.res_sparse_logits_shm = _create_shm(
+            _shm_name("res_sparse_logits", self.worker_id),
+            self.max_batch * MAX_CANDIDATES * 4,
+        )
+        self.res_sparse_logits = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES),
+            dtype=np.float32,
+            buffer=self.res_sparse_logits_shm.buf,
+        )
+
         self.req_ready = SharedEvent(_shm_name("req_ready", self.worker_id), create=True)
         self.res_ready = SharedEvent(_shm_name("res_ready", self.worker_id), create=True)
 
@@ -197,12 +253,61 @@ class WorkerSlots:
             (self.max_batch,), dtype=np.float32, buffer=self.res_value_shm.buf
         )
 
+        self.req_candidate_count_shm = SharedMemory(
+            name=_shm_name("req_candidate_count", self.worker_id), create=False
+        )
+        self.req_candidate_count = np.ndarray(
+            (self.max_batch,), dtype=np.uint16, buffer=self.req_candidate_count_shm.buf
+        )
+        self.req_candidate_indices_shm = SharedMemory(
+            name=_shm_name("req_candidate_indices", self.worker_id), create=False
+        )
+        self.req_candidate_indices = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES),
+            dtype=np.int64,
+            buffer=self.req_candidate_indices_shm.buf,
+        )
+        self.req_candidate_features_shm = SharedMemory(
+            name=_shm_name("req_candidate_features", self.worker_id), create=False
+        )
+        self.req_candidate_features = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES, CANDIDATE_FEATURES),
+            dtype=np.float32,
+            buffer=self.req_candidate_features_shm.buf,
+        )
+        self.req_candidate_mask_shm = SharedMemory(
+            name=_shm_name("req_candidate_mask", self.worker_id), create=False
+        )
+        self.req_candidate_mask = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES),
+            dtype=np.uint8,
+            buffer=self.req_candidate_mask_shm.buf,
+        )
+        self.res_sparse_logits_shm = SharedMemory(
+            name=_shm_name("res_sparse_logits", self.worker_id), create=False
+        )
+        self.res_sparse_logits = np.ndarray(
+            (self.max_batch, MAX_CANDIDATES),
+            dtype=np.float32,
+            buffer=self.res_sparse_logits_shm.buf,
+        )
+
         self.req_ready = SharedEvent(_shm_name("req_ready", self.worker_id), create=False)
         self.res_ready = SharedEvent(_shm_name("res_ready", self.worker_id), create=False)
 
     def close(self):
         """Close and unlink all shared memory segments."""
-        for attr in ("req_tensor_shm", "req_count_shm", "res_policy_shm", "res_value_shm"):
+        for attr in (
+            "req_tensor_shm",
+            "req_count_shm",
+            "res_policy_shm",
+            "res_value_shm",
+            "req_candidate_count_shm",
+            "req_candidate_indices_shm",
+            "req_candidate_features_shm",
+            "req_candidate_mask_shm",
+            "res_sparse_logits_shm",
+        ):
             shm = getattr(self, attr, None)
             if shm is not None:
                 shm.close()

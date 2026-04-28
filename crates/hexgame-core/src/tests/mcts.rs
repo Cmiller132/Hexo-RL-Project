@@ -1,4 +1,5 @@
 use crate::board::HexGameState;
+use crate::core::Hex;
 use crate::encoder::BOARD_AREA;
 use crate::mcts::MCTSEngine;
 
@@ -185,5 +186,73 @@ mod tests {
             root_q > 0.5,
             "same-player placement edge should preserve value sign, got {root_q}"
         );
+    }
+
+    #[test]
+    fn mcts_sparse_stage2_prior_prefers_outside_sparse_action() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let legal = vec![Hex::new(50, 50), Hex::new(0, 0)];
+        let mut dense = vec![-10.0f32; BOARD_AREA];
+        dense[16 * 33 + 16] = 10.0;
+        let sparse_actions = vec![(50, 50)];
+        let sparse_logits = vec![20.0f32];
+
+        engine.expand_root_with_sparse_priors(
+            &dense,
+            0.0,
+            -16,
+            -16,
+            &legal,
+            &sparse_actions,
+            &sparse_logits,
+            2,
+            0.25,
+        );
+        let priors = engine.root_child_priors();
+
+        assert!(priors[0] > priors[1], "outside sparse action should win stage2 prior");
+    }
+
+    #[test]
+    fn mcts_sparse_stage1_no_overlap_falls_back_to_dense() {
+        let game = HexGameState::new();
+        let mut dense_engine =
+            MCTSEngine::with_arena_sim_hint(game.clone(), 1, 50, 1.5, 2, false, 0.0, 0);
+        let mut sparse_engine =
+            MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let legal = vec![Hex::new(0, 0), Hex::new(1, 0)];
+        let mut dense = vec![-10.0f32; BOARD_AREA];
+        dense[16 * 33 + 16] = 3.0;
+        dense[17 * 33 + 16] = 1.0;
+        dense_engine.expand_root(&dense, 0.0, -16, -16, &legal);
+        sparse_engine.expand_root_with_sparse_priors(
+            &dense,
+            0.0,
+            -16,
+            -16,
+            &legal,
+            &[(50, 50)],
+            &[20.0],
+            1,
+            1.0,
+        );
+
+        assert_eq!(sparse_engine.root_child_priors(), dense_engine.root_child_priors());
+    }
+
+    #[test]
+    fn mcts_pending_leaf_metadata_matches_selected_leaves() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 8, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
+        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+
+        let (_, count) = engine.select_leaves(4);
+        let meta = engine.pending_leaf_metadata();
+
+        assert_eq!(meta.len(), count as usize);
+        assert!(meta.iter().all(|(_, _, legal)| !legal.is_empty()));
     }
 }
