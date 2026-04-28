@@ -29,6 +29,17 @@ class CandidateBatch:
     recall_top1: float
     recall_top4: float
     recall_top8: float
+    recall_winning_move: float
+    recall_forced_block: float
+    recall_two_placement_cover: float
+
+
+@dataclass(frozen=True)
+class PairCandidateBatch:
+    pair_indices: np.ndarray
+    mask: np.ndarray
+    target: np.ndarray
+    missing_mass: float
 
 
 def _unique_qr(items: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -46,21 +57,31 @@ def build_candidate_set(
     legal_moves: Sequence[tuple[int, int]],
     policy_target_v2: PolicyTargetV2,
     budget: int,
+    *,
+    winning_moves: Sequence[tuple[int, int]] = (),
+    forced_block_moves: Sequence[tuple[int, int]] = (),
+    cover_cells: Sequence[tuple[int, int]] = (),
+    critical_actions: Sequence[tuple[int, int]] = (),
 ) -> list[tuple[int, int]]:
     """Build a deterministic candidate set.
 
-    Target actions are critical and can exceed the nominal budget; the budget
-    controls only the non-critical fill.
+    Target and tactical actions are critical and can exceed the nominal budget;
+    the budget controls only the non-critical fill.
     """
     budget = max(1, int(budget))
     target_actions = _unique_qr((q, r) for q, r, prob in policy_target_v2 if prob > 0.0)
     legal_set = set(_unique_qr((int(move[0]), int(move[1])) for move in legal_moves))
+    tactical_actions = _unique_qr(
+        list(winning_moves) + list(forced_block_moves) + list(cover_cells) + list(critical_actions)
+    )
+    tactical_actions = [qr for qr in tactical_actions if qr in legal_set]
+    protected = _unique_qr(target_actions + tactical_actions)
     fill_pool = sorted(
-        legal_set - set(target_actions),
+        legal_set - set(protected),
         key=lambda qr: (max(abs(qr[0]), abs(qr[1]), abs(qr[0] + qr[1])), qr[0], qr[1]),
     )
-    slots = max(0, budget - len(target_actions))
-    return target_actions + fill_pool[:slots]
+    slots = max(0, budget - len(protected))
+    return protected + fill_pool[:slots]
 
 
 def build_candidate_batch(
@@ -70,8 +91,24 @@ def build_candidate_batch(
     offset_q: int,
     offset_r: int,
     budget: int,
+    winning_moves: Sequence[tuple[int, int]] = (),
+    forced_block_moves: Sequence[tuple[int, int]] = (),
+    cover_cells: Sequence[tuple[int, int]] = (),
+    critical_actions: Sequence[tuple[int, int]] = (),
 ) -> CandidateBatch:
-    candidates = build_candidate_set(legal_moves, policy_target_v2, budget)
+    winning_set = set(_unique_qr(winning_moves))
+    forced_set = set(_unique_qr(forced_block_moves))
+    cover_set = set(_unique_qr(cover_cells))
+    critical_set = set(_unique_qr(critical_actions)) | winning_set | forced_set | cover_set
+    candidates = build_candidate_set(
+        legal_moves,
+        policy_target_v2,
+        budget,
+        winning_moves=winning_moves,
+        forced_block_moves=forced_block_moves,
+        cover_cells=cover_cells,
+        critical_actions=critical_actions,
+    )
     target_map: dict[tuple[int, int], float] = {
         (int(q), int(r)): float(prob) for q, r, prob in policy_target_v2 if prob > 0.0
     }
@@ -121,7 +158,7 @@ def build_candidate_batch(
                 1.0 if prob > 0.0 else 0.0,
                 legal_rank.get((q, r), 0) / max_legal_rank,
                 1.0 - in_crop,
-                1.0,
+                1.0 if (q, r) in critical_set else 0.0,
             ],
             dtype=np.float32,
         )
@@ -144,4 +181,77 @@ def build_candidate_batch(
         recall_top1=recall(target_top1),
         recall_top4=recall(target_top4),
         recall_top8=recall(target_top8),
+        recall_winning_move=recall(winning_set),
+        recall_forced_block=recall(forced_set),
+        recall_two_placement_cover=recall(cover_set),
     )
+
+
+def _canonical_pair(
+    a: tuple[int, int],
+    b: tuple[int, int],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    a = (int(a[0]), int(a[1]))
+    b = (int(b[0]), int(b[1]))
+    return (a, b) if a <= b else (b, a)
+
+
+def build_pair_candidate_batch(
+    candidate_qr: Sequence[tuple[int, int]],
+    pair_policy_target_v2: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
+    *,
+    budget: int,
+) -> PairCandidateBatch:
+    """Build a bounded pair-action target over candidate row indices."""
+    budget = max(1, int(budget))
+    candidate_list = _unique_qr((int(q), int(r)) for q, r in candidate_qr)
+    candidate_index = {qr: i for i, qr in enumerate(candidate_list)}
+
+    target_map: dict[tuple[tuple[int, int], tuple[int, int]], float] = {}
+    protected: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    total_target_mass = 0.0
+    for a, b, prob in pair_policy_target_v2:
+        if prob <= 0.0:
+            continue
+        key = _canonical_pair(a, b)
+        total_target_mass += float(prob)
+        target_map[key] = target_map.get(key, 0.0) + float(prob)
+        if key[0] in candidate_index and key[1] in candidate_index and key[0] != key[1]:
+            protected.append(key)
+    protected = list(dict.fromkeys(protected))
+
+    fill: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    n = min(len(candidate_list), 64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            key = _canonical_pair(candidate_list[i], candidate_list[j])
+            if key not in target_map:
+                fill.append(key)
+    fill.sort(
+        key=lambda pair: (
+            max(abs(pair[0][0]), abs(pair[0][1]), abs(pair[0][0] + pair[0][1]))
+            + max(abs(pair[1][0]), abs(pair[1][1]), abs(pair[1][0] + pair[1][1])),
+            pair,
+        )
+    )
+    pairs = protected + fill[: max(0, budget - len(protected))]
+    width = max(len(pairs), budget)
+    pair_indices = np.full((width, 2), -1, dtype=np.int64)
+    mask = np.zeros(width, dtype=np.bool_)
+    target = np.zeros(width, dtype=np.float32)
+    represented_mass = 0.0
+
+    for row, pair in enumerate(pairs[:width]):
+        first = candidate_index.get(pair[0], -1)
+        second = candidate_index.get(pair[1], -1)
+        if first < 0 or second < 0 or first == second:
+            continue
+        pair_indices[row] = (first, second)
+        mask[row] = True
+        prob = target_map.get(pair, 0.0)
+        target[row] = prob
+        represented_mass += prob
+    if represented_mass > 0.0:
+        target /= represented_mass
+    missing_mass = max(0.0, total_target_mass - represented_mass)
+    return PairCandidateBatch(pair_indices=pair_indices, mask=mask, target=target, missing_mass=missing_mass)

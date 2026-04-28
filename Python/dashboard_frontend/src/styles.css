@@ -184,6 +184,52 @@ h1 {
   grid-template-columns: minmax(360px, 1.2fr) minmax(260px, 0.6fr) minmax(280px, 0.8fr);
 }
 
+.suiteGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.suiteHero {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.suiteHero div {
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #0d1117;
+  min-width: 0;
+  padding: 10px;
+}
+
+.suiteHero span {
+  display: block;
+  color: #8b949e;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.suiteHero strong {
+  display: block;
+  margin-top: 5px;
+  color: #f0f6fc;
+  font-size: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suitePath {
+  margin-top: 10px;
+  color: #8b949e;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .viewerGrid {
   display: grid;
   grid-template-columns: minmax(520px, 1.4fr) minmax(260px, 0.62fr) minmax(300px, 0.82fr);
@@ -623,6 +669,7 @@ pre {
 
 @media (max-width: 1100px) {
   .kpis,
+  .suiteHero,
   .grid.two,
   .grid.replay,
   .viewerGrid {

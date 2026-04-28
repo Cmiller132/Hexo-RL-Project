@@ -10,6 +10,7 @@
 - At ~10:33 EDT, dense calibration completed in `190.8s`, ResTNet calibration completed in `162.5s`, graph calibration was running, no warnings were present, and swap remained unused.
 - At ~10:39 EDT, graph calibration completed in `85.7s` for 1024 positions. Dense and ResTNet were quarantined by graph-relative throughput gates and their runtime state was released. ASHA started graph-only with six graph trials.
 - At ~10:50 EDT, graph ASHA trials were completing under budget: `asha_00` at `358.0s` / ~`1355 positions/min`, `asha_01` at `324.5s` / ~`995 positions/min`. No warnings and WSL swap still unused.
+- At ~11:05 EDT, the suite-aware dashboard was launched at `http://127.0.0.1:8765` against `/root/hexo_runs/phase2_phase3_autotune_overnight_20260428_ext4`. It aggregated `19` trial databases, `2678+` saved games, and ranked best checkpoints from the live run root.
 - The earlier 3-worker / 96-move guard got through ASHA, but PBT later wedged when it reused calibration-era trials and reached move `82+` / `114+` under full WSL memory pressure.
 - Current intervention: restart from a clean WSL state with PBT restricted to eligible/unquarantined families and pruned/quarantined trial runtime released immediately.
 - Stable capped graph throughput before the PBT stall was roughly `950-1870 self-play positions/min` across graph variants; PBT graph `256 token / 1 layer` hit `~1873 positions/min` before the next population member stalled.
@@ -35,6 +36,7 @@
 17. Added runtime release for pruned/quarantined trials so old trainers and replay buffers do not accumulate across ASHA rungs and PBT.
 18. Tightened the low-RAM non-calibration game cap to `80` moves after the latest stall showed repeated timeouts at move `82` and WSL memory+swap saturation.
 19. Added `C:\Users\epicm\.wslconfig` with `memory=24GB`, `swap=12GB`, and `processors=32`, then restarted WSL and verified the new memory limit.
+20. Fixed dashboard visibility for autotune suites: games and checkpoints were already being saved per trial in `trials/<trial>/dashboard.sqlite3`, but the dashboard only read one default DB. Added suite aggregation endpoints, a Suite tab, best-model ranking, recent saved games, and run-aware replay loading.
 
 ## Performance Findings
 

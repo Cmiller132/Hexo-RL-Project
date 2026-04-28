@@ -29,7 +29,9 @@ from hexorl.inference.client import InferenceClient
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
+    action_to_board_index,
     dense_policy_from_v2,
+    pair_policy_v2_from_place_target,
     policy_v2_from_visits,
     BOARD_AREA,
 )
@@ -59,6 +61,31 @@ def get_temperature(
         if move_index >= threshold:
             temp = t
     return max(temp, 0.0)
+
+
+def _critical_actions_from_root_tensor(
+    tensor: np.ndarray,
+    legal: np.ndarray,
+    offset_q: int,
+    offset_r: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]]]:
+    winning: list[tuple[int, int]] = []
+    forced: list[tuple[int, int]] = []
+    cover: list[tuple[int, int]] = []
+    if tensor.shape[0] <= 10:
+        return winning, forced, cover
+    for q_raw, r_raw in legal:
+        q, r = int(q_raw), int(r_raw)
+        flat = action_to_board_index(q, r, offset_q, offset_r)
+        if flat < 0:
+            continue
+        gi, gj = divmod(flat, 33)
+        if tensor[10, gi, gj] > 0.0:
+            winning.append((q, r))
+        if tensor[9, gi, gj] > 0.0:
+            forced.append((q, r))
+            cover.append((q, r))
+    return winning, forced, cover
 
 
 # ── Mock MCTS Engine ─────────────────────────────────────────────────────────
@@ -768,12 +795,26 @@ class SelfPlayWorker:
             )
             target_mass = sum(prob for _q, _r, prob in policy_v2)
             missing_mass = max(0.0, 1.0 - target_mass) if policy_v2 else 1.0
+            legal_root = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+            winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
+                tensor_3d,
+                legal_root,
+                int(offset_q),
+                int(offset_r),
+            )
             candidate_probe = build_candidate_batch(
-                np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2).tolist(),
+                legal_root.tolist(),
                 policy_v2[: max(8, min(len(policy_v2), self.candidate_budget))],
                 offset_q=int(offset_q),
                 offset_r=int(offset_r),
                 budget=self.candidate_budget,
+                winning_moves=winning_moves,
+                forced_block_moves=forced_blocks,
+                cover_cells=cover_cells,
+            )
+            pair_policy_v2 = pair_policy_v2_from_place_target(
+                policy_v2,
+                top_k=min(max(1, self.candidate_budget), 32),
             )
 
             positions.append(
@@ -781,11 +822,15 @@ class SelfPlayWorker:
                     move_history=record_history,
                     policy_target=policy,
                     policy_target_v2=policy_v2,
+                    pair_policy_target_v2=pair_policy_v2,
                     target_policy_mass_outside_window=outside_mass,
                     missing_target_policy_mass=missing_mass,
                     candidate_recall_mcts_top1=candidate_probe.recall_top1,
                     candidate_recall_mcts_top4=candidate_probe.recall_top4,
                     candidate_recall_mcts_top8=candidate_probe.recall_top8,
+                    candidate_recall_winning_move=candidate_probe.recall_winning_move,
+                    candidate_recall_forced_block=candidate_probe.recall_forced_block,
+                    candidate_recall_two_placement_cover=candidate_probe.recall_two_placement_cover,
                     root_value=root_value,
                     player=player,
                     game_id=game_id,

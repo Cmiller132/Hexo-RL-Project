@@ -47,6 +47,7 @@ def main():
 
     dash_p = subparsers.add_parser("dashboard", help="Serve the FastAPI/React dashboard")
     dash_p.add_argument("--db", type=Path, default=Path("./runs/dashboard.sqlite3"))
+    dash_p.add_argument("--run-root", type=Path, default=None, help="Autotune run root with per-trial dashboard DBs")
     dash_p.add_argument("--host", default="127.0.0.1")
     dash_p.add_argument("--port", type=int, default=8765)
 
@@ -122,7 +123,7 @@ def main():
 
         from hexorl.dashboard.app import create_app
 
-        app = create_app(args.db)
+        app = create_app(args.db, run_root=args.run_root)
         print(f"Serving dashboard at http://{args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
     elif args.command == "index-checkpoints":

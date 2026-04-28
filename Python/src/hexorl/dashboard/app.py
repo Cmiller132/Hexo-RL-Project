@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -92,16 +93,21 @@ class ArenaStartRequest(BaseModel):
 
 
 def _game_summary(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload_json", {}) or {}
     return {
         "game_id": row["game_id"],
         "run_id": row["run_id"],
+        "trial_id": row.get("trial_id") or row["run_id"],
         "external_game_id": row["external_game_id"],
         "source": row["source"],
         "epoch": row["epoch"],
         "outcome": row["outcome"],
         "move_count": row["move_count"],
         "created_at": row["created_at"],
-        "payload": row.get("payload_json", {}),
+        "terminal_reason": payload.get("terminal_reason", ""),
+        "truncated": bool(payload.get("truncated", False)),
+        "positions": payload.get("positions"),
+        "payload": payload,
     }
 
 
@@ -109,12 +115,15 @@ def create_app(
     db_path: Path | str = "runs/dashboard.sqlite3",
     *,
     frontend_dist: Path | str | None = None,
+    run_root: Path | str | None = None,
 ) -> FastAPI:
     store = DashboardStore(db_path)
+    suite_root = Path(run_root).expanduser().resolve() if run_root else None
     model_cache = ModelCache()
     arena_manager = ArenaManager(store)
     app = FastAPI(title="Hexo-RL Dashboard", version="0.1.0")
     app.state.store = store
+    app.state.suite_root = suite_root
     app.state.model_cache = model_cache
     app.state.arena = arena_manager
 
@@ -128,15 +137,27 @@ def create_app(
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "schema_version": 1, "db_path": str(store.path)}
+        return {
+            "ok": True,
+            "schema_version": 1,
+            "db_path": str(store.path),
+            "suite_enabled": suite_root is not None,
+            "suite_run_root": str(suite_root) if suite_root else None,
+        }
 
     @app.get("/api/runs")
     def runs() -> list[dict[str, Any]]:
+        if suite_root is not None:
+            rows = _suite_runs(suite_root)
+            if rows:
+                return rows
         return store.rows("SELECT * FROM runs ORDER BY updated_at DESC")
 
     @app.get("/api/metrics/{run_id}")
     def metrics(run_id: str, limit: int = 500) -> list[dict[str, Any]]:
-        rows = store.rows(
+        trial_store = _suite_store_for_run(suite_root, run_id)
+        source = trial_store or store
+        rows = source.rows(
             """
             SELECT * FROM (
                 SELECT * FROM metrics WHERE run_id=? ORDER BY created_at DESC LIMIT ?
@@ -148,13 +169,17 @@ def create_app(
 
     @app.get("/api/events/{run_id}")
     def events(run_id: str, limit: int = 500) -> list[dict[str, Any]]:
-        return store.rows(
+        trial_store = _suite_store_for_run(suite_root, run_id)
+        source = trial_store or store
+        return source.rows(
             "SELECT * FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT ?",
             (run_id, max(1, min(limit, 5000))),
         )
 
     @app.get("/api/checkpoints")
     def checkpoints(run_id: str | None = None) -> list[dict[str, Any]]:
+        if suite_root is not None:
+            return _suite_checkpoints(suite_root, run_id=run_id)
         if run_id:
             return store.rows(
                 "SELECT * FROM checkpoints WHERE run_id=? ORDER BY indexed_at DESC",
@@ -184,6 +209,9 @@ def create_app(
 
     @app.get("/api/games")
     def games(run_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        if suite_root is not None:
+            rows = _suite_games(suite_root, run_id=run_id, limit=max(1, min(limit, 2000)))
+            return [_game_summary(row) for row in rows]
         if run_id:
             rows = store.rows(
                 "SELECT * FROM games WHERE run_id=? ORDER BY created_at DESC LIMIT ?",
@@ -197,19 +225,45 @@ def create_app(
         return [_game_summary(row) for row in rows]
 
     @app.get("/api/games/{game_id}/replay")
-    def game_replay(game_id: int) -> dict[str, Any]:
+    def game_replay(game_id: int, run_id: str | None = None) -> dict[str, Any]:
+        source = _suite_store_for_run(suite_root, run_id) if run_id else store
         try:
-            return replay_game(store, game_id)
+            return replay_game(source or store, game_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/games/{game_id}/position/{turn_index}")
-    def game_position(game_id: int, turn_index: int) -> dict[str, Any]:
-        rows = store.rows("SELECT final_history_b64 FROM games WHERE game_id=?", (game_id,))
+    def game_position(game_id: int, turn_index: int, run_id: str | None = None) -> dict[str, Any]:
+        source = _suite_store_for_run(suite_root, run_id) if run_id else store
+        rows = (source or store).rows("SELECT final_history_b64 FROM games WHERE game_id=?", (game_id,))
         if not rows:
             raise HTTPException(404, f"Game not found: {game_id}")
         pos = get_replay_position(rows[0]["final_history_b64"], turn_index=turn_index)
         return position_payload(pos)
+
+    @app.get("/api/suite/status")
+    def suite_status() -> dict[str, Any]:
+        if suite_root is None:
+            return {"enabled": False}
+        return _suite_status(suite_root)
+
+    @app.get("/api/suite/trials")
+    def suite_trials() -> list[dict[str, Any]]:
+        if suite_root is None:
+            return []
+        return _suite_trials(suite_root)
+
+    @app.get("/api/suite/best-checkpoints")
+    def suite_best_checkpoints(limit: int = 50) -> list[dict[str, Any]]:
+        if suite_root is None:
+            return []
+        return _suite_best_checkpoints(suite_root, limit=max(1, min(limit, 500)))
+
+    @app.get("/api/suite/events")
+    def suite_events(limit: int = 200) -> list[dict[str, Any]]:
+        if suite_root is None:
+            return []
+        return _jsonl_tail(suite_root / "events.jsonl", limit=max(1, min(limit, 1000)))
 
     @app.post("/api/session/create")
     def session_create(req: CreateSessionRequest) -> dict[str, Any]:
@@ -380,6 +434,294 @@ def create_app(
             )
 
     return app
+
+
+def _suite_trial_dirs(run_root: Path) -> list[Path]:
+    trials = run_root / "trials"
+    if not trials.exists():
+        return []
+    return sorted([path for path in trials.iterdir() if (path / "dashboard.sqlite3").exists()])
+
+
+def _suite_store_for_run(run_root: Path | None, run_id: str | None) -> DashboardStore | None:
+    if run_root is None or not run_id:
+        return None
+    direct = run_root / "trials" / run_id / "dashboard.sqlite3"
+    if direct.exists():
+        return DashboardStore(direct)
+    for trial_dir in _suite_trial_dirs(run_root):
+        db = trial_dir / "dashboard.sqlite3"
+        try:
+            rows = DashboardStore(db).rows("SELECT run_id FROM runs WHERE run_id=? LIMIT 1", (run_id,))
+        except Exception:
+            continue
+        if rows:
+            return DashboardStore(db)
+    return None
+
+
+def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    trial_state = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
+    for trial_dir in _suite_trial_dirs(run_root):
+        db = trial_dir / "dashboard.sqlite3"
+        try:
+            run_rows = DashboardStore(db).rows("SELECT * FROM runs ORDER BY updated_at DESC")
+        except Exception:
+            continue
+        for row in run_rows:
+            trial_id = str(row.get("run_id") or trial_dir.name)
+            row["trial_id"] = trial_id
+            row["source_db"] = str(db)
+            row["name"] = trial_id
+            state = trial_state.get(trial_id, {})
+            row["payload_json"] = {
+                **dict(row.get("payload_json") or {}),
+                "family": (state.get("family") or {}).get("name"),
+                "pruned": state.get("pruned"),
+                "last_score": state.get("last_score"),
+            }
+            rows.append(row)
+    rows.sort(key=lambda row: float(row.get("updated_at") or 0.0), reverse=True)
+    return rows
+
+
+def _suite_games(run_root: Path, *, run_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    trial_dirs = [run_root / "trials" / run_id] if run_id else _suite_trial_dirs(run_root)
+    rows: list[dict[str, Any]] = []
+    for trial_dir in trial_dirs:
+        db = trial_dir / "dashboard.sqlite3"
+        if not db.exists():
+            continue
+        try:
+            store = DashboardStore(db)
+            if run_id:
+                next_rows = store.rows(
+                    "SELECT * FROM games WHERE run_id=? ORDER BY created_at DESC LIMIT ?",
+                    (run_id, limit),
+                )
+            else:
+                next_rows = store.rows("SELECT * FROM games ORDER BY created_at DESC LIMIT ?", (limit,))
+        except Exception:
+            continue
+        for row in next_rows:
+            row["trial_id"] = trial_dir.name
+            row["source_db"] = str(db)
+            rows.append(row)
+    rows.sort(key=lambda row: float(row.get("created_at") or 0.0), reverse=True)
+    return rows[:limit]
+
+
+def _suite_checkpoints(run_root: Path, *, run_id: str | None = None) -> list[dict[str, Any]]:
+    trial_dirs = [run_root / "trials" / run_id] if run_id else _suite_trial_dirs(run_root)
+    rows: list[dict[str, Any]] = []
+    score_by_trial = {
+        trial["trial_id"]: _finite_or_none(trial.get("last_score"))
+        for trial in _suite_state(run_root).get("trials", [])
+        if trial.get("trial_id")
+    }
+    for trial_dir in trial_dirs:
+        db = trial_dir / "dashboard.sqlite3"
+        if not db.exists():
+            continue
+        try:
+            store = DashboardStore(db)
+            if run_id:
+                next_rows = store.rows(
+                    "SELECT * FROM checkpoints WHERE run_id=? ORDER BY indexed_at DESC",
+                    (run_id,),
+                )
+            else:
+                next_rows = store.rows("SELECT * FROM checkpoints ORDER BY indexed_at DESC")
+        except Exception:
+            continue
+        for row in next_rows:
+            trial_id = str(row.get("run_id") or trial_dir.name)
+            row["trial_id"] = trial_id
+            row["source_db"] = str(db)
+            row["score"] = score_by_trial.get(trial_id)
+            rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            float(row.get("score") if row.get("score") is not None else float("-inf")),
+            int(row.get("epoch") or -1),
+            float(row.get("indexed_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _suite_best_checkpoints(run_root: Path, *, limit: int = 50) -> list[dict[str, Any]]:
+    rows = _suite_checkpoints(run_root)
+    best_by_path: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        current = best_by_path.get(path)
+        score = float(row.get("score") if row.get("score") is not None else float("-inf"))
+        current_score = float(current.get("score") if current and current.get("score") is not None else float("-inf"))
+        if current is None or (score, int(row.get("epoch") or -1)) > (current_score, int(current.get("epoch") or -1)):
+            best_by_path[path] = row
+    ranked = list(best_by_path.values())
+    ranked.sort(
+        key=lambda row: (
+            float(row.get("score") if row.get("score") is not None else float("-inf")),
+            int(row.get("epoch") or -1),
+            float(row.get("indexed_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    for idx, row in enumerate(ranked, start=1):
+        row["rank"] = idx
+    return ranked[:limit]
+
+
+def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
+    state_trials = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
+    rows: list[dict[str, Any]] = []
+    for trial_dir in _suite_trial_dirs(run_root):
+        trial_id = trial_dir.name
+        state = dict(state_trials.get(trial_id) or {})
+        trial_json = _read_json(trial_dir / "trial.json")
+        latest = _read_json(trial_dir / "LATEST.json")
+        scores = _jsonl_tail(trial_dir / "scores.jsonl", limit=1)
+        family = state.get("family") or trial_json.get("family") or {}
+        counts = _suite_trial_counts(trial_dir)
+        latest_selfplay = latest.get("selfplay") or {}
+        latest_train = latest.get("train") or {}
+        score = state.get("last_score")
+        if (score is None or score == "-inf") and scores:
+            score = scores[-1].get("scheduler_score")
+        row = {
+            "trial_id": trial_id,
+            "family": family.get("name") or latest.get("family") or "",
+            "stage": latest.get("stage") or state.get("stage") or trial_json.get("stage") or "",
+            "epoch": state.get("epoch") or latest.get("epoch") or trial_json.get("epoch") or 0,
+            "score": _finite_or_none(score),
+            "pruned": bool(state.get("pruned") or trial_json.get("pruned") or False),
+            "prune_reason": state.get("prune_reason") or trial_json.get("prune_reason") or "",
+            "checkpoint_path": state.get("checkpoint_path") or latest.get("checkpoint_path") or "",
+            "games": counts["games"],
+            "positions": counts["positions"],
+            "checkpoints": counts["checkpoints"],
+            "metrics": counts["metrics"],
+            "selfplay_positions_per_min": latest_selfplay.get("positions_per_min"),
+            "epoch_elapsed_s": latest.get("epoch_elapsed_s"),
+            "loss_total": latest_train.get("loss_total"),
+            "policy_top1_acc": latest_train.get("policy_top1_acc"),
+            "sparse_policy_top1_acc": latest_train.get("sparse_policy_top1_acc"),
+            "updated_at": max(_mtime(trial_dir / "LATEST.json"), _mtime(trial_dir / "dashboard.sqlite3")),
+        }
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            not bool(row.get("pruned")),
+            float(row.get("score") if row.get("score") is not None else float("-inf")),
+            float(row.get("updated_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _suite_status(run_root: Path) -> dict[str, Any]:
+    manifest = _read_json(run_root / "manifest.json")
+    state = _suite_state(run_root)
+    events = _jsonl_tail(run_root / "events.jsonl", limit=100)
+    trials = _suite_trials(run_root)
+    latest_stage = ""
+    for event in reversed(events):
+        if event.get("event") == "stage_start":
+            latest_stage = str(event.get("stage") or "")
+            break
+    total_games = sum(int(trial.get("games") or 0) for trial in trials)
+    total_positions = sum(int(trial.get("positions") or 0) for trial in trials)
+    best = next((trial for trial in trials if not trial.get("pruned") and trial.get("score") is not None), None)
+    return {
+        "enabled": True,
+        "run_root": str(run_root),
+        "latest_stage": latest_stage,
+        "trial_count": len(trials),
+        "live_trial_count": sum(1 for trial in trials if not trial.get("pruned")),
+        "total_games": total_games,
+        "total_positions": total_positions,
+        "best_trial_id": best.get("trial_id") if best else None,
+        "best_score": best.get("score") if best else None,
+        "manifest": manifest,
+        "state_elapsed_s": state.get("elapsed_s"),
+        "host": manifest.get("host", {}),
+        "args": manifest.get("args", {}),
+        "last_event": events[-1] if events else None,
+    }
+
+
+def _suite_state(run_root: Path) -> dict[str, Any]:
+    return _read_json(run_root / "state.json")
+
+
+def _suite_trial_counts(trial_dir: Path) -> dict[str, int]:
+    db = trial_dir / "dashboard.sqlite3"
+    counts = {"games": 0, "positions": 0, "checkpoints": 0, "metrics": 0}
+    if not db.exists():
+        return counts
+    try:
+        store = DashboardStore(db)
+        for key, table in [
+            ("games", "games"),
+            ("positions", "positions"),
+            ("checkpoints", "checkpoints"),
+            ("metrics", "metrics"),
+        ]:
+            rows = store.rows(f"SELECT COUNT(*) AS n FROM {table}")
+            counts[key] = int(rows[0]["n"] if rows else 0)
+    except Exception:
+        pass
+    return counts
+
+
+def _jsonl_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number == float("inf") or number == float("-inf") or number != number:
+        return None
+    return number
 
 
 def _axis_input_from_request(store: DashboardStore, req: AxisEvaluateRequest) -> AxisPolicyInput:

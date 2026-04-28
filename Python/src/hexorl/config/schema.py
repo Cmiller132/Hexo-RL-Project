@@ -177,6 +177,8 @@ class Config(BaseModel):
                 "model lookahead heads must match buffer.lookahead_horizons; "
                 f"missing horizons for heads: {missing_horizons}"
             )
+        if "pair_policy" in self.model.heads and not self.model.sparse_policy:
+            self.model.sparse_policy = True
         if self.model.sparse_policy and max(
             self.model.candidate_budget,
             self.selfplay.policy_target_top_k,
@@ -187,6 +189,9 @@ class Config(BaseModel):
             )
         if self.model.sparse_policy and "sparse_policy" not in self.train.loss_weights:
             self.train.loss_weights["sparse_policy"] = 0.25
+        if "pair_policy" in self.model.heads:
+            if "pair_policy" not in self.train.loss_weights:
+                self.train.loss_weights["pair_policy"] = 0.05
 
         return self
 

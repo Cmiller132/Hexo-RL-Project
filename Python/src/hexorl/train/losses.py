@@ -170,6 +170,16 @@ def sparse_policy_loss(
     return loss[valid_rows].mean()
 
 
+def pair_policy_loss(
+    pred_logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    pair_candidate_mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masked cross-entropy for auxiliary pair-action logits."""
+    return sparse_policy_loss(pred_logits, target_probs, pair_candidate_mask, weight)
+
+
 def opp_policy_loss(
     pred_logits: torch.Tensor,
     target_probs: torch.Tensor,
@@ -301,6 +311,15 @@ def compute_losses(
                 pred,
                 targets["sparse_policy_target"],
                 targets["candidate_mask"],
+                targets.get("policy_weight"),
+            )
+        elif head_name == "pair_policy":
+            if "pair_policy_target" not in targets or "pair_candidate_mask" not in targets:
+                continue
+            loss = pair_policy_loss(
+                pred,
+                targets["pair_policy_target"],
+                targets["pair_candidate_mask"],
                 targets.get("policy_weight"),
             )
         elif head_name == "opp_policy":

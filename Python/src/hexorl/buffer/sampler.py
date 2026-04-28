@@ -15,8 +15,12 @@ except ImportError:
     _IterableDataset = object  # type: ignore
 
 from hexorl.buffer.ring import RingBuffer
-from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE
-from hexorl.action_contract.candidates import CANDIDATE_FEATURES, build_candidate_batch
+from hexorl.selfplay.records import BOARD_AREA, NUM_CHANNELS, BOARD_SIZE, action_to_board_index
+from hexorl.action_contract.candidates import (
+    CANDIDATE_FEATURES,
+    build_candidate_batch,
+    build_pair_candidate_batch,
+)
 
 try:
     from hexorl.axis_policy.core import AxisPolicyInput
@@ -193,6 +197,36 @@ def _history_stones(history_bytes: bytes) -> dict[Tuple[int, int], int]:
     return stones
 
 
+def _critical_actions_from_tensor(
+    tensor: np.ndarray,
+    legal: np.ndarray,
+    offset_q: int,
+    offset_r: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]]]:
+    """Extract tactical action sets from encoded hot-cell planes.
+
+    Channel 10 is current-player hot cells (win-now candidates). Channel 9 is
+    opponent hot cells (forced-block / cover-set candidates).
+    """
+    winning: list[tuple[int, int]] = []
+    forced: list[tuple[int, int]] = []
+    cover: list[tuple[int, int]] = []
+    if tensor.shape[0] <= 10:
+        return winning, forced, cover
+    for q_raw, r_raw in legal:
+        q, r = int(q_raw), int(r_raw)
+        flat = action_to_board_index(q, r, offset_q, offset_r)
+        if flat < 0:
+            continue
+        gi, gj = divmod(flat, BOARD_SIZE)
+        if tensor[10, gi, gj] > 0.0:
+            winning.append((q, r))
+        if tensor[9, gi, gj] > 0.0:
+            forced.append((q, r))
+            cover.append((q, r))
+    return winning, forced, cover
+
+
 def _py_decode_compact_record(
     history_bytes: bytes,
     near_radius: int = 8,
@@ -349,6 +383,7 @@ class ReplayDataset(_IterableDataset):
         regret_temperature: float = 0.1,
         include_axis_delta_norm: bool = False,
         include_sparse_policy: bool = False,
+        include_pair_policy: bool = False,
         candidate_budget: int = 256,
         max_game_turns: int = 256,
     ):
@@ -357,6 +392,7 @@ class ReplayDataset(_IterableDataset):
         self.recency_decay = recency_decay
         self.pcr_weight = pcr_weight
         self.include_sparse_policy = bool(include_sparse_policy)
+        self.include_pair_policy = bool(include_pair_policy)
         self.candidate_budget = max(
             int(candidate_budget),
             int(getattr(buffer, "max_policy_v2_entries", int(candidate_budget))),
@@ -457,6 +493,15 @@ class ReplayDataset(_IterableDataset):
             aux_targets["candidate_mask"] = np.zeros((self.batch_size, budget), dtype=np.bool_)
             aux_targets["sparse_policy_target"] = np.zeros((self.batch_size, budget), dtype=np.float32)
             aux_targets["candidate_missing_mass"] = np.zeros(self.batch_size, dtype=np.float32)
+            if self.include_pair_policy:
+                aux_targets["pair_candidate_indices"] = np.full(
+                    (self.batch_size, budget, 2),
+                    -1,
+                    dtype=np.int64,
+                )
+                aux_targets["pair_candidate_mask"] = np.zeros((self.batch_size, budget), dtype=np.bool_)
+                aux_targets["pair_policy_target"] = np.zeros((self.batch_size, budget), dtype=np.float32)
+                aux_targets["pair_candidate_missing_mass"] = np.zeros(self.batch_size, dtype=np.float32)
         if self.include_axis_delta_norm:
             aux_targets["axis_delta_norm"] = np.zeros(
                 (self.batch_size, 6, BOARD_SIZE, BOARD_SIZE),
@@ -506,12 +551,21 @@ class ReplayDataset(_IterableDataset):
                     if legal_bytes
                     else np.empty((0, 2), dtype=np.int32)
                 )
+                winning_moves, forced_blocks, cover_cells = _critical_actions_from_tensor(
+                    tensor_i,
+                    legal,
+                    int(offset_q),
+                    int(offset_r),
+                )
                 cand = build_candidate_batch(
                     [(int(q), int(r)) for q, r in legal],
                     rec.policy_target_v2,
                     offset_q=int(offset_q),
                     offset_r=int(offset_r),
                     budget=self.candidate_budget,
+                    winning_moves=winning_moves,
+                    forced_block_moves=forced_blocks,
+                    cover_cells=cover_cells,
                 )
                 width = min(cand.qr.shape[0], aux_targets["candidate_qr"].shape[1])
                 aux_targets["candidate_qr"][i, :width] = cand.qr[:width]
@@ -520,6 +574,17 @@ class ReplayDataset(_IterableDataset):
                 aux_targets["candidate_mask"][i, :width] = cand.mask[:width]
                 aux_targets["sparse_policy_target"][i, :width] = cand.target[:width]
                 aux_targets["candidate_missing_mass"][i] = cand.missing_mass
+                if self.include_pair_policy:
+                    pair = build_pair_candidate_batch(
+                        [(int(q), int(r)) for q, r in cand.qr[:width]],
+                        rec.pair_policy_target_v2,
+                        budget=self.candidate_budget,
+                    )
+                    pair_width = min(pair.pair_indices.shape[0], aux_targets["pair_candidate_indices"].shape[1])
+                    aux_targets["pair_candidate_indices"][i, :pair_width] = pair.pair_indices[:pair_width]
+                    aux_targets["pair_candidate_mask"][i, :pair_width] = pair.mask[:pair_width]
+                    aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
+                    aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
             if self.include_axis_delta_norm:
                 axis_delta_norm = self._compute_axis_delta_norm(rec)
                 if self.use_symmetry:

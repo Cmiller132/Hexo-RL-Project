@@ -90,6 +90,7 @@ HEAD_BUNDLES: dict[str, list[str]] = {
         "moves_left",
         "regret_rank",
         "regret_value",
+        "pair_policy",
     ],
 }
 
@@ -788,6 +789,8 @@ class Phase3Supervisor:
             weights["regret_value"] = 0.1 * aux
         if cfg.model.sparse_policy:
             weights["sparse_policy"] = dynamic.sparse_policy_loss
+        if "pair_policy" in HEAD_BUNDLES[recipe.head_bundle]:
+            weights["pair_policy"] = dynamic.pair_policy_loss
         cfg.train.loss_weights = weights
 
     def _apply_dynamic_to_config(self, trial: TrialState) -> None:
@@ -1176,10 +1179,17 @@ class Phase3Supervisor:
             recall = float(buffer.get("avg_candidate_recall_mcts_top8", 1.0) or 0.0)
             if record.get("buffer", {}).get("size", 0) > 0 and recall < self.args.candidate_recall_gate:
                 return f"candidate_recall_below_gate:{recall:.4f}"
+            decisive = min(
+                float(buffer.get("avg_candidate_recall_winning_move", 1.0) or 0.0),
+                float(buffer.get("avg_candidate_recall_forced_block", 1.0) or 0.0),
+                float(buffer.get("avg_candidate_recall_two_placement_cover", 1.0) or 0.0),
+            )
+            if record.get("buffer", {}).get("size", 0) > 0 and decisive < 0.995:
+                return f"decisive_candidate_recall_below_gate:{decisive:.4f}"
         elapsed = float(record.get("epoch_elapsed_s", 0.0) or 0.0)
         ref = max(float(self.args.target_epoch_seconds), 1.0)
         last_score = trial.last_score
-        stage = str(record.get("stage") or trial.stage)
+        stage = str(record.get("stage") or getattr(trial, "stage", ""))
         if stage in {"3B_static_asha", "3C_pbt"} and elapsed > 1.20 * ref:
             return f"epoch_time_above_budget:{elapsed:.1f}s_vs_{ref:.1f}s"
         if elapsed > 2.5 * ref and (not math.isfinite(last_score) or last_score < 0.0):
@@ -1558,15 +1568,22 @@ class EvaluationServices:
         top1 = float(buffer.get("avg_candidate_recall_mcts_top1", 0.0) or 0.0)
         top4 = float(buffer.get("avg_candidate_recall_mcts_top4", 0.0) or 0.0)
         top8 = float(buffer.get("avg_candidate_recall_mcts_top8", 0.0) or 0.0)
+        winning = float(buffer.get("avg_candidate_recall_winning_move", 1.0) or 0.0)
+        forced = float(buffer.get("avg_candidate_recall_forced_block", 1.0) or 0.0)
+        cover = float(buffer.get("avg_candidate_recall_two_placement_cover", 1.0) or 0.0)
         missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
+        decisive = min(winning, forced, cover)
         return {
             "applicable": True,
             "candidate_recall_mcts_top1": top1,
             "candidate_recall_mcts_top4": top4,
             "candidate_recall_mcts_top8": top8,
+            "candidate_recall_winning_move": winning,
+            "candidate_recall_forced_block": forced,
+            "candidate_recall_two_placement_cover": cover,
             "missing_target_policy_mass": missing,
-            "gate_pass": top8 >= self.s.args.candidate_recall_gate and missing <= 0.01,
-            "score": max(0.0, min(1.0, top8 - missing)),
+            "gate_pass": top8 >= self.s.args.candidate_recall_gate and decisive >= 0.995 and missing <= 0.01,
+            "score": max(0.0, min(1.0, min(top8, decisive) - missing)),
         }
 
     def tactical_suite(

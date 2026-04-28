@@ -19,7 +19,8 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 2
+COMPACT_VERSION_V2 = 3
+COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
 
@@ -64,9 +65,12 @@ class PositionRecord:
     pair_policy_target_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = field(default_factory=list)
     target_policy_mass_outside_window: float = 0.0
     missing_target_policy_mass: float = 0.0
-    candidate_recall_mcts_top1: float = 0.0
-    candidate_recall_mcts_top4: float = 0.0
-    candidate_recall_mcts_top8: float = 0.0
+    candidate_recall_mcts_top1: float = 1.0
+    candidate_recall_mcts_top4: float = 1.0
+    candidate_recall_mcts_top8: float = 1.0
+    candidate_recall_winning_move: float = 1.0
+    candidate_recall_forced_block: float = 1.0
+    candidate_recall_two_placement_cover: float = 1.0
     regret_rank: float = 0.0
     regret_value: float = 0.0
     axis_label: int = -1
@@ -179,13 +183,22 @@ class GameRecord:
             parts.extend(struct.pack("<H", len(opp_v2_entries)))
             for q, r, prob in opp_v2_entries:
                 parts.extend(struct.pack("<iif", int(q), int(r), float(prob)))
+            pair_v2_entries = list(pos.pair_policy_target_v2)
+            parts.extend(struct.pack("<H", len(pair_v2_entries)))
+            for first, second, prob in pair_v2_entries:
+                q1, r1 = first
+                q2, r2 = second
+                parts.extend(struct.pack("<iiiif", int(q1), int(r1), int(q2), int(r2), float(prob)))
             parts.extend(struct.pack(
-                "<fffff",
+                "<ffffffff",
                 float(pos.target_policy_mass_outside_window),
                 float(pos.missing_target_policy_mass),
                 float(pos.candidate_recall_mcts_top1),
                 float(pos.candidate_recall_mcts_top4),
                 float(pos.candidate_recall_mcts_top8),
+                float(pos.candidate_recall_winning_move),
+                float(pos.candidate_recall_forced_block),
+                float(pos.candidate_recall_two_placement_cover),
             ))
             parts.extend(struct.pack(
                 "<ffhf",
@@ -207,7 +220,7 @@ class GameRecord:
             offset += 4
             version, game_id, outcome, num_pos = struct.unpack_from("<HIfI", data, offset)
             offset += struct.calcsize("<HIfI")
-            if version != COMPACT_VERSION_V2:
+            if not (COMPACT_VERSION_MIN <= version <= COMPACT_VERSION_V2):
                 raise ValueError(f"Unsupported compact GameRecord version {version}")
         else:
             game_id = struct.unpack_from("<I", data, offset)[0]
@@ -252,10 +265,15 @@ class GameRecord:
             opp_policy = {}
             policy_v2: PolicyTargetV2 = []
             opp_policy_v2: PolicyTargetV2 = []
+            pair_policy_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
             target_policy_mass_outside_window = 0.0
             missing_target_policy_mass = 0.0
-            candidate_recall_mcts_top1 = 0.0
-            candidate_recall_mcts_top8 = 0.0
+            candidate_recall_mcts_top1 = 1.0
+            candidate_recall_mcts_top4 = 1.0
+            candidate_recall_mcts_top8 = 1.0
+            candidate_recall_winning_move = 1.0
+            candidate_recall_forced_block = 1.0
+            candidate_recall_two_placement_cover = 1.0
             regret_rank = 0.0
             regret_value = 0.0
             axis_label = -1
@@ -282,14 +300,33 @@ class GameRecord:
                         q, r, prob = struct.unpack_from("<iif", data, offset)
                         offset += struct.calcsize("<iif")
                         opp_policy_v2.append((int(q), int(r), float(prob)))
-                    (
-                        target_policy_mass_outside_window,
-                        missing_target_policy_mass,
-                        candidate_recall_mcts_top1,
-                        candidate_recall_mcts_top4,
-                        candidate_recall_mcts_top8,
-                    ) = struct.unpack_from("<fffff", data, offset)
-                    offset += struct.calcsize("<fffff")
+                    if version >= 3:
+                        num_pair_v2_entries = struct.unpack_from("<H", data, offset)[0]
+                        offset += 2
+                        for _ in range(num_pair_v2_entries):
+                            q1, r1, q2, r2, prob = struct.unpack_from("<iiiif", data, offset)
+                            offset += struct.calcsize("<iiiif")
+                            pair_policy_v2.append(((int(q1), int(r1)), (int(q2), int(r2)), float(prob)))
+                        (
+                            target_policy_mass_outside_window,
+                            missing_target_policy_mass,
+                            candidate_recall_mcts_top1,
+                            candidate_recall_mcts_top4,
+                            candidate_recall_mcts_top8,
+                            candidate_recall_winning_move,
+                            candidate_recall_forced_block,
+                            candidate_recall_two_placement_cover,
+                        ) = struct.unpack_from("<ffffffff", data, offset)
+                        offset += struct.calcsize("<ffffffff")
+                    else:
+                        (
+                            target_policy_mass_outside_window,
+                            missing_target_policy_mass,
+                            candidate_recall_mcts_top1,
+                            candidate_recall_mcts_top4,
+                            candidate_recall_mcts_top8,
+                        ) = struct.unpack_from("<fffff", data, offset)
+                        offset += struct.calcsize("<fffff")
                 regret_rank, regret_value, axis_label, moves_left = struct.unpack_from(
                     "<ffhf", data, offset
                 )
@@ -307,11 +344,15 @@ class GameRecord:
                 opp_policy_target=opp_policy,
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
+                pair_policy_target_v2=pair_policy_v2,
                 target_policy_mass_outside_window=target_policy_mass_outside_window,
                 missing_target_policy_mass=missing_target_policy_mass,
                 candidate_recall_mcts_top1=candidate_recall_mcts_top1,
                 candidate_recall_mcts_top4=candidate_recall_mcts_top4,
                 candidate_recall_mcts_top8=candidate_recall_mcts_top8,
+                candidate_recall_winning_move=candidate_recall_winning_move,
+                candidate_recall_forced_block=candidate_recall_forced_block,
+                candidate_recall_two_placement_cover=candidate_recall_two_placement_cover,
                 regret_rank=regret_rank,
                 regret_value=regret_value,
                 axis_label=axis_label,
@@ -336,6 +377,7 @@ class GameRecord:
         game_id: int,
         is_full_search: bool = True,
         policy_targets_v2: Optional[List[PolicyTargetV2]] = None,
+        pair_policy_targets_v2: Optional[List[List[Tuple[Tuple[int, int], Tuple[int, int], float]]]] = None,
     ) -> "GameRecord":
         """Construct a GameRecord from raw game data.
 
@@ -361,6 +403,7 @@ class GameRecord:
             pos_histories = move_history_bytes
 
         policy_targets_v2 = policy_targets_v2 or [[] for _ in policy_targets]
+        pair_policy_targets_v2 = pair_policy_targets_v2 or [[] for _ in policy_targets]
 
         for i, (history, policy, rv, player) in enumerate(
             zip(pos_histories, policy_targets, root_values, players)
@@ -369,6 +412,7 @@ class GameRecord:
                 move_history=history,
                 policy_target=policy,
                 policy_target_v2=policy_targets_v2[i] if i < len(policy_targets_v2) else [],
+                pair_policy_target_v2=pair_policy_targets_v2[i] if i < len(pair_policy_targets_v2) else [],
                 root_value=rv,
                 player=player,
                 outcome=outcome,
@@ -448,6 +492,36 @@ def policy_v2_from_visits(
         p = 1.0 / len(entries)
         return [(q, r, p) for q, r, _ in entries]
     return [(q, r, v / total) for q, r, v in entries]
+
+
+def pair_policy_v2_from_place_target(
+    policy_v2: PolicyTargetV2,
+    *,
+    top_k: int = 32,
+) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
+    """Build an ordered full-turn pair target from place-action probabilities.
+
+    MCTS still branches on placements, so this is an auxiliary target: it gives
+    graph models a supervised signal for which two action identities belong
+    together in one turn without forcing pair macro expansion.
+    """
+    entries = [(int(q), int(r), float(prob)) for q, r, prob in policy_v2 if prob > 0.0]
+    entries.sort(key=lambda item: (-item[2], item[0], item[1]))
+    if len(entries) < 2:
+        return []
+    pairs: list[tuple[tuple[int, int], tuple[int, int], float]] = []
+    limit = min(len(entries), max(2, int(top_k)))
+    for i in range(limit):
+        q1, r1, p1 = entries[i]
+        for j in range(i + 1, limit):
+            q2, r2, p2 = entries[j]
+            pairs.append(((q1, r1), (q2, r2), p1 * p2))
+    pairs.sort(key=lambda item: (-item[2], item[0], item[1]))
+    pairs = pairs[: max(1, int(top_k))]
+    total = sum(prob for _a, _b, prob in pairs)
+    if total <= 0.0:
+        return []
+    return [(a, b, float(prob / total)) for a, b, prob in pairs]
 
 
 def dense_policy_from_v2(

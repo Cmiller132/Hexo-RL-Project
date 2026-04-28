@@ -222,6 +222,8 @@ class Trainer:
                 candidate_features=targets.get("candidate_features"),
                 candidate_indices=targets.get("candidate_indices"),
                 candidate_mask=targets.get("candidate_mask"),
+                pair_candidate_indices=targets.get("pair_candidate_indices"),
+                pair_candidate_mask=targets.get("pair_candidate_mask"),
             )
             total_loss, per_head = compute_losses(
                 predictions, targets,
@@ -298,6 +300,24 @@ class Trainer:
                     if "candidate_missing_mass" in targets:
                         result["candidate_missing_mass"] = float(
                             targets["candidate_missing_mass"].float().mean().detach().cpu()
+                        )
+        if "pair_policy" in predictions and "pair_policy_target" in targets:
+            with torch.no_grad():
+                mask = targets.get("pair_candidate_mask")
+                pair_target = targets["pair_policy_target"]
+                pair_logits = predictions["pair_policy"]
+                if mask is not None and torch.any(mask):
+                    masked_logits = pair_logits.masked_fill(~mask.to(dtype=torch.bool), -80.0)
+                    pred_top = masked_logits.argmax(dim=-1)
+                    target_top = pair_target.argmax(dim=-1)
+                    valid = mask.any(dim=-1) & (pair_target.sum(dim=-1) > 0)
+                    if torch.any(valid):
+                        result["pair_policy_top1_acc"] = float(
+                            (pred_top[valid] == target_top[valid]).float().mean().detach().cpu()
+                        )
+                    if "pair_candidate_missing_mass" in targets:
+                        result["pair_candidate_missing_mass"] = float(
+                            targets["pair_candidate_missing_mass"].float().mean().detach().cpu()
                         )
 
         return result

@@ -178,6 +178,41 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
     assert out["sparse_policy"].shape == (2, 3)
 
 
+def test_pair_policy_head_forward_and_default_weight():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 16,
+                "blocks": 2,
+                "heads": ["policy", "value", "pair_policy"],
+                "candidate_budget": 8,
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    assert cfg.model.sparse_policy is True
+    assert cfg.train.loss_weights["pair_policy"] == pytest.approx(0.05)
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    x = torch.zeros(2, 13, 33, 33)
+    candidate_indices = torch.tensor([[544, 545, -1], [544, 545, 546]], dtype=torch.long)
+    candidate_features = torch.zeros(2, 3, 12)
+    candidate_mask = candidate_indices >= 0
+    pair_candidate_indices = torch.tensor([[[0, 1], [-1, -1]], [[0, 1], [1, 2]]], dtype=torch.long)
+    pair_candidate_mask = pair_candidate_indices[..., 0] >= 0
+
+    out = model(
+        x,
+        candidate_indices=candidate_indices,
+        candidate_features=candidate_features,
+        candidate_mask=candidate_mask,
+        pair_candidate_indices=pair_candidate_indices,
+        pair_candidate_mask=pair_candidate_mask,
+    )
+
+    assert out["pair_policy"].shape == (2, 2)
+    assert torch.isfinite(out["pair_policy"][pair_candidate_mask]).all()
+
+
 def test_restnet_config_rejects_invalid_attention_position():
     with pytest.raises(ValueError, match="attention_positions"):
         Config.model_validate(

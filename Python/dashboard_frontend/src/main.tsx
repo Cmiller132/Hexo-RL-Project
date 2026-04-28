@@ -12,13 +12,15 @@ import {
   Play,
   RefreshCw,
   Swords,
-  Target
+  Target,
+  Trophy
 } from "lucide-react";
 import "./styles.css";
 
 type AnyRow = Record<string, any>;
 
 const tabs = [
+  { id: "suite", label: "Suite", icon: Trophy },
   { id: "charts", label: "Charts", icon: BarChart3 },
   { id: "games", label: "Games", icon: FileSearch },
   { id: "replay", label: "Replay", icon: Eye },
@@ -38,7 +40,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function App() {
-  const [active, setActive] = useState("charts");
+  const [active, setActive] = useState("suite");
   const [health, setHealth] = useState<AnyRow | null>(null);
   const [runs, setRuns] = useState<AnyRow[]>([]);
   const [selectedRun, setSelectedRun] = useState<string>("");
@@ -52,22 +54,37 @@ function App() {
   const [arena, setArena] = useState<AnyRow[]>([]);
   const [axis, setAxis] = useState<AnyRow[]>([]);
   const [axisResults, setAxisResults] = useState<AnyRow[]>([]);
+  const [suiteStatus, setSuiteStatus] = useState<AnyRow | null>(null);
+  const [suiteTrials, setSuiteTrials] = useState<AnyRow[]>([]);
+  const [bestCheckpoints, setBestCheckpoints] = useState<AnyRow[]>([]);
+  const [suiteEvents, setSuiteEvents] = useState<AnyRow[]>([]);
+  const [suiteGames, setSuiteGames] = useState<AnyRow[]>([]);
   const [error, setError] = useState<string>("");
   const [refreshNonce, setRefreshNonce] = useState(0);
 
   const load = async () => {
     try {
       setError("");
-      const [h, r, a, p] = await Promise.all([
+      const [h, r, a, p, s, t, b, e, sg] = await Promise.all([
         api<AnyRow>("/api/health"),
         api<AnyRow[]>("/api/runs"),
         api<AnyRow[]>("/api/arena/history"),
-        api<AnyRow[]>("/api/axis/prototypes")
+        api<AnyRow[]>("/api/axis/prototypes"),
+        api<AnyRow>("/api/suite/status"),
+        api<AnyRow[]>("/api/suite/trials"),
+        api<AnyRow[]>("/api/suite/best-checkpoints"),
+        api<AnyRow[]>("/api/suite/events"),
+        api<AnyRow[]>("/api/games?limit=32")
       ]);
       setHealth(h);
       setRuns(r);
       setArena(a);
       setAxis(p);
+      setSuiteStatus(s);
+      setSuiteTrials(t);
+      setBestCheckpoints(b);
+      setSuiteEvents(e);
+      setSuiteGames(sg);
       if (!selectedRun && r.length) setSelectedRun(r[0].run_id);
     } catch (e: any) {
       setError(e.message);
@@ -105,22 +122,25 @@ function App() {
 
   useEffect(() => {
     if (!selectedGame) return;
-    api<AnyRow>(`/api/games/${selectedGame}/replay`)
+    const gameRun = games.find((game) => game.game_id === selectedGame)?.run_id || selectedRun;
+    const query = gameRun ? `?run_id=${encodeURIComponent(gameRun)}` : "";
+    api<AnyRow>(`/api/games/${selectedGame}/replay${query}`)
       .then((data) => {
         setReplay(data);
-        return api<AnyRow>(`/api/games/${selectedGame}/position/0`);
+        return api<AnyRow>(`/api/games/${selectedGame}/position/0${query}`);
       })
       .then(setPosition)
       .catch((e) => setError(e.message));
-  }, [selectedGame]);
+  }, [selectedGame, selectedRun, games]);
 
   const latestMetric = metrics[metrics.length - 1]?.metrics_json || {};
+  const selectedGameRun = games.find((game) => game.game_id === selectedGame)?.run_id || selectedRun;
   const kpis = [
     ["Runs", runs.length],
     ["Games", games.length],
     ["Checkpoints", checkpoints.length],
+    ["Suite Games", suiteStatus?.total_games ?? "-"],
     ["Epoch", latestMetric.train?.epoch ?? latestMetric.epoch ?? "-"],
-    ["Buffer", latestMetric.buffer?.size ?? "-"],
     ["Loss", fmt(latestMetric.train?.loss_total ?? latestMetric.loss_total)]
   ];
 
@@ -169,6 +189,28 @@ function App() {
         })}
       </nav>
 
+      {active === "suite" && (
+        <SuitePanel
+          status={suiteStatus}
+          trials={suiteTrials}
+          bestCheckpoints={bestCheckpoints}
+          events={suiteEvents}
+          games={suiteGames}
+          openTrial={(id) => {
+            setSelectedRun(id);
+            setActive("charts");
+          }}
+          openCheckpointTrial={(id) => {
+            setSelectedRun(id);
+            setActive("checkpoints");
+          }}
+          openGame={(row) => {
+            setSelectedRun(row.run_id);
+            setSelectedGame(row.game_id);
+            setActive("replay");
+          }}
+        />
+      )}
       {active === "charts" && <Charts metrics={metrics} />}
       {active === "games" && (
         <Games
@@ -181,7 +223,13 @@ function App() {
         />
       )}
       {active === "replay" && (
-        <Replay replay={replay} position={position} setPosition={setPosition} selectedGame={selectedGame} />
+        <Replay
+          replay={replay}
+          position={position}
+          setPosition={setPosition}
+          selectedGame={selectedGame}
+          runId={selectedGameRun}
+        />
       )}
       {active === "play" && <PlayPanel session={session} setSession={setSession} />}
       {active === "arena" && <ArenaPanel arena={arena} reload={reload} />}
@@ -216,6 +264,110 @@ function Charts({ metrics }: { metrics: AnyRow[] }) {
   );
 }
 
+function SuitePanel({
+  status,
+  trials,
+  bestCheckpoints,
+  events,
+  games,
+  openTrial,
+  openCheckpointTrial,
+  openGame
+}: {
+  status: AnyRow | null;
+  trials: AnyRow[];
+  bestCheckpoints: AnyRow[];
+  events: AnyRow[];
+  games: AnyRow[];
+  openTrial: (id: string) => void;
+  openCheckpointTrial: (id: string) => void;
+  openGame: (row: AnyRow) => void;
+}) {
+  const lastEvent = status?.last_event || {};
+  const activeTrials = trials.filter((trial) => !trial.pruned);
+  const recentEvents = events.slice(-16).reverse();
+  return (
+    <section className="suiteGrid">
+      <Panel title="Autotune Suite">
+        <div className="suiteHero">
+          <div>
+            <span>Stage</span>
+            <strong>{status?.latest_stage || lastEvent.stage || "-"}</strong>
+          </div>
+          <div>
+            <span>Best Trial</span>
+            <strong>{status?.best_trial_id || "-"}</strong>
+          </div>
+          <div>
+            <span>Best Score</span>
+            <strong>{fmt(status?.best_score)}</strong>
+          </div>
+          <div>
+            <span>Saved Games</span>
+            <strong>{formatCount(status?.total_games)}</strong>
+          </div>
+          <div>
+            <span>Saved Positions</span>
+            <strong>{formatCount(status?.total_positions)}</strong>
+          </div>
+          <div>
+            <span>Live Trials</span>
+            <strong>{activeTrials.length}/{status?.trial_count ?? trials.length}</strong>
+          </div>
+        </div>
+        <div className="suitePath">{status?.run_root || "No suite run root configured"}</div>
+      </Panel>
+
+      <Panel title="Best Models">
+        <Table
+          rows={bestCheckpoints}
+          columns={["rank", "trial_id", "score", "epoch", "global_step", "is_loadable", "path"]}
+          onRow={(row) => row.trial_id && openCheckpointTrial(row.trial_id)}
+        />
+      </Panel>
+
+      <Panel title="Trials">
+        <Table
+          rows={trials}
+          columns={[
+            "trial_id",
+            "family",
+            "stage",
+            "epoch",
+            "score",
+            "pruned",
+            "prune_reason",
+            "games",
+            "positions",
+            "checkpoints",
+            "selfplay_positions_per_min",
+            "epoch_elapsed_s",
+            "loss_total",
+            "policy_top1_acc",
+            "sparse_policy_top1_acc"
+          ]}
+          onRow={(row) => row.trial_id && openTrial(row.trial_id)}
+        />
+      </Panel>
+
+      <Panel title="Recent Saved Games">
+        <Table
+          rows={games}
+          columns={["game_id", "trial_id", "source", "epoch", "move_count", "terminal_reason", "truncated", "created_at"]}
+          onRow={openGame}
+        />
+      </Panel>
+
+      <Panel title="Recent Suite Events">
+        <Table
+          rows={recentEvents}
+          columns={["event", "stage", "trial_id", "reason", "score", "elapsed_s", "time"]}
+        />
+      </Panel>
+    </section>
+  );
+}
+
 function Games({ games, selectedGame, openReplay }: {
   games: AnyRow[];
   selectedGame: number | null;
@@ -225,7 +377,7 @@ function Games({ games, selectedGame, openReplay }: {
     <Panel title="Game Browser">
       <Table
         rows={games}
-        columns={["game_id", "run_id", "source", "epoch", "outcome", "move_count"]}
+        columns={["game_id", "trial_id", "source", "epoch", "move_count", "terminal_reason", "truncated", "outcome", "created_at"]}
         onRow={(row) => openReplay(row.game_id)}
         selected={(row) => row.game_id === selectedGame}
       />
@@ -233,11 +385,12 @@ function Games({ games, selectedGame, openReplay }: {
   );
 }
 
-function Replay({ replay, position, setPosition, selectedGame }: {
+function Replay({ replay, position, setPosition, selectedGame, runId }: {
   replay: AnyRow | null;
   position: AnyRow | null;
   setPosition: (p: AnyRow) => void;
   selectedGame: number | null;
+  runId: string;
 }) {
   const moves = replay?.moves || [];
   const [turn, setTurn] = useState(0);
@@ -246,7 +399,8 @@ function Replay({ replay, position, setPosition, selectedGame }: {
     if (!selectedGame) return;
     const nextTurn = clamp(Math.round(turn), 0, moves.length);
     setTurn(nextTurn);
-    api<AnyRow>(`/api/games/${selectedGame}/position/${nextTurn}`).then(setPosition);
+    const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+    api<AnyRow>(`/api/games/${selectedGame}/position/${nextTurn}${query}`).then(setPosition);
   };
   useEffect(() => {
     setAutoplay(false);
@@ -265,14 +419,15 @@ function Replay({ replay, position, setPosition, selectedGame }: {
           setAutoplay(false);
           return current;
         }
-        api<AnyRow>(`/api/games/${selectedGame}/position/${next}`)
+        const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+        api<AnyRow>(`/api/games/${selectedGame}/position/${next}${query}`)
           .then(setPosition)
           .catch(() => setAutoplay(false));
         return next;
       });
     }, 650);
     return () => window.clearInterval(handle);
-  }, [autoplay, selectedGame, moves.length, setPosition]);
+  }, [autoplay, selectedGame, moves.length, setPosition, runId]);
   return (
     <section className="grid replay">
       <Panel title="Board">
@@ -363,7 +518,7 @@ function CheckpointPanel({ checkpoints, reload, selectedRun }: { checkpoints: An
         <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="/path/to/checkpoints" />
         <button onClick={index}><Database size={15} /> Index</button>
       </div>
-      <Table rows={checkpoints} columns={["checkpoint_id", "run_id", "epoch", "global_step", "is_loadable", "path"]} />
+      <Table rows={checkpoints} columns={["checkpoint_id", "trial_id", "run_id", "score", "epoch", "global_step", "is_loadable", "path"]} />
     </Panel>
   );
 }
@@ -1243,6 +1398,12 @@ function cell(value: any) {
 
 function fmt(value: any) {
   return typeof value === "number" ? value.toFixed(4) : value ?? "-";
+}
+
+function formatCount(value: any) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return new Intl.NumberFormat().format(number);
 }
 
 createRoot(document.getElementById("root")!).render(

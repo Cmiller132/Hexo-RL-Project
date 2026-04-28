@@ -23,6 +23,7 @@ from hexorl.selfplay.records import (
     BOARD_SIZE,
     action_to_board_index,
     dense_policy_from_v2,
+    pair_policy_v2_from_place_target,
     policy_v2_from_visits,
     sparsify_policy,
 )
@@ -161,13 +162,18 @@ def test_policy_target_v2_preserves_outside_window_mass():
 
 
 def test_compact_record_v2_roundtrip_preserves_global_targets():
+    pair_target = [((0, 0), (-40, 10), 1.0)]
     rec = PositionRecord(
         move_history=_move(0, 0, 0),
         policy_target={action_to_board_index(0, 0): 1.0},
         policy_target_v2=[(0, 0, 0.4), (-40, 10, 0.6)],
+        pair_policy_target_v2=pair_target,
         target_policy_mass_outside_window=0.6,
         missing_target_policy_mass=0.0,
         candidate_recall_mcts_top4=0.5,
+        candidate_recall_winning_move=1.0,
+        candidate_recall_forced_block=0.75,
+        candidate_recall_two_placement_cover=0.5,
         root_value=0.25,
         player=1,
         outcome=-1.0,
@@ -182,8 +188,12 @@ def test_compact_record_v2_roundtrip_preserves_global_targets():
     assert [prob for _q, _r, prob in out.positions[0].policy_target_v2] == pytest.approx([0.4, 0.6])
     assert [(q, r) for q, r, _ in out.positions[0].opp_policy_target_v2] == [(1, 0)]
     assert [prob for _q, _r, prob in out.positions[0].opp_policy_target_v2] == pytest.approx([1.0])
+    assert out.positions[0].pair_policy_target_v2 == pair_target
     assert out.positions[0].target_policy_mass_outside_window == pytest.approx(0.6)
     assert out.positions[0].candidate_recall_mcts_top4 == pytest.approx(0.5)
+    assert out.positions[0].candidate_recall_winning_move == pytest.approx(1.0)
+    assert out.positions[0].candidate_recall_forced_block == pytest.approx(0.75)
+    assert out.positions[0].candidate_recall_two_placement_cover == pytest.approx(0.5)
 
 
 def test_ring_buffer_preserves_policy_target_v2():
@@ -191,7 +201,9 @@ def test_ring_buffer_preserves_policy_target_v2():
         move_history=b"",
         policy_target={action_to_board_index(0, 0): 1.0},
         policy_target_v2=[(0, 0, 0.5), (30, -12, 0.5)],
+        pair_policy_target_v2=[((0, 0), (30, -12), 1.0)],
         target_policy_mass_outside_window=0.5,
+        candidate_recall_winning_move=1.0,
         root_value=0.0,
         player=0,
         outcome=1.0,
@@ -202,7 +214,9 @@ def test_ring_buffer_preserves_policy_target_v2():
     out = buffer[0]
     assert out is not None
     assert out.policy_target_v2 == rec.policy_target_v2
+    assert out.pair_policy_target_v2 == rec.pair_policy_target_v2
     assert out.target_policy_mass_outside_window == pytest.approx(0.5)
+    assert out.candidate_recall_winning_move == pytest.approx(1.0)
 
 
 def test_dense_projection_uses_all_v2_visits_before_topk():
@@ -263,6 +277,35 @@ def test_sparse_sampler_outputs_candidate_targets():
     assert aux["sparse_policy_target"][0].sum() == pytest.approx(1.0)
 
 
+def test_replay_dataset_can_emit_pair_policy_target():
+    policy_v2 = [(0, 0, 0.75), (1, 0, 0.25)]
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=policy_v2,
+        pair_policy_target_v2=pair_policy_v2_from_place_target(policy_v2, top_k=4),
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=True,
+        include_sparse_policy=True,
+        include_pair_policy=True,
+        candidate_budget=4,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["pair_candidate_indices"].shape == (1, 8, 2)
+    assert aux["pair_candidate_mask"][0].any()
+    assert aux["pair_policy_target"][0].sum() == pytest.approx(1.0)
+
+
 def test_candidate_builder_accepts_list_legal_moves():
     from hexorl.action_contract.candidates import build_candidate_batch
 
@@ -276,6 +319,27 @@ def test_candidate_builder_accepts_list_legal_moves():
 
     assert cand.mask.sum() == 2
     assert cand.target.sum() == pytest.approx(1.0)
+
+
+def test_candidate_builder_keeps_critical_actions_past_budget():
+    from hexorl.action_contract.candidates import build_candidate_batch
+
+    cand = build_candidate_batch(
+        [(0, 0), (1, 0), (2, 0), (3, 0)],
+        [(0, 0, 1.0)],
+        offset_q=-16,
+        offset_r=-16,
+        budget=1,
+        winning_moves=[(3, 0)],
+        forced_block_moves=[(2, 0)],
+        cover_cells=[(1, 0)],
+    )
+
+    represented = {tuple(qr) for qr in cand.qr[cand.mask]}
+    assert {(0, 0), (1, 0), (2, 0), (3, 0)} <= represented
+    assert cand.recall_winning_move == pytest.approx(1.0)
+    assert cand.recall_forced_block == pytest.approx(1.0)
+    assert cand.recall_two_placement_cover == pytest.approx(1.0)
 
 
 def test_sparse_policy_loss_masks_invalid_candidates():

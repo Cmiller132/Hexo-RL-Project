@@ -53,11 +53,20 @@ class RingBuffer:
         self._opp_policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._opp_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
         self._opp_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._pair_policy_v2_q1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._pair_policy_v2_r1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._pair_policy_v2_q2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._pair_policy_v2_r2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._pair_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+        self._pair_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
         self._outside_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._missing_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_top1 = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_top4 = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_top8 = np.zeros(capacity, dtype=np.float32)
+        self._candidate_recall_winning = np.zeros(capacity, dtype=np.float32)
+        self._candidate_recall_forced_block = np.zeros(capacity, dtype=np.float32)
+        self._candidate_recall_cover = np.zeros(capacity, dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
         self._value_weights = np.ones(capacity, dtype=np.float32)
         self._regret_rank = np.zeros(capacity, dtype=np.float32)
@@ -285,6 +294,16 @@ class RingBuffer:
                         int(self._opp_policy_v2_r[idx, j]),
                         prob,
                     ))
+            pair_policy_v2 = []
+            n_pair_v2 = int(self._pair_policy_v2_counts[idx])
+            for j in range(n_pair_v2):
+                prob = float(self._pair_policy_v2_probs[idx, j])
+                if prob > 0:
+                    pair_policy_v2.append((
+                        (int(self._pair_policy_v2_q1[idx, j]), int(self._pair_policy_v2_r1[idx, j])),
+                        (int(self._pair_policy_v2_q2[idx, j]), int(self._pair_policy_v2_r2[idx, j])),
+                        prob,
+                    ))
 
             return PositionRecord(
                 move_history=self._histories[idx],
@@ -298,11 +317,15 @@ class RingBuffer:
                 opp_policy_target=opp_policy,
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
+                pair_policy_target_v2=pair_policy_v2,
                 target_policy_mass_outside_window=float(self._outside_policy_mass[idx]),
                 missing_target_policy_mass=float(self._missing_policy_mass[idx]),
                 candidate_recall_mcts_top1=float(self._candidate_recall_top1[idx]),
                 candidate_recall_mcts_top4=float(self._candidate_recall_top4[idx]),
                 candidate_recall_mcts_top8=float(self._candidate_recall_top8[idx]),
+                candidate_recall_winning_move=float(self._candidate_recall_winning[idx]),
+                candidate_recall_forced_block=float(self._candidate_recall_forced_block[idx]),
+                candidate_recall_two_placement_cover=float(self._candidate_recall_cover[idx]),
                 regret_rank=float(self._regret_rank[idx]),
                 regret_value=float(self._regret_value[idx]),
                 axis_label=int(self._axis[idx]),
@@ -368,6 +391,21 @@ class RingBuffer:
                         [(self._tail + i) % self.capacity for i in range(self._size)]
                     ].mean()
                 ) if self._size > 0 else 0.0,
+                "avg_candidate_recall_winning_move": float(
+                    self._candidate_recall_winning[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "avg_candidate_recall_forced_block": float(
+                    self._candidate_recall_forced_block[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "avg_candidate_recall_two_placement_cover": float(
+                    self._candidate_recall_cover[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
             }
 
     def clear(self):
@@ -385,11 +423,20 @@ class RingBuffer:
             self._opp_policy_v2_r.fill(0)
             self._opp_policy_v2_probs.fill(0.0)
             self._opp_policy_v2_counts.fill(0)
+            self._pair_policy_v2_q1.fill(0)
+            self._pair_policy_v2_r1.fill(0)
+            self._pair_policy_v2_q2.fill(0)
+            self._pair_policy_v2_r2.fill(0)
+            self._pair_policy_v2_probs.fill(0.0)
+            self._pair_policy_v2_counts.fill(0)
             self._outside_policy_mass.fill(0.0)
             self._missing_policy_mass.fill(0.0)
             self._candidate_recall_top1.fill(0.0)
             self._candidate_recall_top4.fill(0.0)
             self._candidate_recall_top8.fill(0.0)
+            self._candidate_recall_winning.fill(0.0)
+            self._candidate_recall_forced_block.fill(0.0)
+            self._candidate_recall_cover.fill(0.0)
             self._values.fill(0.0)
             self._value_weights.fill(1.0)
             self._regret_rank.fill(0.0)
@@ -449,9 +496,29 @@ class RingBuffer:
             self._opp_policy_v2_r[idx, j] = int(r)
             self._opp_policy_v2_probs[idx, j] = float(prob)
 
+        pair_entries = list(record.pair_policy_target_v2)
+        n_pair = min(len(pair_entries), self.max_policy_v2_entries)
+        self._pair_policy_v2_counts[idx] = n_pair
+        self._pair_policy_v2_q1[idx].fill(0)
+        self._pair_policy_v2_r1[idx].fill(0)
+        self._pair_policy_v2_q2[idx].fill(0)
+        self._pair_policy_v2_r2[idx].fill(0)
+        self._pair_policy_v2_probs[idx].fill(0.0)
+        for j, (first, second, prob) in enumerate(pair_entries[:n_pair]):
+            q1, r1 = first
+            q2, r2 = second
+            self._pair_policy_v2_q1[idx, j] = int(q1)
+            self._pair_policy_v2_r1[idx, j] = int(r1)
+            self._pair_policy_v2_q2[idx, j] = int(q2)
+            self._pair_policy_v2_r2[idx, j] = int(r2)
+            self._pair_policy_v2_probs[idx, j] = float(prob)
+
         dropped_mass = sum(float(prob) for _q, _r, prob in entries[n:])
         self._outside_policy_mass[idx] = float(record.target_policy_mass_outside_window)
         self._missing_policy_mass[idx] = float(record.missing_target_policy_mass) + float(dropped_mass)
         self._candidate_recall_top1[idx] = float(record.candidate_recall_mcts_top1)
         self._candidate_recall_top4[idx] = float(record.candidate_recall_mcts_top4)
         self._candidate_recall_top8[idx] = float(record.candidate_recall_mcts_top8)
+        self._candidate_recall_winning[idx] = float(record.candidate_recall_winning_move)
+        self._candidate_recall_forced_block[idx] = float(record.candidate_recall_forced_block)
+        self._candidate_recall_cover[idx] = float(record.candidate_recall_two_placement_cover)

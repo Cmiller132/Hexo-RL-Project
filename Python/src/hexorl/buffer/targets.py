@@ -10,7 +10,7 @@ Runs CPU-side on completed game records. Computes:
 
 import numpy as np
 from typing import List, Tuple, Optional
-from hexorl.selfplay.records import GameRecord, PositionRecord
+from hexorl.selfplay.records import GameRecord, PositionRecord, pair_policy_v2_from_place_target
 
 
 def compute_value_targets(
@@ -184,6 +184,8 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
         else:
             pos.opp_policy_target = {}
             pos.opp_policy_target_v2 = []
+        if not pos.pair_policy_target_v2 and pos.policy_target_v2:
+            pos.pair_policy_target_v2 = pair_policy_v2_from_place_target(pos.policy_target_v2)
         perspective_outcome = record.outcome if pos.player == 0 else -record.outcome
         tail = positions[i:]
         regret = sum(
