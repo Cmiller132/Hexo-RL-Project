@@ -1,5 +1,19 @@
 # Overnight Phase 2/3 Autotune Monitor - 2026-04-28
 
+## Method Status
+
+This run used the current supervisor implementation:
+
+```text
+synchronous ASHA-style static narrowing
+PBT-style compatible exploit/explore
+runtime worker/batch/wait sweeps
+```
+
+It did not use true BOHB and did not use true PB2. The results are still useful
+for throughput, stability, and early model-family screening, but they should
+not be cited as evidence that BOHB or PB2 has been implemented or validated.
+
 ## Current Status
 
 - Active WSL ext4 run root: `/root/hexo_runs/phase2_phase3_autotune_overnight_20260428_ext4`

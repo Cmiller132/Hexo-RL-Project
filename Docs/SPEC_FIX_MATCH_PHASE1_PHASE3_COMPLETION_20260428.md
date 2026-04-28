@@ -25,6 +25,114 @@ The goal is not legacy parity. The goal is a complete, cohesive production
 training system where every enabled feature is real, testable, observable, and
 safe enough to tune.
 
+## Handoff Instructions For Implementation Agents
+
+Treat this document as the root implementation brief. An agent implementing the
+finished Phase 1-3 plan should read the linked documents in the order below,
+then implement the acceptance gates in this document and in the global graph
+spec. Do not treat any partial/scout implementation as complete because it
+trains or runs.
+
+### Required Reading Order
+
+1. [Docs/game.md](game.md)
+   - Source of truth for Hexo rules: one-stone opening, two-placement turns,
+     infinite hex board, placement radius, six-in-a-row win condition, D6
+     symmetry, 4/5-window threat equivalence, pair-turn defense, and axis
+     forking.
+   - Any model, target, search, graph, D6, replay, or dashboard behavior that
+     contradicts this file is wrong.
+
+2. [Docs/SPEC_FIX_MATCH_PHASE1_PHASE3_COMPLETION_20260428.md](SPEC_FIX_MATCH_PHASE1_PHASE3_COMPLETION_20260428.md)
+   - This file. Use it as the root task list, milestone order, and acceptance
+     definition for everything outside the true global graph model.
+
+3. [Docs/SPEC_FIX_MATCH_GLOBAL_GRAPH_MODEL_20260428.md](SPEC_FIX_MATCH_GLOBAL_GRAPH_MODEL_20260428.md)
+   - Required companion spec for the finished `global_graph_option1` /
+     `global_graph768_champion` architecture.
+   - Implement it alongside this document. The Phase 1-3 plan is not finished
+     until this graph contract is also satisfied.
+   - It now defines the graph alternatives to compare:
+     `global_xattn_0`, `global_line_window_0`, `global_pair_twostage_0`,
+     `global_graph_full_0`, optional `global_hybrid_action_0`, and final
+     `global_graph768_champion`.
+
+4. [Docs/PHASE1_RESTNET_ACTION_CONTRACT_SCOUT_20260427.md](PHASE1_RESTNET_ACTION_CONTRACT_SCOUT_20260427.md)
+   - Original Phase 1 intent: strongest crop baseline, ResTNet crop scout, and
+     candidate/action-keyed policy scout.
+   - Important caveat: current ResTNet is only a crop scout until hex-masked
+     convolutions, relative bias, D6-aware coordinates, and real attention
+     tests are implemented.
+
+5. [Docs/TRANSFORMER_ARCHITECTURE_ABLATIONS_FOR_HEXO_20260427.md](TRANSFORMER_ARCHITECTURE_ABLATIONS_FOR_HEXO_20260427.md)
+   - Original Phase 2 architecture intent.
+   - Use the global graph spec above as the corrected no-compromise version
+     when there is any conflict.
+
+6. [Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md](AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md)
+   - Original Phase 3 tuning and champion-selection plan.
+   - Important caveat: current code is ASHA-style + PBT fallback. True BOHB
+     and true PB2 remain required for spec completion.
+
+7. [Docs/RGSC_IMPLEMENTATION.md](RGSC_IMPLEMENTATION.md)
+   - Current regret/RGSC status and the exact requirements to move from regret
+     auxiliary heads plus regret-biased replay to full RGSC search control.
+
+8. [Docs/MODEL_HEAD_TARGET_AND_D6_FIXES_20260428.md](MODEL_HEAD_TARGET_AND_D6_FIXES_20260428.md)
+   - Documents the fixed target/D6 issues from the review pass.
+   - Do not regress these fixes while implementing the broader plan.
+
+9. [Docs/IMPLEMENTATION_SPEC_AUDIT_20260428.md](IMPLEMENTATION_SPEC_AUDIT_20260428.md)
+   - Audit context for earlier implementation gaps. Use it as a checklist for
+     avoiding repeated half-implementations.
+
+10. [Docs/PHASE2_GRAPH_AND_OVERNIGHT_AUTOTUNE_20260428.md](PHASE2_GRAPH_AND_OVERNIGHT_AUTOTUNE_20260428.md)
+    and [Docs/OVERNIGHT_PHASE3_AUTOTUNE_MONITOR_20260428.md](OVERNIGHT_PHASE3_AUTOTUNE_MONITOR_20260428.md)
+    - Historical run notes and practical failure modes.
+    - Use these for host/runtime lessons only. They did not validate BOHB or
+      PB2, and they did not finish the true global graph model.
+
+11. [Docs/ABLATION_RESULTS_20260427.md](ABLATION_RESULTS_20260427.md),
+    [Docs/ABLATION_RESULTS_POST_OPT_20260427.md](ABLATION_RESULTS_POST_OPT_20260427.md),
+    [Docs/PERFORMANCE_PROFILE_20260427.md](PERFORMANCE_PROFILE_20260427.md), and
+    [Docs/OPTIMIZATION_OPTIONS_20260427.md](OPTIMIZATION_OPTIONS_20260427.md)
+    - Supporting performance and ablation context.
+    - Use them to understand why the plan prioritizes throughput telemetry,
+      runtime sweeps, graph/candidate action contracts, and scorecard gates.
+
+12. [Docs/sources.md](sources.md)
+    - Paper/source map for ResTNet, RGSC/regret, PB2, ASHA, BOHB, Mish, and
+      RepVGG.
+    - Use this when checking whether an implementation really matches the
+      source method or is only inspired by it.
+
+13. [Docs/TUNING_ORCHESTRATOR_GUIDE_20260428.md](TUNING_ORCHESTRATOR_GUIDE_20260428.md)
+    - Operational guide for the 30-minute autonomous tuning orchestrator after
+      the audit fixes and spec-match implementation are in place.
+    - Use it when supervising ASHA/BOHB/PB2, interpreting crashes, deciding
+      whether to patch/quarantine/restart, and judging whether model strength
+      is real or a bug artifact.
+
+### Implementation Rules
+
+- Keep the project cohesive. Do not add legacy compatibility branches unless a
+  current production path requires them.
+- Prefer deleting or renaming misleading partial paths over letting them appear
+  complete.
+- Every enabled config feature must have:
+  - target generation;
+  - model outputs;
+  - loss wiring;
+  - metrics;
+  - dashboard/debug visibility when useful;
+  - tests proving it is active.
+- Every scout/fallback must be named as a scout/fallback in configs, reports,
+  and dashboard labels.
+- A run finishing without crashing is not an acceptance gate. The tests and
+  scorecard gates below are the acceptance gates.
+- A model improving in Elo is not sufficient if bug sentinels, invariant
+  suites, D6 checks, replay checks, or independent tactical oracles disagree.
+
 ## Executive Contract
 
 The workspace is considered fully up to the Phase 1-3 spec only when:
@@ -78,6 +186,87 @@ The 2026-04-28 implementation audit already fixed several concrete bugs:
 Those fixes are necessary, but they are not the whole completion story. The
 sections below define the remaining implementation work and the hard gates that
 should prove it.
+
+## Source-Method Adaptation Audit
+
+This audit checks the named methods against what is actually implemented today.
+The rule for this section is simple: an implementation may be useful as a scout
+or diagnostic, but it is not complete unless it implements the full method
+contract and passes the listed acceptance gates.
+
+| Method | Current state | Completion verdict |
+|---|---|---|
+| ResTNet | Attention blocks inside the 33x33 crop exist. Relative-bias control, hex-masked local trunk, D6-aware coordinate encoding, and paper-faithful gated FFN are not complete. | Partial crop scout |
+| Regret / RGSC | Regret heads, selected-action-value recording, and regret-biased replay sampling exist. Full PRB restart search-control loop is not wired. | Partial regret auxiliary system |
+| ASHA | Rung-style top-fraction pruning exists. Replayable ASHA metadata and strict same-resource promotion semantics need hardening. | Partial ASHA-style scheduler |
+| BOHB | No Hyperband bracket plus KDE/TPE density-model sampler exists. | Not implemented |
+| PB2 | Current code is PBT-style exploit/explore with random mutations. No continuous response model or uncertainty-aware acquisition exists. | Not implemented |
+
+No-compromise requirement:
+
+```text
+Documentation and code must use honest names.
+If a method is partial, configs/reports must call it a scout, proxy, or
+baseline, not a completed implementation of the source method.
+```
+
+Docs updated by this audit:
+
+```text
+Docs/PHASE1_RESTNET_ACTION_CONTRACT_SCOUT_20260427.md
+Docs/RGSC_IMPLEMENTATION.md
+Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md
+```
+
+## Milestone 0: Hex-Masked Convolution Contract
+
+Status: not implemented in the active Python model path as of this audit.
+
+Problem:
+
+`Docs/game.md` explains that a square `3x3` convolution includes two axial
+corner offsets, `(-1,-1)` and `(1,1)`, that are hex-distance 2 and are not real
+hex neighbors. The current `Python/src/hexorl/model/network.py` path uses
+ordinary `torch.nn.Conv2d` in `GatedResBlock` and `conv_in`; there is no
+`HexConv2d` module and no optimizer post-step hook that zeros invalid kernel
+entries.
+
+Required behavior:
+
+```text
+CNN crop baseline:
+  local 3x3 trunk convolutions are hex-masked
+
+ResTNet crop scout:
+  local convolutional trunk is hex-masked before/around attention blocks
+
+graph_hybrid_0:
+  any retained crop-local CNN trunk is hex-masked
+
+global_graph_option1:
+  no dense crop conv is required, but any optional conv/distillation side path
+  must obey the same mask if it uses 3x3 axial-grid convolutions
+```
+
+Implementation requirements:
+
+- Add a `HexConv2d` wrapper or a reusable masking hook for `3x3` axial-grid
+  convolutions.
+- Invalid kernel entries for offsets `(-1,-1)` and `(1,1)` must be zero after
+  initialization and after every optimizer step.
+- Decide explicitly whether `1x1` heads are exempt; they normally are, because
+  they do not mix neighboring cells.
+- Configs/reports must state whether a model is `hex_masked_conv = true`.
+
+Acceptance tests:
+
+```text
+test_hexconv2d_invalid_corner_weights_start_zero
+test_hexconv2d_invalid_corner_weights_remain_zero_after_optimizer_step
+test_cnn_trunk_uses_hexconv2d_for_3x3_layers
+test_restnet_trunk_uses_hexconv2d_for_3x3_layers
+test_graph_hybrid_0_local_trunk_uses_hexconv2d
+```
 
 ## Milestone A: Target And Head Correctness
 
@@ -236,10 +425,12 @@ Required target contract:
 
 ```text
 selected_action_value: value of the action actually played at the search root
-final_outcome: source-player perspective final result
-regret_value_target: final_outcome - selected_action_value
-regret_rank_target: monotonic rank/sort target derived from regret quality,
-                    without batch-local minmax normalization
+perspective_outcome_i: final result from position i's current-player perspective
+per_step_error_i: (selected_action_value_i - perspective_outcome_i)^2
+regret_value_target_t: mean_{i=t..T}(per_step_error_i)
+regret_rank_target_t: the same raw nonnegative trajectory regret scale, used
+                      as the RGSC ranking objective bias without batch-local
+                      minmax normalization
 ```
 
 Implementation requirements:
@@ -250,15 +441,22 @@ Implementation requirements:
 - Make missing selected-action value invalid for new production records. Legacy
   imports may read old records, but the active training path must not silently
   fall back to `root_value`.
-- Remove suffix-average regret helpers from the active target path. If retained
-  for research comparison, place them behind an explicitly named experimental
-  module that cannot be selected by production configs.
+- Keep the suffix-average squared-error target from the RGSC paper. Do not
+  replace it with an unsquared residual such as
+  `final_outcome - selected_action_value`.
+- Add `regret_weight` and set it to zero for truncated/non-terminal records.
+  Hexo has no draw, so max-move cutoffs contain useful policy/structure data
+  but no valid final-outcome regret label.
+- Add full RGSC candidate-state handling: played trajectory states are not
+  enough. MCTS tree-node states that meet the visit/quality threshold must also
+  be scored by the regret network and be eligible for PRB insertion.
 - Add a target-debug endpoint in the dashboard to inspect:
 
 ```text
 root_value
 selected_action_value
 final_outcome
+per_step_error
 regret_value_target
 regret_rank_target
 regret_weight
@@ -269,8 +467,11 @@ Acceptance tests:
 ```text
 test_regret_value_uses_selected_action_value
 test_regret_target_missing_selected_action_has_zero_weight
+test_regret_targets_zero_weight_for_truncated_games
+test_regret_suffix_average_matches_paper_equation_2
 test_regret_rank_no_batch_minmax_normalization
 test_compact_record_preserves_selected_action_value
+test_rgsc_tree_node_states_can_enter_prb
 ```
 
 Completion gate:
@@ -281,6 +482,17 @@ The docs and code must agree on whether the regret heads are:
 - experimental auxiliary heads.
 
 They cannot be described as exact while using heuristic targets.
+
+Production config rule:
+
+```text
+if buffer.regret_fraction > 0:
+  either regret heads are enabled and weighted
+  or the config must explicitly name the behavior as replay-priority-only
+```
+
+Silent regret replay with no trained regret heads is not a completed RGSC
+configuration.
 
 ### A5. Draws, Truncation, And Value Weighting
 
@@ -780,6 +992,62 @@ test_dashboard_labels_graph_hybrid_0_honestly
 test_phase3_trial_metadata_marks_graph_hybrid_0_as_crop_compatible
 ```
 
+## Milestone F2: Global Graph Alternatives
+
+Status: required by the updated global graph spec.
+
+Problem:
+
+The maximal `global_graph768_champion` design is intentionally rich. If it is
+the only tested design, a failure will be hard to diagnose and a success may be
+hard to attribute. Phase 3 should compare several architectures while holding
+the graph/action data contract fixed.
+
+Required alternatives:
+
+| Family | What It Tests |
+|---|---|
+| `global_xattn_0` | Whether all-legal global action identity plus context cross-attention is enough. |
+| `global_line_window_0` | Whether explicit `WINDOW6`, `LINE`, and `COVER_SET` structure is the main win. |
+| `global_pair_twostage_0` | Whether pair planning can be learned cheaply through first/second-stage scoring. |
+| `global_graph_full_0` | Whether the full relation-biased graph design is justified. |
+| `global_hybrid_action_0` | Whether a hex-masked crop local trunk plus global legal action head is a useful bridge/control. |
+| `global_graph768_champion` | Scaled final candidate based on the best validated design. |
+
+Shared contract:
+
+```text
+all legal Rust action rows are preserved
+all 12 D6 transforms are tested
+exact engine tactical labels are used
+opening and two-placement masks are correct
+future opponent policy has its own global target table
+pair targets are legal and turn-phase aware
+MCTS consumes global keyed priors
+dashboard and replay inspect the same graph data
+```
+
+Implementation requirements:
+
+- Add config names for every graph alternative.
+- Use the same replay/graph builder for every alternative.
+- Use the same legality, D6, tactical, pair, opponent-policy, and MCTS prior
+  contract tests for every alternative.
+- Compare alternatives on offline target reconstruction before allowing
+  self-play.
+- Promote only variants that pass the automated bug-isolation milestone below.
+
+Acceptance tests:
+
+```text
+test_graph_alternatives_share_graph_data_contract
+test_global_xattn_preserves_all_legal_rows
+test_global_line_window_uses_exact_window_and_cover_labels
+test_global_pair_twostage_masks_opening_and_second_placement_correctly
+test_global_graph_full_uses_relation_bias_contract
+test_global_hybrid_action_keeps_dense_policy_diagnostic_only
+```
+
 ## Milestone G: Dashboard And Replay Debug Completeness
 
 Status: required for completion. Current dashboard improvements are not enough
@@ -966,6 +1234,48 @@ head bundle
 batch size
 ```
 
+BOHB is complete only if it implements both sides of BOHB:
+
+```text
+Hyperband-style brackets over resource budgets
+model-based sampling from good/bad density estimates after warmup
+```
+
+Random or hand-built static candidate generation followed by successive
+halving is useful, but it is not BOHB.
+
+ASHA resource policy:
+
+```text
+default asha_resources = 8,12,14
+default max_active_trials = 6
+```
+
+Rung semantics:
+
+```text
+epoch < 8:
+  health checks only
+  do not use classical survival or checkpoint-league strength for pruning
+
+8 <= epoch < 12:
+  pre-classical strategy scoring
+  use target quality, tactical fixtures, outside-window diagnostics, value
+  calibration, throughput, and hard bug sentinels
+
+epoch >= 12:
+  classical survival can enter the scorecard
+  12-14 epochs is the first meaningful classical-survival ASHA comparison band
+```
+
+Acceptance tests:
+
+```text
+test_asha_default_resources_start_at_epoch_8
+test_scorecard_ignores_classical_survival_before_epoch_12
+test_short_health_rung_prunes_only_hard_failures
+```
+
 - PB2 mutates dynamic schedules:
 
 ```text
@@ -993,15 +1303,21 @@ path must include:
 - a continuous hyperparameter response model over completed trial observations;
 - uncertainty-aware proposals for dynamic knobs;
 - compatibility checks before exploitation or checkpoint transfer;
+- no shared mutable replay-buffer ownership after exploit unless explicitly
+  designed and logged as shared lineage;
 - explicit logging of model fit inputs, proposed mutations, accepted
-  mutations, rejected mutations, and any baseline PBT comparison events;
+  mutations, rejected mutations, clone failures, and any baseline PBT
+  comparison events;
 - deterministic replay of the scheduler decision from persisted metadata.
 
 Acceptance tests:
 
 ```text
 test_pbt_exploit_only_between_compatible_architectures
+test_pbt_clone_does_not_share_mutable_replay_unless_declared
 test_pbt_mutations_are_clamped_and_logged
+test_bohb_creates_hyperband_brackets
+test_bohb_samples_from_good_bad_density_models
 test_pb2_fits_continuous_response_model
 test_pb2_proposals_are_uncertainty_aware_and_clamped
 test_mutation_events_include_source_method
@@ -1013,6 +1329,17 @@ test_scheduler_decisions_replay_from_persisted_metadata
 The Phase 3 scorecard should use the documented structure:
 
 ```text
+health_warmup_score, epoch < 8 =
+    0.45 * z(policy_target_quality)
+  + 0.35 * z(value_calibration_score)
+  + 0.20 * z(outside_window_robustness)
+
+pre_classical_strategy_score, 8 <= epoch < 12 =
+    0.30 * z(tactical_suite_score)
+  + 0.25 * z(outside_window_robustness)
+  + 0.25 * z(policy_target_quality)
+  + 0.20 * z(value_calibration_score)
+
 strength_score =
     0.40 * z(league_lcb)
   + 0.20 * z(outside_window_robustness)
@@ -1027,6 +1354,10 @@ scheduler_score =
   - 0.10 * z(truncation_rate)
   - 0.20 * z(illegal_or_crash_rate)
 ```
+
+Use `strength_score` with classical survival and league components only at
+`epoch >= 12` unless a run explicitly raises the threshold. This prevents ASHA
+from pruning on noisy sub-strategy checkpoints.
 
 Graph/candidate models add hard gates:
 
@@ -1043,6 +1374,8 @@ Acceptance tests:
 
 ```text
 test_scorecard_uses_documented_weights
+test_scorecard_uses_health_mode_before_epoch_8
+test_scorecard_uses_pre_classical_mode_before_epoch_12
 test_scorecard_applies_candidate_hard_gates
 test_scorecard_penalizes_illegal_crash_and_truncation_rates
 ```
@@ -1118,6 +1451,224 @@ test_tiny_pipeline_sparse_metrics_are_present_when_sparse_enabled
 This test should be fast enough for CI but complete enough to catch broken
 contracts before another overnight run.
 
+## Milestone K: Automated Bug-Isolation And Engine-Sanity Gates
+
+Status: required before trusting model strength, architecture comparisons, or
+overnight/autotune conclusions.
+
+Problem:
+
+Self-play systems can appear to improve because a model, target generator, MCTS
+path, dashboard replay path, or engine binding exploits a bug. A stronger
+checkpoint is only meaningful if independent legality, replay, D6, tactical,
+and evaluation checks agree that the games are valid and the labels are clean.
+
+Required principle:
+
+```text
+Elo, loss curves, game length, or classical survival are never sufficient alone.
+Promotion requires zero hard bug-sentinel failures.
+```
+
+### K1. Engine Invariant Suite
+
+Required checks:
+
+```text
+opening is exactly player 0 at origin
+turn order is P0, P1/P1, P0/P0, ...
+legal moves are empty cells within distance 8 of an existing stone
+legal move set is unchanged by dashboard/debug overlays
+winner detection matches six-in-a-row on all three axes
+terminal states reject further moves
+compact replay reconstructs final board, current player, winner, and terminal reason
+```
+
+Acceptance tests:
+
+```text
+test_engine_opening_and_two_placement_turn_order
+test_engine_legal_moves_match_radius_rule
+test_engine_winner_matches_reference_axis_scan
+test_engine_rejects_post_terminal_moves
+test_compact_replay_reconstructs_terminal_state
+```
+
+### K2. Differential Reference Oracles
+
+Maintain slow, simple reference checks for small and medium states:
+
+```text
+Python legal-move generator
+Python six-in-row winner scanner
+Python 6-window/threat scanner
+Rust engine result
+dashboard replay reconstruction
+```
+
+The reference implementation does not need to be fast. It exists to catch Rust
+FFI, graph builder, target, and replay bugs.
+
+Acceptance tests:
+
+```text
+test_rust_and_python_legal_moves_agree_on_random_histories
+test_rust_and_python_winner_scans_agree_on_random_histories
+test_rust_and_python_window_oracles_agree_on_tactical_fixtures
+test_dashboard_replay_matches_engine_replay
+```
+
+### K3. Metamorphic D6 And Serialization Tests
+
+Required checks for dense, sparse, pair, graph, and dashboard paths:
+
+```text
+all 12 D6 transforms preserve legality and winner
+legal masks transform bijectively
+policy, opponent-policy, and pair targets transform by global key
+graph tokens, relation ids, relation float biases, and pair rows transform correctly
+move-history serialize/deserialize/replay is identity
+MCTS with uniform priors is invariant up to transformed action keys
+```
+
+Acceptance tests:
+
+```text
+test_d6_all_12_preserve_engine_state
+test_d6_legal_mask_bijection_random_histories
+test_d6_graph_token_relation_pair_equivariance
+test_move_history_round_trip_identity
+test_uniform_prior_mcts_d6_invariance
+```
+
+### K4. Tactical Holdout Suites
+
+Holdout suites must be independent from model training labels and scheduler
+training signals.
+
+Required suites:
+
+```text
+win-now
+forced block
+two-placement cover
+unblockable fork
+block plus counterattack
+outside-window win
+outside-window block
+separated-cluster defense
+late-game high-legal-count state
+```
+
+Each fixture stores:
+
+```text
+move history
+expected legal action set
+expected pair/cover set when relevant
+expected terminal result after action when relevant
+legal count
+board span
+source/generator metadata
+```
+
+Acceptance tests:
+
+```text
+test_tactical_holdout_expected_actions_are_legal
+test_tactical_holdout_oracle_labels_are_stable
+test_outside_window_holdout_has_expected_action_outside_crop
+test_late_game_holdout_exercises_high_legal_count
+```
+
+### K5. Shadow Evaluation Matrix
+
+Promoted checkpoints must be evaluated under multiple modes:
+
+```text
+direct policy sampling
+PUCT/MCTS with model priors
+PUCT/MCTS with uniform priors for engine sanity
+classical opponent
+checkpoint league
+fixed tactical holdout suite
+outside-window suite
+```
+
+Quarantine rule:
+
+```text
+If strength appears only in one evaluator and bug sentinels or tactical suites
+disagree, quarantine the checkpoint and inspect before promotion.
+```
+
+Acceptance tests:
+
+```text
+test_shadow_eval_runs_all_required_modes
+test_shadow_eval_quarantines_bug_sentinel_failures
+test_checkpoint_promotion_requires_tactical_and_replay_cleanliness
+```
+
+### K6. Anti-Leak And Label-Quality Tests
+
+Fail promotion if:
+
+```text
+candidate/action features contain target probability or target-present bits
+dashboard/debug labels enter live model features
+future opponent policy target leaks into current-state features
+low-PCR policy rows train policy as full-search rows
+truncated games train terminal value or regret heads
+graph alternatives use different target contracts
+```
+
+Acceptance tests:
+
+```text
+test_candidate_features_have_no_target_leakage
+test_graph_features_have_no_future_or_dashboard_leakage
+test_low_pcr_policy_weight_zero_for_policy_heads
+test_truncation_zero_weights_value_and_regret
+test_graph_alternatives_share_targets_and_masks
+```
+
+### K7. Bug Sentinel Metrics
+
+Persist these metrics to JSONL/SQLite/dashboard and hard-gate promotion:
+
+```text
+illegal_move_rate
+post_terminal_move_attempts
+replay_mismatch_rate
+d6_mismatch_rate
+legal_mask_mismatch_rate
+oracle_threat_mismatch_rate
+fallback_prior_use_on_mcts_topk
+missing_legal_action_rows
+pair_mask_violation_rate
+terminal_reason_distribution
+truncation_rate
+target_leakage_check_status
+```
+
+Hard gate:
+
+```text
+illegal_move_rate == 0
+post_terminal_move_attempts == 0
+replay_mismatch_rate == 0
+d6_mismatch_rate == 0
+legal_mask_mismatch_rate == 0
+oracle_threat_mismatch_rate == 0
+missing_legal_action_rows == 0
+pair_mask_violation_rate == 0
+target_leakage_check_status == pass
+```
+
+The scorecard may include softer penalties for truncation and fallback-prior
+usage, but legality/replay/D6/oracle mismatches are hard failures.
+
 ## P1/P2/P3 Vision Coverage Matrix
 
 Implementing this document plus
@@ -1157,6 +1708,8 @@ legal-token policy replaces dense 1089 policy for the true graph path
 pair policy is graph-native and active during two-placement turns
 graph-native D6 is tested across tokens, relations, legal actions, and pairs
 dashboard can inspect tokens, relations, logits, targets, and prior sources
+global_xattn_0, global_line_window_0, global_pair_twostage_0, global_graph_full_0,
+and optional global_hybrid_action_0 are comparable under one shared contract
 ```
 
 This exceeds Phase 2 by requiring the champion graph model, not only a smaller
@@ -1172,6 +1725,7 @@ real PB2 tunes dynamic schedules
 checkpoint league uses both colors and lower confidence bounds
 tactical and outside-window suites are first-class evaluators
 candidate safety gates use discovery recall, critical overflow, and fallback-prior metrics
+bug sentinels hard-gate promotion before Elo or loss curves can matter
 scorecard formula matches the Phase 3 plan
 EMA, pair-policy, graph_hybrid_0, baseline, and global_graph_option1 checkpoints are league-visible
 production smoke test proves games, metrics, checkpoints, dashboard replay, eval, and sparse metrics
@@ -1269,6 +1823,22 @@ Exit gate:
 cargo test
 ```
 
+### Step 8: Bug-Isolation Promotion Gates
+
+- Add engine invariant tests.
+- Add independent Python reference oracles.
+- Add all-12-D6 metamorphic tests for graph/action/pair/relation paths.
+- Add tactical holdout suites.
+- Add shadow evaluation matrix.
+- Add anti-leak tests.
+- Wire bug sentinel metrics into Phase 3 promotion gates and dashboard.
+
+Exit gate:
+
+```text
+pytest Python/tests/test_engine_invariants.py Python/tests/test_tactical_oracle.py Python/tests/test_phase3_autotune.py -q
+```
+
 ## Acceptance Definition
 
 This plan is complete only when:
@@ -1283,6 +1853,9 @@ full-board tactical oracle covers outside-window wins/blocks
 MCTS exposes sparse/dense/default prior-source telemetry
 dashboard can inspect sparse and pair policy data from real replay positions
 Phase 3 scorecards use league/tactical/outside-window/candidate safety metrics
+global graph alternatives are tested under one shared graph/action contract
+engine/reference/replay/D6/tactical oracles agree on promoted checkpoints
+bug sentinel hard gates are zero before promotion
 real PB2 scheduler path exists, is persisted, and can be replayed deterministically
 tiny production integration test saves games, metrics, checkpoint, and replay
 ```

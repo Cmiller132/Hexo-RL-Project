@@ -37,6 +37,29 @@ priors used as the primary search path. The finished target is
 `global_graph768_champion` or a strictly stronger `global_graph_option1`
 successor with the same complete contracts.
 
+## 2026-04-28 No-Compromise Audit Update
+
+This spec has been tightened after auditing it against `Docs/game.md` and the
+current implementation.
+
+New hard rules:
+
+```text
+legal policy rows are all Rust-legal moves, not a capped candidate subset
+D6 means all 12 transforms, not only six rotations
+opening and two-placement turn semantics are explicit policy-mask contracts
+pair policy must handle legal first moves, conditional second moves, and joint
+  turn-pair priors without synthetic single-policy products as the final target
+tactical tokens and labels must come from the exact engine threat/block oracle
+opponent policy uses its own future global target table, not the current legal
+  row table unless the rows are explicitly matched by global key
+graph inference has a first-class token/relation/action IPC contract
+```
+
+Current `graph_hybrid_0` is still useful as a scout, but none of these rules
+are satisfied by a crop-selected token model or by sparse candidates that can
+drop legal actions.
+
 ## Current Implementation Snapshot
 
 Current `graph_hybrid_0`:
@@ -104,12 +127,234 @@ pair_first_indices:   (B, P)
 pair_second_indices:  (B, P)
 relation_bias:        (B, H or 1, T, T)
 policy_target:        (B, A)
-opp_policy_target:    (B, A)
+opp_legal_qr:         (B, A_opp, 2)
+opp_legal_mask:       (B, A_opp)
+opp_policy_target:    (B, A_opp)
 pair_policy_target:   (B, P)
 ```
 
 Keep padding explicit. Every padded action or token must have a mask. No loss or
 prior gather should rely on sentinel logits alone.
+
+Action-row rule:
+
+```text
+A is the number of all legal actions in the state, padded per batch.
+It is not a candidate budget.
+Every Rust-legal action must appear exactly once in legal_qr/legal_mask.
+```
+
+The future opponent turn can have a different legal set from the source
+position, so opponent-policy targets must carry their own global-key table or a
+sparse key/value target that is matched by `(q,r)`. Do not train
+`opp_policy_target` over the source position's `A` rows unless those rows have
+been explicitly rebuilt for the opponent target state.
+
+## Token Budget Policy
+
+The true global graph model should not have a semantic token cap that drops
+legal policy actions. Letting the model run slower as games get longer is
+acceptable for correctness; silent action loss is not.
+
+Required policy:
+
+```text
+all legal action rows are preserved
+all stones are preserved for normal configured max-game lengths
+all exact win/block/cover tactical structures are preserved
+context summarization may reduce redundant WINDOW6/LINE/COMPONENT tokens only
+  if exact legal-action policy rows and exact tactical labels remain intact
+```
+
+Why a token budget is still a performance concern:
+
+```text
+full self-attention is O(T^2)
+pair-action tables can be O(A^2)
+long games increase legal count and tactical-token count
+```
+
+Use engineering optimizations rather than semantic truncation:
+
+- microbatch long positions;
+- bucket batches by token/action count;
+- score legal actions with cross-attention from state/context tokens if full
+  legal-action self-attention is too slow;
+- use sparse/block/local relation attention for stone/window context tokens;
+- chunk pair-action scoring;
+- record throughput by token count and legal count.
+
+If a configured max-game length would exceed memory, fail the run with a clear
+capacity error or lower the training game-length config. Do not silently drop
+legal actions, stones, or decisive tactical rows to fit a fixed tensor width.
+
+## Architecture Alternatives To Test
+
+The strict graph/action data contract above should be shared by multiple model
+families. That lets Phase 3 compare architectural ideas without confounding the
+result with different target semantics, legal-action coverage, D6 transforms,
+or tactical-oracle quality.
+
+Every alternative below must obey:
+
+```text
+all legal action rows are preserved
+all 12 D6 transforms are supported
+opening and two-placement masks are correct
+exact engine tactical labels are used
+opponent policy uses its own future global target table
+pair targets are legal and turn-phase aware
+MCTS consumes global keyed priors
+dashboard/replay can inspect the same graph data contract
+```
+
+### `global_xattn_0`
+
+Purpose:
+
+```text
+Test whether all-legal global action identity is the main win.
+```
+
+Design:
+
+- Build context tokens from `STATE`, `TURN`, `PLAYER`, `STONE`, `WINDOW6`,
+  `LINE`, `COVER_SET`, and `COMPONENT`.
+- Keep all `LEGAL` action rows.
+- Score legal actions by cross-attention from legal-action queries into context
+  tokens.
+- Legal actions may use light self-attention or no full legal-to-legal
+  self-attention in the first version.
+
+Why test it:
+
+- It preserves the correct infinite-board action contract.
+- It avoids the worst `O(T^2)` pressure of full all-token attention.
+- If it works, the most important missing ingredient was likely global legal
+  action identity rather than a very rich relation graph.
+
+Risks:
+
+- May under-model legal-action interactions, especially fork geometry and
+  pair-turn set-cover interactions.
+
+### `global_line_window_0`
+
+Purpose:
+
+```text
+Test whether explicit Hexo tactical structure beats generic graph attention.
+```
+
+Design:
+
+- Emphasize `WINDOW6`, `LINE`, `COVER_SET`, and `HOT_CELL` tokens.
+- Legal action embeddings are built from the tactical structures each action
+  touches.
+- Relation bias prioritizes same-window, same-line, cover-set, and multi-axis
+  intersections.
+
+Why test it:
+
+- Hexo is won through window pressure, line strength, and unblockable
+  multi-threat structure.
+- This model should be easier to debug tactically than a fully generic graph.
+
+Risks:
+
+- If labels or tactical-token construction are wrong, the model can become
+  brittle or overfit to hand-designed structure.
+
+### `global_graph_full_0`
+
+Purpose:
+
+```text
+Test the full relation-biased global graph design before champion scaling.
+```
+
+Design:
+
+- Use all required token families.
+- Use relation-biased Transformer blocks over the full graph context.
+- Include legal-token, pair-token, value, lookahead, opponent-policy, axis,
+  tactical, moves-left, and regret heads.
+
+Why test it:
+
+- This is the closest direct implementation of the maximal spec.
+- If it wins after correctness gates, the rich graph design is justified.
+
+Risks:
+
+- Hardest to stabilize and profile.
+- Failures can be harder to attribute because many mechanisms change together.
+
+### `global_pair_twostage_0`
+
+Purpose:
+
+```text
+Test whether two-placement strength needs an explicit pair planner without
+materializing every pair through full graph attention.
+```
+
+Design:
+
+- First stage scores every legal first placement.
+- Second stage scores conditional legal second placements after a chosen or
+  sampled first placement.
+- A chunked joint-pair scorer evaluates high-priority first moves plus all
+  legal conditional seconds.
+
+Why test it:
+
+- Hexo's turn is two placements, but full `A^2` pair tables can be expensive.
+- This tests a cheaper pair-aware route.
+
+Risks:
+
+- If the first-stage filter is too narrow, it can hide the best pair. The
+  filter must be auditable and tactical-critical first moves must be protected.
+
+### `global_hybrid_action_0`
+
+Purpose:
+
+```text
+Bridge from the current crop models to the global action contract.
+```
+
+Design:
+
+- Use a hex-masked CNN/ResTNet crop trunk only as a local feature extractor or
+  distillation helper.
+- Use global legal `(q,r)` action rows as the primary policy output.
+- Keep dense `1089` logits diagnostic-only.
+
+Why test it:
+
+- Easier to train and compare against current crop baselines.
+- Helps isolate whether global action identity alone fixes major failures.
+
+Risks:
+
+- Still carries crop-context limitations if the global action scorer depends
+  too heavily on local crop features.
+
+### Recommended Test Order
+
+```text
+1. global_xattn_0
+2. global_line_window_0
+3. global_pair_twostage_0
+4. global_graph_full_0
+5. global_graph768_champion, scaled from the best validated design
+```
+
+`global_hybrid_action_0` can run in parallel as a bridge/control if it is cheap
+enough. It should not replace the true graph path unless it satisfies the same
+all-legal global action and bug-isolation gates.
 
 ## Token Families
 
@@ -155,9 +400,12 @@ Features:
 
 ### `STONE`
 
-Represent every stone unless token budget is exceeded by extremely long games.
-Because Hexo has no captures, old stones remain strategically relevant as
-blockers, anchors, and line extenders.
+Represent every stone for every position admitted by the configured training
+game length. Because Hexo has no captures, old stones remain strategically
+relevant as blockers, anchors, and line extenders. For pathological debug
+positions beyond the configured capacity, the builder should fail loudly or use
+an explicitly named summarization/debug mode that is not accepted as the
+production `global_graph_option1` path.
 
 Features:
 
@@ -172,9 +420,10 @@ Features:
 
 ### `LEGAL`
 
-These are the primary policy actions. Every selected legal token must preserve
+These are the primary policy actions. Every Rust-legal action must preserve
 global `(q,r)` identity through batching, loss, D6, checkpoint inference, and
-MCTS prior gather.
+MCTS prior gather. `LEGAL` rows are an all-legal action table, not a heuristic
+candidate set.
 
 Features:
 
@@ -187,14 +436,21 @@ Features:
 - blocks opponent 3/4/5/6-window indicators;
 - cover-set membership bits/counts;
 - candidate-source bits;
-- target-policy mass if this token is in a replay target.
+- optional teacher/debug prior values only if they are available at inference
+  time or explicitly marked as distillation-only inputs.
+
+Target-policy mass belongs in `policy_target`, not in `token_features`. It must
+not leak into live inference features.
 
 Critical inclusion rule:
 
 ```text
-immediate wins, forced blocks, target-policy actions, and required cover-set
-actions must be included even if the normal candidate budget is full.
+immediate wins, forced blocks, target-policy actions, required cover-set
+actions, and every legal Rust action must be present in the legal table.
 ```
+
+For context token families such as `WINDOW6`, `HOT_CELL`, and `COVER_SET`,
+critical tactical rows also override any optional context-token compression.
 
 ### `HOT_CELL`
 
@@ -252,6 +508,10 @@ Features:
 `COVER_SET` is important because Hexo defense is not just one best block. With
 two-placement turns, the correct defensive policy often needs a set-cover view.
 
+The source of truth must be the Rust/engine threat oracle, including exact
+winning-turn status, must-block status, unblockable status, blocking cells, and
+blocking pairs. Crop hot planes are not sufficient for the finished model.
+
 ### `COMPONENT`
 
 Required for the finished model. Summarize separated clusters so the model can
@@ -274,6 +534,33 @@ Features:
 - opponent-block delta;
 - pair distance bucket;
 - duplicate/illegal/self-overlap mask.
+
+Turn-state contract:
+
+```text
+opening turn:
+  no pair-action loss or pair prior; player 0 has exactly one placement at
+  origin
+
+first placement of a normal turn:
+  policy_pair_first scores all currently legal first placements
+  policy_pair_joint covers every distinct two-stone turn pair that can be
+  legally realized by at least one sequential order
+
+second placement of a normal turn:
+  policy_pair_second scores the legal second-placement table after the first
+  placement has been applied
+```
+
+Pair identity:
+
+- final board-state pair identity is canonicalized as an unordered pair of
+  distinct cells;
+- reachability/order metadata records whether only one order is legal or both
+  orders are legal;
+- duplicate cells are always illegal;
+- synthetic products of single-placement policies are acceptable only as a
+  bootstrap/debug target, not the finished pair-policy target.
 
 ## Relation Bias Builder
 
@@ -434,9 +721,11 @@ Required D6 tests:
 - every token type transforms equivariantly;
 - every legal target key survives the transform;
 - every immediate win and forced block remains included after transform;
-- `WINDOW6` axes remap correctly under all six symmetries;
-- `COVER_SET` contents remap correctly under all six symmetries;
+- `WINDOW6` axes remap correctly under all 12 D6 transforms;
+- `COVER_SET` contents remap correctly under all 12 D6 transforms;
 - pair-action canonicalization is stable after transform;
+- relation ids and float relation biases remap correctly under all 12 D6
+  transforms;
 - sparse policy loss is finite for every architecture using graph batches.
 
 ## MCTS Prior Integration
@@ -449,13 +738,45 @@ legal (q,r) -> logit/prob
 
 Implementation steps:
 
-1. Add inference output metadata containing `legal_qr` and `policy_place` logits.
+1. Add inference output metadata containing all `legal_qr` rows and
+   `policy_place` logits.
 2. Convert logits to priors only over Rust legal actions.
-3. If a legal action is missing from graph candidates, use an explicit measured
-   fallback prior and log it.
-4. Fail tactical tests if missing candidates include immediate wins, forced
+3. If a Rust legal action is missing from `legal_qr`, fail the graph inference
+   contract for that position. This is a model/data bug, not a normal fallback.
+4. Emergency fallback priors may exist only for crash containment and must be
+   logged as failures. They are not part of the accepted
+   `global_graph_option1` policy path.
+5. Fail tactical tests if missing legal/context rows include immediate wins, forced
    blocks, target-policy actions, or required cover-set actions.
-5. Keep dense crop prior mixing disabled by default for `global_graph`.
+6. Keep dense crop prior mixing disabled by default for `global_graph`.
+
+## Graph Inference Contract
+
+The inference server needs a first-class graph path. The existing dense tensor
+IPC plus optional candidate arrays is not enough.
+
+Required request options:
+
+```text
+compact move history, letting the server build graph tokens
+or prebuilt token/action/relation tensors with versioned feature metadata
+```
+
+Required response:
+
+```text
+legal_qr
+policy_place_logits
+policy_pair_first_logits when applicable
+policy_pair_second_logits or pair-conditioned scorer metadata when applicable
+policy_pair_joint logits over pair rows when applicable
+value and enabled aux heads
+token/action masks and graph schema version
+```
+
+Every graph batch must carry a schema version so checkpoints, replay, dashboard,
+and MCTS agree on feature order, relation ids, token families, and pair
+semantics.
 
 ## Configuration Plan
 
@@ -469,6 +790,11 @@ architecture = "global_graph_option1"  # true spec-match model
 Suggested global graph configs:
 
 ```text
+global_xattn_0
+global_line_window_0
+global_pair_twostage_0
+global_graph_full_0
+global_hybrid_action_0
 global_graph256_cells
 global_graph384_windows
 global_graph512_cover
@@ -506,7 +832,13 @@ pair-action graph schema.
 
 ### Step 4: Train Full Graph Heads Offline
 
-- Train the full `global_graph_option1` head bundle on replay:
+- Train each graph alternative on the same replay/data contract:
+  - `global_xattn_0`;
+  - `global_line_window_0`;
+  - `global_pair_twostage_0`;
+  - `global_graph_full_0`;
+  - `global_hybrid_action_0`, if used as a bridge/control.
+- Keep the head bundle comparable across variants where possible:
   - `policy_place`;
   - `policy_pair_first`;
   - `policy_pair_second`;
@@ -516,6 +848,8 @@ pair-action graph schema.
 - Compare against dense crop and `graph_hybrid_0` on target reconstruction,
   legal recall, tactical recall, pair recall, value calibration, and throughput
   before self-play.
+- Promote to self-play only after the offline contract tests and bug-isolation
+  sentinels pass.
 
 ### Step 5: Validate Cover And Tactical Tokens
 
@@ -547,13 +881,16 @@ The true implementation is not complete until all of these pass:
 
 - graph token builder reconstructs all stones and legal actions from compact
   history;
-- every immediate win and forced block is included under token-budget pressure;
-- D6 transform/re-encode preserves legal targets and pair targets;
+- no legal action is dropped under token-budget pressure;
+- every immediate win and forced block is included under context-token pressure;
+- D6 transform/re-encode preserves legal targets and pair targets under all 12
+  transforms;
 - relation bias is correct for same-axis, same-window, cover-set, and pair
   relations;
 - model forward works with padded token/action batches;
 - policy loss masks padded actions and only trains valid legal tokens;
-- MCTS prior gather consumes global `(q,r)` logits with measured fallback use;
+- MCTS prior gather consumes all global `(q,r)` logits with zero normal fallback
+  use;
 - dashboard can inspect token families, relations, and policy logits;
 - tactical suites pass for win-now, forced-block, cover-set, separated-cluster,
   and outside-window cases;
@@ -561,6 +898,12 @@ The true implementation is not complete until all of these pass:
   `graph_hybrid_0`.
 - pair policy actively shapes two-placement MCTS decisions and reports pair
   prior-source telemetry;
+- opening positions have no pair loss and no pair prior;
+- second-placement positions use the legal table after the first placement,
+  not the turn-start table;
+- opponent policy targets are matched by their own future global legal table;
+- graph inference IPC/server tests cover token/relation/action request and
+  response paths;
 - PB2/Phase 3 can tune `global_graph_option1` as a first-class family using the
   same league, tactical, outside-window, candidate, and throughput evaluators as
   every other survivor.
@@ -597,6 +940,11 @@ Required properties:
 Smaller configs are allowed only as implementation tests:
 
 ```text
+global_xattn_0
+global_line_window_0
+global_pair_twostage_0
+global_graph_full_0
+global_hybrid_action_0
 global_graph256_cells
 global_graph384_windows
 global_graph512_cover

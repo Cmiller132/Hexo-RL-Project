@@ -22,6 +22,15 @@
   - `runs/phase2_phase3_autotune_overnight_20260428/overnight_monitor.md`
   - `runs/phase2_phase3_autotune_overnight_20260428/overnight_monitor_events.jsonl`
 
+Method-status note:
+
+```text
+The overnight supervisor used synchronous ASHA-style static narrowing and
+PBT-style exploit/explore. It did not run true BOHB, and it did not run true
+PB2. Any report from this run should use ASHA-style/PBT terminology unless the
+real BOHB/PB2 scheduler paths are later implemented.
+```
+
 ## Early Risk
 
 The first Phase 3 attempt found that sparse/candidate trials can go non-finite at the original CNN LR center. The supervisor now starts sparse and graph families at a conservative finite-metric safety rail, then lets PBT explore upward after a valid scorecard exists.

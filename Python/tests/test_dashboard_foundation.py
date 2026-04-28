@@ -11,6 +11,7 @@ from hexorl.dashboard.db import DashboardStore
 from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical_fixtures
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
 from hexorl.dashboard.recorder import RunRecorder
+from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png
 from hexorl.eval.players import NoisyModelPlayer, NoisyPolicyConfig
 from hexorl.eval.arena import ArenaStats, MatchResult
 from hexorl.model.network import HexNet
@@ -44,6 +45,26 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     assert len(positions) == 2
     assert positions[0]["policy_json"]
     assert (tmp_path / "events.jsonl").exists()
+
+
+def test_match_snapshot_renderer_outputs_png_bytes():
+    history = (
+        _move(0, 0, 0)
+        + _move(1, 1, 0)
+        + _move(1, 1, -1)
+        + _move(0, -1, 0)
+        + _move(0, -1, 1)
+    )
+
+    png = render_match_snapshot_png(
+        history,
+        options=MatchSnapshotOptions(width=420, height=320, title="unit snapshot"),
+        metadata={"run_id": "unit-run", "game_id": 3, "source": "unit"},
+    )
+
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert b"IHDR" in png[:32]
+    assert len(png) > 1000
 
 
 def test_checkpoint_indexing_extracts_current_hexorl_metadata(tmp_path):
@@ -235,6 +256,10 @@ def test_fastapi_dashboard_smoke(tmp_path):
     assert games[0]["move_count"] == 1
     assert games[0]["payload"] == {"fixture": True}
     assert "final_history_b64" not in games[0]
+    snapshot = client.get(f"/api/games/{games[0]['game_id']}/snapshot.png?width=360&height=280")
+    assert snapshot.status_code == 200
+    assert snapshot.headers["content-type"] == "image/png"
+    assert snapshot.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert client.get("/api/axis/prototypes").json()
     created = client.post("/api/session/create", json={}).json()
     assert created["session_id"]

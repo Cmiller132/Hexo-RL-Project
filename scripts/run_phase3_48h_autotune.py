@@ -1430,14 +1430,32 @@ class Phase3Supervisor:
             if not trial.score_history or trial.pruned:
                 continue
             row = trial.score_history[-1]
-            strength = (
-                0.40 * z["league_lcb"].get(id(row), 0.0)
-                + 0.20 * z["outside_window_robustness"].get(id(row), 0.0)
-                + 0.15 * z["tactical_suite_score"].get(id(row), 0.0)
-                + 0.10 * z["classical_survival_score"].get(id(row), 0.0)
-                + 0.10 * z["value_calibration_score"].get(id(row), 0.0)
-                + 0.05 * z["policy_target_quality"].get(id(row), 0.0)
-            )
+            epoch = int(row.get("epoch", 0) or 0)
+            if epoch < int(self.args.strategy_score_min_epochs):
+                strength = (
+                    0.45 * z["policy_target_quality"].get(id(row), 0.0)
+                    + 0.35 * z["value_calibration_score"].get(id(row), 0.0)
+                    + 0.20 * z["outside_window_robustness"].get(id(row), 0.0)
+                )
+                score_mode = "health_warmup"
+            elif epoch < int(self.args.classical_score_min_epochs):
+                strength = (
+                    0.30 * z["tactical_suite_score"].get(id(row), 0.0)
+                    + 0.25 * z["outside_window_robustness"].get(id(row), 0.0)
+                    + 0.25 * z["policy_target_quality"].get(id(row), 0.0)
+                    + 0.20 * z["value_calibration_score"].get(id(row), 0.0)
+                )
+                score_mode = "pre_classical_strategy"
+            else:
+                strength = (
+                    0.40 * z["league_lcb"].get(id(row), 0.0)
+                    + 0.20 * z["outside_window_robustness"].get(id(row), 0.0)
+                    + 0.15 * z["tactical_suite_score"].get(id(row), 0.0)
+                    + 0.10 * z["classical_survival_score"].get(id(row), 0.0)
+                    + 0.10 * z["value_calibration_score"].get(id(row), 0.0)
+                    + 0.05 * z["policy_target_quality"].get(id(row), 0.0)
+                )
+                score_mode = "classical_strategy"
             scheduler = (
                 strength
                 - 0.10 * z["epoch_seconds"].get(id(row), 0.0)
@@ -1447,6 +1465,7 @@ class Phase3Supervisor:
             row["strength_score"] = strength
             row["scheduler_score"] = scheduler
             row["score_stage"] = stage
+            row["score_mode"] = score_mode
             self.log.write("score_updated", {"trial_id": trial.trial_id, **row})
 
     def _hard_prune_reason(self, trial: TrialState, record: dict[str, Any]) -> str:
@@ -1813,15 +1832,22 @@ class EvaluationServices:
         policy_quality = float(train.get("policy_full_search_frac", 0.0) or 0.0) * (
             1.0 - float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
         )
-        league_lcb = float(arena.get("model_win_rate", 0.0)) - float(arena.get("winrate_std", 0.0))
+        raw_league_lcb = float(arena.get("model_win_rate", 0.0)) - float(arena.get("winrate_std", 0.0))
+        raw_classical_survival = float(arena.get("classical_survival_score", 0.0) or 0.0)
+        classical_score_active = int(trial.epoch) >= int(self.args.classical_score_min_epochs)
+        league_lcb = raw_league_lcb if classical_score_active else 0.0
+        classical_survival = raw_classical_survival if classical_score_active else 0.0
         row = {
             "stage": stage,
             "trial_id": trial.trial_id,
             "epoch": trial.epoch,
             "league_lcb": league_lcb,
+            "raw_league_lcb": raw_league_lcb,
             "outside_window_robustness": outside["outside_window_robustness"],
             "tactical_suite_score": tactical["tactical_suite_score"],
-            "classical_survival_score": arena.get("classical_survival_score", 0.0),
+            "classical_survival_score": classical_survival,
+            "raw_classical_survival_score": raw_classical_survival,
+            "classical_score_active": classical_score_active,
             "value_calibration_score": value_calibration,
             "policy_target_quality": policy_quality,
             "epoch_seconds": throughput["epoch_seconds"],
@@ -1956,13 +1982,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum worker/batch/wait candidates per uncached runtime sweep.",
     )
     parser.add_argument("--train-batches", type=int, default=100)
-    parser.add_argument("--max-active-trials", type=int, default=8)
-    parser.add_argument("--asha-resources", default="2,5,10")
+    parser.add_argument("--max-active-trials", type=int, default=6)
+    parser.add_argument("--asha-resources", default="8,12,14")
     parser.add_argument("--asha-promote-fraction", type=float, default=0.5)
     parser.add_argument("--pbt-population", type=int, default=8)
     parser.add_argument("--perturb-interval", type=int, default=5)
     parser.add_argument("--pbt-generations", type=int, default=6)
     parser.add_argument("--champion-min-epochs", type=int, default=20)
+    parser.add_argument("--strategy-score-min-epochs", type=int, default=8)
+    parser.add_argument("--classical-score-min-epochs", type=int, default=12)
     parser.add_argument("--eval-every-epochs", type=int, default=2)
     parser.add_argument("--eval-games", type=int, default=4)
     parser.add_argument("--final-eval-games", type=int, default=12)

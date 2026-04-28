@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,7 @@ from hexorl.dashboard.fixtures import (
 )
 from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
+from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
 from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -242,6 +243,58 @@ def create_app(
         pos = get_replay_position(rows[0]["final_history_b64"], turn_index=turn_index)
         return position_payload(pos)
 
+    @app.get("/api/games/{game_id}/snapshot.png")
+    def game_snapshot(
+        game_id: int,
+        run_id: str | None = None,
+        turn_index: int = -1,
+        width: int = 1280,
+        height: int = 960,
+        context_rings: int = 2,
+        show_numbers: bool = True,
+        show_legal: bool = False,
+        fit: str = "played",
+        near_radius: int = 8,
+    ) -> Response:
+        row = _game_row_for_request(store, suite_root, game_id, run_id)
+        if row is None:
+            raise HTTPException(404, f"Game not found: {game_id}")
+        history = row["final_history_b64"]
+        turn = None if turn_index < 0 else turn_index
+        legal_moves = None
+        if show_legal:
+            try:
+                legal_moves = get_replay_position(
+                    history,
+                    turn_index=turn,
+                    near_radius=max(1, min(near_radius, 64)),
+                    constrain_threats=False,
+                ).legal_moves
+            except Exception:
+                legal_moves = None
+        title = f"{row.get('source') or 'match'} epoch {row.get('epoch') if row.get('epoch') is not None else '-'}"
+        png = render_match_snapshot_png(
+            history,
+            options=MatchSnapshotOptions(
+                width=width,
+                height=height,
+                turn_index=turn,
+                context_rings=context_rings,
+                show_numbers=show_numbers,
+                show_legal=show_legal,
+                fit=fit,
+                title=title,
+            ),
+            legal_moves=legal_moves,
+            metadata=row,
+        )
+        filename = snapshot_filename(row, turn_index=turn)
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+
     @app.get("/api/suite/status")
     def suite_status() -> dict[str, Any]:
         if suite_root is None:
@@ -451,6 +504,40 @@ def _suite_trial_dirs(run_root: Path) -> list[Path]:
     if not trials.exists():
         return []
     return sorted([path for path in trials.iterdir() if (path / "dashboard.sqlite3").exists()])
+
+
+def _game_row_for_request(
+    store: DashboardStore,
+    run_root: Path | None,
+    game_id: int,
+    run_id: str | None,
+) -> dict[str, Any] | None:
+    if run_id:
+        trial_store = _suite_store_for_run(run_root, run_id)
+        if trial_store is not None:
+            rows = trial_store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+            if rows:
+                rows[0]["source_db"] = str(trial_store.path)
+                return rows[0]
+        rows = store.rows("SELECT * FROM games WHERE game_id=? AND run_id=?", (game_id, run_id))
+        return rows[0] if rows else None
+    rows = store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+    if rows:
+        return rows[0]
+    if run_root is None:
+        return None
+    for trial_dir in _suite_trial_dirs(run_root):
+        db = trial_dir / "dashboard.sqlite3"
+        try:
+            trial_store = DashboardStore(db)
+            rows = trial_store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+        except Exception:
+            continue
+        if rows:
+            rows[0]["trial_id"] = trial_dir.name
+            rows[0]["source_db"] = str(db)
+            return rows[0]
+    return None
 
 
 def _suite_store_for_run(run_root: Path | None, run_id: str | None) -> DashboardStore | None:
