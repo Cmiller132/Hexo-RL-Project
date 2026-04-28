@@ -252,6 +252,143 @@ h1 {
   margin-bottom: 10px;
 }
 
+.panelHint {
+  margin: -4px 0 10px;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.activityStrip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid #30363d;
+  background: #0d1117;
+  border-radius: 6px;
+  color: #c9d1d9;
+  flex-wrap: wrap;
+}
+
+.activityStrip button {
+  min-height: 26px;
+}
+
+.activityMeta {
+  color: #8b949e;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.emptyState {
+  color: #8b949e;
+  padding: 10px 0;
+}
+
+.detailHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.detailHeader h2 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.detailHeader p {
+  margin: 5px 0 0;
+  color: #8b949e;
+  font-size: 12px;
+}
+
+.detailCards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.metricCard,
+.kvPanel {
+  border: 1px solid #30363d;
+  background: #0d1117;
+  border-radius: 6px;
+  padding: 10px;
+  min-width: 0;
+}
+
+.metricCard span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #8b949e;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.metricCard strong {
+  display: block;
+  margin-top: 6px;
+  color: #f0f6fc;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.kvPanel h3 {
+  margin: 0 0 8px;
+  color: #f0f6fc;
+  font-size: 13px;
+}
+
+.kvPanel dl {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.45fr) minmax(0, 1fr);
+  gap: 6px 10px;
+  margin: 0;
+}
+
+.kvPanel dt {
+  color: #8b949e;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.kvPanel dd {
+  margin: 0;
+  color: #c9d1d9;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.configDetails {
+  margin-top: 10px;
+  border: 1px solid #30363d;
+  background: #0d1117;
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.configDetails summary {
+  cursor: pointer;
+  color: #58a6ff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .tableWrap {
   overflow: auto;
   max-height: 68vh;
@@ -670,6 +807,8 @@ pre {
 @media (max-width: 1100px) {
   .kpis,
   .suiteHero,
+  .detailCards,
+  .detailGrid,
   .grid.two,
   .grid.replay,
   .viewerGrid {

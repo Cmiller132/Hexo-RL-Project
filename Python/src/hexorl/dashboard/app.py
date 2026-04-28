@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -252,6 +253,15 @@ def create_app(
         if suite_root is None:
             return []
         return _suite_trials(suite_root)
+
+    @app.get("/api/suite/trials/{trial_id}")
+    def suite_trial_detail(trial_id: str) -> dict[str, Any]:
+        if suite_root is None:
+            raise HTTPException(404, "Suite run root is not configured")
+        detail = _suite_trial_detail(suite_root, trial_id)
+        if not detail:
+            raise HTTPException(404, f"Trial not found: {trial_id}")
+        return detail
 
     @app.get("/api/suite/best-checkpoints")
     def suite_best_checkpoints(limit: int = 50) -> list[dict[str, Any]]:
@@ -597,6 +607,8 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
         row = {
             "trial_id": trial_id,
             "family": family.get("name") or latest.get("family") or "",
+            "architecture": family.get("architecture") or "",
+            "model_summary": _model_summary_from_trial(family, state.get("static") or trial_json.get("static") or latest.get("static") or {}),
             "stage": latest.get("stage") or state.get("stage") or trial_json.get("stage") or "",
             "epoch": state.get("epoch") or latest.get("epoch") or trial_json.get("epoch") or 0,
             "score": _finite_or_none(score),
@@ -608,10 +620,14 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
             "checkpoints": counts["checkpoints"],
             "metrics": counts["metrics"],
             "selfplay_positions_per_min": latest_selfplay.get("positions_per_min"),
+            "positions_per_sec": _per_second(latest_selfplay.get("positions_per_min")),
+            "workers": _worker_summary(latest_selfplay),
             "epoch_elapsed_s": latest.get("epoch_elapsed_s"),
             "loss_total": latest_train.get("loss_total"),
             "policy_top1_acc": latest_train.get("policy_top1_acc"),
             "sparse_policy_top1_acc": latest_train.get("sparse_policy_top1_acc"),
+            "pair_policy_top1_acc": latest_train.get("pair_policy_top1_acc"),
+            "runtime_sweep": state.get("runtime_sweep") or trial_json.get("runtime_sweep") or {},
             "updated_at": max(_mtime(trial_dir / "LATEST.json"), _mtime(trial_dir / "dashboard.sqlite3")),
         }
         rows.append(row)
@@ -639,6 +655,7 @@ def _suite_status(run_root: Path) -> dict[str, Any]:
     total_games = sum(int(trial.get("games") or 0) for trial in trials)
     total_positions = sum(int(trial.get("positions") or 0) for trial in trials)
     best = next((trial for trial in trials if not trial.get("pruned") and trial.get("score") is not None), None)
+    activity = _supervisor_activity(run_root, trials, events, manifest)
     return {
         "enabled": True,
         "run_root": str(run_root),
@@ -654,6 +671,61 @@ def _suite_status(run_root: Path) -> dict[str, Any]:
         "host": manifest.get("host", {}),
         "args": manifest.get("args", {}),
         "last_event": events[-1] if events else None,
+        "current_activity": activity,
+        "current_trial_id": activity.get("trial_id"),
+        "current_model": activity.get("model"),
+        "current_positions_per_sec": activity.get("positions_per_sec"),
+    }
+
+
+def _suite_trial_detail(run_root: Path, trial_id: str) -> dict[str, Any]:
+    trial_dir = run_root / "trials" / trial_id
+    if not trial_dir.exists():
+        return {}
+    state = next((trial for trial in _suite_state(run_root).get("trials", []) if trial.get("trial_id") == trial_id), {})
+    trial_json = _read_json(trial_dir / "trial.json")
+    latest = _read_json(trial_dir / "LATEST.json")
+    scores = _jsonl_tail(trial_dir / "scores.jsonl", limit=12)
+    summaries = _jsonl_tail(trial_dir / "summary.jsonl", limit=12)
+    events = _jsonl_tail(trial_dir / "events.jsonl", limit=80)
+    checkpoints = _suite_checkpoints(run_root, run_id=trial_id)
+    checkpoint_path = (
+        state.get("checkpoint_path")
+        or latest.get("checkpoint_path")
+        or (checkpoints[0].get("path") if checkpoints else "")
+    )
+    checkpoint = _checkpoint_metadata(Path(checkpoint_path)) if checkpoint_path else {}
+    cfg = checkpoint.get("cfg") or {}
+    model_metadata = checkpoint.get("model_metadata") or cfg.get("model") or {}
+    family = state.get("family") or trial_json.get("family") or {}
+    static = state.get("static") or trial_json.get("static") or latest.get("static") or {}
+    architecture = model_metadata or {
+        "architecture": family.get("architecture"),
+        "channels": family.get("channels"),
+        "blocks": family.get("blocks"),
+        "heads": trial_json.get("heads"),
+        "graph_token_set": static.get("graph_token_set"),
+        "graph_token_budget": static.get("graph_token_budget"),
+        "graph_layers": static.get("graph_layers"),
+        "candidate_budget": static.get("candidate_budget"),
+        "sparse_prior_stage": static.get("sparse_prior_stage"),
+    }
+    return {
+        "trial_id": trial_id,
+        "trial_dir": str(trial_dir),
+        "trial": trial_json,
+        "state": state,
+        "latest": latest,
+        "scores": scores,
+        "summary": summaries,
+        "events": events,
+        "checkpoints": checkpoints,
+        "checkpoint_metadata": checkpoint,
+        "config": cfg,
+        "model_metadata": model_metadata,
+        "architecture": architecture,
+        "architecture_summary": _architecture_summary(architecture, family),
+        "current_activity": _trial_activity(events, latest),
     }
 
 
@@ -695,6 +767,165 @@ def _jsonl_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def _supervisor_activity(
+    run_root: Path,
+    trials: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    trial_by_id = {str(trial.get("trial_id")): trial for trial in trials if trial.get("trial_id")}
+    latest_trial_id = ""
+    for event in reversed(events):
+        if event.get("trial_id"):
+            latest_trial_id = str(event.get("trial_id"))
+            break
+    trial = trial_by_id.get(latest_trial_id, {})
+    log_lines = _tail_lines(run_root / "supervisor.log", limit=120)
+    progress = _last_progress(log_lines)
+    max_game_moves = int((manifest.get("args") or {}).get("max_game_moves") or 0)
+    positions_per_sec = None
+    if progress and max_game_moves > 0:
+        positions_per_sec = float(progress["games_per_min"]) * max_game_moves / 60.0
+    elif trial.get("positions_per_sec") is not None:
+        positions_per_sec = trial.get("positions_per_sec")
+    latest_event = events[-1] if events else {}
+    action = "Waiting for supervisor events"
+    if progress:
+        action = f"Self-play running, {progress['progress_pct']:.1f}% of current epoch"
+    elif latest_event.get("event"):
+        action = _event_blurb(str(latest_event.get("event")))
+    return {
+        "trial_id": latest_trial_id or None,
+        "model": trial.get("family") or latest_event.get("family") or None,
+        "architecture": trial.get("architecture") or None,
+        "action": action,
+        "positions_per_sec": positions_per_sec,
+        "progress": progress,
+        "last_log_line": log_lines[-1] if log_lines else "",
+        "log_tail": log_lines[-20:],
+        "last_event": latest_event,
+    }
+
+
+def _trial_activity(events: list[dict[str, Any]], latest: dict[str, Any]) -> dict[str, Any]:
+    event = events[-1] if events else {}
+    latest_selfplay = latest.get("selfplay") or {}
+    latest_train = latest.get("train") or {}
+    return {
+        "event": event.get("event_type") or event.get("event") or "",
+        "phase": event.get("phase") or latest.get("stage") or "",
+        "epoch": latest.get("epoch") or latest_train.get("epoch"),
+        "positions_per_sec": _per_second(latest_selfplay.get("positions_per_min")),
+        "loss_total": latest_train.get("loss_total"),
+        "updated_at": latest.get("epoch_elapsed_s"),
+    }
+
+
+def _last_progress(lines: list[str]) -> dict[str, Any] | None:
+    pattern = re.compile(
+        r"Progress:\s+([0-9.]+)%\s+\|\s+Games:\s+(\d+)\s+\(([0-9.]+)/min\)\s+\|\s+Buffer:\s+(\d+)\s+\|\s+Workers:\s+(\d+)/(\d+)"
+    )
+    for line in reversed(lines):
+        match = pattern.search(line)
+        if not match:
+            continue
+        return {
+            "progress_pct": float(match.group(1)),
+            "games_done": int(match.group(2)),
+            "games_per_min": float(match.group(3)),
+            "buffer_positions": int(match.group(4)),
+            "workers_alive": int(match.group(5)),
+            "workers_total": int(match.group(6)),
+        }
+    return None
+
+
+def _tail_lines(path: Path, *, limit: int) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return []
+
+
+def _checkpoint_metadata(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"path": str(path), "error": "checkpoint_not_found"}
+    try:
+        import torch
+
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+    cfg = checkpoint.get("cfg_json") or {}
+    model_metadata = checkpoint.get("model_metadata") or cfg.get("model") or {}
+    state = checkpoint.get("model_state_dict") or {}
+    return {
+        "path": str(path),
+        "epoch": checkpoint.get("epoch"),
+        "global_step": checkpoint.get("global_step"),
+        "cfg": cfg,
+        "model_metadata": model_metadata,
+        "model_parameter_tensors": len(state) if hasattr(state, "__len__") else None,
+    }
+
+
+def _architecture_summary(model: dict[str, Any], family: dict[str, Any] | None = None) -> str:
+    family = family or {}
+    arch = str(model.get("architecture") or family.get("architecture") or "").lower()
+    channels = model.get("channels") or family.get("channels")
+    blocks = model.get("blocks") or family.get("blocks")
+    heads = model.get("heads") or []
+    if arch == "graph":
+        return (
+            f"Graph transformer, {channels} channels, {blocks} residual blocks, "
+            f"{model.get('graph_token_budget', '?')} {model.get('graph_token_set', 'tokens')}, "
+            f"{model.get('graph_layers', '?')} graph layers, heads: {len(heads)}."
+        )
+    if arch == "restnet":
+        return (
+            f"ResTNet hybrid trunk, {channels} channels, {blocks} blocks, "
+            f"attention at {model.get('attention_positions') or []}, heads: {len(heads)}."
+        )
+    return f"CNN residual trunk, {channels} channels, {blocks} blocks, heads: {len(heads)}."
+
+
+def _model_summary_from_trial(family: dict[str, Any], static: dict[str, Any]) -> str:
+    arch = str(family.get("architecture") or "")
+    if arch == "graph":
+        return f"graph {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
+    return f"{arch or 'model'} {family.get('channels', '?')}x{family.get('blocks', '?')}"
+
+
+def _worker_summary(selfplay: dict[str, Any]) -> str:
+    alive = selfplay.get("workers_alive")
+    total = selfplay.get("workers_total")
+    if alive is None and total is None:
+        return ""
+    return f"{alive or 0}/{total or 0}"
+
+
+def _per_second(positions_per_min: Any) -> float | None:
+    try:
+        return float(positions_per_min) / 60.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_blurb(event: str) -> str:
+    return {
+        "runtime_sweep_start": "Runtime sweep is testing worker/batch settings",
+        "runtime_sweep_result": "Runtime sweep recorded a probe result",
+        "runtime_sweep_selected": "Runtime sweep selected the fastest stable setting",
+        "trial_epoch_complete": "Epoch finished; metrics and checkpoint were written",
+        "trial_evaluated": "Evaluation finished; scheduler score updated",
+        "trial_pruned": "Trial was pruned by a hard gate or scheduler decision",
+        "pbt_generation_start": "PBT generation started",
+        "stage_start": "Autotune stage started",
+    }.get(event, event.replace("_", " "))
 
 
 def _read_json(path: Path) -> dict[str, Any]:

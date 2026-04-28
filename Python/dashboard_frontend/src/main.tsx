@@ -4,10 +4,13 @@ import {
   Activity,
   BarChart3,
   Bot,
+  Cpu,
   Database,
   Eye,
   FileSearch,
+  Gauge,
   Gamepad2,
+  Layers,
   Pause,
   Play,
   RefreshCw,
@@ -139,7 +142,8 @@ function App() {
     ["Runs", runs.length],
     ["Games", games.length],
     ["Checkpoints", checkpoints.length],
-    ["Suite Games", suiteStatus?.total_games ?? "-"],
+    ["Pos/sec", formatRate(suiteStatus?.current_positions_per_sec)],
+    ["Current", suiteStatus?.current_model ?? selectedRun ?? "-"],
     ["Epoch", latestMetric.train?.epoch ?? latestMetric.epoch ?? "-"],
     ["Loss", fmt(latestMetric.train?.loss_total ?? latestMetric.loss_total)]
   ];
@@ -284,11 +288,31 @@ function SuitePanel({
   openGame: (row: AnyRow) => void;
 }) {
   const lastEvent = status?.last_event || {};
+  const activity = status?.current_activity || {};
   const activeTrials = trials.filter((trial) => !trial.pruned);
   const recentEvents = events.slice(-16).reverse();
+  const [selectedTrialId, setSelectedTrialId] = useState<string>("");
+  const [trialDetail, setTrialDetail] = useState<AnyRow | null>(null);
+  useEffect(() => {
+    if (selectedTrialId) return;
+    const next = status?.current_trial_id || bestCheckpoints[0]?.trial_id || trials[0]?.trial_id || "";
+    if (next) setSelectedTrialId(String(next));
+  }, [selectedTrialId, status?.current_trial_id, bestCheckpoints, trials]);
+  useEffect(() => {
+    if (!selectedTrialId) {
+      setTrialDetail(null);
+      return;
+    }
+    api<AnyRow>(`/api/suite/trials/${encodeURIComponent(selectedTrialId)}`)
+      .then(setTrialDetail)
+      .catch(() => setTrialDetail(null));
+  }, [selectedTrialId]);
   return (
     <section className="suiteGrid">
-      <Panel title="Autotune Suite">
+      <Panel
+        title="Autotune Suite"
+        hint="Live suite totals, current trainer activity, and the model that most recently wrote progress."
+      >
         <div className="suiteHero">
           <div>
             <span>Stage</span>
@@ -303,35 +327,60 @@ function SuitePanel({
             <strong>{fmt(status?.best_score)}</strong>
           </div>
           <div>
-            <span>Saved Games</span>
-            <strong>{formatCount(status?.total_games)}</strong>
+            <span>Current Model</span>
+            <strong>{status?.current_model || "-"}</strong>
           </div>
           <div>
-            <span>Saved Positions</span>
-            <strong>{formatCount(status?.total_positions)}</strong>
+            <span>Positions/sec</span>
+            <strong>{formatRate(status?.current_positions_per_sec)}</strong>
           </div>
           <div>
             <span>Live Trials</span>
             <strong>{activeTrials.length}/{status?.trial_count ?? trials.length}</strong>
           </div>
         </div>
+        <div className="activityStrip">
+          <Gauge size={15} />
+          <span>{activity.action || "Waiting for trainer activity"}</span>
+          {activity.trial_id && <button onClick={() => setSelectedTrialId(activity.trial_id)}>Inspect {activity.trial_id}</button>}
+          {activity.progress && (
+            <span className="activityMeta">
+              {activity.progress.workers_alive}/{activity.progress.workers_total} workers,
+              {" "}{formatCount(activity.progress.buffer_positions)} buffered positions
+            </span>
+          )}
+        </div>
         <div className="suitePath">{status?.run_root || "No suite run root configured"}</div>
       </Panel>
 
-      <Panel title="Best Models">
+      <Panel
+        title="Best Models"
+        hint="Ranked checkpoints from the suite. Click a row to inspect architecture, config, runtime, losses, and checkpoint metadata."
+      >
         <Table
           rows={bestCheckpoints}
           columns={["rank", "trial_id", "score", "epoch", "global_step", "is_loadable", "path"]}
-          onRow={(row) => row.trial_id && openCheckpointTrial(row.trial_id)}
+          onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
         />
       </Panel>
 
-      <Panel title="Trials">
+      <TrialDetail
+        detail={trialDetail}
+        trialId={selectedTrialId}
+        openMetrics={(id) => openTrial(id)}
+        openCheckpoints={(id) => openCheckpointTrial(id)}
+      />
+
+      <Panel
+        title="Trials"
+        hint="Every autotune trial with latest completed epoch metrics. Throughput is self-play positions/sec from the most recent epoch."
+      >
         <Table
           rows={trials}
           columns={[
             "trial_id",
             "family",
+            "architecture",
             "stage",
             "epoch",
             "score",
@@ -340,17 +389,20 @@ function SuitePanel({
             "games",
             "positions",
             "checkpoints",
-            "selfplay_positions_per_min",
+            "positions_per_sec",
+            "workers",
             "epoch_elapsed_s",
             "loss_total",
             "policy_top1_acc",
-            "sparse_policy_top1_acc"
+            "sparse_policy_top1_acc",
+            "pair_policy_top1_acc"
           ]}
-          onRow={(row) => row.trial_id && openTrial(row.trial_id)}
+          onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
+          selected={(row) => row.trial_id === selectedTrialId}
         />
       </Panel>
 
-      <Panel title="Recent Saved Games">
+      <Panel title="Recent Saved Games" hint="Recently persisted self-play games. Click one to open its replay.">
         <Table
           rows={games}
           columns={["game_id", "trial_id", "source", "epoch", "move_count", "terminal_reason", "truncated", "created_at"]}
@@ -358,13 +410,165 @@ function SuitePanel({
         />
       </Panel>
 
-      <Panel title="Recent Suite Events">
+      <Panel title="Recent Suite Events" hint="Supervisor decisions such as sweeps, pruning, epoch completions, and stage changes.">
         <Table
           rows={recentEvents}
           columns={["event", "stage", "trial_id", "reason", "score", "elapsed_s", "time"]}
         />
       </Panel>
     </section>
+  );
+}
+
+function TrialDetail({
+  detail,
+  trialId,
+  openMetrics,
+  openCheckpoints
+}: {
+  detail: AnyRow | null;
+  trialId: string;
+  openMetrics: (id: string) => void;
+  openCheckpoints: (id: string) => void;
+}) {
+  if (!trialId) {
+    return (
+      <Panel title="Selected Model" hint="Pick a trial or model row to inspect the exact configuration.">
+        <div className="emptyState">No model selected.</div>
+      </Panel>
+    );
+  }
+  if (!detail) {
+    return (
+      <Panel title="Selected Model" hint="Loading model metadata and config from the trial checkpoint.">
+        <div className="emptyState">Loading {trialId}...</div>
+      </Panel>
+    );
+  }
+  const latest = detail.latest || {};
+  const train = latest.train || {};
+  const selfplay = latest.selfplay || {};
+  const cfg = detail.config || {};
+  const model = detail.model_metadata || detail.architecture || {};
+  const selfplayCfg = cfg.selfplay || {};
+  const inferenceCfg = cfg.inference || {};
+  const runtimeCfg = cfg.runtime || {};
+  const checkpoint = detail.checkpoint_metadata || {};
+  const selected = detail.trial || {};
+  const runtimeSweep = detail.state?.runtime_sweep || selected.runtime_sweep || {};
+  return (
+    <Panel
+      title="Selected Model"
+      hint="A clickable model inspection view: architecture, search settings, runtime, latest trainer metrics, and raw config."
+    >
+      <div className="detailHeader">
+        <div>
+          <h2>{trialId}</h2>
+          <p>{detail.architecture_summary || "No architecture metadata yet."}</p>
+        </div>
+        <div className="toolbar compact">
+          <button onClick={() => openMetrics(trialId)}><BarChart3 size={15} /> Metrics</button>
+          <button onClick={() => openCheckpoints(trialId)}><Database size={15} /> Checkpoints</button>
+        </div>
+      </div>
+      <div className="detailCards">
+        <MetricCard icon={<Layers size={15} />} label="Architecture" value={model.architecture || selected.family?.architecture || "-"} />
+        <MetricCard icon={<Cpu size={15} />} label="Workers" value={selfplayCfg.num_workers ?? runtimeSweep.selected?.workers ?? "-"} />
+        <MetricCard icon={<Gauge size={15} />} label="Positions/sec" value={formatRate((selfplay.positions_per_min || 0) / 60)} />
+        <MetricCard icon={<Activity size={15} />} label="Loss" value={fmt(train.loss_total)} />
+      </div>
+      <div className="detailGrid">
+        <KeyValue
+          title="Architecture"
+          rows={{
+            architecture: model.architecture,
+            channels: model.channels,
+            blocks: model.blocks,
+            heads: Array.isArray(model.heads) ? model.heads.join(", ") : model.heads,
+            graph_token_set: model.graph_token_set,
+            graph_token_budget: model.graph_token_budget,
+            graph_layers: model.graph_layers,
+            sparse_policy: model.sparse_policy,
+            candidate_budget: model.candidate_budget,
+            sparse_prior_stage: model.sparse_prior_stage,
+            sparse_prior_mix: model.sparse_prior_mix
+          }}
+        />
+        <KeyValue
+          title="Self-Play And Search"
+          rows={{
+            mcts_simulations: selfplayCfg.mcts_simulations,
+            pcr_low_sims: selfplayCfg.pcr_low_sims,
+            pcr_low_sim_prob: selfplayCfg.pcr_low_sim_prob,
+            max_game_moves: selfplayCfg.max_game_moves,
+            states_per_epoch: selfplayCfg.states_per_epoch,
+            games_per_epoch: selfplayCfg.games_per_epoch,
+            c_puct: selfplayCfg.c_puct,
+            dirichlet_alpha: selfplayCfg.dirichlet_alpha,
+            dirichlet_fraction: selfplayCfg.dirichlet_fraction
+          }}
+        />
+        <KeyValue
+          title="Runtime"
+          rows={{
+            num_workers: selfplayCfg.num_workers,
+            batch_size_per_worker: selfplayCfg.batch_size_per_worker,
+            max_batch_size: inferenceCfg.max_batch_size,
+            max_wait_us: inferenceCfg.max_wait_us,
+            fp16: inferenceCfg.fp16,
+            cpu_threads: runtimeCfg.cpu_threads,
+            compile_model: runtimeCfg.compile_model,
+            compile_inference: runtimeCfg.compile_inference,
+            runtime_sweep_selected: runtimeSweep.selected
+          }}
+        />
+        <KeyValue
+          title="Latest Trainer"
+          rows={{
+            epoch: latest.epoch || train.epoch,
+            loss_total: train.loss_total,
+            loss_policy: train.loss_policy,
+            loss_value: train.loss_value,
+            policy_top1_acc: train.policy_top1_acc,
+            sparse_policy_top1_acc: train.sparse_policy_top1_acc,
+            pair_policy_top1_acc: train.pair_policy_top1_acc,
+            checkpoint_epoch: checkpoint.epoch,
+            global_step: checkpoint.global_step,
+            checkpoint_path: checkpoint.path
+          }}
+        />
+      </div>
+      <details className="configDetails">
+        <summary>Full checkpoint config</summary>
+        <pre>{JSON.stringify(cfg || {}, null, 2)}</pre>
+      </details>
+    </Panel>
+  );
+}
+
+function MetricCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: React.ReactNode }) {
+  return (
+    <div className="metricCard">
+      <span>{icon}{label}</span>
+      <strong>{value ?? "-"}</strong>
+    </div>
+  );
+}
+
+function KeyValue({ title, rows }: { title: string; rows: AnyRow }) {
+  const entries = Object.entries(rows).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  return (
+    <div className="kvPanel">
+      <h3>{title}</h3>
+      <dl>
+        {entries.map(([key, value]) => (
+          <React.Fragment key={key}>
+            <dt>{labelFor(key)}</dt>
+            <dd>{cell(value, key)}</dd>
+          </React.Fragment>
+        ))}
+      </dl>
+    </div>
   );
 }
 
@@ -1227,10 +1431,11 @@ function scaleAxisValue(value: number, mode: string) {
   return n;
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
     <section className="panel">
       <div className="panelTitle"><Activity size={14} /> {title}</div>
+      {hint && <p className="panelHint">{hint}</p>}
       {children}
     </section>
   );
@@ -1246,7 +1451,7 @@ function Table({ rows, columns, onRow, selected }: {
     <div className="tableWrap">
       <table>
         <thead>
-          <tr>{columns.map((c) => <th key={c}>{c}</th>)}</tr>
+          <tr>{columns.map((c) => <th key={c}>{labelFor(c)}</th>)}</tr>
         </thead>
         <tbody>
           {rows.map((row, i) => (
@@ -1255,7 +1460,7 @@ function Table({ rows, columns, onRow, selected }: {
               onClick={() => onRow?.(row)}
               className={selected?.(row) ? "selected" : onRow ? "clickable" : ""}
             >
-              {columns.map((c) => <td key={c}>{cell(row[c])}</td>)}
+              {columns.map((c) => <td key={c}>{cell(row[c], c)}</td>)}
             </tr>
           ))}
         </tbody>
@@ -1388,11 +1593,14 @@ function Sparkline({ points }: { points: { x: number; y: number }[] }) {
   return <svg className="chart" viewBox={`0 0 ${width} ${height}`}><path d={d} /></svg>;
 }
 
-function cell(value: any) {
+function cell(value: any, key = "") {
   if (value === null || value === undefined) return "-";
-  if (typeof value === "number") return Number.isInteger(value) ? value : value.toFixed(4);
+  if (isTimestampKey(key)) return formatTimestamp(value);
+  if (key.endsWith("_s") || key === "elapsed_s" || key === "epoch_elapsed_s") return formatDuration(value);
+  if (key.includes("positions_per_sec")) return formatRate(value);
+  if (typeof value === "number") return Number.isInteger(value) ? formatCount(value) : value.toFixed(4);
   if (typeof value === "boolean") return value ? "yes" : "no";
-  if (typeof value === "object") return JSON.stringify(value).slice(0, 80);
+  if (typeof value === "object") return JSON.stringify(value).slice(0, 140);
   return String(value);
 }
 
@@ -1404,6 +1612,41 @@ function formatCount(value: any) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
   return new Intl.NumberFormat().format(number);
+}
+
+function formatRate(value: any) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number.toFixed(number >= 10 ? 1 : 2)}/s`;
+}
+
+function formatDuration(value: any) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  if (number < 60) return `${number.toFixed(1)}s`;
+  if (number < 3600) return `${Math.floor(number / 60)}m ${Math.round(number % 60)}s`;
+  return `${Math.floor(number / 3600)}h ${Math.round((number % 3600) / 60)}m`;
+}
+
+function formatTimestamp(value: any) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return value ?? "-";
+  const ms = number > 10_000_000_000 ? number : number * 1000;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(new Date(ms));
+}
+
+function isTimestampKey(key: string) {
+  return ["created_at", "updated_at", "indexed_at", "time"].includes(key);
+}
+
+function labelFor(key: string) {
+  return key.replace(/_/g, " ");
 }
 
 createRoot(document.getElementById("root")!).render(

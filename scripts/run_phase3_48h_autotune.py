@@ -25,6 +25,7 @@ import os
 import random
 import shutil
 import statistics
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -245,6 +246,7 @@ class TrialState:
     score_history: list[dict[str, Any]] = field(default_factory=list)
     mutation_history: list[dict[str, Any]] = field(default_factory=list)
     checkpoint_history: list[Path] = field(default_factory=list)
+    runtime_sweep: dict[str, Any] = field(default_factory=dict)
     pruned: bool = False
     prune_reason: str = ""
 
@@ -299,6 +301,7 @@ class Phase3Supervisor:
         self.baseline_loss_p75 = {True: 128.0, False: 128.0}
         self.reference_checkpoints = self._reference_checkpoints()
         self.calibration: dict[str, Any] = {}
+        self.runtime_sweep_cache: dict[str, dict[str, Any]] = self._load_runtime_sweep_cache()
         self._write_manifest()
 
     def run(self) -> None:
@@ -403,7 +406,7 @@ class Phase3Supervisor:
             active.append(trial)
             self.trials.append(trial)
 
-        resources = [1, 2, 4]
+        resources = self._asha_resources()
         current = active
         for resource in resources:
             if not self._within_stage(stage) or not current:
@@ -413,7 +416,7 @@ class Phase3Supervisor:
                 while trial.epoch < resource and self._within_stage(stage):
                     self._train_trial_epoch(trial, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
                 self._evaluate_trial(trial, stage=stage, force=True)
-            current = self._promote_top_quartile(current, stage=stage)
+            current = self._promote_top_fraction(current, stage=stage)
         self._save_state()
 
     def phase_3c_pbt(self) -> None:
@@ -439,6 +442,17 @@ class Phase3Supervisor:
     def phase_3d_champion(self) -> None:
         stage = "3D_champion"
         candidates = [t for t in self.trials if not t.pruned and t.checkpoint_path]
+        mature = [t for t in candidates if t.epoch >= self.args.champion_min_epochs]
+        if mature:
+            candidates = mature
+        elif candidates:
+            self.log.write(
+                "champion_min_epochs_fallback",
+                {
+                    "requested_min_epochs": self.args.champion_min_epochs,
+                    "available": {t.trial_id: t.epoch for t in candidates},
+                },
+            )
         champion = max(candidates, key=lambda t: t.last_score, default=None)
         if champion is None:
             self.log.write("champion_unavailable", {"reason": "no unpruned trial with checkpoint"})
@@ -519,6 +533,7 @@ class Phase3Supervisor:
         self._apply_epoch_budget(trial, stage, target_epoch_seconds, force_states, force_train_batches)
         self._apply_dynamic_to_config(trial)
         self._apply_dynamic_to_trainer(trial)
+        self._ensure_runtime_sweep(trial, stage=stage)
         started = time.monotonic()
         try:
             result = run_epoch(
@@ -717,10 +732,7 @@ class Phase3Supervisor:
         cfg.selfplay.subtree_reuse = recipe.subtree_reuse
         cfg.selfplay.train_policy_on_full_search_only = True
         cfg.selfplay.train_on_truncated_games = True
-        cfg.selfplay.max_game_moves = min(
-            int(getattr(cfg.selfplay, "max_game_moves", 256)),
-            self._max_game_moves_for_stage(stage),
-        )
+        cfg.selfplay.max_game_moves = self._max_game_moves_for_stage(stage)
         cfg.runtime.autotune = True
         cfg.selfplay.num_workers = 0
         cfg.selfplay.batch_size_per_worker = 0
@@ -835,14 +847,7 @@ class Phase3Supervisor:
         trainer.batches_per_epoch = trial.cfg.train.batches_per_epoch
 
     def _max_game_moves_for_stage(self, stage: str) -> int:
-        cap = max(1, int(self.args.max_game_moves))
-        if stage == "3A_calibration" or not self.host.cuda_available:
-            return cap
-        if self.host.cuda_memory_gb < 16.0:
-            cap = min(cap, 96)
-            if self._low_memory_cuda_host():
-                cap = min(cap, 80)
-        return cap
+        return max(1, int(self.args.max_game_moves))
 
     def _apply_epoch_budget(
         self,
@@ -852,10 +857,7 @@ class Phase3Supervisor:
         force_states: int | None,
         force_train_batches: int | None,
     ) -> None:
-        trial.cfg.selfplay.max_game_moves = min(
-            int(getattr(trial.cfg.selfplay, "max_game_moves", 256)),
-            self._max_game_moves_for_stage(stage),
-        )
+        trial.cfg.selfplay.max_game_moves = self._max_game_moves_for_stage(stage)
         if force_states is not None:
             states = int(force_states)
         else:
@@ -877,6 +879,271 @@ class Phase3Supervisor:
         )
         pos_per_s = cal_positions / cal_elapsed * sims_scale
         return int(pos_per_s * target_seconds)
+
+    def _ensure_runtime_sweep(self, trial: TrialState, *, stage: str) -> None:
+        sweep_states = int(getattr(self.args, "runtime_sweep_states", 0) or 0)
+        if sweep_states <= 0:
+            return
+        if trial.runtime_sweep.get("applied"):
+            return
+        key = self._runtime_sweep_key(trial)
+        cached = self.runtime_sweep_cache.get(key)
+        if cached and cached.get("selected"):
+            selected = dict(cached["selected"])
+            self._apply_runtime_candidate(trial.cfg, selected)
+            trial.runtime_sweep = {
+                "applied": True,
+                "cached": True,
+                "key": key,
+                "selected": selected,
+            }
+            self.log.write("runtime_sweep_cached", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
+            return
+
+        candidates = self._runtime_sweep_candidates(trial)
+        if not candidates:
+            trial.runtime_sweep = {"applied": False, "skipped": True, "reason": "no_candidates", "key": key}
+            self.log.write("runtime_sweep_skipped", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
+            return
+
+        self.log.write(
+            "runtime_sweep_start",
+            {
+                "trial_id": trial.trial_id,
+                "stage": stage,
+                "key": key,
+                "states": sweep_states,
+                "candidates": candidates,
+            },
+        )
+        results: list[dict[str, Any]] = []
+        for idx, candidate in enumerate(candidates):
+            if not self._within_stage(stage):
+                results.append({"candidate": candidate, "error": "stage_deadline_reached"})
+                break
+            probe_dir = trial.run_dir / "runtime_sweep" / f"candidate_{idx:02d}"
+            row = self._run_runtime_sweep_candidate(
+                trial,
+                stage=stage,
+                candidate=candidate,
+                probe_dir=probe_dir,
+                sweep_states=sweep_states,
+                index=idx,
+            )
+            results.append(row)
+            self.log.write("runtime_sweep_result", {"trial_id": trial.trial_id, "stage": stage, **row})
+            _append_jsonl(self.output_root / "runtime_sweep_results.jsonl", {"trial_id": trial.trial_id, "stage": stage, **row})
+
+        valid = [row for row in results if row.get("ok") and float(row.get("positions_per_min", 0.0) or 0.0) > 0.0]
+        if not valid:
+            selected = dict(candidates[0])
+            selected_record = {
+                "candidate": selected,
+                "positions_per_min": 0.0,
+                "fallback": True,
+                "reason": "all_probe_candidates_failed",
+            }
+        else:
+            selected_record = max(valid, key=lambda row: float(row.get("score", row.get("positions_per_min", 0.0)) or 0.0))
+            selected = dict(selected_record["candidate"])
+
+        self._apply_runtime_candidate(trial.cfg, selected)
+        trial.runtime_sweep = {
+            "applied": True,
+            "cached": False,
+            "key": key,
+            "selected": selected,
+            "selected_positions_per_min": float(selected_record.get("positions_per_min", 0.0) or 0.0),
+            "candidate_count": len(candidates),
+        }
+        self.runtime_sweep_cache[key] = {
+            "key": key,
+            "created_time": time.time(),
+            "selected": selected,
+            "selected_record": selected_record,
+            "results": results,
+        }
+        self._save_runtime_sweep_cache()
+        self.log.write("runtime_sweep_selected", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
+
+    def _run_runtime_sweep_candidate(
+        self,
+        trial: TrialState,
+        *,
+        stage: str,
+        candidate: dict[str, int],
+        probe_dir: Path,
+        sweep_states: int,
+        index: int,
+    ) -> dict[str, Any]:
+        probe_cfg = trial.cfg.model_copy(deep=True)
+        self._apply_runtime_candidate(probe_cfg, candidate)
+        max_game_moves = max(1, int(probe_cfg.selfplay.max_game_moves))
+        states = max(max_game_moves, int(sweep_states))
+        games = max(1, math.ceil(states / max_game_moves))
+        probe_cfg.selfplay.states_per_epoch = states
+        probe_cfg.selfplay.games_per_epoch = games
+        probe_cfg.buffer.capacity = max(512, states + max_game_moves * max(2, int(candidate["workers"])))
+        probe_cfg.train.batches_per_epoch = 0
+        probe_cfg.run.output_dir = str(probe_dir)
+        probe_cfg.run.seed = int(probe_cfg.run.seed) + 10_000 + index
+        probe_cfg = Config.model_validate(probe_cfg.model_dump())
+
+        recorder = RunRecorder.for_run_dir(probe_dir, run_id=f"{trial.trial_id}_runtime_sweep_{index:02d}")
+        probe_buffer = RingBuffer(
+            capacity=probe_cfg.buffer.capacity,
+            max_policy_entries=probe_cfg.selfplay.policy_target_top_k,
+            max_policy_v2_entries=max(probe_cfg.selfplay.policy_target_top_k, probe_cfg.model.candidate_budget),
+            recency_decay=probe_cfg.buffer.recency_decay,
+            num_lookahead=len(probe_cfg.buffer.lookahead_horizons),
+        )
+        model = trial.trainer.model if trial.trainer is not None else None
+        gpu_before = self._nvidia_smi_snapshot()
+        started = time.monotonic()
+        try:
+            result = run_epoch(
+                probe_cfg,
+                model=model,
+                buffer=probe_buffer,
+                output_dir=probe_dir,
+                bootstrap_games=0,
+                use_selfplay=True,
+                train=False,
+                recorder=recorder,
+            )
+            elapsed_s = max(time.monotonic() - started, 1e-6)
+            selfplay = _latest_metric(probe_dir / "events.jsonl", "selfplay")
+            positions = int(selfplay.get("positions_done") or result.buffer_stats.get("size") or 0)
+            positions_per_min = float(selfplay.get("positions_per_min") or (positions / elapsed_s * 60.0))
+            gpu_after = self._nvidia_smi_snapshot()
+            gpu_util = float(gpu_after.get("gpu_util_pct", 0.0) or 0.0)
+            score = positions_per_min * (1.0 + min(gpu_util, 95.0) / 2000.0)
+            return {
+                "ok": positions > 0,
+                "candidate": candidate,
+                "elapsed_s": elapsed_s,
+                "positions": positions,
+                "positions_per_min": positions_per_min,
+                "score": score,
+                "gpu_before": gpu_before,
+                "gpu_after": gpu_after,
+                "selfplay": selfplay,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "candidate": candidate,
+                "elapsed_s": time.monotonic() - started,
+                "error": f"{type(exc).__name__}:{exc}",
+                "gpu_before": gpu_before,
+                "gpu_after": self._nvidia_smi_snapshot(),
+            }
+        finally:
+            self._cleanup_shared_memory()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _runtime_sweep_candidates(self, trial: TrialState) -> list[dict[str, int]]:
+        cfg = trial.cfg
+        base_workers = max(1, int(cfg.selfplay.num_workers))
+        base_bpw = max(1, int(cfg.selfplay.batch_size_per_worker))
+        base_wait = max(1, int(cfg.inference.max_wait_us))
+        worker_values = _parse_int_list(getattr(self.args, "runtime_sweep_workers", ""))
+        if not worker_values:
+            worker_values = [max(1, base_workers - 1), base_workers, base_workers + 1]
+        worker_budget = max(1, int(self.host.logical_cpus) - max(1, int(cfg.runtime.selfplay_cpu_reserve)))
+        max_workers = min(worker_budget, max(worker_values + [base_workers]))
+
+        candidates: list[dict[str, int]] = []
+
+        def add(workers: int, wait_us: int) -> None:
+            workers = max(1, min(int(workers), max_workers))
+            batch_per_worker = base_bpw
+            max_batch = max(64, workers * batch_per_worker + 64)
+            if self.host.cuda_available and self.host.cuda_memory_gb < 16.0:
+                max_batch = min(max_batch, 128)
+            candidate = {
+                "workers": workers,
+                "batch_size_per_worker": batch_per_worker,
+                "max_batch_size": max_batch,
+                "max_wait_us": max(1, int(wait_us)),
+            }
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        add(base_workers, base_wait)
+        for workers in sorted(set(worker_values)):
+            add(workers, base_wait)
+        if len(candidates) < int(self.args.runtime_sweep_max_candidates):
+            add(base_workers, max(base_wait, 800))
+        if len(candidates) < int(self.args.runtime_sweep_max_candidates):
+            add(max_workers, max(base_wait, 800))
+        return candidates[: max(1, int(self.args.runtime_sweep_max_candidates))]
+
+    def _apply_runtime_candidate(self, cfg: Config, candidate: dict[str, int]) -> None:
+        cfg.selfplay.num_workers = max(1, int(candidate["workers"]))
+        cfg.selfplay.batch_size_per_worker = max(1, int(candidate["batch_size_per_worker"]))
+        cfg.inference.max_batch_size = max(1, int(candidate["max_batch_size"]))
+        cfg.inference.max_wait_us = max(1, int(candidate["max_wait_us"]))
+
+    def _runtime_sweep_key(self, trial: TrialState) -> str:
+        payload = {
+            "family": trial.family.compatible_key,
+            "static": asdict(trial.static),
+            "heads": list(trial.cfg.model.heads),
+            "max_game_moves": int(trial.cfg.selfplay.max_game_moves),
+            "mcts_simulations": int(trial.cfg.selfplay.mcts_simulations),
+            "pcr_low_sims": int(trial.cfg.selfplay.pcr_low_sims),
+            "candidate_budget": int(getattr(trial.cfg.model, "candidate_budget", 256)),
+        }
+        return json.dumps(_jsonable(payload), sort_keys=True)
+
+    def _load_runtime_sweep_cache(self) -> dict[str, dict[str, Any]]:
+        path = self.output_root / "runtime_sweep_cache.json"
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if isinstance(payload, dict):
+            return {str(k): v for k, v in payload.items() if isinstance(v, dict)}
+        return {}
+
+    def _save_runtime_sweep_cache(self) -> None:
+        _write_json(self.output_root / "runtime_sweep_cache.json", self.runtime_sweep_cache)
+
+    def _nvidia_smi_snapshot(self) -> dict[str, Any]:
+        try:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+        except Exception:
+            return {}
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return {}
+        first = proc.stdout.strip().splitlines()[0]
+        parts = [part.strip() for part in first.split(",")]
+        if len(parts) < 4:
+            return {}
+        try:
+            return {
+                "gpu_util_pct": float(parts[0]),
+                "memory_util_pct": float(parts[1]),
+                "memory_used_mb": float(parts[2]),
+                "memory_total_mb": float(parts[3]),
+            }
+        except ValueError:
+            return {}
 
     # ── Search/Selection ───────────────────────────────────────────────
 
@@ -980,6 +1247,19 @@ class Phase3Supervisor:
         constrained_cpu = self.host.physical_cpus <= 16
         return bool(self.host.cuda_available and self.host.cuda_memory_gb < 16.0 and (constrained_ram or constrained_cpu))
 
+    def _asha_resources(self) -> list[int]:
+        raw = str(getattr(self.args, "asha_resources", "2,5,10") or "2,5,10")
+        resources: list[int] = []
+        for part in raw.replace(",", " ").split():
+            value = int(part)
+            if value <= 0:
+                raise ValueError(f"ASHA resources must be positive epochs, got {value}")
+            resources.append(value)
+        resources = sorted(set(resources))
+        if not resources:
+            raise ValueError("ASHA resources must contain at least one epoch")
+        return resources
+
     def _apply_host_argument_guards(self) -> None:
         if not self._low_memory_cuda_host():
             return
@@ -1021,6 +1301,7 @@ class Phase3Supervisor:
             return
         best_rate = max(rates.values())
         graph_available = any(f.graph and rates.get(f.name, 0.0) > 0.0 for f in self.families)
+        gate = max(0.0, min(1.0, float(getattr(self.args, "calibration_throughput_gate", 0.35))))
         for family in self.families:
             if family.name in self.blocked_families:
                 continue
@@ -1028,7 +1309,6 @@ class Phase3Supervisor:
             if not latency_sensitive:
                 continue
             rate = rates.get(family.name, 0.0)
-            gate = 0.85 if graph_available and not family.graph else 0.65
             if rate >= best_rate * gate:
                 continue
             reason = f"calibration_throughput_below_gate:{rate:.1f}_vs_best_{best_rate:.1f}_gate_{gate:.2f}"
@@ -1069,11 +1349,12 @@ class Phase3Supervisor:
         )
         self._prune_trials_for_family(family, reason, stage=stage)
 
-    def _promote_top_quartile(self, trials: list[TrialState], *, stage: str) -> list[TrialState]:
+    def _promote_top_fraction(self, trials: list[TrialState], *, stage: str) -> list[TrialState]:
         live = [t for t in trials if not t.pruned]
         self._score_population(live, stage=stage)
         live.sort(key=lambda t: t.last_score, reverse=True)
-        keep_n = max(1, math.ceil(len(live) / 4))
+        fraction = max(0.05, min(1.0, float(self.args.asha_promote_fraction)))
+        keep_n = max(1, math.ceil(len(live) * fraction))
         promoted = live[:keep_n]
         pruned = live[keep_n:]
         for trial in pruned:
@@ -1418,6 +1699,7 @@ class Phase3Supervisor:
             "calibration": self.calibration,
             "blocked_families": self.blocked_families,
             "baseline_loss_p75": self.baseline_loss_p75,
+            "runtime_sweep_cache_size": len(self.runtime_sweep_cache),
             "trials": [self._trial_public_state(t) for t in self.trials],
         }
         _write_json(self.output_root / "state.json", state)
@@ -1437,6 +1719,7 @@ class Phase3Supervisor:
             "score_history": trial.score_history[-5:],
             "metrics_history": trial.metrics_history[-3:],
             "mutation_history": trial.mutation_history[-10:],
+            "runtime_sweep": trial.runtime_sweep,
             "pruned": trial.pruned,
             "prune_reason": trial.prune_reason,
             "heads": list(trial.cfg.model.heads),
@@ -1641,15 +1924,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-epoch-seconds", type=float, default=240.0)
     parser.add_argument("--calibration-states", type=int, default=1024)
     parser.add_argument("--calibration-train-batches", type=int, default=50)
+    parser.add_argument(
+        "--calibration-throughput-gate",
+        type=float,
+        default=0.35,
+        help="Only quarantine latency-sensitive families below this fraction of best calibration throughput.",
+    )
     parser.add_argument("--default-states-per-epoch", type=int, default=1536)
     parser.add_argument("--min-states-per-epoch", type=int, default=256)
     parser.add_argument("--max-states-per-epoch", type=int, default=8192)
-    parser.add_argument("--max-game-moves", type=int, default=128)
+    parser.add_argument("--max-game-moves", type=int, default=192)
+    parser.add_argument(
+        "--runtime-sweep-states",
+        type=int,
+        default=384,
+        help="Self-play positions per startup runtime probe. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--runtime-sweep-workers",
+        default="2,3,4,5",
+        help="Comma/space-separated worker counts to test before a trial's first real epoch.",
+    )
+    parser.add_argument(
+        "--runtime-sweep-max-candidates",
+        type=int,
+        default=4,
+        help="Maximum worker/batch/wait candidates per uncached runtime sweep.",
+    )
     parser.add_argument("--train-batches", type=int, default=100)
     parser.add_argument("--max-active-trials", type=int, default=8)
+    parser.add_argument("--asha-resources", default="2,5,10")
+    parser.add_argument("--asha-promote-fraction", type=float, default=0.5)
     parser.add_argument("--pbt-population", type=int, default=8)
-    parser.add_argument("--perturb-interval", type=int, default=2)
+    parser.add_argument("--perturb-interval", type=int, default=5)
     parser.add_argument("--pbt-generations", type=int, default=6)
+    parser.add_argument("--champion-min-epochs", type=int, default=20)
     parser.add_argument("--eval-every-epochs", type=int, default=2)
     parser.add_argument("--eval-games", type=int, default=4)
     parser.add_argument("--final-eval-games", type=int, default=12)
@@ -1693,6 +2002,18 @@ def _latest_metric(events_path: Path, phase: str) -> dict[str, Any]:
             if row.get("event_type") == "metric" and row.get("phase") == phase:
                 latest = dict(row.get("payload") or {})
     return latest
+
+
+def _parse_int_list(raw: Any) -> list[int]:
+    values: list[int] = []
+    for part in str(raw or "").replace(",", " ").split():
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return values
 
 
 def _zscore_map(rows: list[dict[str, Any]], key: str) -> dict[int, float]:
