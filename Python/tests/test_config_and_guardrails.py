@@ -148,7 +148,7 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
             "model": {
                 "channels": 16,
                 "blocks": 4,
-                "architecture": "graph",
+                "architecture": "graph_hybrid_0",
                 "attention_heads": 4,
                 "graph_token_set": "graph256_cells",
                 "graph_token_budget": 64,
@@ -160,6 +160,7 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
             "inference": {"fp16": False},
         }
     )
+    assert cfg.model.architecture == "graph_hybrid_0"
     model = build_model_from_config(cfg, device=torch.device("cpu"))
     x = torch.zeros(2, 13, 33, 33)
     x[:, 2] = 1.0
@@ -176,6 +177,11 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
     assert out["policy"].shape == (2, 1089)
     assert out["value"].shape == (2, 65)
     assert out["sparse_policy"].shape == (2, 3)
+
+
+def test_graph_architecture_alias_maps_to_graph_hybrid_0():
+    cfg = Config.model_validate({"model": {"architecture": "graph"}})
+    assert cfg.model.architecture == "graph_hybrid_0"
 
 
 def test_pair_policy_head_forward_and_default_weight():

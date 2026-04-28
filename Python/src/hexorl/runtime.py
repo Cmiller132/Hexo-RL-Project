@@ -227,7 +227,7 @@ def _estimate_train_peak_gb(cfg: Config, batch_size: int) -> float:
     attention_scale = 1.0 + 0.22 * attention_blocks
     if architecture == "restnet":
         attention_scale = max(attention_scale, 1.15)
-    if architecture == "graph":
+    if architecture in {"graph", "graph_hybrid_0"}:
         token_scale = max(0.5, float(getattr(cfg.model, "graph_token_budget", 512)) / 512.0)
         layer_scale = max(0.5, float(getattr(cfg.model, "graph_layers", 3)) / 3.0)
         attention_scale = max(attention_scale, 1.35 * token_scale * layer_scale)

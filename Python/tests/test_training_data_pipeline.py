@@ -411,7 +411,7 @@ def test_sparse_sampler_keeps_d6_enabled_and_transforms_candidates():
     assert dataset.use_symmetry is True
 
 
-@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph"])
+@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph_hybrid_0"])
 def test_sparse_d6_batch_trains_for_all_model_architectures(architecture):
     pytest.importorskip("_engine")
     rec = PositionRecord(

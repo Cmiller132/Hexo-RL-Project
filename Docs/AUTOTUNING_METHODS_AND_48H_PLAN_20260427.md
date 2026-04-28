@@ -20,8 +20,8 @@ best_restnet_33:
 candidate_policy_33:
   whether action-keyed candidate priors are safe
 
-best_graph_option1:
-  whether the transformer window replacement is viable
+graph_hybrid_0:
+  whether the crop-compatible sparse-token hybrid is viable as a scout
 ```
 
 The purpose of Phase 3 is to turn the best survivor into the strongest model
@@ -83,17 +83,18 @@ Tune:
 best_current_33
 best_restnet_33
 candidate_policy_33 or restnet_candidate_policy_33
-best_graph_option1
+graph_hybrid_0
 ```
 
 Expected winner prior:
 
 ```text
-best_graph_option1 = graph512_turn_pair_prior
+graph_hybrid_0 = crop-compatible sparse token Transformer + action-keyed priors
 ```
 
 But only keep it as favorite if it preserves tactical reliability and throughput
-well enough for self-play volume.
+well enough for self-play volume. It should not be treated as the true global
+window replacement until the Phase 2 spec-match work is implemented.
 
 ### If The Graph Transformer Does Not Pass
 
@@ -265,7 +266,7 @@ top 6 active checkpoints
 best previous checkpoint
 best_current_33 reference
 best_restnet_33 reference
-best_graph_option1 reference, if available
+graph_hybrid_0 reference, if available
 one conservative classical-reference model
 ```
 
@@ -394,7 +395,7 @@ Run:
 best_current_33 throughput + arena probe
 best_restnet_33 throughput + arena probe
 candidate_policy_33 throughput + recall probe, if available
-best_graph_option1 throughput + recall probe, if available
+graph_hybrid_0 throughput + recall probe, if available
 ```
 
 Outputs:
@@ -554,7 +555,7 @@ best EMA checkpoint
 best shadow checkpoint
 best_current_33
 best_restnet_33
-best_graph_option1, if not primary
+graph_hybrid_0, if not primary
 ```
 
 Run:

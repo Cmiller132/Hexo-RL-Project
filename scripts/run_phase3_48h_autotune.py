@@ -782,7 +782,11 @@ class Phase3Supervisor:
         return Config.model_validate(cfg.model_dump())
 
     def _apply_head_bundle_weights(self, cfg: Config, recipe: StaticRecipe, dynamic: DynamicParams) -> None:
-        aux = dynamic.graph_aux_multiplier if getattr(cfg.model, "architecture", "cnn") == "graph" else dynamic.aux_multiplier
+        aux = (
+            dynamic.graph_aux_multiplier
+            if getattr(cfg.model, "architecture", "cnn") in {"graph", "graph_hybrid_0"}
+            else dynamic.aux_multiplier
+        )
         weights = {
             "policy": 1.0,
             "value": dynamic.value_loss_weight,
@@ -1638,9 +1642,9 @@ class Phase3Supervisor:
                 attention_positions=(5, 10, 14),
             ),
             FamilySpec(
-                "best_graph_option1",
-                "Phase 2 sparse Hex graph Transformer with action-keyed priors.",
-                "graph",
+                "graph_hybrid_0",
+                "Crop-compatible sparse token Transformer hybrid with action-keyed priors.",
+                "graph_hybrid_0",
                 graph=True,
                 sparse_policy=True,
                 available=True,

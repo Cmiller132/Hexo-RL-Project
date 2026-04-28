@@ -102,14 +102,15 @@ class SpatialTransformerBlock(nn.Module):
         return tokens.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
 
-class SparseHexGraphEncoder(nn.Module):
-    """Sparse token Transformer trunk for Phase 2 graph finalists.
+class SparseHexGraphHybrid0Encoder(nn.Module):
+    """Sparse token Transformer trunk for the graph_hybrid_0 scout.
 
     The public model contract remains `(B,13,33,33) -> dense heads`, but this
-    module replaces part of the crop trunk with deterministic sparse graph
-    attention over tactically relevant cells. The action identity path is the
+    module replaces part of the crop trunk with deterministic sparse attention
+    over tactically relevant crop cells. The action identity path is the
     candidate/action-keyed sparse policy head, which keeps global `(q,r)` priors
-    out of the dense crop projection.
+    out of the dense crop projection. This is not the true global sparse graph
+    model from the architecture spec.
     """
 
     TOKEN_SETS = {
@@ -234,7 +235,7 @@ class SparseHexGraphEncoder(nn.Module):
     def forward(self, features: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
         b, c, h, w = features.shape
         if h != BOARD_SIZE or w != BOARD_SIZE:
-            raise ValueError(f"SparseHexGraphEncoder expects {BOARD_SIZE}x{BOARD_SIZE}, got {h}x{w}")
+            raise ValueError(f"SparseHexGraphHybrid0Encoder expects {BOARD_SIZE}x{BOARD_SIZE}, got {h}x{w}")
         k = min(self.cell_budget, h * w)
         flat = features.flatten(2).transpose(1, 2).contiguous()
         score = self._selection_score(raw)
@@ -544,13 +545,15 @@ class HexNet(nn.Module):
         self.conv_in = nn.Conv2d(13, channels, kernel_size=3, padding=1)
 
         self.res_blocks = nn.ModuleList()
-        self.graph_encoder: Optional[SparseHexGraphEncoder] = None
+        self.graph_encoder: Optional[SparseHexGraphHybrid0Encoder] = None
         attention_set = set(self.attention_positions)
         if self.architecture == "graph":
+            self.architecture = "graph_hybrid_0"
+        if self.architecture == "graph_hybrid_0":
             local_blocks = max(1, min(blocks, max(2, blocks // 4)))
             for _ in range(local_blocks):
                 self.res_blocks.append(GatedResBlock(channels))
-            self.graph_encoder = SparseHexGraphEncoder(
+            self.graph_encoder = SparseHexGraphHybrid0Encoder(
                 channels,
                 token_budget=graph_token_budget,
                 token_set=graph_token_set,

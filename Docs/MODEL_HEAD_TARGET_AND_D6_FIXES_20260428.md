@@ -224,7 +224,7 @@ This affected:
 
 - sparse policy;
 - pair policy;
-- graph models using sparse action heads;
+- graph_hybrid_0 models using sparse action heads;
 - RestNet models using sparse action heads.
 
 The guard existed because sparse global candidates were not transformed. If the guard were removed without more work, the tensor and dense policy could be transformed while `candidate_qr`, `candidate_indices`, `policy_target_v2`, and `pair_policy_target_v2` stayed in the original coordinate system.
@@ -264,7 +264,7 @@ The sampler now:
 
 `test_pair_candidate_builder_ignores_padded_candidate_rows()` verifies padded candidate rows cannot create fake pair targets.
 
-`test_sparse_d6_batch_trains_for_all_model_architectures()` runs a finite forward/loss pass for `cnn`, `restnet`, and `graph` with sparse D6 data.
+`test_sparse_d6_batch_trains_for_all_model_architectures()` runs a finite forward/loss pass for `cnn`, `restnet`, and `graph_hybrid_0` with sparse D6 data.
 
 ## 6. Opponent Policy Loss Weighting
 
@@ -346,4 +346,4 @@ Server and clients share the same mapping, so the protocol is unchanged except f
 
 The regret heads are now aligned with the RGSC target formula for trajectory states, but this is not a full prioritized-regret-buffer restart implementation. The current replay sampler still uses `regret_fraction` and `sample_regret_indices()` as the practical training hook. A full RGSC PRB would also need restart-state selection, stored opening states, and EMA regret updates for replayed PRB states.
 
-The D6 path now uses transformed history re-encoding, which is the safest route for sparse/graph models. If performance ever becomes a bottleneck, the optimization should be a tested Rust batch transform/re-encode helper, not a return to rotating already-cropped tensors.
+The D6 path now uses transformed history re-encoding, which is the safest route for sparse/graph_hybrid_0 models. If performance ever becomes a bottleneck, the optimization should be a tested Rust batch transform/re-encode helper, not a return to rotating already-cropped tensors.

@@ -33,8 +33,10 @@ class ModelConfig(BaseModel):
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
         arch = self.architecture.lower()
-        if arch not in {"cnn", "restnet", "graph"}:
-            raise ValueError("model.architecture must be 'cnn', 'restnet', or 'graph'")
+        if arch == "graph":
+            arch = "graph_hybrid_0"
+        if arch not in {"cnn", "restnet", "graph_hybrid_0"}:
+            raise ValueError("model.architecture must be 'cnn', 'restnet', or 'graph_hybrid_0'")
         self.architecture = arch
         if self.blocks <= 0:
             raise ValueError("model.blocks must be positive")
@@ -42,7 +44,7 @@ class ModelConfig(BaseModel):
             raise ValueError("model.channels must be positive")
         if self.attention_heads <= 0:
             raise ValueError("model.attention_heads must be positive")
-        if (arch in {"restnet", "graph"} or self.attention_positions) and self.channels % self.attention_heads != 0:
+        if (arch in {"restnet", "graph_hybrid_0"} or self.attention_positions) and self.channels % self.attention_heads != 0:
             raise ValueError("model.channels must be divisible by model.attention_heads")
         if self.attention_mlp_ratio <= 0.0:
             raise ValueError("model.attention_mlp_ratio must be positive")
@@ -85,7 +87,7 @@ class ModelConfig(BaseModel):
             )
         if arch == "cnn" and self.attention_positions:
             raise ValueError("model.attention_positions require architecture='restnet'")
-        if arch == "graph" and self.attention_positions:
+        if arch == "graph_hybrid_0" and self.attention_positions:
             raise ValueError("model.attention_positions are only used by architecture='restnet'")
         return self
 
