@@ -197,6 +197,11 @@ class Config(BaseModel):
         if "pair_policy" in self.model.heads:
             if "pair_policy" not in self.train.loss_weights:
                 self.train.loss_weights["pair_policy"] = 0.05
+        for head in self.model.heads:
+            if head.startswith("lookahead_") and head not in self.train.loss_weights:
+                self.train.loss_weights[head] = 0.15
+        if self.model.sparse_prior_stage > 0 and not self.model.sparse_policy:
+            raise ValueError("model.sparse_prior_stage > 0 requires model.sparse_policy = true")
 
         return self
 

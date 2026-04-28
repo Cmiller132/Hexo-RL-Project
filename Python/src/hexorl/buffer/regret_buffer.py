@@ -127,7 +127,7 @@ def compute_regret(
     R(st) = (1/(T-t)) * Σ_{i=t}^{T} (V_selected(si) - z)^2
 
     where:
-      - V_selected(si) = MCTS root value at state si (from that player's perspective)
+      - V_selected(si) = MCTS value of the selected action from that player's perspective
       - z = game outcome from P0's perspective
       - T = total number of positions
 
@@ -143,7 +143,11 @@ def compute_regret(
     for t in range(T):
         sum_sq = 0.0
         for i in range(t, T):
-            v_selected = positions[i].root_value
+            v_selected = (
+                positions[i].selected_action_value
+                if getattr(positions[i], "selected_action_value", None) is not None
+                else positions[i].root_value
+            )
             player = positions[i].player
             z = outcome if player == 0 else -outcome
             sum_sq += (v_selected - z) ** 2

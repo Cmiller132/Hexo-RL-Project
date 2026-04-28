@@ -23,6 +23,11 @@ def test_config_rejects_lookahead_head_without_matching_horizon():
         )
 
 
+def test_config_adds_default_loss_for_matching_lookahead_head():
+    cfg = Config.model_validate({"model": {"heads": ["policy", "value", "lookahead_4"]}})
+    assert cfg.train.loss_weights["lookahead_4"] == pytest.approx(0.15)
+
+
 def test_config_rejects_mismatched_lookahead_horizon_and_lambda_counts():
     with pytest.raises(ValueError, match="same length"):
         Config.model_validate(
@@ -268,3 +273,8 @@ def test_sparse_policy_effective_candidate_width_capped_by_shm():
                 "selfplay": {"policy_target_top_k": 513},
             }
         )
+
+
+def test_sparse_prior_stage_requires_sparse_policy_contract():
+    with pytest.raises(ValueError, match="sparse_prior_stage"):
+        Config.model_validate({"model": {"sparse_prior_stage": 1}})

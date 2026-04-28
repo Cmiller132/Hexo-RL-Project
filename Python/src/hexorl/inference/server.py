@@ -43,6 +43,13 @@ class InferenceServer:
         initial_state_dict: Optional[dict] = None,
     ):
         self.cfg = cfg
+        required_heads = {"policy", "value"}
+        missing_heads = sorted(required_heads - set(cfg.model.heads))
+        if missing_heads:
+            raise ValueError(
+                "InferenceServer requires model heads for self-play inference: "
+                f"{missing_heads}"
+            )
         self.num_workers = num_workers
         self.max_batch = cfg.inference.max_batch_size
         self.max_wait_us = cfg.inference.max_wait_us

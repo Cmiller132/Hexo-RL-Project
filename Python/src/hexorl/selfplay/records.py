@@ -19,7 +19,7 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 4
+COMPACT_VERSION_V2 = 5
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
@@ -219,6 +219,7 @@ class GameRecord:
                 pos.moves_left,
             ))
             parts.extend(struct.pack("<f", float(pos.opp_policy_weight)))
+            parts.extend(struct.pack("<f", float(pos.value_weight)))
 
         return bytes(parts)
 
@@ -295,6 +296,7 @@ class GameRecord:
             axis_label = -1
             moves_left = 0.0
             opp_policy_weight = 0.0
+            value_weight = 1.0
             if offset < len(data):
                 num_opp_entries = struct.unpack_from("<H", data, offset)[0]
                 offset += 2
@@ -353,6 +355,9 @@ class GameRecord:
                     offset += 4
                 elif opp_policy or opp_policy_v2:
                     opp_policy_weight = 1.0
+                if is_v2 and version >= 5:
+                    value_weight = struct.unpack_from("<f", data, offset)[0]
+                    offset += 4
 
             positions.append(PositionRecord(
                 move_history=move_history,
@@ -366,6 +371,7 @@ class GameRecord:
                 turn_index=turn_idx,
                 opp_policy_target=opp_policy,
                 opp_policy_weight=opp_policy_weight,
+                value_weight=value_weight,
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
                 pair_policy_target_v2=pair_policy_v2,

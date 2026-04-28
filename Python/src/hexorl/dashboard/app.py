@@ -879,9 +879,9 @@ def _architecture_summary(model: dict[str, Any], family: dict[str, Any] | None =
     channels = model.get("channels") or family.get("channels")
     blocks = model.get("blocks") or family.get("blocks")
     heads = model.get("heads") or []
-    if arch == "graph":
+    if arch in {"graph", "graph_hybrid_0"}:
         return (
-            f"Graph transformer, {channels} channels, {blocks} residual blocks, "
+            f"Graph hybrid 0, {channels} channels, {blocks} residual blocks, "
             f"{model.get('graph_token_budget', '?')} {model.get('graph_token_set', 'tokens')}, "
             f"{model.get('graph_layers', '?')} graph layers, heads: {len(heads)}."
         )
@@ -895,8 +895,8 @@ def _architecture_summary(model: dict[str, Any], family: dict[str, Any] | None =
 
 def _model_summary_from_trial(family: dict[str, Any], static: dict[str, Any]) -> str:
     arch = str(family.get("architecture") or "")
-    if arch == "graph":
-        return f"graph {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
+    if arch in {"graph", "graph_hybrid_0"}:
+        return f"graph_hybrid_0 {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
     return f"{arch or 'model'} {family.get('channels', '?')}x{family.get('blocks', '?')}"
 
 

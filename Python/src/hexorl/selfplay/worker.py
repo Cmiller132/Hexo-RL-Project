@@ -610,12 +610,21 @@ class SelfPlayWorker:
                     root_tensor = tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False)
                     if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
                         legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                        winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
+                            tensor_3d,
+                            legal,
+                            int(offset_q),
+                            int(offset_r),
+                        )
                         cand = build_candidate_batch(
                             [(int(q), int(r)) for q, r in legal],
                             [],
                             offset_q=int(offset_q),
                             offset_r=int(offset_r),
                             budget=self.candidate_budget,
+                            winning_moves=winning_moves,
+                            forced_block_moves=forced_blocks,
+                            cover_cells=cover_cells,
                         )
                         p, v, sparse = client.submit_sparse(
                             root_tensor,
@@ -708,12 +717,21 @@ class SelfPlayWorker:
                                 cand_counts = np.zeros(count, dtype=np.uint16)
                                 for row, (leaf_oq, leaf_or, leaf_legal_bytes) in enumerate(meta):
                                     legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
+                                    leaf_winning, leaf_forced, leaf_cover = _critical_actions_from_root_tensor(
+                                        batch_4d[row],
+                                        legal,
+                                        int(leaf_oq),
+                                        int(leaf_or),
+                                    )
                                     cand = build_candidate_batch(
                                         [(int(q), int(r)) for q, r in legal],
                                         [],
                                         offset_q=int(leaf_oq),
                                         offset_r=int(leaf_or),
                                         budget=self.candidate_budget,
+                                        winning_moves=leaf_winning,
+                                        forced_block_moves=leaf_forced,
+                                        cover_cells=leaf_cover,
                                     )
                                     width = min(self.candidate_budget, cand.qr.shape[0])
                                     cand_qr[row, :width] = cand.qr[:width]
@@ -814,7 +832,7 @@ class SelfPlayWorker:
             )
             candidate_probe = build_candidate_batch(
                 legal_root.tolist(),
-                policy_v2[: max(8, min(len(policy_v2), self.candidate_budget))],
+                policy_v2,
                 offset_q=int(offset_q),
                 offset_r=int(offset_r),
                 budget=self.candidate_budget,

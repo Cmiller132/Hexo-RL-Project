@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from hexorl.config import Config
+from hexorl.action_contract.candidates import build_candidate_batch
 from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
@@ -77,8 +78,28 @@ class ModelCache:
             .unsqueeze(0)
             .to(device=cached.device, dtype=model_input_dtype(cached.model))
         )
+        model_sparse = bool(getattr(cached.model, "sparse_policy_enabled", False))
+        candidate_payload: dict[str, Any] | None = None
+        forward_kwargs: dict[str, torch.Tensor] = {}
+        if model_sparse and len(arr) > 0:
+            cand = build_candidate_batch(
+                [(int(q), int(r)) for q, r in arr],
+                [],
+                offset_q=int(offset_q),
+                offset_r=int(offset_r),
+                budget=min(max(len(arr), 1), 512),
+            )
+            candidate_payload = {
+                "qr": cand.qr,
+                "mask": cand.mask,
+            }
+            forward_kwargs = {
+                "candidate_indices": torch.from_numpy(cand.indices.reshape(1, -1)).to(cached.device),
+                "candidate_features": torch.from_numpy(cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1])).to(cached.device),
+                "candidate_mask": torch.from_numpy(cand.mask.reshape(1, -1)).to(cached.device),
+            }
         with torch.no_grad():
-            out = cached.model(x)
+            out = cached.model(x, **forward_kwargs) if forward_kwargs else cached.model(x)
         result: dict[str, Any] = {
             "model_id": model_id,
             "legal_moves": [{"q": int(q), "r": int(r)} for q, r in arr],
@@ -89,6 +110,21 @@ class ModelCache:
         if "policy" in out:
             logits = out["policy"][0].detach().cpu().numpy()
             result["heads"]["policy"] = policy_debug(logits, legal_mask)
+        if "sparse_policy" in out and candidate_payload is not None:
+            sparse_logits = out["sparse_policy"][0].detach().float().cpu().numpy()
+            mask = candidate_payload["mask"]
+            qr = candidate_payload["qr"]
+            valid_rows = np.where(mask)[0]
+            if valid_rows.size:
+                top_rows = valid_rows[np.argsort(-sparse_logits[valid_rows])[:16]]
+                result["heads"]["sparse_policy"] = [
+                    {
+                        "q": int(qr[row, 0]),
+                        "r": int(qr[row, 1]),
+                        "logit": float(sparse_logits[row]),
+                    }
+                    for row in top_rows
+                ]
         if "value" in out:
             value_logits = out["value"].detach().cpu()
             result["heads"]["value"] = float(cached.model.bins_to_value(value_logits)[0])

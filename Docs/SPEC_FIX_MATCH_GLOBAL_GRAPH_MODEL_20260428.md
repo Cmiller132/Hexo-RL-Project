@@ -30,6 +30,13 @@ global_graph_option1
 contract. It should consume global sparse tokens and emit legal global `(q,r)`
 policy logits.
 
+Implementation order below is sequencing only. The finished Phase 2/3 graph
+plan is not satisfied by `graph_hybrid_0`, a place-policy-only graph, a
+diagnostic pair head, token names that are only score modifiers, or dense/crop
+priors used as the primary search path. The finished target is
+`global_graph768_champion` or a strictly stronger `global_graph_option1`
+successor with the same complete contracts.
+
 ## Current Implementation Snapshot
 
 Current `graph_hybrid_0`:
@@ -82,7 +89,7 @@ but it must not be the primary state representation for the target model.
 Add a graph batch data contract under `Python/src/hexorl/action_contract/` or a
 new `Python/src/hexorl/graph/` package.
 
-Recommended tensors:
+Required tensors:
 
 ```text
 token_features:       (B, T, F)
@@ -92,13 +99,13 @@ token_mask:           (B, T)
 legal_token_indices:  (B, A)
 legal_qr:             (B, A, 2)
 legal_mask:           (B, A)
-pair_token_indices:   (B, P), optional
-pair_first_indices:   (B, P), optional
-pair_second_indices:  (B, P), optional
+pair_token_indices:   (B, P)
+pair_first_indices:   (B, P)
+pair_second_indices:  (B, P)
 relation_bias:        (B, H or 1, T, T)
 policy_target:        (B, A)
-opp_policy_target:    (B, A), optional
-pair_policy_target:   (B, P), optional
+opp_policy_target:    (B, A)
+pair_policy_target:   (B, P)
 ```
 
 Keep padding explicit. Every padded action or token must have a mask. No loss or
@@ -175,7 +182,7 @@ Features:
 - distance to nearest own stone;
 - distance to nearest opponent stone;
 - inside old `33x33` crop flag for diagnostics only;
-- old dense prior or teacher prior, optional;
+- old dense prior or teacher prior for diagnostics/distillation only;
 - creates current-player 3/4/5/6-window indicators;
 - blocks opponent 3/4/5/6-window indicators;
 - cover-set membership bits/counts;
@@ -247,7 +254,7 @@ two-placement turns, the correct defensive policy often needs a set-cover view.
 
 ### `COMPONENT`
 
-Optional early, useful later. Summarize separated clusters so the model can
+Required for the finished model. Summarize separated clusters so the model can
 reason about long-span threats without needing all pairwise stone relations.
 
 ### `PAIR_ACTION`
@@ -299,7 +306,7 @@ Implementation notes:
 
 - Start with a compact relation id tensor `(B,T,T)` and an embedding table
   projected to `(heads,T,T)`.
-- Keep an optional float bias channel for clipped distance and strength
+- Keep a required float bias channel for clipped distance and strength
   quantities.
 - Build relations on CPU in the replay/data-loader path first; only optimize
   after correctness tests pass.
@@ -314,7 +321,7 @@ Add a new class rather than extending the crop hybrid until it is tangled:
 GlobalHexGraphNet
 ```
 
-Recommended first version:
+Required finished version:
 
 ```text
 token input projection
@@ -324,7 +331,7 @@ token input projection
 + relation-biased Transformer blocks
 + state-token pooling
 + legal-token policy heads
-+ pair-token policy head, optional
++ pair-token policy heads
 + value/aux heads from pooled state and selected tactical tokens
 ```
 
@@ -334,7 +341,7 @@ inside `build_model_from_config()` keyed by:
 
 ```toml
 [model]
-architecture = "global_graph"
+architecture = "global_graph_option1"
 ```
 
 Do not overload `graph_hybrid_0`.
@@ -366,8 +373,10 @@ Useful for shaping first-placement choices on two-placement turns.
 
 ### `policy_pair_second`
 
-Conditioned second-placement scorer. First pass can score selected
-`PAIR_ACTION` tokens instead of a full `(A,A)` matrix.
+Conditioned second-placement scorer over legal second placements given the
+selected first placement. It may be implemented with selected `PAIR_ACTION`
+tokens, but the contract must be equivalent to a masked legal conditional
+distribution.
 
 ### `policy_pair_joint`
 
@@ -377,9 +386,9 @@ Logits over `PAIR_ACTION` tokens:
 (B, P)
 ```
 
-This should become the main pair-turn prior once stable. The current
-`PairPolicyHead` is only an auxiliary scorer over candidate pairs and should not
-be treated as this final head.
+This is the main pair-turn prior. The current crop-compatible `PairPolicyHead`
+is only an auxiliary scorer over candidate pairs and should not be treated as
+this final head.
 
 ## Value And Auxiliary Heads
 
@@ -391,15 +400,16 @@ source to pooled graph state:
 - `regret_rank`;
 - binned `regret_value`;
 - `moves_left`;
-- `axis_delta_norm` or future dual-strength target.
+- perspective-indexed dual axis strength and delta-norm axis targets.
 
-Add graph-native tactical heads only if they have clean labels:
+Add graph-native tactical heads with clean engine-derived labels:
 
 - `win_now`;
 - `opp_win_next`;
 - `threat_count_delta`;
 - `cover_set_status`;
-- `legal_token_quality`, optional diagnostic only.
+- `legal_token_quality` as a diagnostic head whose label source is explicitly
+  documented and tested.
 
 Do not add heads that duplicate noisy dashboard experiments unless the target is
 stable and documented.
@@ -453,7 +463,7 @@ Use separate architecture names:
 
 ```toml
 architecture = "graph_hybrid_0"  # current crop-compatible scout
-architecture = "global_graph"    # true spec-match model
+architecture = "global_graph_option1"  # true spec-match model
 ```
 
 Suggested global graph configs:
@@ -479,10 +489,11 @@ pair-action graph schema.
 - Update dashboards/docs so new trials use `graph_hybrid_0`.
 - Do not add more target-spec behavior to the hybrid except bug fixes.
 
-### Step 2: Build Graph State Extractor
+### Step 2: Build Complete Graph State Extractor
 
 - Add a deterministic graph state builder from compact move history.
-- Include `STONE`, `LEGAL`, `HOT_CELL`, `WINDOW6`, and `LINE` first.
+- Include `STATE`, `TURN`, `PLAYER`, `STONE`, `LEGAL`, `HOT_CELL`, `WINDOW6`,
+  `LINE`, `COVER_SET`, `COMPONENT`, and `PAIR_ACTION`.
 - Build candidate recall tests before model training.
 - Save token debug payloads for dashboard inspection.
 
@@ -493,30 +504,40 @@ pair-action graph schema.
   buckets, and D6 remapping.
 - Add a tiny `GlobalHexGraphNet` smoke test with masked attention.
 
-### Step 4: Train Place-Policy Only
+### Step 4: Train Full Graph Heads Offline
 
-- Train `global_graph256_cells` or `global_graph384_windows` on replay.
-- Use `policy_place`, `value`, `moves_left`, and maybe `axis_delta_norm`.
-- Compare against dense crop on target reconstruction and legal recall before
-  self-play.
+- Train the full `global_graph_option1` head bundle on replay:
+  - `policy_place`;
+  - `policy_pair_first`;
+  - `policy_pair_second`;
+  - `policy_pair_joint`;
+  - value, lookahead, moves-left, opponent policy, axis, tactical, and regret
+    heads.
+- Compare against dense crop and `graph_hybrid_0` on target reconstruction,
+  legal recall, tactical recall, pair recall, value calibration, and throughput
+  before self-play.
 
-### Step 5: Add Cover And Tactical Tokens
+### Step 5: Validate Cover And Tactical Tokens
 
-- Add `COVER_SET` tokens and cover-status aux labels.
+- Validate `COVER_SET` tokens and cover-status aux labels.
 - Run forced-block and multi-threat suites.
 - Require no missing decisive candidates.
 
-### Step 6: Add Pair Policy
+### Step 6: Validate Pair Policy
 
-- Add `PAIR_ACTION` tokens.
-- Add `policy_pair_first`, `policy_pair_second`, and `policy_pair_joint`.
-- Gate on pair candidate recall and finite pair loss before MCTS integration.
+- Validate `PAIR_ACTION` tokens.
+- Validate `policy_pair_first`, `policy_pair_second`, and
+  `policy_pair_joint`.
+- Require pair candidate recall, finite pair loss, D6 pair equivariance, and
+  legal-pair guards before self-play.
 
 ### Step 7: Self-Play Integration
 
 - Add a graph inference path that returns legal keyed priors.
-- Start with shadow prior logging beside the current policy.
-- Promote to active MCTS priors only after fallback-prior use is near zero.
+- Use graph priors as the active MCTS prior path for `global_graph_option1`.
+- Use pair policy as the active two-placement prior path.
+- Keep dense/crop priors only as measured diagnostics or emergency fallback
+  counters, not as the primary graph policy.
 - Run sample-normalized, wall-clock-normalized, and search-normalized matches
   against `best_current_33`, `best_restnet_33`, and `graph_hybrid_0`.
 
@@ -538,40 +559,50 @@ The true implementation is not complete until all of these pass:
   and outside-window cases;
 - benchmarks report throughput, memory, and fallback-prior use separately from
   `graph_hybrid_0`.
+- pair policy actively shapes two-placement MCTS decisions and reports pair
+  prior-source telemetry;
+- PB2/Phase 3 can tune `global_graph_option1` as a first-class family using the
+  same league, tactical, outside-window, candidate, and throughput evaluators as
+  every other survivor.
 
 ## Non-Goals
 
 - Do not add legacy Hexagon checkpoint compatibility to the graph path.
-- Do not keep dense `1089` policy as the primary `global_graph` policy.
+- Do not keep dense `1089` policy as the primary `global_graph_option1` policy.
 - Do not make `WINDOW6`/`COVER_SET` names mere score modifiers.
 - Do not rely on dashboard-only axis experiments as training targets until they
   are separately validated.
 - Do not hide missing legal actions behind silent fallback priors.
 
-## Recommended First Implementation Target
+## Finished Implementation Target
 
-The best first spec-matching target is:
+The spec-matching target is:
 
 ```text
-global_graph384_windows
+global_graph768_champion
 ```
 
-Reason:
+Required properties:
 
-- It is much more real than `graph_hybrid_0` because it removes the crop as the
-  primary input.
-- It includes `WINDOW6` and `LINE`, which are core to Hexo geometry.
-- It avoids `COVER_SET` and `PAIR_ACTION` complexity until the token/relation
-  contract is proven.
-- It should expose quickly whether global legal-token policy can train and run
-  inside MCTS without collapsing throughput.
+- removes the crop as the primary state and policy contract;
+- includes all required token families;
+- includes relation-biased global attention;
+- trains place, pair, value, lookahead, opponent-policy, axis, tactical,
+  moves-left, and regret heads;
+- consumes global keyed priors in MCTS;
+- consumes pair priors on two-placement turns;
+- passes D6, tactical, outside-window, pair, dashboard, and Phase 3 evaluator
+  gates.
 
-After that, move to:
+Smaller configs are allowed only as implementation tests:
 
 ```text
+global_graph256_cells
+global_graph384_windows
 global_graph512_cover
 global_graph512_turn
 ```
 
-Only attempt `global_graph768_champion` if the smaller global models are
-capacity-limited rather than throughput-limited.
+They are not acceptance targets for the finished P2/P3 plan. The finished plan
+requires `global_graph768_champion` or a strictly stronger successor with the
+same complete contracts.

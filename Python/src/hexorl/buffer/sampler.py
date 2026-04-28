@@ -519,6 +519,14 @@ class ReplayDataset(_IterableDataset):
         if len(records) < self.batch_size:
             return None
 
+        candidate_width = max(
+            int(self.candidate_budget),
+            max((len(getattr(rec, "policy_target_v2", [])) for rec in records), default=0),
+            max((len(getattr(rec, "opp_policy_target_v2", [])) for rec in records), default=0),
+            1,
+        )
+        candidate_width = min(candidate_width, 512)
+
         tensors = np.zeros(
             (self.batch_size, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE),
             dtype=np.float32,
@@ -537,7 +545,7 @@ class ReplayDataset(_IterableDataset):
             "opp_policy_weight": np.zeros(self.batch_size, dtype=np.float32),
         }
         if self.include_sparse_policy:
-            budget = max(1, self.candidate_budget)
+            budget = candidate_width
             aux_targets["candidate_qr"] = np.zeros((self.batch_size, budget, 2), dtype=np.int32)
             aux_targets["candidate_indices"] = np.full((self.batch_size, budget), -1, dtype=np.int64)
             aux_targets["candidate_features"] = np.zeros(
@@ -644,7 +652,7 @@ class ReplayDataset(_IterableDataset):
                     policy_v2,
                     offset_q=int(offset_q),
                     offset_r=int(offset_r),
-                    budget=self.candidate_budget,
+                    budget=candidate_width,
                     winning_moves=winning_moves,
                     forced_block_moves=forced_blocks,
                     cover_cells=cover_cells,
@@ -655,12 +663,16 @@ class ReplayDataset(_IterableDataset):
                 aux_targets["candidate_features"][i, :width] = cand.features[:width]
                 aux_targets["candidate_mask"][i, :width] = cand.mask[:width]
                 aux_targets["sparse_policy_target"][i, :width] = cand.target[:width]
-                aux_targets["candidate_missing_mass"][i] = cand.missing_mass
+                represented = float(aux_targets["sparse_policy_target"][i, :width].sum())
+                aux_targets["candidate_missing_mass"][i] = max(
+                    float(cand.missing_mass),
+                    1.0 - represented,
+                )
                 if self.include_pair_policy:
                     pair = build_pair_candidate_batch(
                         [(int(q), int(r)) for q, r in cand.qr[:width]],
                         pair_policy_v2,
-                        budget=self.candidate_budget,
+                        budget=candidate_width,
                         candidate_mask=cand.mask[:width],
                     )
                     pair_width = min(pair.pair_indices.shape[0], aux_targets["pair_candidate_indices"].shape[1])

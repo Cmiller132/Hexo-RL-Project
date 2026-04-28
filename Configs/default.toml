@@ -21,8 +21,6 @@ dirichlet_alpha = 0.3
 dirichlet_fraction = 0.25
 pcr_low_sim_prob = 0.75
 pcr_low_sims = 192
-resign_threshold = -0.95
-resign_disable_prob = 0.1
 
 [inference]
 max_batch_size = 128

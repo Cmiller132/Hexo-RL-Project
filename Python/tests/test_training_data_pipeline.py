@@ -274,6 +274,7 @@ def test_compact_record_v2_roundtrip_preserves_global_targets():
         outcome=-1.0,
         opp_policy_target_v2=[(1, 0, 1.0)],
         opp_policy_weight=1.0,
+        value_weight=0.0,
     )
     game = GameRecord(positions=[rec], outcome=-1.0, game_id=9, final_move_history=_move(0, 0, 0))
 
@@ -287,6 +288,7 @@ def test_compact_record_v2_roundtrip_preserves_global_targets():
     assert out.positions[0].pair_policy_target_v2 == pair_target
     assert out.positions[0].selected_action_value == pytest.approx(-0.5)
     assert out.positions[0].opp_policy_weight == pytest.approx(1.0)
+    assert out.positions[0].value_weight == pytest.approx(0.0)
     assert out.positions[0].target_policy_mass_outside_window == pytest.approx(0.6)
     assert out.positions[0].candidate_recall_mcts_top4 == pytest.approx(0.5)
     assert out.positions[0].candidate_recall_winning_move == pytest.approx(1.0)
@@ -545,6 +547,53 @@ def test_candidate_builder_keeps_critical_actions_past_budget():
     assert cand.recall_winning_move == pytest.approx(1.0)
     assert cand.recall_forced_block == pytest.approx(1.0)
     assert cand.recall_two_placement_cover == pytest.approx(1.0)
+
+
+def test_candidate_features_do_not_include_policy_target_labels():
+    from hexorl.action_contract.candidates import build_candidate_batch
+
+    kwargs = {
+        "legal_moves": [(0, 0), (1, 0)],
+        "offset_q": -16,
+        "offset_r": -16,
+        "budget": 4,
+    }
+    with_target = build_candidate_batch(policy_target_v2=[(1, 0, 1.0)], **kwargs)
+    without_target = build_candidate_batch(policy_target_v2=[], **kwargs)
+
+    row_with = np.where((with_target.qr == np.array([1, 0])).all(axis=1))[0][0]
+    row_without = np.where((without_target.qr == np.array([1, 0])).all(axis=1))[0][0]
+    assert with_target.features[row_with].tolist() == pytest.approx(
+        without_target.features[row_without].tolist()
+    )
+    assert with_target.target[row_with] == pytest.approx(1.0)
+
+
+def test_sparse_sampler_reports_missing_mass_if_protected_candidates_overflow_width():
+    targets = [(i, 0, 0.2) for i in range(5)]
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=targets,
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=2)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_sparse_policy=True,
+        candidate_budget=2,
+    )
+
+    *_prefix, aux = next(iter(dataset))
+
+    assert aux["sparse_policy_target"].shape[1] == 2
+    assert aux["sparse_policy_target"][0].sum() == pytest.approx(1.0)
+    assert aux["candidate_missing_mass"][0] == pytest.approx(0.6)
 
 
 def test_sparse_policy_loss_masks_invalid_candidates():

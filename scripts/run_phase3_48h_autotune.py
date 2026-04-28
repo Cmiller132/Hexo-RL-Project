@@ -1843,7 +1843,7 @@ class EvaluationServices:
         )
         row["scheduler_score"] = (
             row["strength_score"]
-            - 0.10 * row["epoch_seconds"] / max(self.s.args.target_epoch_seconds, 1.0)
+            - 0.10 * row["epoch_seconds"] / max(self.args.target_epoch_seconds, 1.0)
             - 0.10 * row["truncation_rate"]
             - 0.20 * row["illegal_or_crash_rate"]
         )
@@ -1869,7 +1869,7 @@ class EvaluationServices:
             "candidate_recall_forced_block": forced,
             "candidate_recall_two_placement_cover": cover,
             "missing_target_policy_mass": missing,
-            "gate_pass": top8 >= self.s.args.candidate_recall_gate and decisive >= 0.995 and missing <= 0.01,
+            "gate_pass": top8 >= self.args.candidate_recall_gate and decisive >= 0.995 and missing <= 0.01,
             "score": max(0.0, min(1.0, min(top8, decisive) - missing)),
         }
 
