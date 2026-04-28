@@ -20,6 +20,7 @@ class HostProfile:
     cuda_available: bool
     cuda_name: str | None = None
     cuda_memory_gb: float = 0.0
+    system_memory_gb: float = 0.0
 
 
 def detect_host() -> HostProfile:
@@ -39,6 +40,7 @@ def detect_host() -> HostProfile:
         cuda_available=cuda_available,
         cuda_name=cuda_name,
         cuda_memory_gb=cuda_memory_gb,
+        system_memory_gb=_system_memory_gb(),
     )
 
 
@@ -130,6 +132,7 @@ def configure_torch_runtime(cfg: Config, host: HostProfile | None = None) -> dic
         "cuda": host.cuda_available,
         "cuda_name": host.cuda_name,
         "cuda_memory_gb": round(host.cuda_memory_gb, 2),
+        "system_memory_gb": round(host.system_memory_gb, 2),
         "channels_last": bool(rt.channels_last and host.cuda_available),
         "compile_model": bool(rt.compile_model and host.cuda_available),
         "compile_inference": bool(rt.compile_inference and host.cuda_available),
@@ -153,6 +156,21 @@ def _physical_cpu_count(logical: int) -> int:
         return psutil.cpu_count(logical=False) or max(1, logical // 2)
     except Exception:
         return max(1, logical // 2)
+
+
+def _system_memory_gb() -> float:
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.virtual_memory().total / (1024**3))
+    except Exception:
+        pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        return float(page_size * phys_pages / (1024**3))
+    except Exception:
+        return 0.0
 
 
 def _cuda_batch_target(cfg: Config, host: HostProfile) -> int:
@@ -204,10 +222,15 @@ def _estimate_train_peak_gb(cfg: Config, batch_size: int) -> float:
     channels_scale = max(0.25, cfg.model.channels / 128.0)
     blocks_scale = max(0.25, cfg.model.blocks / 16.0)
     head_scale = max(0.75, len(cfg.model.heads) / 6.0)
+    architecture = getattr(cfg.model, "architecture", "cnn")
     attention_blocks = len(getattr(cfg.model, "attention_positions", []))
     attention_scale = 1.0 + 0.22 * attention_blocks
-    if getattr(cfg.model, "architecture", "cnn") == "restnet":
+    if architecture == "restnet":
         attention_scale = max(attention_scale, 1.15)
+    if architecture == "graph":
+        token_scale = max(0.5, float(getattr(cfg.model, "graph_token_budget", 512)) / 512.0)
+        layer_scale = max(0.5, float(getattr(cfg.model, "graph_layers", 3)) / 3.0)
+        attention_scale = max(attention_scale, 1.35 * token_scale * layer_scale)
     sparse_scale = 1.0 + (0.04 if getattr(cfg.model, "sparse_policy", False) else 0.0)
     per_sample_gb = 0.0327 * channels_scale * blocks_scale * head_scale * attention_scale * sparse_scale
     model_overhead_gb = 0.35 * (channels_scale ** 2) * blocks_scale * attention_scale

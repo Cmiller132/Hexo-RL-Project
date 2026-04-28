@@ -142,6 +142,42 @@ def test_restnet_config_validation_and_forward_shapes():
     assert out["value"].shape == (2, 65)
 
 
+def test_graph_config_validation_and_action_keyed_forward_shapes():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 16,
+                "blocks": 4,
+                "architecture": "graph",
+                "attention_heads": 4,
+                "graph_token_set": "graph256_cells",
+                "graph_token_budget": 64,
+                "graph_layers": 1,
+                "sparse_policy": True,
+                "candidate_budget": 8,
+                "heads": ["policy", "value"],
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    x = torch.zeros(2, 13, 33, 33)
+    x[:, 2] = 1.0
+    x[:, 3, 16, 16] = 1.0
+    candidate_indices = torch.tensor([[544, -1, -1], [544, 545, -1]], dtype=torch.long)
+    candidate_features = torch.zeros(2, 3, 12)
+    candidate_mask = candidate_indices >= 0
+    out = model(
+        x,
+        candidate_indices=candidate_indices,
+        candidate_features=candidate_features,
+        candidate_mask=candidate_mask,
+    )
+    assert out["policy"].shape == (2, 1089)
+    assert out["value"].shape == (2, 65)
+    assert out["sparse_policy"].shape == (2, 3)
+
+
 def test_restnet_config_rejects_invalid_attention_position():
     with pytest.raises(ValueError, match="attention_positions"):
         Config.model_validate(

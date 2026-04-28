@@ -164,6 +164,32 @@ mod tests {
     }
 
     #[test]
+    fn mcts_reroot_clears_pending_after_failed_batch() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
+        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+
+        let (moves_q, moves_r, visits_before, _) = engine.get_results();
+        assert!(!visits_before.is_empty(), "root should have children");
+        let (_, count) = engine.select_leaves(8);
+        assert!(count > 0, "expected pending non-terminal leaves");
+        assert!(
+            !engine.pending_leaf_metadata().is_empty(),
+            "select_leaves should leave pending metadata before backprop"
+        );
+
+        engine
+            .re_root(moves_q[0] as i16, moves_r[0] as i16, 50)
+            .expect("re_root should clear pending leaves and continue");
+        assert!(
+            engine.pending_leaf_metadata().is_empty(),
+            "re_root must not carry stale pending leaves across moves"
+        );
+    }
+
+    #[test]
     fn mcts_backprop_does_not_flip_between_same_player_placements() {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");

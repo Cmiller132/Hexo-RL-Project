@@ -22,6 +22,9 @@ class ModelConfig(BaseModel):
     attention_dropout: float = 0.0
     dropout: float = 0.0
     relative_bias: bool = False
+    graph_token_set: str = "graph512_turn_pair_prior"
+    graph_token_budget: int = 512
+    graph_layers: int = 3
     sparse_policy: bool = False
     candidate_budget: int = 256
     sparse_prior_stage: int = 0
@@ -30,8 +33,8 @@ class ModelConfig(BaseModel):
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
         arch = self.architecture.lower()
-        if arch not in {"cnn", "restnet"}:
-            raise ValueError("model.architecture must be 'cnn' or 'restnet'")
+        if arch not in {"cnn", "restnet", "graph"}:
+            raise ValueError("model.architecture must be 'cnn', 'restnet', or 'graph'")
         self.architecture = arch
         if self.blocks <= 0:
             raise ValueError("model.blocks must be positive")
@@ -39,7 +42,7 @@ class ModelConfig(BaseModel):
             raise ValueError("model.channels must be positive")
         if self.attention_heads <= 0:
             raise ValueError("model.attention_heads must be positive")
-        if (arch == "restnet" or self.attention_positions) and self.channels % self.attention_heads != 0:
+        if (arch in {"restnet", "graph"} or self.attention_positions) and self.channels % self.attention_heads != 0:
             raise ValueError("model.channels must be divisible by model.attention_heads")
         if self.attention_mlp_ratio <= 0.0:
             raise ValueError("model.attention_mlp_ratio must be positive")
@@ -49,6 +52,21 @@ class ModelConfig(BaseModel):
             raise ValueError("model.attention_dropout must be in [0, 1)")
         if self.relative_bias:
             raise ValueError("model.relative_bias is reserved and must remain false")
+        valid_graph_sets = {
+            "graph256_cells",
+            "graph384_windows",
+            "graph512_cover",
+            "graph512_turn",
+            "graph512_turn_pair_prior",
+            "graph768_champion",
+        }
+        self.graph_token_set = self.graph_token_set.lower()
+        if self.graph_token_set not in valid_graph_sets:
+            raise ValueError(f"model.graph_token_set must be one of {sorted(valid_graph_sets)}")
+        if not 16 <= self.graph_token_budget <= 768:
+            raise ValueError("model.graph_token_budget must be in [16, 768]")
+        if self.graph_layers <= 0:
+            raise ValueError("model.graph_layers must be positive")
         if self.candidate_budget <= 0:
             raise ValueError("model.candidate_budget must be positive")
         if self.candidate_budget > 512:
@@ -67,6 +85,8 @@ class ModelConfig(BaseModel):
             )
         if arch == "cnn" and self.attention_positions:
             raise ValueError("model.attention_positions require architecture='restnet'")
+        if arch == "graph" and self.attention_positions:
+            raise ValueError("model.attention_positions are only used by architecture='restnet'")
         return self
 
 

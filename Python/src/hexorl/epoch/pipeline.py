@@ -162,6 +162,7 @@ def run_epoch(
             include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
             include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False)),
             candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
+            max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
         )
         num_workers = dataloader_worker_count(cfg)
         dataloader = DataLoader(

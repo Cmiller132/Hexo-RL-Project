@@ -350,6 +350,7 @@ class ReplayDataset(_IterableDataset):
         include_axis_delta_norm: bool = False,
         include_sparse_policy: bool = False,
         candidate_budget: int = 256,
+        max_game_turns: int = 256,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -367,6 +368,7 @@ class ReplayDataset(_IterableDataset):
         self.lookahead_horizons = lookahead_horizons or []
         self.regret_fraction = max(0.0, min(1.0, regret_fraction))
         self.regret_temperature = regret_temperature
+        self.max_game_turns = max(1, int(max_game_turns))
         self.include_axis_delta_norm = bool(include_axis_delta_norm)
         self._axis_delta_norm_proto = (
             get_prototype("exp_delta_norm")
@@ -440,6 +442,7 @@ class ReplayDataset(_IterableDataset):
             "regret_value": np.zeros(self.batch_size, dtype=np.float32),
             "axis": np.full(self.batch_size, -1, dtype=np.int64),
             "moves_left": np.zeros(self.batch_size, dtype=np.float32),
+            "moves_left_weight": np.ones(self.batch_size, dtype=np.float32),
             "value_weight": np.ones(self.batch_size, dtype=np.float32),
             "policy_weight": np.ones(self.batch_size, dtype=np.float32),
         }
@@ -493,7 +496,8 @@ class ReplayDataset(_IterableDataset):
             aux_targets["regret_rank"][i] = rec.regret_rank
             aux_targets["regret_value"][i] = rec.regret_value
             aux_targets["axis"][i] = axis_label
-            aux_targets["moves_left"][i] = rec.moves_left
+            aux_targets["moves_left"][i] = np.log1p(max(float(rec.moves_left), 0.0)) / np.log1p(self.max_game_turns)
+            aux_targets["moves_left_weight"][i] = 0.0 if rec.outcome == 0.0 else 1.0
             aux_targets["value_weight"][i] = rec.value_weight
             aux_targets["policy_weight"][i] = 1.0 if rec.is_full_search else 0.0
             if self.include_sparse_policy:

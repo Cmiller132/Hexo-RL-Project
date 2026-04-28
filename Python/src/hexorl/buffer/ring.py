@@ -353,6 +353,21 @@ class RingBuffer:
                         [(self._tail + i) % self.capacity for i in range(self._size)]
                     ].mean()
                 ) if self._size > 0 else 0.0,
+                "avg_candidate_recall_mcts_top1": float(
+                    self._candidate_recall_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "avg_candidate_recall_mcts_top4": float(
+                    self._candidate_recall_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "avg_candidate_recall_mcts_top8": float(
+                    self._candidate_recall_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
             }
 
     def clear(self):

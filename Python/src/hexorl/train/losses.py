@@ -219,6 +219,7 @@ def axis_map_loss(
 def moves_left_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MSE on positive scalar moves-left target.
 
@@ -229,7 +230,13 @@ def moves_left_loss(
     Returns:
         Scalar loss.
     """
-    return F.mse_loss(pred.squeeze(-1), target)
+    loss = (pred.squeeze(-1).float() - target.to(device=pred.device, dtype=torch.float32)).pow(2)
+    if weight is not None:
+        w = weight.to(device=loss.device, dtype=loss.dtype)
+        if not torch.any(w > 0):
+            return pred.sum() * 0.0
+        return (loss * w).sum() / w.sum().clamp(min=1e-6)
+    return loss.mean()
 
 
 def entropy_loss(policy_logits: torch.Tensor) -> torch.Tensor:
@@ -317,7 +324,7 @@ def compute_losses(
                 continue
             loss = axis_map_loss(pred, target)
         elif head_name == "moves_left":
-            loss = moves_left_loss(pred, targets["moves_left"])
+            loss = moves_left_loss(pred, targets["moves_left"], targets.get("moves_left_weight"))
         else:
             continue
 

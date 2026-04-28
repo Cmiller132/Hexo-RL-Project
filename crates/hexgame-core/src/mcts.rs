@@ -897,6 +897,23 @@ impl MCTSEngine {
             .collect()
     }
 
+    pub fn clear_pending_leaves(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut leaves = Vec::new();
+        std::mem::swap(&mut leaves, &mut self.pending);
+        for leaf in &leaves {
+            for &ni in &leaf.search_path {
+                let n = &mut self.arena[ni as usize];
+                n.visit_count = n.visit_count.saturating_sub(VIRTUAL_LOSS_VISITS);
+                n.total_value += VIRTUAL_LOSS_VISITS as f32;
+            }
+        }
+        leaves.clear();
+        std::mem::swap(&mut leaves, &mut self.pending);
+    }
+
     // ── Tree management ────────────────────────────────────────────────
 
     /// Re-root the tree at the child matching action `(q, r)`.
@@ -912,10 +929,7 @@ impl MCTSEngine {
     /// are never referenced.  With typical tree sizes this wastes ~400KB, which
     /// is acceptable since the arena is recreated per turn.
     pub fn re_root(&mut self, q: i16, r: i16, new_num_simulations: u32) -> Result<(), MCTSError> {
-        assert!(
-            self.pending.is_empty(),
-            "re_root: pending leaves must be flushed"
-        );
+        self.clear_pending_leaves();
 
         let root = &self.arena[self.root_idx as usize];
         let start = root.children_start as usize;
