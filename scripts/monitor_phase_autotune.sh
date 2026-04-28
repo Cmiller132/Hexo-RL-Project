@@ -9,6 +9,7 @@ RUN_ROOT="${1:-runs/phase2_phase3_autotune_overnight_20260428}"
 HOURS="${2:-8}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-300}"
 MAX_RESTARTS="${MAX_RESTARTS:-3}"
+NO_PROGRESS_WARN_CHECKS="${NO_PROGRESS_WARN_CHECKS:-3}"
 STATUS_MD="${RUN_ROOT}/overnight_monitor.md"
 EVENTS_JSONL="${RUN_ROOT}/overnight_monitor_events.jsonl"
 
@@ -40,10 +41,10 @@ write_status_header() {
 
 Run root: \`${RUN_ROOT}\`
 
-This watchdog checks the active supervisor every ${INTERVAL_SECONDS}s for ${HOURS}h, records GPU/process/event health, and restarts the supervisor up to ${MAX_RESTARTS} times if it exits.
+This watchdog checks the active supervisor every ${INTERVAL_SECONDS}s for ${HOURS}h, records GPU/process/event health, warns after ${NO_PROGRESS_WARN_CHECKS} repeated no-progress checks, and restarts the supervisor up to ${MAX_RESTARTS} times if it exits.
 
-| Time UTC | PID | State | GPU Used MB | GPU % | Last Event | Action |
-|---|---:|---|---:|---:|---|---|
+| Time UTC | PID | State | GPU Used MB | GPU % | Last Event | Last Progress | Action |
+|---|---:|---|---:|---:|---|---|---|
 EOF
 }
 
@@ -79,6 +80,39 @@ gpu_snapshot() {
     nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo "0,0"
 }
 
+progress_snapshot() {
+    python3 - "$RUN_ROOT/supervisor.log" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()[-1500:]
+except Exception as exc:
+    print(f"unreadable:{type(exc).__name__}")
+    raise SystemExit
+
+for line in reversed(lines):
+    if "Progress:" in line:
+        match = re.search(
+            r"Progress:\s*([0-9.]+)%\s*\|\s*Games:\s*(\d+)\s*\(([0-9.]+)/min\)\s*\|\s*Buffer:\s*(\d+)\s*\|\s*Workers:\s*(\d+)/(\d+)",
+            line,
+        )
+        if match:
+            pct, games, gpm, buffer_size, alive, total = match.groups()
+            print(f"progress={pct}% games={games} gpm={gpm} buffer={buffer_size} workers={alive}/{total}")
+            raise SystemExit
+    if "Checkpoint saved" in line:
+        print("checkpoint_saved")
+        raise SystemExit
+    if "Epoch complete!" in line:
+        print("epoch_complete")
+        raise SystemExit
+print("no_progress_line")
+PY
+}
+
 restart_supervisor() {
     MAX_GAME_MOVES="${MAX_GAME_MOVES:-192}" \
     CALIBRATION_THROUGHPUT_GATE="${CALIBRATION_THROUGHPUT_GATE:-0.35}" \
@@ -101,6 +135,8 @@ print(time.time() + float(sys.argv[1]) * 3600.0)
 PY
 )"
 restarts=0
+last_progress=""
+stagnant_checks=0
 
 while python3 - "$end_epoch" <<'PY'
 import sys, time
@@ -128,9 +164,19 @@ do
     gpu_mem="${gpu%%,*}"
     gpu_util="${gpu##*,}"
     event="$(last_event_name)"
-    printf '| %s | %s | %s | %s | %s | %s | %s |\n' \
-        "${now}" "${pid:-0}" "${state}" "${gpu_mem:-0}" "${gpu_util:-0}" "${event}" "${action}" >> "${STATUS_MD}"
-    append_json "monitor_check" "{\"pid\":\"${pid:-}\",\"state\":\"${state}\",\"gpu_mem_mb\":\"${gpu_mem:-0}\",\"gpu_util_pct\":\"${gpu_util:-0}\",\"last_event\":\"${event}\",\"action\":\"${action}\",\"restarts\":${restarts}}"
+    progress="$(progress_snapshot)"
+    if [[ "${state}" != "dead" && "${progress}" == "${last_progress}" && "${progress}" != "epoch_complete" && "${progress}" != "checkpoint_saved" ]]; then
+        stagnant_checks=$((stagnant_checks + 1))
+    else
+        stagnant_checks=0
+    fi
+    last_progress="${progress}"
+    if [[ "${action}" == "none" && "${stagnant_checks}" -ge "${NO_PROGRESS_WARN_CHECKS}" ]]; then
+        action="no_progress_${stagnant_checks}_checks"
+    fi
+    printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        "${now}" "${pid:-0}" "${state}" "${gpu_mem:-0}" "${gpu_util:-0}" "${event}" "${progress}" "${action}" >> "${STATUS_MD}"
+    append_json "monitor_check" "{\"pid\":\"${pid:-}\",\"state\":\"${state}\",\"gpu_mem_mb\":\"${gpu_mem:-0}\",\"gpu_util_pct\":\"${gpu_util:-0}\",\"last_event\":\"${event}\",\"last_progress\":\"${progress}\",\"stagnant_checks\":${stagnant_checks},\"action\":\"${action}\",\"restarts\":${restarts}}"
     sleep "${INTERVAL_SECONDS}"
 done
 

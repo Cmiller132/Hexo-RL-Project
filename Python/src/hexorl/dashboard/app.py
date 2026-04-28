@@ -784,13 +784,15 @@ def _supervisor_activity(
     trial = trial_by_id.get(latest_trial_id, {})
     log_lines = _tail_lines(run_root / "supervisor.log", limit=120)
     progress = _last_progress(log_lines)
+    latest_event = events[-1] if events else {}
     max_game_moves = int((manifest.get("args") or {}).get("max_game_moves") or 0)
     positions_per_sec = None
-    if progress and max_game_moves > 0:
+    if progress and max_game_moves > 0 and float(progress["games_per_min"]) > 0.0:
         positions_per_sec = float(progress["games_per_min"]) * max_game_moves / 60.0
-    elif trial.get("positions_per_sec") is not None:
+    if positions_per_sec is None:
+        positions_per_sec = _event_positions_per_second(latest_event)
+    if positions_per_sec is None and trial.get("positions_per_sec") is not None:
         positions_per_sec = trial.get("positions_per_sec")
-    latest_event = events[-1] if events else {}
     action = "Waiting for supervisor events"
     if progress:
         action = f"Self-play running, {progress['progress_pct']:.1f}% of current epoch"
@@ -913,6 +915,19 @@ def _per_second(positions_per_min: Any) -> float | None:
         return float(positions_per_min) / 60.0
     except (TypeError, ValueError):
         return None
+
+
+def _event_positions_per_second(event: dict[str, Any]) -> float | None:
+    for key in ("positions_per_min", "selected_positions_per_min"):
+        value = _per_second(event.get(key))
+        if value is not None:
+            return value
+    selfplay = event.get("selfplay") or {}
+    value = _per_second(selfplay.get("positions_per_min"))
+    if value is not None:
+        return value
+    throughput = event.get("throughput") or {}
+    return _per_second(throughput.get("selfplay_positions_per_min"))
 
 
 def _event_blurb(event: str) -> str:
