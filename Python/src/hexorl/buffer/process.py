@@ -86,6 +86,7 @@ class BufferProcess:
                 self.cfg.model.heads,
                 architecture=self.cfg.model.architecture,
                 sparse_policy=self.cfg.model.sparse_policy,
+                graph=str(getattr(self.cfg.model, "architecture", "")).lower().startswith("global_"),
             ),
         )
 

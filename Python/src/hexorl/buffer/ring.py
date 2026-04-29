@@ -18,7 +18,7 @@ from hexorl.selfplay.records import PositionRecord
 
 HISTORY_STRIDE = 12
 REPLAY_POLICY_WIDTH_CAP = 512
-PAIR_POLICY_HEADS = {"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
 GLOBAL_GRAPH_ARCHITECTURES = {
     "global_graph_option1",
     "global_xattn_0",
@@ -327,7 +327,7 @@ class RingBuffer:
         self._opp_policy_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_opp_policy else None
         self._opp_legal_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_opp_policy else None
         self._pair_policy_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_pair_policy else None
-        self._pair_policy_complete = np.zeros(self.capacity, dtype=np.bool_)
+        self._pair_policy_complete = _optional_array(self.store_pair_policy, (self.capacity,), np.bool_, default=False)
 
         self._game_histories: list[bytes | None] = []
         self._game_refcounts: list[int] = []

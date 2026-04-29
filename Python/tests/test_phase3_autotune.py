@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+from hexorl.config import Config
 from hexorl.tuning.asha import ASHARungTable, DEFAULT_ASHA_RESOURCES, TrialObservation
 from hexorl.tuning.bohb import BOHBSampler, SearchSpace
 from hexorl.tuning.pb2 import PB2Observation, PB2Scheduler
@@ -587,6 +588,74 @@ def test_replay_buffer_skips_disabled_optional_storage():
         "sparse_diagnostics": False,
     }
     assert replay.memory_estimate()["optional_target_blob_mib"] == 0.0
+
+
+def test_phase3_pair_policy_storage_is_only_for_global_pair_heads(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.host = SimpleNamespace(
+        system="linux",
+        cuda_available=True,
+        cuda_name="NVIDIA GeForce RTX 4070 Ti",
+        cuda_memory_gb=12.0,
+        system_memory_gb=24.0,
+        physical_cpus=16,
+        logical_cpus=32,
+    )
+    supervisor.base_cfg = Config()
+    supervisor.base_cfg.model.channels = 8
+    supervisor.base_cfg.model.blocks = 1
+    supervisor.base_cfg.train.batch_size = 8
+    supervisor.base_cfg.buffer.capacity = 32
+    supervisor.base_cfg.buffer.lookahead_horizons = []
+    supervisor.base_cfg.buffer.lookahead_lambdas = []
+    supervisor.args = SimpleNamespace(seed=9300, train_batches=1, max_game_moves=64)
+
+    graph_hybrid = module.FamilySpec("graph_hybrid_0", "graph_hybrid_0", "graph_hybrid_0", graph=True, available=True)
+    pair_global = module.FamilySpec(
+        "global_pair_twostage_0",
+        "global_pair_twostage_0",
+        "global_pair_twostage_0",
+        graph=True,
+        global_graph=True,
+        available=True,
+    )
+    recipe = module.StaticRecipe(
+        full_sims=384,
+        pcr_low_sims=128,
+        policy_top_k=96,
+        candidate_budget=256,
+        head_bundle="graph_tactical",
+        temperature_family="slow_cool",
+        train_batch_size=128,
+    )
+
+    hybrid_cfg = module.Phase3Supervisor._make_config(
+        supervisor,
+        graph_hybrid,
+        recipe,
+        module.DynamicParams(),
+        tmp_path / "hybrid",
+        "3A_calibration",
+    )
+    global_cfg = module.Phase3Supervisor._make_config(
+        supervisor,
+        pair_global,
+        recipe,
+        module.DynamicParams(),
+        tmp_path / "global",
+        "3A_calibration",
+    )
+
+    assert "pair_policy" not in hybrid_cfg.model.heads
+    assert not (set(hybrid_cfg.model.heads) & module.GLOBAL_GRAPH_PAIR_HEADS)
+    assert set(global_cfg.model.heads) & module.GLOBAL_GRAPH_PAIR_HEADS
+
+    hybrid_replay = module.Phase3Supervisor._make_replay_buffer(supervisor, hybrid_cfg, graph_hybrid)
+    global_replay = module.Phase3Supervisor._make_replay_buffer(supervisor, global_cfg, pair_global)
+
+    assert hybrid_replay.memory_estimate()["feature_groups"]["pair_policy"] is False
+    assert global_replay.memory_estimate()["feature_groups"]["pair_policy"] is True
 
 
 def test_global_graph_candidate_recall_is_not_sparse_penalized():

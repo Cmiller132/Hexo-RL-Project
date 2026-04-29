@@ -121,7 +121,6 @@ HEAD_BUNDLES: dict[str, list[str]] = {
         "moves_left",
         "regret_rank",
         "regret_value",
-        "pair_policy",
     ],
 }
 

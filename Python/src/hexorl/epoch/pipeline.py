@@ -38,6 +38,13 @@ from hexorl.dashboard.recorder import RunRecorder
 
 logger = logging.getLogger(__name__)
 
+GRAPH_PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+
+
+def _uses_pair_policy_targets(cfg: Config) -> bool:
+    heads = set(getattr(cfg.model, "heads", []))
+    return bool((heads & GRAPH_PAIR_POLICY_HEADS) or "pair_policy" in heads)
+
 
 @dataclass
 class EpochResult:
@@ -173,7 +180,7 @@ def run_epoch(
                 or "sparse_policy" in cfg.model.heads
                 or "pair_policy" in cfg.model.heads
             ),
-            include_pair_policy="pair_policy" in cfg.model.heads,
+            include_pair_policy=_uses_pair_policy_targets(cfg),
             include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
             candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
             max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
@@ -312,7 +319,7 @@ def run_tiny_training_smoke(
             or "sparse_policy" in cfg.model.heads
             or "pair_policy" in cfg.model.heads
         ),
-        include_pair_policy="pair_policy" in cfg.model.heads,
+        include_pair_policy=_uses_pair_policy_targets(cfg),
         include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
         candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
     )
