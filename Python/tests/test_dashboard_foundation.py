@@ -50,6 +50,23 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     assert (tmp_path / "events.jsonl").exists()
 
 
+def test_dashboard_store_repairs_partial_v1_schema(tmp_path):
+    db_path = tmp_path / "dashboard.sqlite3"
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
+        )
+        conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, 1.0)")
+
+    store = DashboardStore(db_path)
+    store.upsert_run("repaired-run")
+
+    rows = store.rows("SELECT run_id FROM runs")
+    assert rows == [{"run_id": "repaired-run"}]
+
+
 def test_match_snapshot_renderer_outputs_png_bytes():
     history = (
         _move(0, 0, 0)

@@ -53,6 +53,33 @@ alive_match() {
     ps -p "`$pid" -o args= 2>/dev/null | grep -q "`$pattern"
 }
 
+kill_duplicate_supervisors() {
+    local current_pid=""
+    local current_pgid=""
+    current_pid=`$(cat "`$RUN/supervisor.pid" 2>/dev/null || true)
+    if [[ -n "`$current_pid" ]]; then
+        current_pgid=`$(ps -p "`$current_pid" -o pgid= 2>/dev/null | awk '{print `$1}')
+    fi
+    if [[ -z "`$current_pgid" ]]; then
+        return 0
+    fi
+    while read -r pid _ppid pgid; do
+        if [[ -z "`$pid" || "`$pgid" == "`$current_pgid" ]]; then
+            continue
+        fi
+        log "duplicate_supervisor stopping pid=`$pid pgid=`$pgid current_pid=`$current_pid current_pgid=`$current_pgid"
+        kill -TERM -- "-`$pgid" 2>/dev/null || true
+        sleep 5
+        if ps -eo pgid= | awk '{print `$1}' | grep -qx "`$pgid"; then
+            log "duplicate_supervisor forcing pgid=`$pgid"
+            kill -KILL -- "-`$pgid" 2>/dev/null || true
+        fi
+    done < <(
+        ps -eo pid=,ppid=,pgid=,args= |
+            awk -v run="`$RUN" '`$0 ~ /run_phase3_48h_autotune.py/ && index(`$0, "--output-root " run) {print `$1, `$2, `$3}'
+    )
+}
+
 snapshot() {
     log "snapshot processes=`$(ps -eo pid,ppid,stat,etime,%cpu,%mem,args | grep -E 'run_phase3_48h|hexorl.cli dashboard|monitor_phase_autotune' | grep -v grep | tr '\n' ';' || true)"
     if command -v free >/dev/null 2>&1; then
@@ -146,6 +173,7 @@ while true; do
         log "supervisor missing or stale"
         start_supervisor
     fi
+    kill_duplicate_supervisors
     if ! alive_match "`$RUN/dashboard.pid" "hexorl.cli dashboard"; then
         log "dashboard missing or stale"
         start_dashboard

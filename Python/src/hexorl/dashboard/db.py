@@ -17,6 +17,20 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 SCHEMA_VERSION = 1
+REQUIRED_V1_TABLES = {
+    "arena_matches",
+    "artifacts",
+    "axis_presets",
+    "checkpoints",
+    "eval_games",
+    "eval_runs",
+    "events",
+    "games",
+    "metrics",
+    "play_sessions",
+    "positions",
+    "runs",
+}
 
 
 def _json_dumps(value: Any) -> str:
@@ -83,8 +97,15 @@ class DashboardStore:
                 int(row[0])
                 for row in conn.execute("SELECT version FROM schema_migrations")
             }
-            if 1 not in current:
+            existing_tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if 1 not in current or not REQUIRED_V1_TABLES.issubset(existing_tables):
                 _apply_v1(conn)
+            if 1 not in current:
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (1, time.time()),

@@ -397,6 +397,59 @@ def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
     ).train_batch_size == 256
 
 
+def test_static_candidates_are_family_balanced(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(seed=9300)
+    supervisor.output_root = tmp_path
+    supervisor.log = _CaptureLog()
+    supervisor.host = SimpleNamespace(
+        cuda_available=True,
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+        physical_cpus=16,
+    )
+    supervisor.blocked_families = {}
+    supervisor.families = [
+        module.FamilySpec(
+            name="best_current_33",
+            description="cnn",
+            architecture="cnn",
+            available=True,
+        ),
+        module.FamilySpec(
+            name="best_restnet_33",
+            description="restnet",
+            architecture="restnet",
+            attention_positions=(5, 10, 14),
+            available=True,
+        ),
+        module.FamilySpec(
+            name="graph_hybrid_0",
+            description="graph",
+            architecture="graph_hybrid_0",
+            graph=True,
+            sparse_policy=True,
+            available=True,
+        ),
+    ]
+    supervisor.bohb_sampler = BOHBSampler(
+        module.Phase3Supervisor._bohb_search_space(supervisor),
+        min_resource=8,
+        max_resource=14,
+        warmup_points=6,
+    )
+
+    candidates = module.Phase3Supervisor._generate_static_candidates(supervisor, 12)
+    counts = {}
+    for family, _recipe in candidates:
+        counts[family.name] = counts.get(family.name, 0) + 1
+
+    assert counts == {"best_current_33": 4, "best_restnet_33": 4, "graph_hybrid_0": 4}
+    assert supervisor.log.events[-1][0] == "static_candidates_generated"
+    assert supervisor.log.events[-1][1]["family_balanced"] is True
+
+
 def test_low_memory_graph_config_extends_inference_start_timeout(tmp_path):
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)

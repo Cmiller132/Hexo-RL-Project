@@ -1429,41 +1429,66 @@ class Phase3Supervisor:
 
     def _generate_static_candidates(self, max_trials: int) -> list[tuple[FamilySpec, StaticRecipe]]:
         available = self._eligible_families()
-        by_name = {family.name: family for family in available}
         combos: list[tuple[FamilySpec, StaticRecipe]] = []
         seen: set[str] = set()
-        for family in available:
-            recipe = self._recommended_recipe(family)
+
+        def add_candidate(family: FamilySpec, recipe: StaticRecipe) -> bool:
             key = json.dumps({"family": family.name, "recipe": asdict(recipe)}, sort_keys=True)
             if key in seen:
-                continue
+                return False
             seen.add(key)
             combos.append((family, recipe))
+            return True
+
+        for family in available:
+            recipe = self._recommended_recipe(family)
+            add_candidate(family, recipe)
             if len(combos) >= max_trials:
                 break
         attempts = 0
-        while len(combos) < max_trials and attempts < max_trials * 8 and by_name:
-            attempts += 1
-            record = self.bohb_sampler.sample(seed=self.args.seed + attempts)
-            config = record["config"]
-            family = by_name.get(config.get("model_family"))
-            if family is None:
-                continue
-            recipe = self._static_recipe_from_bohb_config(family, config)
-            key = json.dumps({"family": family.name, "recipe": asdict(recipe)}, sort_keys=True)
-            if key in seen:
-                continue
-            seen.add(key)
-            combos.append((family, recipe))
+        while len(combos) < max_trials and attempts < max_trials * 8 * max(1, len(available)) and available:
+            made_progress = False
+            for family in available:
+                if len(combos) >= max_trials:
+                    break
+                for _ in range(max_trials * 8):
+                    attempts += 1
+                    rng = random.Random(self.args.seed + attempts)
+                    config = self.bohb_sampler.search_space.sample_random(rng, {"model_family": family.name})
+                    recipe = self._static_recipe_from_bohb_config(family, config)
+                    if not add_candidate(family, recipe):
+                        continue
+                    self.bohb_sampler.samples.append(
+                        {
+                            "config": config,
+                            "seed": self.args.seed + attempts,
+                            "source": "family_balanced_random",
+                            "density_model": None,
+                            "candidate_scores": [],
+                            "brackets": [asdict(bracket) for bracket in self.bohb_sampler.create_brackets()],
+                        }
+                    )
+                    made_progress = True
+                    break
+            if not made_progress:
+                break
         if len(combos) < min(max_trials, len(available)):
             for family in available:
                 recipe = self._recommended_recipe(family)
-                key = json.dumps({"family": family.name, "recipe": asdict(recipe)}, sort_keys=True)
-                if key not in seen:
-                    combos.append((family, recipe))
-                    seen.add(key)
+                add_candidate(family, recipe)
                 if len(combos) >= max_trials:
                     break
+        counts: dict[str, int] = {}
+        for family, _recipe in combos:
+            counts[family.name] = counts.get(family.name, 0) + 1
+        self.log.write(
+            "static_candidates_generated",
+            {
+                "max_trials": max_trials,
+                "family_counts": counts,
+                "family_balanced": bool(available and max(counts.values(), default=0) - min(counts.values(), default=0) <= 1),
+            },
+        )
         self.bohb_sampler.save(self.output_root / "bohb_sampler.json")
         _write_json(
             self.output_root / "static_search_space.json",
