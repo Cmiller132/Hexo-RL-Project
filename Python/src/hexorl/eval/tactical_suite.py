@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Callable, Iterable
 
 from hexorl.action_contract.tactical_oracle import (
@@ -195,62 +196,143 @@ def _late_game_high_legal_position() -> SuitePosition:
 
 
 def _p0_line_history(length: int, *, start_q: int) -> tuple[Move, ...]:
-    p0_cells = [(start_q + idx, 0) for idx in range(length)]
-    if (0, 0) not in p0_cells:
-        p0_cells = [(0, 0), *p0_cells]
+    p0_cells = _unique_cells(
+        [(0, 0), *_axis_bridge_cells(start_q), *((start_q + idx, 0) for idx in range(length))]
+    )
     return _paired_history(p0_cells, _distractors(player=1, start_q=-20, count=12))
 
 
 def _p1_line_history(length: int, *, start_q: int) -> tuple[Move, ...]:
-    p1_cells = [(start_q + idx, 0) for idx in range(length)]
+    p1_cells = _unique_cells([*_axis_bridge_cells(start_q), *((start_q + idx, 0) for idx in range(length))])
     return _paired_history(_distractors(player=0, start_q=-20, count=12), p1_cells)
 
 
 def _p1_two_hot_windows_history() -> tuple[Move, ...]:
-    p1_cells = [(10 + idx, 0) for idx in range(5)] + [(30 + idx, 0) for idx in range(5)]
+    p1_cells = _unique_cells(
+        [
+            *_axis_bridge_cells(10),
+            *_axis_bridge_cells(30),
+            *((10 + idx, 0) for idx in range(5)),
+            *((30 + idx, 0) for idx in range(5)),
+        ]
+    )
     return _paired_history(_distractors(player=0, start_q=-30, count=16), p1_cells)
 
 
 def _separated_cluster_history() -> tuple[Move, ...]:
-    p0_cells = [(0, 0), (1, 0), (2, 0), (40, -5), (41, -5), (42, -5)]
+    p0_cells = _unique_cells(
+        [
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            *_bridge_cells_to((40, -5)),
+            (40, -5),
+            (41, -5),
+            (42, -5),
+        ]
+    )
     return _paired_history(p0_cells, _distractors(player=1, start_q=-20, count=12))
 
 
 def _paired_history(p0_cells: list[Cell], p1_cells: list[Cell]) -> tuple[Move, ...]:
     p0 = [cell for cell in p0_cells if cell != (0, 0)]
     history: list[Move] = [(0, 0, 0)]
+    occupied: set[Cell] = {(0, 0)}
+    reserved: set[Cell] = set(p0) | set(p1_cells) | occupied
     turn = 1
     p0_idx = 0
     p1_idx = 0
-    filler_idx = 0
     while p0_idx < len(p0) or p1_idx < len(p1_cells):
         if turn == 1:
             pair = p1_cells[p1_idx : p1_idx + 2]
             p1_idx += len(pair)
             while len(pair) < 2:
-                filler_idx += 1
-                pair.append((-80 - filler_idx, -80 - len(pair)))
+                pair.append(_next_filler(occupied | reserved | set(pair)))
             history.extend((1, q, r) for q, r in pair)
+            occupied.update(pair)
             turn = 0
         else:
             pair = p0[p0_idx : p0_idx + 2]
             p0_idx += len(pair)
             while len(pair) < 2:
-                filler_idx += 1
-                pair.append((80 + filler_idx, 80 + len(pair)))
+                pair.append(_next_filler(occupied | reserved | set(pair)))
             history.extend((0, q, r) for q, r in pair)
+            occupied.update(pair)
             turn = 1
     if turn == 0:
-        history.extend((0, q, r) for q, r in [(90 + filler_idx, 0), (91 + filler_idx, 0)])
+        pair = [_next_filler(occupied | reserved)]
+        pair.append(_next_filler(occupied | reserved | set(pair)))
+        history.extend((0, q, r) for q, r in pair)
+        occupied.update(pair)
         turn = 1
     if turn == 1:
-        history.extend((1, q, r) for q, r in [(-90 - filler_idx, 0), (-91 - filler_idx, 0)])
+        pair = [_next_filler(occupied | reserved)]
+        pair.append(_next_filler(occupied | reserved | set(pair)))
+        history.extend((1, q, r) for q, r in pair)
     return tuple(history)
 
 
 def _distractors(*, player: int, start_q: int, count: int) -> list[Cell]:
     r = 10 if player == 0 else -10
-    return [(start_q - 3 * idx, r + 2 * idx) for idx in range(count)]
+    target = (start_q, r)
+    cells = [*_bridge_cells_to(target), target]
+    idx = 1
+    while len(cells) < count:
+        cells.append((start_q - 3 * idx, r + 2 * idx))
+        idx += 1
+    return _unique_cells(cells)[:count]
+
+
+def _axis_bridge_cells(start_q: int) -> list[Cell]:
+    if abs(start_q) <= 8:
+        return []
+    step = 8 if start_q > 0 else -8
+    return [(q, 0) for q in range(step, start_q, step)]
+
+
+def _bridge_cells_to(target: Cell, *, max_step: int = 8) -> list[Cell]:
+    tq, tr = target
+    distance = max(abs(tq), abs(tr), abs(tq + tr))
+    if distance <= max_step:
+        return []
+    steps = max(1, math.ceil(distance / max_step))
+    cells: list[Cell] = []
+    for idx in range(1, steps):
+        q = round(tq * idx / steps)
+        r = round(tr * idx / steps)
+        cells.append((q, r))
+    return _unique_cells(cells)
+
+
+def _unique_cells(cells: Iterable[Cell]) -> list[Cell]:
+    out: list[Cell] = []
+    seen: set[Cell] = set()
+    for q, r in cells:
+        cell = (int(q), int(r))
+        if cell not in seen:
+            seen.add(cell)
+            out.append(cell)
+    return out
+
+
+def _next_filler(blocked: set[Cell]) -> Cell:
+    for radius in range(1, 9):
+        for q in range(-radius, radius + 1):
+            for r in range(-radius, radius + 1):
+                if (
+                    max(abs(q), abs(r), abs(q + r)) == radius
+                    and q != 0
+                    and r != 0
+                    and q + r != 0
+                    and (q, r) not in blocked
+                ):
+                    return (q, r)
+    for radius in range(1, 9):
+        for q in range(-radius, radius + 1):
+            for r in range(-radius, radius + 1):
+                if max(abs(q), abs(r), abs(q + r)) == radius and (q, r) not in blocked:
+                    return (q, r)
+    raise ValueError("No legal filler cells available within radius 8 of origin")
 
 
 def _history_state(history: tuple[Move, ...]) -> tuple[dict[Cell, int], int]:

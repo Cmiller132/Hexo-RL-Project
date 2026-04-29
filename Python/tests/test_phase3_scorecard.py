@@ -145,6 +145,15 @@ def test_tactical_suite_positions_are_replayable():
         assert position.expected_action_set
 
 
+def test_tactical_suite_positions_replay_in_engine_when_available():
+    engine = pytest.importorskip("_engine")
+    game_cls = getattr(engine, "HexGame", None) or getattr(engine, "PyHexGame")
+    for position in phase3_tactical_suite_positions():
+        game = game_cls()
+        for _player, q, r in position.move_history:
+            game.place(int(q), int(r))
+
+
 def test_tactical_suite_expected_actions_are_legal():
     for position in phase3_tactical_suite_positions():
         stones, _current = replay_position(position)

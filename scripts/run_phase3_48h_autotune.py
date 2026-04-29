@@ -2507,11 +2507,12 @@ class EvaluationServices:
             missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
             legal = 1.0 - float(arena.get("illegal_or_crash_rate", 0.0) or 0.0)
             recall = float(candidate.get("score", 1.0))
-            base = max(0.0, min(1.0, legal * recall * (1.0 - missing)))
+            diagnostic_proxy = max(0.0, min(1.0, legal * recall * (1.0 - missing)))
             return {
-                "components": {name: base for name in TACTICAL_COMPONENTS},
-                "tactical_suite_score": base,
+                "components": {name: 0.0 for name in TACTICAL_COMPONENTS},
+                "tactical_suite_score": 0.0,
                 "fixture_mode": "diagnostic_fallback_after_fixture_error",
+                "diagnostic_proxy_score": diagnostic_proxy,
                 "error": repr(exc),
             }
 
