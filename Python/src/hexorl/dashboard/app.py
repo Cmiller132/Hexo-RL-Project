@@ -16,7 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hexorl.axis_policy.core import AxisPolicyInput
-from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
+from hexorl.action_contract.candidates import (
+    CANDIDATE_FEATURE_NAMES,
+    CANDIDATE_FEATURE_VERSION,
+    build_candidate_batch,
+    build_pair_candidate_batch,
+)
 from hexorl.buffer.sampler import _transform_history_bytes
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
@@ -95,6 +100,7 @@ class ModelLoadRequest(BaseModel):
 
 class InferRequest(BaseModel):
     history_b64: str
+    model_ids: list[str] = Field(default_factory=list)
 
 
 class ArenaStartRequest(BaseModel):
@@ -478,6 +484,12 @@ def create_app(
             transformed = _transform_history_bytes(history, sym_idx)
             graph = _graph_debug_payload(transformed)
             position = position_payload(get_replay_position(transformed, constrain_threats=False))
+            model_logits = {}
+            for model_id in req.model_ids:
+                try:
+                    model_logits[model_id] = model_cache.infer_history(model_id, transformed)
+                except KeyError as exc:
+                    raise HTTPException(404, f"Model not loaded: {model_id}") from exc
             transforms.append(
                 {
                     "symmetry_index": sym_idx,
@@ -486,6 +498,8 @@ def create_app(
                     "placements_remaining": position["placements_remaining"],
                     "legal_count": len(position["legal_moves"]),
                     "graph": graph,
+                    "contracts": _d6_contract_payload(transformed, position, graph),
+                    "model_logits": model_logits,
                 }
             )
         return {
@@ -1139,6 +1153,99 @@ def _graph_debug_payload(history: bytes) -> dict[str, Any]:
         "relation_bias_shape": [int(dim) for dim in graph.relation_bias.shape],
         "placements_remaining": int(graph.placements_remaining),
         "current_player": int(graph.current_player),
+    }
+
+
+def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
+    legal_moves = [
+        (int(row["q"]), int(row["r"]))
+        for row in position.get("legal_moves", [])
+    ]
+    offset_q = int(position.get("encoding", {}).get("offset_q", -16))
+    offset_r = int(position.get("encoding", {}).get("offset_r", -16))
+    candidate_budget = min(max(len(legal_moves), 1), 512)
+    candidates = build_candidate_batch(
+        legal_moves,
+        [],
+        offset_q=offset_q,
+        offset_r=offset_r,
+        budget=candidate_budget,
+        storage_width=candidate_budget,
+    )
+    candidate_rows = [
+        {
+            "q": int(candidates.qr[row, 0]),
+            "r": int(candidates.qr[row, 1]),
+            "dense_index": int(candidates.indices[row]),
+        }
+        for row, active in enumerate(candidates.mask)
+        if bool(active)
+    ][:64]
+    pair_rows: list[dict[str, Any]] = []
+    if len(legal_moves) >= 2 and int(position.get("placements_remaining", 1)) >= 2:
+        pair = build_pair_candidate_batch(
+            candidates.qr,
+            [],
+            budget=min(512, len(legal_moves) * max(len(legal_moves) - 1, 0) // 2),
+            candidate_mask=candidates.mask,
+            legal_moves=legal_moves,
+        )
+        for row, active in enumerate(pair.mask):
+            if not bool(active) or len(pair_rows) >= 64:
+                continue
+            first_idx, second_idx = pair.pair_indices[row]
+            pair_rows.append(
+                {
+                    "first": {
+                        "q": int(candidates.qr[int(first_idx), 0]),
+                        "r": int(candidates.qr[int(first_idx), 1]),
+                    },
+                    "second": {
+                        "q": int(candidates.qr[int(second_idx), 0]),
+                        "r": int(candidates.qr[int(second_idx), 1]),
+                    },
+                }
+            )
+    axis_input = AxisPolicyInput(
+        stones=list(position.get("stones", [])),
+        legal_moves=list(position.get("legal_moves", [])),
+        current_player=int(position.get("current_player", 0)),
+        offset_q=offset_q,
+        offset_r=offset_r,
+        metadata={
+            "source": "dashboard_d6_debug",
+            "placements_remaining": int(position.get("placements_remaining", 1)),
+            "history_b64": base64.b64encode(history).decode("ascii"),
+        },
+    )
+    axis_results = evaluate_all(axis_input, {})
+    return {
+        "dense_legal_mask": {
+            "offset_q": offset_q,
+            "offset_r": offset_r,
+            "legal_indices": list(position.get("encoding", {}).get("legal_mask", []))[:128],
+            "legal_count": len(legal_moves),
+        },
+        "sparse_candidates": {
+            "feature_version": CANDIDATE_FEATURE_VERSION,
+            "feature_names": list(CANDIDATE_FEATURE_NAMES),
+            "candidate_count": int(candidates.mask.sum()),
+            "rows": candidate_rows,
+        },
+        "pair_rows": {
+            "available": bool(pair_rows),
+            "rows": pair_rows,
+        },
+        "axis": {
+            "prototype_count": len(axis_results),
+            "results": axis_results[:8],
+        },
+        "graph_targets": {
+            "legal_count": int(graph["legal_count"]),
+            "pair_count": int(graph["pair_count"]),
+            "opp_legal_count": int(graph["opp_legal_count"]),
+            "token_counts": graph["token_counts"],
+        },
     }
 
 

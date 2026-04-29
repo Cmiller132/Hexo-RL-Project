@@ -33,6 +33,11 @@ from hexorl.action_contract.tactical_oracle import (
     TACTICAL_SCAN_RADIUS,
     scan_tactical_oracle_from_history,
 )
+from hexorl.graph.batch import (
+    build_graph_batch_from_history,
+    collate_graph_batches,
+    graph_batch_with_reference_pair_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +307,20 @@ def _transform_policy_v2(policy: PolicyTargetV2, sym_idx: int) -> PolicyTargetV2
     return [(q, r, prob) for (q, r), prob in transformed.items()]
 
 
+def _transform_policy_keys(keys: List[Tuple[int, int]], sym_idx: int) -> List[Tuple[int, int]]:
+    """Transform global action-key table entries under D6."""
+    transformed: List[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    for q, r in keys:
+        tq, tr = _hex_transform(int(q), int(r), sym_idx % 12)
+        qr = (int(tq), int(tr))
+        if qr in seen:
+            continue
+        seen.add(qr)
+        transformed.append(qr)
+    return transformed
+
+
 def _transform_pair_policy_v2(
     pairs: List[Tuple[Tuple[int, int], Tuple[int, int], float]],
     sym_idx: int,
@@ -446,6 +465,7 @@ class ReplayDataset(_IterableDataset):
         include_axis_delta_norm: bool = False,
         include_sparse_policy: bool = False,
         include_pair_policy: bool = False,
+        include_graph_policy: bool = False,
         candidate_budget: int = 256,
         max_game_turns: int = 256,
     ):
@@ -455,6 +475,7 @@ class ReplayDataset(_IterableDataset):
         self.pcr_weight = pcr_weight
         self.include_sparse_policy = bool(include_sparse_policy)
         self.include_pair_policy = bool(include_pair_policy)
+        self.include_graph_policy = bool(include_graph_policy)
         self.candidate_budget = max(
             int(candidate_budget),
             int(getattr(buffer, "max_policy_v2_entries", int(candidate_budget))),
@@ -550,6 +571,8 @@ class ReplayDataset(_IterableDataset):
             "moves_left_weight": np.ones(self.batch_size, dtype=np.float32),
             "value_weight": np.ones(self.batch_size, dtype=np.float32),
             "policy_weight": np.ones(self.batch_size, dtype=np.float32),
+            "sparse_policy_weight": np.ones(self.batch_size, dtype=np.float32),
+            "pair_policy_weight": np.ones(self.batch_size, dtype=np.float32),
             "opp_policy_weight": np.zeros(self.batch_size, dtype=np.float32),
         }
         if self.include_sparse_policy:
@@ -601,9 +624,11 @@ class ReplayDataset(_IterableDataset):
                 policy_v2 = _transform_policy_v2(policy_v2, sym_idx)
                 opp_policy_v2 = _transform_policy_v2(opp_policy_v2, sym_idx)
                 pair_policy_v2 = _transform_pair_policy_v2(pair_policy_v2, sym_idx)
+                opp_legal_v2 = _transform_policy_keys(getattr(rec, "opp_policy_legal_v2", []), sym_idx)
                 axis_label = _transform_axis_label(rec.axis_label, sym_idx)
             else:
                 axis_label = rec.axis_label
+                opp_legal_v2 = list(getattr(rec, "opp_policy_legal_v2", []))
 
             tensor_i, offset_q, offset_r, legal_bytes = self._encode_tensor_meta(sample_history)
             tensors[i] = tensor_i
@@ -650,6 +675,12 @@ class ReplayDataset(_IterableDataset):
             aux_targets["moves_left_weight"][i] = 0.0 if rec.outcome == 0.0 else 1.0
             aux_targets["value_weight"][i] = rec.value_weight
             aux_targets["policy_weight"][i] = 1.0 if rec.is_full_search else 0.0
+            aux_targets["sparse_policy_weight"][i] = aux_targets["policy_weight"][i]
+            aux_targets["pair_policy_weight"][i] = aux_targets["policy_weight"][i]
+            if int(getattr(rec, "candidate_critical_overflow_count", 0)) > 0:
+                aux_targets["sparse_policy_weight"][i] = 0.0
+                aux_targets["pair_policy_weight"][i] = 0.0
+                aux_targets["opp_policy_weight"][i] = 0.0
             if self.include_sparse_policy:
                 legal = (
                     np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
@@ -701,6 +732,10 @@ class ReplayDataset(_IterableDataset):
                         aux_targets["candidate_critical_overflow_examples"][i, ex_idx] = (q, r)
                 aux_targets["candidate_critical_count"][i] = cand.critical_count
                 aux_targets["candidate_critical_overflow_count"][i] = cand.critical_overflow_count
+                if critical_overflow:
+                    aux_targets["sparse_policy_weight"][i] = 0.0
+                    aux_targets["pair_policy_weight"][i] = 0.0
+                    aux_targets["opp_policy_weight"][i] = 0.0
                 represented = float(aux_targets["sparse_policy_target"][i, :width].sum())
                 aux_targets["candidate_missing_mass"][i] = max(
                     float(cand.missing_mass),
@@ -721,6 +756,21 @@ class ReplayDataset(_IterableDataset):
                     aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
                 elif self.include_pair_policy and critical_overflow:
                     aux_targets["pair_candidate_missing_mass"][i] = 1.0
+            if self.include_graph_policy:
+                if opp_policy_v2 and not opp_legal_v2:
+                    raise ValueError("graph training requires opp_policy_legal_v2 whenever opp_policy_target_v2 is present")
+                graph = build_graph_batch_from_history(
+                    sample_history,
+                    policy_target=policy_v2,
+                    opp_legal_moves=[(int(q), int(r)) for q, r in opp_legal_v2] if opp_legal_v2 else None,
+                    opp_policy_target=opp_policy_v2,
+                    radius=8,
+                    include_pair_rows=False,
+                )
+                if pair_policy_v2:
+                    graph = graph_batch_with_reference_pair_rows(graph, pair_policy_v2)
+                graph_batch = aux_targets.setdefault("_graph_batches", [])
+                graph_batch.append(graph)
             if self.include_axis_delta_norm:
                 axis_delta_norm = self._compute_axis_delta_norm(sample_history)
                 aux_targets["axis_delta_norm"][i] = axis_delta_norm
@@ -731,6 +781,29 @@ class ReplayDataset(_IterableDataset):
                 else:
                     lookahead_arrays[h_idx][i] = values[i]  # fallback
 
+        if self.include_graph_policy:
+            graph_batch = collate_graph_batches(aux_targets.pop("_graph_batches"))
+            aux_targets.update({
+                "token_features": graph_batch.token_features,
+                "token_type": graph_batch.token_type,
+                "token_qr": graph_batch.token_qr,
+                "token_mask": graph_batch.token_mask,
+                "legal_token_indices": graph_batch.legal_token_indices,
+                "legal_qr": graph_batch.legal_qr,
+                "legal_mask": graph_batch.legal_mask,
+                "pair_token_indices": graph_batch.pair_token_indices,
+                "pair_first_indices": graph_batch.pair_first_indices,
+                "pair_second_indices": graph_batch.pair_second_indices,
+                "relation_type": graph_batch.relation_type,
+                "relation_bias": graph_batch.relation_bias,
+                "policy_target": graph_batch.policy_target,
+                "opp_legal_qr": graph_batch.opp_legal_qr,
+                "opp_legal_mask": graph_batch.opp_legal_mask,
+                "opp_policy_target": graph_batch.opp_policy_target,
+                "pair_first_policy_target": graph_batch.pair_first_policy_target,
+                "pair_policy_target": graph_batch.pair_policy_target,
+                "tactical_target": graph_batch.tactical_target,
+            })
         return tensors, policies, values, lookahead_arrays, aux_targets
 
     def _encode_tensor(self, history: bytes) -> np.ndarray:

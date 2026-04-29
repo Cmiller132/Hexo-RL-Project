@@ -20,10 +20,26 @@ from hexorl.model.network import from_config, HexNet, load_model_state
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
+    GRAPH_SCHEMA_VERSION,
+    MAX_GRAPH_ACTIONS,
+    MAX_GRAPH_PAIRS,
+    MAX_GRAPH_TOKENS,
     MAX_PAIR_CANDIDATES,
+    RELATION_SCHEMA_VERSION,
     create_inference_queue,
     connect_inference_queue,
 )
+
+
+def _graph_pair_request_is_second_placement(graph_inputs: dict[str, torch.Tensor]) -> bool:
+    first = graph_inputs.get("pair_first_indices")
+    legal = graph_inputs.get("legal_token_indices")
+    if first is None or legal is None or first.numel() == 0 or legal.numel() == 0:
+        return False
+    valid_first = first[first >= 0]
+    if valid_first.numel() == 0:
+        return False
+    return not bool(torch.isin(valid_first, legal[legal >= 0]).all().item())
 
 
 class InferenceServer:
@@ -44,7 +60,9 @@ class InferenceServer:
         initial_state_dict: Optional[dict] = None,
     ):
         self.cfg = cfg
-        required_heads = {"policy", "value"}
+        architecture = str(getattr(cfg.model, "architecture", "")).lower()
+        self._global_graph_mode = architecture.startswith("global_")
+        required_heads = {"value"} if self._global_graph_mode else {"policy", "value"}
         missing_heads = sorted(required_heads - set(cfg.model.heads))
         if missing_heads:
             raise ValueError(
@@ -251,9 +269,19 @@ class InferenceServer:
             if not ready_workers:
                 continue
 
+            graph_request = self._ready_workers_graph_mode(ready_workers)
+            if graph_request is not None:
+                ready_workers = graph_request
+
             build_t0 = time.monotonic()
-            batch_tensor, per_worker_counts, total_count = self._build_batch(ready_workers)
-            sparse_inputs = self._build_sparse_inputs(ready_workers, per_worker_counts, total_count)
+            if self._is_graph_request(ready_workers):
+                graph_inputs, per_worker_counts, total_count = self._build_graph_inputs(ready_workers)
+                batch_tensor = None
+                sparse_inputs = None
+            else:
+                batch_tensor, per_worker_counts, total_count = self._build_batch(ready_workers)
+                graph_inputs = None
+                sparse_inputs = self._build_sparse_inputs(ready_workers, per_worker_counts, total_count)
             self.total_build_ms += (time.monotonic() - build_t0) * 1000.0
 
             if total_count > 0:
@@ -261,17 +289,32 @@ class InferenceServer:
                 for worker_id in ready_workers:
                     self._queue.get_slot(worker_id).req_ready.clear()
 
-                policies, values, sparse_logits, pair_logits = self._forward(batch_tensor, sparse_inputs)
+                if graph_inputs is not None:
+                    graph_place, values, graph_opp, graph_pair, graph_regret = self._forward_graph(graph_inputs)
+                    sparse_logits = pair_logits = policies = None
+                else:
+                    policies, values, sparse_logits, pair_logits = self._forward(batch_tensor, sparse_inputs)
+                    graph_place = graph_opp = graph_pair = None
 
                 scatter_t0 = time.monotonic()
-                self._scatter_results(
-                    ready_workers,
-                    per_worker_counts,
-                    policies,
-                    values,
-                    sparse_logits,
-                    pair_logits,
-                )
+                if graph_inputs is not None:
+                    self._scatter_graph_results(
+                        ready_workers,
+                        values,
+                        graph_place,
+                        graph_opp,
+                        graph_pair,
+                        graph_regret,
+                    )
+                else:
+                    self._scatter_results(
+                        ready_workers,
+                        per_worker_counts,
+                        policies,
+                        values,
+                        sparse_logits,
+                        pair_logits,
+                    )
                 self.total_scatter_ms += (time.monotonic() - scatter_t0) * 1000.0
 
                 for worker_id in ready_workers:
@@ -334,6 +377,27 @@ class InferenceServer:
 
         return ready
 
+    def _is_graph_request(self, ready_workers: List[int]) -> bool:
+        if not ready_workers:
+            return False
+        slot = self._queue.get_slot(ready_workers[0])
+        return bool(getattr(slot, "req_mode", np.array([0], dtype=np.uint8))[0] == 1)
+
+    def _ready_workers_graph_mode(self, ready_workers: List[int]) -> Optional[List[int]]:
+        """Keep a drained batch homogeneous when graph and dense workers race."""
+        modes = [
+            int(getattr(self._queue.get_slot(worker_id), "req_mode", np.array([0], dtype=np.uint8))[0])
+            for worker_id in ready_workers
+        ]
+        if not modes or all(mode == modes[0] for mode in modes):
+            return None
+        target = modes[0]
+        return [
+            worker_id
+            for worker_id, mode in zip(ready_workers, modes)
+            if int(mode) == int(target)
+        ]
+
     # ── Batch building ────────────────────────────────────────────────────
 
     def _build_batch(
@@ -366,6 +430,91 @@ class InferenceServer:
             batch_tensor = batch_tensor.contiguous(memory_format=torch.channels_last)
 
         return batch_tensor, counts, total
+
+    def _build_graph_inputs(
+        self,
+        ready_workers: List[int],
+    ) -> Tuple[dict[str, torch.Tensor], List[int], int]:
+        if not self._global_graph_mode:
+            raise RuntimeError("graph IPC request received by a non-global-graph inference server")
+        metas = []
+        for worker_id in ready_workers:
+            slot = self._queue.get_slot(worker_id)
+            if int(slot.req_count[0]) != 1:
+                raise ValueError("graph IPC supports exactly one graph position per worker request")
+            meta = np.array(slot.req_graph_meta, copy=True)
+            if int(meta[0]) != GRAPH_SCHEMA_VERSION or int(meta[1]) != RELATION_SCHEMA_VERSION:
+                raise ValueError(
+                    "graph IPC schema mismatch: "
+                    f"got ({int(meta[0])}, {int(meta[1])}), "
+                    f"expected ({GRAPH_SCHEMA_VERSION}, {RELATION_SCHEMA_VERSION})"
+                )
+            token_count, legal_count, opp_count, pair_count = map(int, meta[2:6])
+            if token_count > MAX_GRAPH_TOKENS or legal_count > MAX_GRAPH_ACTIONS:
+                raise ValueError("graph request exceeds shared-memory token/legal capacity")
+            if opp_count > MAX_GRAPH_ACTIONS or pair_count > MAX_GRAPH_PAIRS:
+                raise ValueError("graph request exceeds shared-memory opponent/pair capacity")
+            metas.append(meta)
+        total = len(ready_workers)
+        if total == 0:
+            return {}, [], 0
+        max_t = max(int(meta[2]) for meta in metas)
+        max_a = max(int(meta[3]) for meta in metas)
+        max_o = max(int(meta[4]) for meta in metas)
+        max_p = max(int(meta[5]) for meta in metas)
+
+        token_features = np.zeros((total, max_t, self._queue.get_slot(ready_workers[0]).req_graph_token_features.shape[1]), dtype=np.float32)
+        token_type = np.zeros((total, max_t), dtype=np.int64)
+        token_qr = np.zeros((total, max_t, 2), dtype=np.int32)
+        token_mask = np.zeros((total, max_t), dtype=np.bool_)
+        legal_token_indices = np.full((total, max_a), -1, dtype=np.int64)
+        legal_mask = np.zeros((total, max_a), dtype=np.bool_)
+        opp_legal_qr = np.zeros((total, max_o, 2), dtype=np.int32)
+        opp_legal_mask = np.zeros((total, max_o), dtype=np.bool_)
+        pair_token_indices = np.full((total, max_p), -1, dtype=np.int64)
+        pair_first_indices = np.full((total, max_p), -1, dtype=np.int64)
+        pair_second_indices = np.full((total, max_p), -1, dtype=np.int64)
+        relation_type = np.zeros((total, max_t, max_t), dtype=np.int64)
+        relation_bias = np.zeros((total, 1, max_t, max_t), dtype=np.float32)
+
+        for row, worker_id in enumerate(ready_workers):
+            slot = self._queue.get_slot(worker_id)
+            t, a, o, p = map(int, metas[row][2:6])
+            token_features[row, :t] = slot.req_graph_token_features[:t]
+            token_type[row, :t] = slot.req_graph_token_type[:t].astype(np.int64)
+            token_qr[row, :t] = slot.req_graph_token_qr[:t]
+            token_mask[row, :t] = slot.req_graph_token_mask[:t].astype(bool)
+            legal_token_indices[row, :a] = slot.req_graph_legal_token_indices[:a]
+            legal_mask[row, :a] = slot.req_graph_legal_mask[:a].astype(bool)
+            if o:
+                opp_legal_qr[row, :o] = slot.req_graph_opp_legal_qr[:o]
+                opp_legal_mask[row, :o] = slot.req_graph_opp_legal_mask[:o].astype(bool)
+            if p:
+                pair_token_indices[row, :p] = slot.req_graph_pair_token_indices[:p]
+                pair_first_indices[row, :p] = slot.req_graph_pair_first_indices[:p]
+                pair_second_indices[row, :p] = slot.req_graph_pair_second_indices[:p]
+            relation_type[row, :t, :t] = slot.req_graph_relation_type[:t, :t].astype(np.int64)
+            relation_bias[row, :, :t, :t] = slot.req_graph_relation_bias[:, :t, :t]
+
+        return (
+            {
+                "token_features": torch.from_numpy(token_features).to(self._device, non_blocking=True),
+                "token_type": torch.from_numpy(token_type).to(self._device, non_blocking=True),
+                "token_qr": torch.from_numpy(token_qr).to(self._device, non_blocking=True),
+                "token_mask": torch.from_numpy(token_mask).to(self._device, non_blocking=True),
+                "legal_token_indices": torch.from_numpy(legal_token_indices).to(self._device, non_blocking=True),
+                "legal_mask": torch.from_numpy(legal_mask).to(self._device, non_blocking=True),
+                "opp_legal_qr": torch.from_numpy(opp_legal_qr).to(self._device, non_blocking=True),
+                "opp_legal_mask": torch.from_numpy(opp_legal_mask).to(self._device, non_blocking=True),
+                "pair_token_indices": torch.from_numpy(pair_token_indices).to(self._device, non_blocking=True),
+                "pair_first_indices": torch.from_numpy(pair_first_indices).to(self._device, non_blocking=True),
+                "pair_second_indices": torch.from_numpy(pair_second_indices).to(self._device, non_blocking=True),
+                "relation_type": torch.from_numpy(relation_type).to(self._device, non_blocking=True),
+                "relation_bias": torch.from_numpy(relation_bias).to(self._device, non_blocking=True),
+            },
+            [1 for _ in ready_workers],
+            total,
+        )
 
     def _build_sparse_inputs(
         self,
@@ -442,7 +591,7 @@ class InferenceServer:
         self,
         batch_tensor: torch.Tensor,
         sparse_inputs: Optional[dict[str, torch.Tensor]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """Run the model forward pass on a batch.
 
         Args:
@@ -500,6 +649,65 @@ class InferenceServer:
         self.total_download_ms += download_ms
 
         return policies, values, sparse, pair
+
+    def _forward_graph(
+        self,
+        graph_inputs: dict[str, torch.Tensor],
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """Run the global graph model and return keyed graph logits."""
+        t0 = time.monotonic()
+        model_t0 = time.monotonic()
+        with torch.inference_mode():
+            if self._device.type == "cuda" and self._forward_stream is not None:
+                with torch.cuda.stream(self._forward_stream):
+                    if self.fp16:
+                        with torch.amp.autocast("cuda", dtype=torch.float16):
+                            out = self._model(**graph_inputs)
+                    else:
+                        out = self._model(**graph_inputs)
+                self._forward_stream.synchronize()
+            elif self.fp16 and self._device.type == "cuda":
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    out = self._model(**graph_inputs)
+            else:
+                out = self._model(**graph_inputs)
+        model_ms = (time.monotonic() - model_t0) * 1000.0
+
+        post_t0 = time.monotonic()
+        if "policy_place" not in out:
+            raise RuntimeError("global graph model did not return policy_place")
+        place = self._sanitize_policy_logits(out["policy_place"])
+        value_logits = self._sanitize_value_logits(out["value"])
+        values = torch.nan_to_num(
+            HexNet.bins_to_value(value_logits).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp_(-1.0, 1.0)
+        opp = self._sanitize_policy_logits(out["opp_policy"]) if "opp_policy" in out else None
+        pair = None
+        if "policy_pair_joint" in out:
+            pair_head = out["policy_pair_joint"]
+            if "policy_pair_second" in out and _graph_pair_request_is_second_placement(graph_inputs):
+                pair_head = out["policy_pair_second"]
+            pair = self._sanitize_policy_logits(pair_head)
+        regret = out.get("regret_rank")
+        post_ms = (time.monotonic() - post_t0) * 1000.0
+
+        download_t0 = time.monotonic()
+        place_np = place.cpu().numpy()
+        values_np = values.cpu().numpy()
+        opp_np = opp.cpu().numpy() if opp is not None else None
+        pair_np = pair.cpu().numpy() if pair is not None else None
+        regret_np = regret.detach().float().cpu().numpy().reshape(-1) if regret is not None else None
+        download_ms = (time.monotonic() - download_t0) * 1000.0
+
+        elapsed = (time.monotonic() - t0) * 1000.0
+        self.total_forward_ms += elapsed
+        self.total_model_ms += model_ms
+        self.total_postprocess_ms += post_ms
+        self.total_download_ms += download_ms
+        return place_np, values_np, opp_np, pair_np, regret_np
 
     @staticmethod
     def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -559,6 +767,50 @@ class InferenceServer:
                 p = pair_logits.shape[1]
                 slot.res_pair_logits[:count, :p] = pair_logits[offset:offset + count]
             offset += count
+
+    def _scatter_graph_results(
+        self,
+        ready_workers: List[int],
+        values: np.ndarray,
+        place_logits: np.ndarray,
+        opp_logits: Optional[np.ndarray],
+        pair_logits: Optional[np.ndarray],
+        regret_rank: Optional[np.ndarray] = None,
+    ):
+        """Scatter graph logits using each worker's keyed legal/pair counts."""
+        for row, worker_id in enumerate(ready_workers):
+            slot = self._queue.get_slot(worker_id)
+            token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
+            if legal_count > place_logits.shape[1]:
+                raise ValueError("graph place logits shorter than legal row table")
+            if pair_count and pair_logits is None:
+                raise ValueError("graph model did not return pair logits for a pair request")
+            slot.res_value[0] = float(values[row])
+            slot.res_graph_meta[:] = (
+                GRAPH_SCHEMA_VERSION,
+                RELATION_SCHEMA_VERSION,
+                legal_count,
+                opp_count,
+                pair_count,
+                token_count,
+                MAX_GRAPH_TOKENS,
+                MAX_GRAPH_ACTIONS,
+            )
+            slot.res_graph_place_logits.fill(0.0)
+            slot.res_graph_opp_logits.fill(0.0)
+            slot.res_graph_pair_logits.fill(0.0)
+            if getattr(slot, "res_graph_regret_rank", None) is not None:
+                slot.res_graph_regret_rank[0] = (
+                    float(regret_rank[row])
+                    if regret_rank is not None and row < len(regret_rank)
+                    else 0.0
+                )
+            slot.res_graph_place_logits[:legal_count] = place_logits[row, :legal_count]
+            if opp_count and opp_logits is not None:
+                slot.res_graph_opp_logits[:opp_count] = opp_logits[row, :opp_count]
+            if pair_count and pair_logits is not None:
+                slot.res_graph_pair_logits[:pair_count] = pair_logits[row, :pair_count]
+            slot.req_mode[0] = 0
 
     # ── Stats ─────────────────────────────────────────────────────────────
 

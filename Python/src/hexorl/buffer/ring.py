@@ -53,6 +53,9 @@ class RingBuffer:
         self._opp_policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._opp_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
         self._opp_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._opp_policy_legal_v2_q = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_legal_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_legal_v2_counts = np.zeros(capacity, dtype=np.uint16)
         self._pair_policy_v2_q1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_r1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_q2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
@@ -67,6 +70,18 @@ class RingBuffer:
         self._candidate_recall_winning = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_forced_block = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_cover = np.zeros(capacity, dtype=np.float32)
+        self._candidate_discovery_top1 = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_top4 = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_top8 = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_winning = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_forced_block = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_cover = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_open_four = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_open_five = np.ones(capacity, dtype=np.float32)
+        self._candidate_critical_count = np.zeros(capacity, dtype=np.float32)
+        self._candidate_critical_overflow_count = np.zeros(capacity, dtype=np.float32)
+        self._candidate_critical_overflow_examples = np.zeros((capacity, 8, 2), dtype=np.int32)
+        self._candidate_critical_overflow_example_counts = np.zeros(capacity, dtype=np.uint8)
         self._sparse_prior_stage = np.zeros(capacity, dtype=np.uint8)
         self._sparse_prior_root_candidate_count = np.zeros(capacity, dtype=np.float32)
         self._sparse_prior_leaf_candidate_count = np.zeros(capacity, dtype=np.float32)
@@ -325,6 +340,13 @@ class RingBuffer:
                         int(self._opp_policy_v2_r[idx, j]),
                         prob,
                     ))
+            opp_policy_legal_v2 = []
+            n_opp_legal_v2 = int(self._opp_policy_legal_v2_counts[idx])
+            for j in range(n_opp_legal_v2):
+                opp_policy_legal_v2.append((
+                    int(self._opp_policy_legal_v2_q[idx, j]),
+                    int(self._opp_policy_legal_v2_r[idx, j]),
+                ))
             pair_policy_v2 = []
             n_pair_v2 = int(self._pair_policy_v2_counts[idx])
             for j in range(n_pair_v2):
@@ -354,6 +376,7 @@ class RingBuffer:
                 opp_policy_weight=float(self._opp_policy_weights[idx]),
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
+                opp_policy_legal_v2=opp_policy_legal_v2,
                 pair_policy_target_v2=pair_policy_v2,
                 target_policy_mass_outside_window=float(self._outside_policy_mass[idx]),
                 missing_target_policy_mass=float(self._missing_policy_mass[idx]),
@@ -363,6 +386,22 @@ class RingBuffer:
                 candidate_recall_winning_move=float(self._candidate_recall_winning[idx]),
                 candidate_recall_forced_block=float(self._candidate_recall_forced_block[idx]),
                 candidate_recall_two_placement_cover=float(self._candidate_recall_cover[idx]),
+                candidate_discovery_top1=float(self._candidate_discovery_top1[idx]),
+                candidate_discovery_top4=float(self._candidate_discovery_top4[idx]),
+                candidate_discovery_top8=float(self._candidate_discovery_top8[idx]),
+                candidate_discovery_winning_move=float(self._candidate_discovery_winning[idx]),
+                candidate_discovery_forced_block=float(self._candidate_discovery_forced_block[idx]),
+                candidate_discovery_two_placement_cover=float(self._candidate_discovery_cover[idx]),
+                candidate_discovery_open_four=float(self._candidate_discovery_open_four[idx]),
+                candidate_discovery_open_five=float(self._candidate_discovery_open_five[idx]),
+                candidate_critical_count=int(self._candidate_critical_count[idx]),
+                candidate_critical_overflow_count=int(self._candidate_critical_overflow_count[idx]),
+                candidate_critical_overflow_examples=tuple(
+                    (int(q), int(r))
+                    for q, r in self._candidate_critical_overflow_examples[
+                        idx, : int(self._candidate_critical_overflow_example_counts[idx])
+                    ]
+                ),
                 sparse_prior_stage=int(self._sparse_prior_stage[idx]),
                 sparse_prior_root_candidate_count=int(self._sparse_prior_root_candidate_count[idx]),
                 sparse_prior_leaf_candidate_count=float(self._sparse_prior_leaf_candidate_count[idx]),
@@ -462,6 +501,56 @@ class RingBuffer:
                         [(self._tail + i) % self.capacity for i in range(self._size)]
                     ].mean()
                 ) if self._size > 0 else 0.0,
+                "candidate_discovery_top1": float(
+                    self._candidate_discovery_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_top4": float(
+                    self._candidate_discovery_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_top8": float(
+                    self._candidate_discovery_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_winning_move": float(
+                    self._candidate_discovery_winning[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_forced_block": float(
+                    self._candidate_discovery_forced_block[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_two_placement_cover": float(
+                    self._candidate_discovery_cover[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_open_four": float(
+                    self._candidate_discovery_open_four[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_open_five": float(
+                    self._candidate_discovery_open_five[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "critical_count": float(
+                    self._candidate_critical_count[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "critical_overflow_count": float(
+                    self._candidate_critical_overflow_count[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].sum()
+                ) if self._size > 0 else 0.0,
                 "fallback_prior_use": float(
                     self._fallback_prior_use[
                         [(self._tail + i) % self.capacity for i in range(self._size)]
@@ -549,6 +638,9 @@ class RingBuffer:
             self._opp_policy_v2_r.fill(0)
             self._opp_policy_v2_probs.fill(0.0)
             self._opp_policy_v2_counts.fill(0)
+            self._opp_policy_legal_v2_q.fill(0)
+            self._opp_policy_legal_v2_r.fill(0)
+            self._opp_policy_legal_v2_counts.fill(0)
             self._pair_policy_v2_q1.fill(0)
             self._pair_policy_v2_r1.fill(0)
             self._pair_policy_v2_q2.fill(0)
@@ -563,6 +655,18 @@ class RingBuffer:
             self._candidate_recall_winning.fill(0.0)
             self._candidate_recall_forced_block.fill(0.0)
             self._candidate_recall_cover.fill(0.0)
+            self._candidate_discovery_top1.fill(1.0)
+            self._candidate_discovery_top4.fill(1.0)
+            self._candidate_discovery_top8.fill(1.0)
+            self._candidate_discovery_winning.fill(1.0)
+            self._candidate_discovery_forced_block.fill(1.0)
+            self._candidate_discovery_cover.fill(1.0)
+            self._candidate_discovery_open_four.fill(1.0)
+            self._candidate_discovery_open_five.fill(1.0)
+            self._candidate_critical_count.fill(0.0)
+            self._candidate_critical_overflow_count.fill(0.0)
+            self._candidate_critical_overflow_examples.fill(0)
+            self._candidate_critical_overflow_example_counts.fill(0)
             self._sparse_prior_stage.fill(0)
             self._sparse_prior_root_candidate_count.fill(0.0)
             self._sparse_prior_leaf_candidate_count.fill(0.0)
@@ -625,6 +729,12 @@ class RingBuffer:
     def _write_v2_targets(self, idx: int, record: PositionRecord):
         """Write action-keyed global policy targets and diagnostics."""
         entries = list(record.policy_target_v2)
+        if len(entries) > self.max_policy_v2_entries:
+            raise ValueError(
+                "policy_target_v2 exceeds RingBuffer capacity: "
+                f"{len(entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
+                "Silent global action target truncation is not allowed."
+            )
         n = min(len(entries), self.max_policy_v2_entries)
         self._policy_v2_counts[idx] = n
         self._policy_v2_q[idx].fill(0)
@@ -636,6 +746,12 @@ class RingBuffer:
             self._policy_v2_probs[idx, j] = float(prob)
 
         opp_entries = list(record.opp_policy_target_v2)
+        if len(opp_entries) > self.max_policy_v2_entries:
+            raise ValueError(
+                "opp_policy_target_v2 exceeds RingBuffer capacity: "
+                f"{len(opp_entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
+                "Silent opponent policy target truncation is not allowed."
+            )
         n_opp = min(len(opp_entries), self.max_policy_v2_entries)
         self._opp_policy_v2_counts[idx] = n_opp
         self._opp_policy_v2_q[idx].fill(0)
@@ -646,7 +762,28 @@ class RingBuffer:
             self._opp_policy_v2_r[idx, j] = int(r)
             self._opp_policy_v2_probs[idx, j] = float(prob)
 
+        opp_legal_entries = list(record.opp_policy_legal_v2)
+        if len(opp_legal_entries) > self.max_policy_v2_entries:
+            raise ValueError(
+                "opp_policy_legal_v2 exceeds RingBuffer capacity: "
+                f"{len(opp_legal_entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
+                "Silent opponent legal-table truncation is not allowed."
+            )
+        n_opp_legal = min(len(opp_legal_entries), self.max_policy_v2_entries)
+        self._opp_policy_legal_v2_counts[idx] = n_opp_legal
+        self._opp_policy_legal_v2_q[idx].fill(0)
+        self._opp_policy_legal_v2_r[idx].fill(0)
+        for j, (q, r) in enumerate(opp_legal_entries[:n_opp_legal]):
+            self._opp_policy_legal_v2_q[idx, j] = int(q)
+            self._opp_policy_legal_v2_r[idx, j] = int(r)
+
         pair_entries = list(record.pair_policy_target_v2)
+        if len(pair_entries) > self.max_policy_v2_entries:
+            raise ValueError(
+                "pair_policy_target_v2 exceeds RingBuffer capacity: "
+                f"{len(pair_entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
+                "Silent pair target truncation is not allowed."
+            )
         n_pair = min(len(pair_entries), self.max_policy_v2_entries)
         self._pair_policy_v2_counts[idx] = n_pair
         self._pair_policy_v2_q1[idx].fill(0)
@@ -672,6 +809,21 @@ class RingBuffer:
         self._candidate_recall_winning[idx] = float(record.candidate_recall_winning_move)
         self._candidate_recall_forced_block[idx] = float(record.candidate_recall_forced_block)
         self._candidate_recall_cover[idx] = float(record.candidate_recall_two_placement_cover)
+        self._candidate_discovery_top1[idx] = float(record.candidate_discovery_top1)
+        self._candidate_discovery_top4[idx] = float(record.candidate_discovery_top4)
+        self._candidate_discovery_top8[idx] = float(record.candidate_discovery_top8)
+        self._candidate_discovery_winning[idx] = float(record.candidate_discovery_winning_move)
+        self._candidate_discovery_forced_block[idx] = float(record.candidate_discovery_forced_block)
+        self._candidate_discovery_cover[idx] = float(record.candidate_discovery_two_placement_cover)
+        self._candidate_discovery_open_four[idx] = float(record.candidate_discovery_open_four)
+        self._candidate_discovery_open_five[idx] = float(record.candidate_discovery_open_five)
+        self._candidate_critical_count[idx] = float(record.candidate_critical_count)
+        self._candidate_critical_overflow_count[idx] = float(record.candidate_critical_overflow_count)
+        self._candidate_critical_overflow_examples[idx].fill(0)
+        example_count = min(len(record.candidate_critical_overflow_examples), 8)
+        self._candidate_critical_overflow_example_counts[idx] = example_count
+        for row, (q, r) in enumerate(record.candidate_critical_overflow_examples[:example_count]):
+            self._candidate_critical_overflow_examples[idx, row] = (int(q), int(r))
         self._sparse_prior_stage[idx] = int(record.sparse_prior_stage)
         self._sparse_prior_root_candidate_count[idx] = float(record.sparse_prior_root_candidate_count)
         self._sparse_prior_leaf_candidate_count[idx] = float(record.sparse_prior_leaf_candidate_count)

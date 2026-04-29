@@ -1485,7 +1485,8 @@ class Phase3Supervisor:
         hard_reasons = (
             "selfplay_generated_no_positions",
             "policy_target_mass_silently_dropped",
-            "candidate_recall_below_gate",
+            "candidate_discovery_below_gate",
+            "decisive_candidate_discovery_below_gate",
             "non_finite_train_metric",
             "train_exception",
             "illegal_or_crash_rate",
@@ -1807,16 +1808,16 @@ class Phase3Supervisor:
         if float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0) > 1e-6:
             return "policy_target_mass_silently_dropped"
         if trial.family.sparse_policy:
-            recall = float(buffer.get("avg_candidate_recall_mcts_top8", 1.0) or 0.0)
-            if record.get("buffer", {}).get("size", 0) > 0 and recall < self.args.candidate_recall_gate:
-                return f"candidate_recall_below_gate:{recall:.4f}"
+            discovery = float(buffer.get("avg_candidate_discovery_top8", 1.0) or 0.0)
+            if record.get("buffer", {}).get("size", 0) > 0 and discovery < self.args.candidate_recall_gate:
+                return f"candidate_discovery_below_gate:{discovery:.4f}"
             decisive = min(
-                float(buffer.get("avg_candidate_recall_winning_move", 1.0) or 0.0),
-                float(buffer.get("avg_candidate_recall_forced_block", 1.0) or 0.0),
-                float(buffer.get("avg_candidate_recall_two_placement_cover", 1.0) or 0.0),
+                float(buffer.get("avg_candidate_discovery_winning_move", 1.0) or 0.0),
+                float(buffer.get("avg_candidate_discovery_forced_block", 1.0) or 0.0),
+                float(buffer.get("avg_candidate_discovery_two_placement_cover", 1.0) or 0.0),
             )
             if record.get("buffer", {}).get("size", 0) > 0 and decisive < 0.995:
-                return f"decisive_candidate_recall_below_gate:{decisive:.4f}"
+                return f"decisive_candidate_discovery_below_gate:{decisive:.4f}"
         elapsed = float(record.get("epoch_elapsed_s", 0.0) or 0.0)
         ref = max(float(self.args.target_epoch_seconds), 1.0)
         last_score = trial.last_score
@@ -2171,6 +2172,7 @@ class EvaluationServices:
 
     def __init__(self, supervisor: Phase3Supervisor):
         self.s = supervisor
+        self.args = supervisor.args
 
     def evaluate_trial(self, trial: TrialState, *, stage: str) -> dict[str, Any]:
         latest = trial.metrics_history[-1] if trial.metrics_history else {}
@@ -2236,22 +2238,22 @@ class EvaluationServices:
     def candidate_recall(self, trial: TrialState, buffer: dict[str, Any]) -> dict[str, Any]:
         if not trial.family.sparse_policy:
             return {"applicable": False, "score": 1.0}
-        top1 = float(buffer.get("avg_candidate_recall_mcts_top1", 0.0) or 0.0)
-        top4 = float(buffer.get("avg_candidate_recall_mcts_top4", 0.0) or 0.0)
-        top8 = float(buffer.get("avg_candidate_recall_mcts_top8", 0.0) or 0.0)
-        winning = float(buffer.get("avg_candidate_recall_winning_move", 1.0) or 0.0)
-        forced = float(buffer.get("avg_candidate_recall_forced_block", 1.0) or 0.0)
-        cover = float(buffer.get("avg_candidate_recall_two_placement_cover", 1.0) or 0.0)
+        top1 = float(buffer.get("avg_candidate_discovery_top1", 0.0) or 0.0)
+        top4 = float(buffer.get("avg_candidate_discovery_top4", 0.0) or 0.0)
+        top8 = float(buffer.get("avg_candidate_discovery_top8", 0.0) or 0.0)
+        winning = float(buffer.get("avg_candidate_discovery_winning_move", 1.0) or 0.0)
+        forced = float(buffer.get("avg_candidate_discovery_forced_block", 1.0) or 0.0)
+        cover = float(buffer.get("avg_candidate_discovery_two_placement_cover", 1.0) or 0.0)
         missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
         decisive = min(winning, forced, cover)
         return {
             "applicable": True,
-            "candidate_recall_mcts_top1": top1,
-            "candidate_recall_mcts_top4": top4,
-            "candidate_recall_mcts_top8": top8,
-            "candidate_recall_winning_move": winning,
-            "candidate_recall_forced_block": forced,
-            "candidate_recall_two_placement_cover": cover,
+            "candidate_discovery_top1": top1,
+            "candidate_discovery_top4": top4,
+            "candidate_discovery_top8": top8,
+            "candidate_discovery_winning_move": winning,
+            "candidate_discovery_forced_block": forced,
+            "candidate_discovery_two_placement_cover": cover,
             "missing_target_policy_mass": missing,
             "gate_pass": top8 >= self.args.candidate_recall_gate and decisive >= 0.995 and missing <= 0.01,
             "score": max(0.0, min(1.0, min(top8, decisive) - missing)),

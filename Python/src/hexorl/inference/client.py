@@ -10,6 +10,9 @@ import numpy as np
 from typing import Optional
 from hexorl.inference.shm_queue import (
     MAX_CANDIDATES,
+    MAX_GRAPH_ACTIONS,
+    MAX_GRAPH_PAIRS,
+    MAX_GRAPH_TOKENS,
     MAX_PAIR_CANDIDATES,
     InferenceQueue,
     connect_inference_queue,
@@ -100,6 +103,8 @@ class InferenceClient:
             self._slot.req_candidate_count[:count] = 0
         if getattr(self._slot, "req_pair_count", None) is not None:
             self._slot.req_pair_count[:count] = 0
+        if getattr(self._slot, "req_mode", None) is not None:
+            self._slot.req_mode[0] = 0
         self._slot.req_count[0] = count
 
         # 3. Signal the server.
@@ -151,6 +156,8 @@ class InferenceClient:
 
         self._slot.res_ready.clear()
         np.copyto(self._slot.req_tensor[:count], tensor.reshape(count, 13, 33, 33))
+        if getattr(self._slot, "req_mode", None) is not None:
+            self._slot.req_mode[0] = 0
         self._slot.req_candidate_count[:count] = k
         if getattr(self._slot, "req_pair_count", None) is not None:
             self._slot.req_pair_count[:count] = 0
@@ -216,6 +223,8 @@ class InferenceClient:
 
         self._slot.res_ready.clear()
         np.copyto(self._slot.req_tensor[:count], tensor.reshape(count, 13, 33, 33))
+        if getattr(self._slot, "req_mode", None) is not None:
+            self._slot.req_mode[0] = 0
         self._slot.req_candidate_count[:count] = k
         self._slot.req_candidate_indices[:count, :k] = candidate_indices[:count, :k]
         self._slot.req_candidate_features[:count, :k] = candidate_features[:count, :k]
@@ -247,6 +256,119 @@ class InferenceClient:
         self._slot.req_candidate_count[:count] = 0
         self._slot.req_pair_count[:count] = 0
         return policies, values, sparse, pair
+
+    def submit_graph(self, graph_batch) -> dict[str, np.ndarray | dict[str, object]]:
+        """Submit one padded global graph request and return keyed logits.
+
+        The graph IPC slot is deliberately single-position per worker. Graph
+        MCTS prioritizes exact global action identity and capacity failures over
+        dense fallback throughput.
+        """
+        if not self._connected:
+            raise RuntimeError("InferenceClient not connected. Call connect() first.")
+        if self._slot.req_mode is None:
+            raise RuntimeError("inference queue does not expose graph IPC slots")
+
+        token_count = int(np.asarray(graph_batch.token_features).shape[0])
+        legal_count = int(np.asarray(graph_batch.legal_qr).shape[0])
+        opp_count = int(np.asarray(graph_batch.opp_legal_qr).shape[0])
+        pair_count = int(np.asarray(graph_batch.pair_token_indices).shape[0])
+        if token_count > MAX_GRAPH_TOKENS:
+            raise ValueError(f"graph token count {token_count} exceeds MAX_GRAPH_TOKENS {MAX_GRAPH_TOKENS}")
+        if legal_count > MAX_GRAPH_ACTIONS:
+            raise ValueError(f"graph legal row count {legal_count} exceeds MAX_GRAPH_ACTIONS {MAX_GRAPH_ACTIONS}")
+        if opp_count > MAX_GRAPH_ACTIONS:
+            raise ValueError(f"graph opponent legal row count {opp_count} exceeds MAX_GRAPH_ACTIONS {MAX_GRAPH_ACTIONS}")
+        if pair_count > MAX_GRAPH_PAIRS:
+            raise ValueError(f"graph pair row count {pair_count} exceeds MAX_GRAPH_PAIRS {MAX_GRAPH_PAIRS}")
+
+        self._slot.res_ready.clear()
+        self._slot.req_mode[0] = 1
+        self._slot.req_count[0] = 1
+        self._slot.req_candidate_count[:1] = 0
+        self._slot.req_pair_count[:1] = 0
+        self._slot.req_graph_meta[:] = (
+            int(graph_batch.schema_version),
+            int(graph_batch.relation_schema_version),
+            token_count,
+            legal_count,
+            opp_count,
+            pair_count,
+            MAX_GRAPH_TOKENS,
+            MAX_GRAPH_ACTIONS,
+        )
+
+        self._slot.req_graph_token_features.fill(0.0)
+        self._slot.req_graph_token_type.fill(0)
+        self._slot.req_graph_token_qr.fill(0)
+        self._slot.req_graph_token_mask.fill(0)
+        self._slot.req_graph_legal_token_indices.fill(-1)
+        self._slot.req_graph_legal_qr.fill(0)
+        self._slot.req_graph_legal_mask.fill(0)
+        self._slot.req_graph_opp_legal_qr.fill(0)
+        self._slot.req_graph_opp_legal_mask.fill(0)
+        self._slot.req_graph_pair_token_indices.fill(-1)
+        self._slot.req_graph_pair_first_indices.fill(-1)
+        self._slot.req_graph_pair_second_indices.fill(-1)
+        self._slot.req_graph_relation_type.fill(0)
+        self._slot.req_graph_relation_bias.fill(0.0)
+
+        self._slot.req_graph_token_features[:token_count] = np.asarray(graph_batch.token_features, dtype=np.float32)
+        self._slot.req_graph_token_type[:token_count] = np.asarray(graph_batch.token_type, dtype=np.int16)
+        self._slot.req_graph_token_qr[:token_count] = np.asarray(graph_batch.token_qr, dtype=np.int32)
+        self._slot.req_graph_token_mask[:token_count] = np.asarray(graph_batch.token_mask, dtype=np.uint8)
+        self._slot.req_graph_legal_token_indices[:legal_count] = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
+        self._slot.req_graph_legal_qr[:legal_count] = np.asarray(graph_batch.legal_qr, dtype=np.int32)
+        self._slot.req_graph_legal_mask[:legal_count] = np.asarray(graph_batch.legal_mask, dtype=np.uint8)
+        if opp_count:
+            self._slot.req_graph_opp_legal_qr[:opp_count] = np.asarray(graph_batch.opp_legal_qr, dtype=np.int32)
+            self._slot.req_graph_opp_legal_mask[:opp_count] = np.asarray(graph_batch.opp_legal_mask, dtype=np.uint8)
+        if pair_count:
+            self._slot.req_graph_pair_token_indices[:pair_count] = np.asarray(graph_batch.pair_token_indices, dtype=np.int64)
+            self._slot.req_graph_pair_first_indices[:pair_count] = np.asarray(graph_batch.pair_first_indices, dtype=np.int64)
+            self._slot.req_graph_pair_second_indices[:pair_count] = np.asarray(graph_batch.pair_second_indices, dtype=np.int64)
+        self._slot.req_graph_relation_type[:token_count, :token_count] = np.asarray(
+            graph_batch.relation_type,
+            dtype=np.int16,
+        )
+        self._slot.req_graph_relation_bias[:, :token_count, :token_count] = np.asarray(
+            graph_batch.relation_bias,
+            dtype=np.float32,
+        )
+
+        self._slot.req_ready.set()
+        t0 = time.monotonic()
+        if not self._slot.res_ready.wait(timeout=self.timeout_ms / 1000.0):
+            raise TimeoutError(
+                f"Inference server did not respond within {self.timeout_ms:.0f}ms"
+            )
+        elapsed = (time.monotonic() - t0) * 1000.0
+        self.total_wait_ms += elapsed
+        self.n_submits += 1
+        self._slot.res_ready.clear()
+        self._slot.req_mode[0] = 0
+
+        meta = {
+            "schema_version": int(self._slot.res_graph_meta[0]),
+            "relation_schema_version": int(self._slot.res_graph_meta[1]),
+            "legal_count": int(self._slot.res_graph_meta[2]),
+            "opp_legal_count": int(self._slot.res_graph_meta[3]),
+            "pair_count": int(self._slot.res_graph_meta[4]),
+            "prior_source": "global_graph",
+            "legal_qr": np.array(self._slot.req_graph_legal_qr[:legal_count], copy=True),
+            "legal_mask": np.array(self._slot.req_graph_legal_mask[:legal_count].astype(bool), copy=True),
+        }
+        return {
+            "policy_place": np.array(self._slot.res_graph_place_logits[:legal_count], copy=True),
+            "opp_policy": np.array(self._slot.res_graph_opp_logits[:opp_count], copy=True),
+            "policy_pair_joint": np.array(self._slot.res_graph_pair_logits[:pair_count], copy=True),
+            "regret_rank": np.array(
+                getattr(self._slot, "res_graph_regret_rank", np.zeros(1, dtype=np.float32))[:1],
+                copy=True,
+            ),
+            "value": np.array(self._slot.res_value[:1], copy=True),
+            "metadata": meta,
+        }
 
     @property
     def avg_wait_ms(self) -> float:

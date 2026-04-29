@@ -51,7 +51,7 @@ class SelfPlayOrchestrator:
         self._buffer = RingBuffer(
             capacity=buffer_capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )

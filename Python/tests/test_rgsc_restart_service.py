@@ -1,8 +1,10 @@
 import struct
 
+import numpy as np
 import pytest
 
 from hexorl.selfplay.records import GameRecord, PositionRecord
+from hexorl.buffer.regret_buffer import PrioritizedRegretBuffer
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history, restore_game_from_history
 
 
@@ -133,3 +135,34 @@ def test_rgsc_tree_node_source_is_persisted_honestly():
     )
 
     assert service.prb.get_entries()[0].source == "mcts_tree_node_depth_heuristic"
+
+
+def test_prb_sampling_uses_rank_score_not_ema_regret():
+    prb = PrioritizedRegretBuffer(capacity=4, sampling_temperature=0.5)
+    low_rank = _move(0, 0, 0)
+    high_rank = _move(0, 0, 0) + _move(1, 1, 0)
+    assert prb.add(low_rank, regret=100.0, rank_score=1.0)
+    assert prb.add(high_rank, regret=1.0, rank_score=100.0)
+
+    sampled = [
+        prb.sample_with_index(rng=np.random.RandomState(seed))[1].move_history
+        for seed in range(10)
+    ]
+
+    assert sampled.count(high_rank) >= 9
+
+
+def test_prb_eviction_prefers_lower_ema_regret_then_oldest_sampled():
+    prb = PrioritizedRegretBuffer(capacity=2)
+    old_low = _move(0, 0, 0)
+    high = _move(0, 0, 0) + _move(1, 1, 0)
+    replacement = _move(0, 0, 0) + _move(1, 1, 0) + _move(1, 2, 0)
+    assert prb.add(old_low, regret=1.0, rank_score=100.0)
+    assert prb.add(high, regret=5.0, rank_score=1.0)
+
+    assert prb.add(replacement, regret=2.0, rank_score=2.0)
+
+    histories = {entry.move_history for entry in prb.get_entries()}
+    assert old_low not in histories
+    assert replacement in histories
+    assert high in histories

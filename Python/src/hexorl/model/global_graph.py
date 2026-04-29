@@ -135,6 +135,15 @@ class GlobalHexGraphNet(nn.Module):
         self.input = nn.Linear(GRAPH_FEATURE_DIM, channels)
         self.type_embedding = nn.Embedding(max(int(t) for t in GraphTokenType) + 1, channels)
         self.coord = nn.Sequential(nn.Linear(3, channels), nn.SiLU(), nn.Linear(channels, channels))
+        self.architecture_family = {
+            "global_graph_option1": "relation_graph",
+            "global_xattn_0": "context_cross_attention",
+            "global_line_window_0": "line_window_cover",
+            "global_pair_twostage_0": "pair_two_stage",
+            "global_graph_full_0": "full_relation_graph",
+            "global_hybrid_action_0": "crop_diagnostic_global_action",
+            "global_graph768_champion": "scaled_relation_graph",
+        }[architecture]
         block_count = max(1, int(layers))
         if architecture == "global_xattn_0":
             block_count = max(1, min(block_count, 2))
@@ -142,10 +151,19 @@ class GlobalHexGraphNet(nn.Module):
             block_count = max(block_count, 6)
         self.blocks = nn.ModuleList([GraphBlock(channels, heads, dropout=dropout) for _ in range(block_count)])
         self.norm = nn.LayerNorm(channels)
+        self.context_to_action = nn.Sequential(nn.Linear(channels * 2, channels), nn.SiLU(), nn.Linear(channels, channels))
+        self.line_window_gate = nn.Sequential(nn.Linear(channels * 2, channels), nn.SiLU(), nn.Linear(channels, channels))
+        self.hybrid_action_gate = nn.Sequential(nn.Linear(channels + GRAPH_FEATURE_DIM, channels), nn.SiLU(), nn.Linear(channels, channels))
         self.policy_place = nn.Linear(channels, 1)
         self.policy_pair_first = nn.Linear(channels, 1)
+        self.policy_opp = nn.Linear(channels, 1)
         self.pair_joint = nn.Sequential(
-            nn.Linear(channels * 3, channels),
+            nn.Linear(channels * 4, channels),
+            nn.SiLU(),
+            nn.Linear(channels, 1),
+        )
+        self.pair_second = nn.Sequential(
+            nn.Linear(channels * 4, channels),
             nn.SiLU(),
             nn.Linear(channels, 1),
         )
@@ -163,6 +181,8 @@ class GlobalHexGraphNet(nn.Module):
         token_mask: torch.Tensor,
         legal_token_indices: torch.Tensor,
         legal_mask: torch.Tensor,
+        opp_legal_qr: Optional[torch.Tensor] = None,
+        opp_legal_mask: Optional[torch.Tensor] = None,
         pair_first_indices: Optional[torch.Tensor] = None,
         pair_second_indices: Optional[torch.Tensor] = None,
         pair_token_indices: Optional[torch.Tensor] = None,
@@ -195,6 +215,27 @@ class GlobalHexGraphNet(nn.Module):
 
         legal_idx = legal_idx_raw.clamp(0, max(x.shape[1] - 1, 0))
         legal_vec = x.gather(1, legal_idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+        if self.architecture == "global_xattn_0":
+            legal_vec = legal_vec + self.context_to_action(
+                torch.cat([legal_vec, state.unsqueeze(1).expand_as(legal_vec)], dim=-1)
+            )
+        elif self.architecture == "global_line_window_0":
+            tactical_types = torch.tensor(
+                [int(GraphTokenType.WINDOW6), int(GraphTokenType.LINE), int(GraphTokenType.COVER_SET)],
+                device=x.device,
+            )
+            tactical_mask = torch.isin(token_type.to(device=x.device), tactical_types) & mask
+            denom = tactical_mask.sum(dim=1, keepdim=True).clamp(min=1).to(dtype=x.dtype)
+            tactical_context = (x * tactical_mask.unsqueeze(-1).to(dtype=x.dtype)).sum(dim=1) / denom
+            legal_vec = legal_vec + self.line_window_gate(
+                torch.cat([legal_vec, tactical_context.unsqueeze(1).expand_as(legal_vec)], dim=-1)
+            )
+        elif self.architecture == "global_hybrid_action_0":
+            legal_features = token_features.gather(
+                1,
+                legal_idx.unsqueeze(-1).expand(-1, -1, token_features.shape[-1]),
+            )
+            legal_vec = legal_vec + self.hybrid_action_gate(torch.cat([legal_vec, legal_features], dim=-1))
         policy_place = self.policy_place(legal_vec).squeeze(-1).masked_fill(
             ~legal_mask_bool,
             -80.0,
@@ -211,6 +252,27 @@ class GlobalHexGraphNet(nn.Module):
             "moves_left": self.moves_left(state),
             "tactical": self.tactical(state),
         }
+        if opp_legal_qr is not None and opp_legal_mask is not None:
+            if opp_legal_qr.ndim != 3 or opp_legal_qr.shape[-1] != 2:
+                raise ValueError("opp_legal_qr must have shape (B, A_opp, 2)")
+            if opp_legal_mask.shape != opp_legal_qr.shape[:2]:
+                raise ValueError("opp_legal_mask must match opp_legal_qr leading dimensions")
+            oqr = opp_legal_qr.to(device=x.device, dtype=token_features.dtype)
+            ocoord = torch.stack([oqr[..., 0], oqr[..., 1], oqr[..., 0] + oqr[..., 1]], dim=-1) / 64.0
+            opp_vec = (
+                state.unsqueeze(1)
+                + self.type_embedding(
+                    torch.full(
+                        opp_legal_mask.shape,
+                        int(GraphTokenType.LEGAL),
+                        device=x.device,
+                        dtype=torch.long,
+                    )
+                ).to(dtype=x.dtype)
+                + self.coord(ocoord)
+            )
+            opp_mask = opp_legal_mask.to(device=x.device, dtype=torch.bool)
+            out["opp_policy"] = self.policy_opp(opp_vec).squeeze(-1).masked_fill(~opp_mask, -80.0)
         if pair_first_indices is not None and pair_second_indices is not None:
             if pair_first_indices.shape != pair_second_indices.shape:
                 raise ValueError("pair_first_indices and pair_second_indices must have matching shape")
@@ -229,14 +291,17 @@ class GlobalHexGraphNet(nn.Module):
             second = second_raw.clamp(0, max(x.shape[1] - 1, 0))
             first_vec = x.gather(1, first.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             second_vec = x.gather(1, second.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+            state_pair = state.unsqueeze(1).expand_as(first_vec)
             pair_features = torch.cat(
-                [first_vec, second_vec, (first_vec - second_vec).abs()],
+                [state_pair, first_vec, second_vec, (first_vec - second_vec).abs()],
                 dim=-1,
             )
             joint = self.pair_joint(pair_features).squeeze(-1)
             joint = joint.masked_fill(~pair_mask, -80.0)
+            second_logits = self.pair_second(pair_features).squeeze(-1)
+            second_logits = second_logits.masked_fill(~pair_mask, -80.0)
             out["policy_pair_joint"] = joint
-            out["policy_pair_second"] = joint
+            out["policy_pair_second"] = second_logits
         return out
 
     @staticmethod

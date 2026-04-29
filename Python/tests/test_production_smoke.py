@@ -49,7 +49,7 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
     replay_buffer = RingBuffer(
         capacity=cfg.buffer.capacity,
         max_policy_entries=cfg.selfplay.policy_target_top_k,
-        max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+        max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
         num_lookahead=0,
     )
     for game in game_records:

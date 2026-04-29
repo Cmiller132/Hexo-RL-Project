@@ -11,7 +11,8 @@ Runs CPU-side on completed game records. Computes:
 from bisect import bisect_right
 import numpy as np
 from typing import List, Tuple, Optional
-from hexorl.selfplay.records import GameRecord, PositionRecord, pair_policy_v2_from_place_target
+from hexorl.graph.batch import legal_moves_for_stones, parse_history
+from hexorl.selfplay.records import GameRecord, PositionRecord
 
 
 def compute_value_targets(
@@ -194,13 +195,17 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
             opp = positions[opp_idx]
             pos.opp_policy_target = dict(opp.policy_target)
             pos.opp_policy_target_v2 = list(getattr(opp, "policy_target_v2", []))
-            pos.opp_policy_weight = 1.0
+            pos.opp_policy_legal_v2 = _legal_qr_from_history(opp.move_history)
+            pos.opp_policy_weight = float(
+                getattr(opp, "policy_weight", 1.0 if getattr(opp, "is_full_search", False) else 0.0)
+            )
         else:
             pos.opp_policy_target = {}
             pos.opp_policy_target_v2 = []
+            pos.opp_policy_legal_v2 = []
             pos.opp_policy_weight = 0.0
-        if not pos.pair_policy_target_v2 and pos.policy_target_v2:
-            pos.pair_policy_target_v2 = pair_policy_v2_from_place_target(pos.policy_target_v2)
+        if not pos.pair_policy_target_v2:
+            pos.pair_policy_target_v2 = _real_pair_policy_target(positions, i)
         tail = positions[i:]
         regret_weight = 0.0 if getattr(record, "truncated", False) else 1.0
         if any(p.selected_action_value is None for p in tail):
@@ -230,6 +235,52 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
     axis = _dominant_axis_label(axis_history, winner)
     for pos in positions:
         pos.axis_label = axis
+
+
+def _legal_qr_from_history(history: bytes) -> List[Tuple[int, int]]:
+    stones = {(q, r): player for player, q, r in parse_history(history)}
+    return legal_moves_for_stones(stones, radius=8)
+
+
+def _last_move_qr(history: bytes) -> Tuple[int, int] | None:
+    if len(history) < 12:
+        return None
+    moves = parse_history(history)
+    if not moves:
+        return None
+    _player, q, r = moves[-1]
+    return (int(q), int(r))
+
+
+def _history_len(history: bytes) -> int:
+    return len(history) // 12
+
+
+def _real_pair_policy_target(
+    positions: List[PositionRecord],
+    index: int,
+) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
+    pos = positions[index]
+    if not pos.policy_target_v2:
+        return []
+    legal = set(_legal_qr_from_history(pos.move_history))
+    if len(legal) <= 1:
+        return []
+    # Second placement: the known first move is the final move in this history.
+    if index > 0 and positions[index - 1].player == pos.player:
+        first = _last_move_qr(pos.move_history)
+        if first is None:
+            return []
+        return [
+            (first, (int(q), int(r)), float(prob))
+            for q, r, prob in pos.policy_target_v2
+            if float(prob) > 0.0 and (int(q), int(r)) in legal and (int(q), int(r)) != first
+        ]
+    # First-placement joint pair targets must come from the root MCTS joint
+    # table recorded during self-play.  Reconstructing them from the sampled
+    # next state only labels one observed first move and is not an all-legal
+    # joint prior.
+    return []
 
 
 def _next_full_search_opponent_turn_start(

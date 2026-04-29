@@ -233,6 +233,8 @@ def test_mid_turn_lookahead_targets_next_turn_start():
 
 
 def test_opponent_policy_uses_next_full_search_opponent_turn_start():
+    target_turn = PositionRecord(b"", {6: 1.0}, 0.0, player=1, is_full_search=True)
+    target_turn.policy_weight = 0.375
     game = GameRecord(
         positions=[
             PositionRecord(b"", {1: 1.0}, 0.0, player=0, is_full_search=False),
@@ -240,7 +242,7 @@ def test_opponent_policy_uses_next_full_search_opponent_turn_start():
             PositionRecord(b"", {3: 1.0}, 0.0, player=1, is_full_search=False),
             PositionRecord(b"", {4: 1.0}, 0.0, player=0, is_full_search=True),
             PositionRecord(b"", {5: 1.0}, 0.0, player=0, is_full_search=True),
-            PositionRecord(b"", {6: 1.0}, 0.0, player=1, is_full_search=True),
+            target_turn,
         ],
         outcome=1.0,
     )
@@ -250,7 +252,9 @@ def test_opponent_policy_uses_next_full_search_opponent_turn_start():
     assert game.positions[1].opp_policy_target == {4: 1.0}
     assert game.positions[1].opp_policy_weight == pytest.approx(1.0)
     assert game.positions[0].opp_policy_target == {6: 1.0}
+    assert game.positions[0].opp_policy_weight == pytest.approx(0.375)
     assert game.positions[3].opp_policy_target == {6: 1.0}
+    assert game.positions[3].opp_policy_weight == pytest.approx(0.375)
 
 
 def test_opponent_policy_ignores_low_pcr_opponent_turn():
@@ -634,7 +638,7 @@ def test_dense_projection_uses_all_v2_visits_before_topk():
     assert policy[action_to_board_index(1, 0)] == pytest.approx(1 / 3)
 
 
-def test_ring_buffer_reports_v2_truncation_as_missing_mass():
+def test_ring_buffer_rejects_v2_truncation():
     rec = PositionRecord(
         move_history=b"",
         policy_target={action_to_board_index(0, 0): 1.0},
@@ -644,12 +648,8 @@ def test_ring_buffer_reports_v2_truncation_as_missing_mass():
         outcome=1.0,
     )
     buffer = RingBuffer(capacity=2, max_policy_v2_entries=2)
-    buffer.append(rec)
-
-    out = buffer[0]
-    assert out is not None
-    assert len(out.policy_target_v2) == 2
-    assert out.missing_target_policy_mass == pytest.approx(0.2)
+    with pytest.raises(ValueError, match="policy_target_v2 exceeds RingBuffer capacity"):
+        buffer.append(rec)
 
 
 def test_sparse_sampler_outputs_candidate_targets():
@@ -898,6 +898,47 @@ def test_pair_policy_targets_use_full_policy_v2_by_default():
     assert sum(prob for _first, _second, prob in pair_target) == pytest.approx(1.0)
 
 
+def test_graph_replay_can_emit_full_first_placement_pair_rows():
+    pair_target = [((1, 0), (0, 1), 1.0)]
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        pair_policy_target_v2=pair_target,
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_graph_policy=True,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["legal_qr"].shape[1] == 216
+    assert aux["pair_token_indices"].shape[1] == 216 * 215 // 2
+    assert aux["pair_policy_target"][0].sum() == pytest.approx(1.0)
+    legal_qr = np.asarray(aux["legal_qr"][0])
+    legal_mask = np.asarray(aux["legal_mask"][0], dtype=bool)
+    first_row = {
+        tuple(qr.tolist()): row
+        for row, qr in enumerate(legal_qr)
+        if legal_mask[row]
+    }[(1, 0)]
+    second_row = {
+        tuple(qr.tolist()): row
+        for row, qr in enumerate(legal_qr)
+        if legal_mask[row]
+    }[(0, 1)]
+    assert aux["pair_first_policy_target"][0, first_row] == pytest.approx(1.0)
+    assert aux["pair_first_policy_target"][0, second_row] == pytest.approx(0.0)
+
+
 def test_pair_policy_d6_bijection_preserves_pair_identity():
     from hexorl.action_contract.candidates import build_pair_candidate_batch
 
@@ -935,7 +976,7 @@ def test_pair_policy_rejects_duplicate_and_illegal_pairs():
     with pytest.raises(ValueError, match="illegal action pair"):
         build_pair_candidate_batch(
             [(0, 0), (1, 0)],
-            [((0, 0), (9, 0), 1.0)],
+            [((8, 0), (9, 0), 1.0)],
             budget=2,
             legal_moves=[(0, 0), (1, 0)],
         )
@@ -1087,13 +1128,13 @@ def test_critical_overflow_zeroes_sparse_and_pair_signal(caplog):
     rec = PositionRecord(
         move_history=history,
         policy_target={action_to_board_index(-1, 0): 1.0},
-        policy_target_v2=[(-1, 0, 0.5), (5, 0, 0.5)],
+        policy_target_v2=[(-1, 0, 1.0)],
         pair_policy_target_v2=[((-1, 0), (5, 0), 1.0)],
         root_value=0.0,
         player=0,
         outcome=1.0,
     )
-    buffer = RingBuffer(capacity=4, max_policy_v2_entries=2)
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=1)
     buffer.append(rec)
     dataset = ReplayDataset(
         buffer,
@@ -1101,7 +1142,7 @@ def test_critical_overflow_zeroes_sparse_and_pair_signal(caplog):
         use_symmetry=False,
         include_sparse_policy=True,
         include_pair_policy=True,
-        candidate_budget=2,
+        candidate_budget=1,
     )
 
     with caplog.at_level("ERROR"):
@@ -1110,11 +1151,14 @@ def test_critical_overflow_zeroes_sparse_and_pair_signal(caplog):
     assert aux["candidate_critical_overflow_count"][0] > 0
     assert aux["sparse_policy_target"][0].sum() == pytest.approx(0.0)
     assert aux["pair_policy_target"][0].sum() == pytest.approx(0.0)
+    assert aux["policy_weight"][0] == pytest.approx(1.0)
+    assert aux["sparse_policy_weight"][0] == pytest.approx(0.0)
+    assert aux["pair_policy_weight"][0] == pytest.approx(0.0)
     assert policies[0].sum() == pytest.approx(1.0)
     assert "Critical candidate overflow" in caplog.text
 
 
-def test_sparse_sampler_reports_missing_mass_if_protected_candidates_overflow_width():
+def test_sparse_sampler_preserves_all_targets_when_capacity_is_sufficient():
     targets = [(i, 0, 0.2) for i in range(5)]
     rec = PositionRecord(
         move_history=b"",
@@ -1124,7 +1168,7 @@ def test_sparse_sampler_reports_missing_mass_if_protected_candidates_overflow_wi
         player=0,
         outcome=1.0,
     )
-    buffer = RingBuffer(capacity=4, max_policy_v2_entries=2)
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
     buffer.append(rec)
     dataset = ReplayDataset(
         buffer,
@@ -1136,9 +1180,40 @@ def test_sparse_sampler_reports_missing_mass_if_protected_candidates_overflow_wi
 
     *_prefix, aux = next(iter(dataset))
 
-    assert aux["sparse_policy_target"].shape[1] == 2
+    assert aux["sparse_policy_target"].shape[1] == 8
     assert aux["sparse_policy_target"][0].sum() == pytest.approx(1.0)
-    assert aux["candidate_missing_mass"][0] == pytest.approx(0.6)
+    assert aux["candidate_missing_mass"][0] == pytest.approx(0.0)
+
+
+def test_first_placement_pair_target_requires_recorded_joint_table():
+    first_turn = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        selected_action_value=0.0,
+        player=1,
+        is_full_search=True,
+    )
+    observed_second = PositionRecord(
+        move_history=_move(0, 0, 0) + _move(1, 1, 0),
+        policy_target={action_to_board_index(2, 0): 1.0},
+        policy_target_v2=[(2, 0, 1.0)],
+        root_value=0.0,
+        selected_action_value=0.0,
+        player=1,
+        is_full_search=True,
+    )
+    game = GameRecord(
+        game_id="pair-joint-required",
+        positions=[first_turn, observed_second],
+        outcome=1.0,
+    )
+
+    processed = process_game_record(game)
+
+    assert processed[0].pair_policy_target_v2 == []
+    assert processed[1].pair_policy_target_v2 == [((1, 0), (2, 0), 1.0)]
 
 
 def test_sparse_policy_loss_masks_invalid_candidates():

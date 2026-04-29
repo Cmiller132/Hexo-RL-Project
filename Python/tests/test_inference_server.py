@@ -17,6 +17,7 @@ from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import CANDIDATE_FEATURES, connect_inference_queue
+from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
 from hexorl.model.network import from_config
 
 # Try to import the compiled Rust extension.
@@ -124,6 +125,49 @@ class TestInferenceServer(unittest.TestCase):
         self.assertEqual(pair.shape, (count, p_rows))
         self.assertTrue(np.isfinite(sparse).all())
         self.assertTrue(np.isfinite(pair).all())
+
+    def test_server_forward_graph_returns_keyed_logits(self):
+        cfg = load_config()
+        cfg.model.architecture = "global_xattn_0"
+        cfg.model.channels = 16
+        cfg.model.attention_heads = 4
+        cfg.model.graph_layers = 1
+        cfg.model.heads = ["value", "policy_place", "policy_pair_joint", "opp_policy"]
+        cfg.inference.max_batch_size = 2
+        cfg.inference.fp16 = False
+        server = InferenceServer(cfg, num_workers=1)
+        server._device = torch.device("cpu")
+        server._model = from_config(cfg, device=server._device)
+        server._model.eval()
+        graph = collate_graph_batches([
+            build_graph_batch_from_history(b"", include_pair_rows=False),
+        ])
+        graph_inputs = {
+            "token_features": torch.from_numpy(graph.token_features),
+            "token_type": torch.from_numpy(graph.token_type),
+            "token_qr": torch.from_numpy(graph.token_qr),
+            "token_mask": torch.from_numpy(graph.token_mask),
+            "legal_token_indices": torch.from_numpy(graph.legal_token_indices),
+            "legal_mask": torch.from_numpy(graph.legal_mask),
+            "opp_legal_qr": torch.from_numpy(graph.opp_legal_qr),
+            "opp_legal_mask": torch.from_numpy(graph.opp_legal_mask),
+            "pair_token_indices": torch.from_numpy(graph.pair_token_indices),
+            "pair_first_indices": torch.from_numpy(graph.pair_first_indices),
+            "pair_second_indices": torch.from_numpy(graph.pair_second_indices),
+            "relation_type": torch.from_numpy(graph.relation_type),
+            "relation_bias": torch.from_numpy(graph.relation_bias),
+        }
+
+        place, values, opp, pair, regret = server._forward_graph(graph_inputs)
+
+        self.assertEqual(place.shape, graph.legal_mask.shape)
+        self.assertEqual(values.shape, (1,))
+        self.assertTrue(np.isfinite(place).all())
+        self.assertTrue(np.isfinite(values).all())
+        self.assertIsNotNone(opp)
+        self.assertIsNotNone(pair)
+        self.assertIsNotNone(regret)
+        self.assertEqual(regret.shape, (1,))
 
     def test_adaptive_batching_two_clients(self):
         """Two clients submitting simultaneously get correct results."""

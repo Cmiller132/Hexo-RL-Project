@@ -361,6 +361,16 @@ def _public_position(row: dict[str, Any]) -> dict[str, Any]:
     debug.setdefault("opp_policy_weight", 0.0)
     debug.setdefault("value_weight", 1.0)
     debug.setdefault("regret_weight", 0.0)
+    debug.setdefault("final_outcome", debug.get("outcome"))
+    selected_action_value = debug.get("selected_action_value")
+    if selected_action_value is not None and debug.get("final_outcome") is not None:
+        perspective_outcome = float(debug["final_outcome"])
+        if int(row["player"]) == 1:
+            perspective_outcome = -perspective_outcome
+        debug.setdefault(
+            "per_step_error",
+            (float(selected_action_value) - perspective_outcome) ** 2,
+        )
     debug["candidate_rows"] = _candidate_rows_debug(row, debug)
     prior_sources = {
         key: debug.get(key, 0.0)
@@ -389,6 +399,10 @@ def _public_position(row: dict[str, Any]) -> dict[str, Any]:
         "player": row["player"],
         "root_value": row["root_value"],
         "selected_action_value": debug.get("selected_action_value"),
+        "final_outcome": debug.get("final_outcome"),
+        "per_step_error": debug.get("per_step_error"),
+        "regret_rank": debug.get("regret_rank", 0.0),
+        "regret_value": debug.get("regret_value", 0.0),
         "value_weight": debug["value_weight"],
         "policy_weight": debug["policy_weight"],
         "opp_policy_weight": debug["opp_policy_weight"],

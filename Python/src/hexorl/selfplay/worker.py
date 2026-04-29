@@ -14,6 +14,7 @@ import logging
 import multiprocessing as mp
 import signal
 import numpy as np
+from dataclasses import replace
 from typing import Optional, List, Tuple
 
 try:
@@ -25,15 +26,19 @@ except ImportError:
 
 from hexorl.config import Config
 from hexorl.action_contract.candidates import build_candidate_batch, build_pair_candidate_batch
-from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.action_contract.tactical_oracle import (
+    scan_tactical_oracle_from_game,
+    scan_tactical_oracle_from_history,
+)
 from hexorl.inference.client import InferenceClient
+from hexorl.inference.shm_queue import MAX_GRAPH_PAIRS
+from hexorl.graph.batch import GraphBatch, GraphTokenType, build_graph_batch_from_history
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
     action_to_board_index,
     dense_policy_from_v2,
-    pair_policy_v2_from_place_target,
     policy_v2_from_visits,
 )
 from hexorl.buffer.targets import process_game_record
@@ -44,6 +49,111 @@ PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
 PRIOR_SOURCE_DEFAULT = 3
 PRIOR_SOURCE_PAIR = 4
+
+
+def _graph_batch_with_pair_rows(
+    graph_batch: GraphBatch,
+    pair_first_indices: np.ndarray,
+    pair_second_indices: np.ndarray,
+) -> GraphBatch:
+    pair_count = int(pair_first_indices.shape[0])
+    return replace(
+        graph_batch,
+        pair_token_indices=np.zeros(pair_count, dtype=np.int64),
+        pair_first_indices=np.asarray(pair_first_indices, dtype=np.int64),
+        pair_second_indices=np.asarray(pair_second_indices, dtype=np.int64),
+        pair_policy_target=np.zeros(pair_count, dtype=np.float32),
+    )
+
+
+def _graph_stone_token_for_qr(graph_batch: GraphBatch, qr: tuple[int, int]) -> int:
+    q, r = int(qr[0]), int(qr[1])
+    for idx, (token_q, token_r) in enumerate(np.asarray(graph_batch.token_qr, dtype=np.int32).tolist()):
+        if (
+            int(token_q) == q
+            and int(token_r) == r
+            and int(graph_batch.token_type[idx]) == int(GraphTokenType.STONE)
+        ):
+            return idx
+    raise ValueError(f"first placement {qr} is not present as a graph STONE token")
+
+
+def _score_graph_pair_chunks(
+    client: InferenceClient,
+    graph_batch: GraphBatch,
+    *,
+    second_placement: bool,
+    first_qr: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Score every legal pair row while using the IPC pair table as a chunk."""
+    legal = np.asarray(graph_batch.legal_qr, dtype=np.int32)
+    legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
+    if legal.shape[0] == 0:
+        return np.zeros((0, 4), dtype=np.int32), np.zeros(0, dtype=np.float32)
+
+    pair_qr_chunks: list[np.ndarray] = []
+    logit_chunks: list[np.ndarray] = []
+
+    if second_placement:
+        if first_qr is None:
+            raise ValueError("second-placement pair scoring requires first_qr")
+        first_token = _graph_stone_token_for_qr(graph_batch, first_qr)
+        first = np.asarray(first_qr, dtype=np.int32)
+        for start in range(0, legal.shape[0], MAX_GRAPH_PAIRS):
+            stop = min(start + MAX_GRAPH_PAIRS, legal.shape[0])
+            width = stop - start
+            pair_first = np.full(width, first_token, dtype=np.int64)
+            pair_second = legal_tokens[start:stop]
+            chunk = _graph_batch_with_pair_rows(graph_batch, pair_first, pair_second)
+            out = client.submit_graph(chunk)
+            logits = np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[:width]
+            pair_qr = np.column_stack([
+                np.full(width, int(first[0]), dtype=np.int32),
+                np.full(width, int(first[1]), dtype=np.int32),
+                legal[start:stop, 0],
+                legal[start:stop, 1],
+            ])
+            pair_qr_chunks.append(pair_qr)
+            logit_chunks.append(logits)
+    else:
+        first_rows: list[int] = []
+        second_rows: list[int] = []
+        qr_rows: list[tuple[int, int, int, int]] = []
+        for a_idx in range(legal.shape[0]):
+            for b_idx in range(a_idx + 1, legal.shape[0]):
+                first_rows.append(int(legal_tokens[a_idx]))
+                second_rows.append(int(legal_tokens[b_idx]))
+                qr_rows.append((
+                    int(legal[a_idx, 0]),
+                    int(legal[a_idx, 1]),
+                    int(legal[b_idx, 0]),
+                    int(legal[b_idx, 1]),
+                ))
+                if len(first_rows) == MAX_GRAPH_PAIRS:
+                    chunk = _graph_batch_with_pair_rows(
+                        graph_batch,
+                        np.asarray(first_rows, dtype=np.int64),
+                        np.asarray(second_rows, dtype=np.int64),
+                    )
+                    out = client.submit_graph(chunk)
+                    logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
+                    pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
+                    first_rows.clear()
+                    second_rows.clear()
+                    qr_rows.clear()
+        if first_rows:
+            chunk = _graph_batch_with_pair_rows(
+                graph_batch,
+                np.asarray(first_rows, dtype=np.int64),
+                np.asarray(second_rows, dtype=np.int64),
+            )
+            out = client.submit_graph(chunk)
+            logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
+            pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
+
+    if not pair_qr_chunks:
+        return np.zeros((0, 4), dtype=np.int32), np.zeros(0, dtype=np.float32)
+    return np.concatenate(pair_qr_chunks, axis=0), np.concatenate(logit_chunks, axis=0)
 
 
 # ── Temperature Schedule ─────────────────────────────────────────────────────
@@ -173,6 +283,47 @@ def _last_move_qr(move_history: bytes | bytearray) -> tuple[int, int] | None:
     return q, r
 
 
+def _pair_qr_from_graph_batch(graph_batch) -> np.ndarray:
+    """Return `(q1, r1, q2, r2)` rows for graph pair logits."""
+    pair_count = int(np.asarray(graph_batch.pair_first_indices).shape[0])
+    if pair_count <= 0:
+        return np.zeros((0, 4), dtype=np.int32)
+    token_qr = np.asarray(graph_batch.token_qr, dtype=np.int32)
+    first = np.asarray(graph_batch.pair_first_indices, dtype=np.int64)
+    second = np.asarray(graph_batch.pair_second_indices, dtype=np.int64)
+    rows = np.zeros((pair_count, 4), dtype=np.int32)
+    for idx, (a, b) in enumerate(zip(first, second)):
+        if int(a) < 0 or int(b) < 0:
+            continue
+        rows[idx, :2] = token_qr[int(a)]
+        rows[idx, 2:] = token_qr[int(b)]
+    return rows
+
+
+def _legal_bytes_from_qr(qr_rows: np.ndarray) -> bytes:
+    """Encode global `(q,r)` rows for the Rust MCTS legal-row byte contract."""
+    return np.asarray(qr_rows, dtype=np.int32).reshape(-1, 2).tobytes(order="C")
+
+
+def _normalize_pair_visit_targets(rows) -> list[tuple[tuple[int, int], tuple[int, int], float]]:
+    parsed: list[tuple[tuple[int, int], tuple[int, int], float]] = []
+    total = 0.0
+    for row in rows or []:
+        q1, r1, q2, r2, weight = row
+        weight = float(weight)
+        if weight <= 0.0:
+            continue
+        first = (int(q1), int(r1))
+        second = (int(q2), int(r2))
+        if first == second:
+            continue
+        parsed.append((first, second, weight))
+        total += weight
+    if total <= 0.0:
+        return []
+    return [(first, second, float(weight / total)) for first, second, weight in parsed]
+
+
 # ── Mock MCTS Engine ─────────────────────────────────────────────────────────
 
 class MockMCTSEngine:
@@ -259,6 +410,19 @@ class MockMCTSEngine:
     ):
         """Mock sparse root expansion by preserving dense mock semantics."""
         self.expand_root(policy, value, offset_q, offset_r, legal_bytes)
+
+    def expand_root_with_global_priors(self, legal_bytes: bytes, global_qr: np.ndarray, global_logits: np.ndarray, value: float):
+        """Mock graph root expansion from keyed global priors."""
+        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+        if legal.shape != np.asarray(global_qr).shape or not np.array_equal(legal, np.asarray(global_qr, dtype=np.int32)):
+            raise ValueError("mock global priors legal_qr does not match legal_bytes")
+        self._num_children = int(legal.shape[0])
+        logits = np.asarray(global_logits, dtype=np.float32)[: self._num_children]
+        logits = logits - np.max(logits) if logits.size else logits
+        exp = np.exp(logits)
+        self._priors = (exp / max(float(exp.sum()), 1e-6)).astype(np.float32)
+        self._root_value = float(value)
+        self._visits = np.zeros(self._num_children, dtype=np.uint32)
 
     def apply_root_pair_priors(
         self,
@@ -395,6 +559,9 @@ class MockMCTSEngine:
             ).astype(np.float32)
         return self._q_values.tolist()
 
+    def root_pair_visit_targets(self):
+        return []
+
     def move_history_bytes(self) -> bytes:
         """Return mock packed move history."""
         n_bytes = self._move_count * 12
@@ -492,6 +659,16 @@ class RealMCTSEngine:
             )
         else:
             self._engine.expand_root(policy, value, oq, or_, legal_bytes)
+
+    def expand_root_with_global_priors(self, legal_bytes, global_qr, global_logits, value):
+        if not hasattr(self._engine, "expand_root_with_global_priors"):
+            raise RuntimeError("Rust engine does not expose expand_root_with_global_priors")
+        self._engine.expand_root_with_global_priors(
+            legal_bytes,
+            np.asarray(global_qr, dtype=np.int32),
+            np.asarray(global_logits, dtype=np.float32),
+            float(value),
+        )
 
     def apply_root_pair_priors(self, pair_qr, pair_logits, pair_mix):
         if hasattr(self._engine, "apply_root_pair_priors"):
@@ -607,6 +784,11 @@ class RealMCTSEngine:
     def root_child_q_values(self):
         return self._engine.root_child_q_values()
 
+    def root_pair_visit_targets(self):
+        if hasattr(self._engine, "root_pair_visit_targets"):
+            return self._engine.root_pair_visit_targets()
+        return []
+
     def extract_tree_node_histories(self, min_visits: int = 2):
         if hasattr(self._engine, "extract_tree_node_states"):
             _tensors, histories, _count = self._engine.extract_tree_node_states(int(min_visits))
@@ -663,8 +845,16 @@ class SelfPlayWorker:
         self.sparse_prior_stage = int(getattr(cfg.model, "sparse_prior_stage", 0))
         self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
         self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
-        self.pair_policy_enabled = "pair_policy" in set(getattr(cfg.model, "heads", []))
+        self.global_graph_enabled = str(getattr(cfg.model, "architecture", "")).lower().startswith("global_")
+        if self.global_graph_enabled:
+            self.near_radius = 8
+            self.constrain_threats = False
         self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
+        configured_heads = set(getattr(cfg.model, "heads", []))
+        self.pair_policy_enabled = bool(
+            (self.global_graph_enabled and self.pair_prior_mix > 0.0)
+            or ({"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"} & configured_heads)
+        )
         self.candidate_budget = max(
             int(getattr(cfg.model, "candidate_budget", 256)),
             int(sp.policy_target_top_k),
@@ -738,10 +928,13 @@ class SelfPlayWorker:
                             else 0.0,
                             "rgsc_prb_insertions": 1.0 if inserted else 0.0,
                             "rgsc_prb_refreshes": float(self.rgsc.refreshes - refreshes_before),
+                            "rgsc_last_ema_delta": float(self.rgsc.last_ema_delta),
+                            "rgsc_last_staleness": float(self.rgsc.last_staleness),
                             "rgsc_tree_node_insertions": float(
                                 getattr(game_record, "rgsc_tree_node_insertions", 0)
                             ),
                         }
+                        game_record.rgsc_prb_snapshot = self.rgsc.snapshot_entries()
                         while self.stop_event is None or not self.stop_event.is_set():
                             try:
                                 self.record_queue.put(game_record, timeout=0.5)
@@ -834,194 +1027,269 @@ class SelfPlayWorker:
             if client is not None:
                 try:
                     root_tensor = tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False)
-                    if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
-                        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
-                        winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
-                            tensor_3d,
-                            legal,
-                            int(offset_q),
-                            int(offset_r),
-                        )
-                        oracle = scan_tactical_oracle_from_history(
+                    if self.global_graph_enabled:
+                        graph_batch = build_graph_batch_from_history(
                             bytes(move_history),
-                            [(int(q), int(r)) for q, r in legal],
-                            offset_q=int(offset_q),
-                            offset_r=int(offset_r),
-                            )
+                            radius=8,
+                            max_pair_rows=0,
+                            include_pair_rows=False,
+                        )
+                        graph_out = client.submit_graph(graph_batch)
+                        graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
+                        graph_legal_bytes = _legal_bytes_from_qr(graph_legal)
+                        graph_value = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
+                        engine.expand_root_with_global_priors(
+                            graph_legal_bytes,
+                            graph_legal,
+                            np.asarray(graph_out["policy_place"], dtype=np.float32),
+                            graph_value,
+                        )
                         root_placements_remaining = (
                             int(getattr(engine._game, "placements_remaining", 1))
                             if HAS_ENGINE and hasattr(engine, "_game")
-                            else (2 if move_idx > 0 and move_idx % 2 == 1 else 1)
+                            else int(graph_batch.placements_remaining)
                         )
-                        candidate_budget = self.candidate_budget
-                        if self.pair_policy_enabled and root_placements_remaining == 1:
-                            candidate_budget = max(1, min(candidate_budget, 511))
-                        t_build = time.monotonic()
-                        cand = build_candidate_batch(
-                            [(int(q), int(r)) for q, r in legal],
-                            [],
-                            offset_q=int(offset_q),
-                            offset_r=int(offset_r),
-                            budget=candidate_budget,
-                            winning_moves=list(winning_moves) + list(oracle.win_now_cells),
-                            forced_block_moves=list(forced_blocks) + list(oracle.forced_block_cells),
-                            cover_cells=list(cover_cells) + list(oracle.cover_cells),
-                            open_four_cells=oracle.open_four_cells,
-                            open_five_cells=oracle.open_five_cells,
-                        )
-                        active_rows = np.flatnonzero(cand.mask)
-                        active_width = int(active_rows.shape[0])
-                        sparse_prior_candidate_build_ms += (time.monotonic() - t_build) * 1000.0
-                        if active_width <= 0:
-                            p, v = client.submit(root_tensor, 1)
-                            engine.expand_root(
-                                p, v[0], offset_q, offset_r, legal_bytes
+                        if self.pair_policy_enabled:
+                            first_qr = _last_move_qr(move_history) if root_placements_remaining == 1 else None
+                            pair_qr, pair_logits = _score_graph_pair_chunks(
+                                client,
+                                graph_batch,
+                                second_placement=root_placements_remaining == 1,
+                                first_qr=first_qr,
                             )
                         else:
-                            root_candidate_qr = cand.qr[active_rows]
-                            forward_indices = cand.indices[active_rows]
-                            forward_features = cand.features[active_rows]
-                            forward_mask = cand.mask[active_rows]
-                            pair_indices_for_forward = None
-                            pair_mask_for_forward = None
                             pair_qr = np.zeros((0, 4), dtype=np.int32)
-                            pair_width = 0
-                            sparse_logit_start = 0
-                            use_second_pair_priors = False
-                            if (
-                                self.pair_policy_enabled
-                                and root_placements_remaining >= 2
-                                and active_width >= 2
-                            ):
-                                pair_batch = build_pair_candidate_batch(
-                                    root_candidate_qr.tolist(),
-                                    [],
-                                    budget=min(512, max(1, self.candidate_budget)),
-                                    candidate_mask=np.ones(active_width, dtype=np.bool_),
-                                    legal_moves=legal.tolist(),
+                            pair_logits = np.zeros(0, dtype=np.float32)
+                        if self.pair_policy_enabled and pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
+                            if root_placements_remaining == 1 and hasattr(engine, "apply_root_pair_second_priors"):
+                                engine.apply_root_pair_second_priors(
+                                    pair_qr,
+                                    pair_logits[: pair_qr.shape[0]],
+                                    self.pair_prior_mix,
                                 )
-                                pair_rows = np.flatnonzero(pair_batch.mask)
-                                pair_width = int(pair_rows.shape[0])
-                                if pair_width > 0:
-                                    pair_indices = pair_batch.pair_indices[pair_rows[:pair_width]]
-                                    pair_qr = np.asarray(
-                                        [
-                                            [
-                                                int(root_candidate_qr[a, 0]),
-                                                int(root_candidate_qr[a, 1]),
-                                                int(root_candidate_qr[b, 0]),
-                                                int(root_candidate_qr[b, 1]),
-                                            ]
-                                            for a, b in pair_indices
-                                        ],
-                                        dtype=np.int32,
-                                    )
-                                    pair_indices_for_forward = pair_indices
-                                    pair_mask_for_forward = pair_batch.mask[pair_rows[:pair_width]]
-                            elif self.pair_policy_enabled and root_placements_remaining == 1 and active_width >= 1:
-                                first_qr = _last_move_qr(move_history)
-                                legal_set = {(int(q), int(r)) for q, r in legal.tolist()}
-                                if first_qr is not None and first_qr not in legal_set:
-                                    first_cand = build_candidate_batch(
-                                        [first_qr],
-                                        [],
-                                        offset_q=int(offset_q),
-                                        offset_r=int(offset_r),
-                                        budget=1,
-                                        critical_actions=[first_qr],
-                                    )
-                                    forward_indices = np.concatenate(
-                                        [first_cand.indices[:1], cand.indices[active_rows]],
-                                        axis=0,
-                                    )
-                                    forward_features = np.concatenate(
-                                        [first_cand.features[:1], cand.features[active_rows]],
-                                        axis=0,
-                                    )
-                                    forward_mask = np.concatenate(
-                                        [first_cand.mask[:1], cand.mask[active_rows]],
-                                        axis=0,
-                                    )
-                                    sparse_logit_start = 1
-                                    pair_width = active_width
-                                    pair_indices_for_forward = np.asarray(
-                                        [[0, i] for i in range(1, active_width + 1)],
-                                        dtype=np.int64,
-                                    )
-                                    pair_mask_for_forward = np.ones(pair_width, dtype=np.bool_)
-                                    first_q, first_r = first_qr
-                                    pair_qr = np.asarray(
-                                        [
-                                            [
-                                                int(first_q),
-                                                int(first_r),
-                                                int(root_candidate_qr[i, 0]),
-                                                int(root_candidate_qr[i, 1]),
-                                            ]
-                                            for i in range(active_width)
-                                        ],
-                                        dtype=np.int32,
-                                    )
-                                    use_second_pair_priors = True
-                            t_forward = time.monotonic()
-                            if pair_indices_for_forward is not None and pair_width > 0:
-                                p, v, sparse, pair_logits = client.submit_sparse_pair(
-                                    root_tensor,
-                                    1,
-                                    forward_indices.reshape(1, -1),
-                                    forward_features.reshape(1, forward_features.shape[0], forward_features.shape[1]),
-                                    forward_mask.reshape(1, -1),
-                                    pair_indices_for_forward.reshape(1, pair_width, 2),
-                                    pair_mask_for_forward.reshape(1, pair_width),
+                            elif root_placements_remaining >= 2:
+                                engine.apply_root_pair_priors(
+                                    pair_qr,
+                                    pair_logits[: pair_qr.shape[0]],
+                                    self.pair_prior_mix,
                                 )
-                            else:
-                                p, v, sparse = client.submit_sparse(
-                                    root_tensor,
-                                    1,
-                                    forward_indices.reshape(1, -1),
-                                    forward_features.reshape(1, forward_features.shape[0], forward_features.shape[1]),
-                                    forward_mask.reshape(1, -1),
-                                )
-                                pair_logits = None
-                            sparse_prior_forward_ms += (time.monotonic() - t_forward) * 1000.0
-                            root_sparse_logits = sparse[0, sparse_logit_start:sparse_logit_start + active_width]
-                            sparse_vs_dense_disagreement = _sparse_dense_disagreement(
-                                p,
-                                root_candidate_qr,
-                                root_sparse_logits,
+                    else:
+                        use_action_keyed_root = (
+                            (self.sparse_policy_enabled and self.sparse_prior_stage > 0)
+                            or self.pair_policy_enabled
+                        )
+                        if use_action_keyed_root:
+                            legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                            winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
+                                tensor_3d,
                                 legal,
                                 int(offset_q),
                                 int(offset_r),
                             )
-                            engine.expand_root_with_sparse_priors(
-                                p,
-                                v[0],
-                                offset_q,
-                                offset_r,
-                                legal_bytes,
-                                root_candidate_qr,
-                                root_sparse_logits,
-                                self.sparse_prior_stage,
-                                self.sparse_prior_mix,
+                            root_game = getattr(engine, "_game", None)
+                            if root_game is not None:
+                                oracle = scan_tactical_oracle_from_game(
+                                    root_game,
+                                    [(int(q), int(r)) for q, r in legal],
+                                    offset_q=int(offset_q),
+                                    offset_r=int(offset_r),
+                                )
+                            else:
+                                oracle = scan_tactical_oracle_from_history(
+                                    bytes(move_history),
+                                    [(int(q), int(r)) for q, r in legal],
+                                    offset_q=int(offset_q),
+                                    offset_r=int(offset_r),
+                                )
+                            root_placements_remaining = (
+                                int(getattr(engine._game, "placements_remaining", 1))
+                                if HAS_ENGINE and hasattr(engine, "_game")
+                                else (2 if move_idx > 0 and move_idx % 2 == 1 else 1)
                             )
-                            if pair_logits is not None and pair_width > 0 and pair_qr.size > 0:
-                                if use_second_pair_priors and hasattr(engine, "apply_root_pair_second_priors"):
-                                    engine.apply_root_pair_second_priors(
-                                        pair_qr,
-                                        pair_logits[0, :pair_width],
-                                        self.pair_prior_mix,
+                            candidate_budget = self.candidate_budget
+                            if self.pair_policy_enabled:
+                                if legal.shape[0] > 512:
+                                    raise ValueError(
+                                        "pair_policy root prior requires all legal rows in the current IPC path; "
+                                        f"legal_count={legal.shape[0]} exceeds 512"
+                                    )
+                                candidate_budget = int(legal.shape[0])
+                            t_build = time.monotonic()
+                            cand = build_candidate_batch(
+                                [(int(q), int(r)) for q, r in legal],
+                                [],
+                                offset_q=int(offset_q),
+                                offset_r=int(offset_r),
+                                budget=candidate_budget,
+                                storage_width=candidate_budget,
+                                winning_moves=list(winning_moves) + list(oracle.win_now_cells),
+                                forced_block_moves=list(forced_blocks) + list(oracle.forced_block_cells),
+                                cover_cells=list(cover_cells) + list(oracle.cover_cells),
+                                open_four_cells=oracle.open_four_cells,
+                                open_five_cells=oracle.open_five_cells,
+                            )
+                            active_rows = np.flatnonzero(cand.mask)
+                            active_width = int(active_rows.shape[0])
+                            sparse_prior_candidate_build_ms += (time.monotonic() - t_build) * 1000.0
+                            if active_width <= 0:
+                                p, v = client.submit(root_tensor, 1)
+                                engine.expand_root(
+                                    p, v[0], offset_q, offset_r, legal_bytes
+                                )
+                            else:
+                                root_candidate_qr = cand.qr[active_rows]
+                                forward_indices = cand.indices[active_rows]
+                                forward_features = cand.features[active_rows]
+                                forward_mask = cand.mask[active_rows]
+                                pair_indices_for_forward = None
+                                pair_mask_for_forward = None
+                                pair_qr = np.zeros((0, 4), dtype=np.int32)
+                                pair_width = 0
+                                sparse_logit_start = 0
+                                use_second_pair_priors = False
+                                if (
+                                    self.pair_policy_enabled
+                                    and root_placements_remaining >= 2
+                                    and active_width >= 2
+                                ):
+                                    total_pair_rows = active_width * (active_width - 1) // 2
+                                    if total_pair_rows > 512:
+                                        raise ValueError(
+                                            "pair_policy root prior requires all legal pair rows in the current IPC path; "
+                                            f"pair_count={total_pair_rows} exceeds 512"
+                                        )
+                                    pair_batch = build_pair_candidate_batch(
+                                        root_candidate_qr.tolist(),
+                                        [],
+                                        budget=total_pair_rows,
+                                        candidate_mask=np.ones(active_width, dtype=np.bool_),
+                                        legal_moves=legal.tolist(),
+                                    )
+                                    pair_rows = np.flatnonzero(pair_batch.mask)
+                                    pair_width = int(pair_rows.shape[0])
+                                    if pair_width > 0:
+                                        pair_indices = pair_batch.pair_indices[pair_rows[:pair_width]]
+                                        pair_qr = np.asarray(
+                                            [
+                                                [
+                                                    int(root_candidate_qr[a, 0]),
+                                                    int(root_candidate_qr[a, 1]),
+                                                    int(root_candidate_qr[b, 0]),
+                                                    int(root_candidate_qr[b, 1]),
+                                                ]
+                                                for a, b in pair_indices
+                                            ],
+                                            dtype=np.int32,
+                                        )
+                                        pair_indices_for_forward = pair_indices
+                                        pair_mask_for_forward = pair_batch.mask[pair_rows[:pair_width]]
+                                elif self.pair_policy_enabled and root_placements_remaining == 1 and active_width >= 1:
+                                    first_qr = _last_move_qr(move_history)
+                                    legal_set = {(int(q), int(r)) for q, r in legal.tolist()}
+                                    if first_qr is not None and first_qr not in legal_set:
+                                        first_cand = build_candidate_batch(
+                                            [first_qr],
+                                            [],
+                                            offset_q=int(offset_q),
+                                            offset_r=int(offset_r),
+                                            budget=1,
+                                            critical_actions=[first_qr],
+                                        )
+                                        forward_indices = np.concatenate(
+                                            [first_cand.indices[:1], cand.indices[active_rows]],
+                                            axis=0,
+                                        )
+                                        forward_features = np.concatenate(
+                                            [first_cand.features[:1], cand.features[active_rows]],
+                                            axis=0,
+                                        )
+                                        forward_mask = np.concatenate(
+                                            [first_cand.mask[:1], cand.mask[active_rows]],
+                                            axis=0,
+                                        )
+                                        sparse_logit_start = 1
+                                        pair_width = active_width
+                                        pair_indices_for_forward = np.asarray(
+                                            [[0, i] for i in range(1, active_width + 1)],
+                                            dtype=np.int64,
+                                        )
+                                        pair_mask_for_forward = np.ones(pair_width, dtype=np.bool_)
+                                        first_q, first_r = first_qr
+                                        pair_qr = np.asarray(
+                                            [
+                                                [
+                                                    int(first_q),
+                                                    int(first_r),
+                                                    int(root_candidate_qr[i, 0]),
+                                                    int(root_candidate_qr[i, 1]),
+                                                ]
+                                                for i in range(active_width)
+                                            ],
+                                            dtype=np.int32,
+                                        )
+                                        use_second_pair_priors = True
+                                t_forward = time.monotonic()
+                                if pair_indices_for_forward is not None and pair_width > 0:
+                                    p, v, sparse, pair_logits = client.submit_sparse_pair(
+                                        root_tensor,
+                                        1,
+                                        forward_indices.reshape(1, -1),
+                                        forward_features.reshape(1, forward_features.shape[0], forward_features.shape[1]),
+                                        forward_mask.reshape(1, -1),
+                                        pair_indices_for_forward.reshape(1, pair_width, 2),
+                                        pair_mask_for_forward.reshape(1, pair_width),
                                     )
                                 else:
-                                    engine.apply_root_pair_priors(
-                                        pair_qr,
-                                        pair_logits[0, :pair_width],
-                                        self.pair_prior_mix,
+                                    p, v, sparse = client.submit_sparse(
+                                        root_tensor,
+                                        1,
+                                        forward_indices.reshape(1, -1),
+                                        forward_features.reshape(1, forward_features.shape[0], forward_features.shape[1]),
+                                        forward_mask.reshape(1, -1),
                                     )
-                    else:
-                        p, v = client.submit(root_tensor, 1)
-                        engine.expand_root(
-                            p, v[0], offset_q, offset_r, legal_bytes
-                        )
+                                    pair_logits = None
+                                sparse_prior_forward_ms += (time.monotonic() - t_forward) * 1000.0
+                                root_sparse_logits = sparse[0, sparse_logit_start:sparse_logit_start + active_width]
+                                sparse_vs_dense_disagreement = _sparse_dense_disagreement(
+                                    p,
+                                    root_candidate_qr,
+                                    root_sparse_logits,
+                                    legal,
+                                    int(offset_q),
+                                    int(offset_r),
+                                )
+                                if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
+                                    engine.expand_root_with_sparse_priors(
+                                        p,
+                                        v[0],
+                                        offset_q,
+                                        offset_r,
+                                        legal_bytes,
+                                        root_candidate_qr,
+                                        root_sparse_logits,
+                                        self.sparse_prior_stage,
+                                        self.sparse_prior_mix,
+                                    )
+                                else:
+                                    engine.expand_root(p, v[0], offset_q, offset_r, legal_bytes)
+                                if pair_logits is not None and pair_width > 0 and pair_qr.size > 0:
+                                    if use_second_pair_priors and hasattr(engine, "apply_root_pair_second_priors"):
+                                        engine.apply_root_pair_second_priors(
+                                            pair_qr,
+                                            pair_logits[0, :pair_width],
+                                            self.pair_prior_mix,
+                                        )
+                                    else:
+                                        engine.apply_root_pair_priors(
+                                            pair_qr,
+                                            pair_logits[0, :pair_width],
+                                            self.pair_prior_mix,
+                                        )
+                        else:
+                            p, v = client.submit(root_tensor, 1)
+                            engine.expand_root(
+                                p, v[0], offset_q, offset_r, legal_bytes
+                            )
                 except Exception as exc:
                     logger.warning(
                         "Worker %s: root inference failed at move %s: %s",
@@ -1029,6 +1297,9 @@ class SelfPlayWorker:
                         move_idx,
                         exc,
                     )
+                    if self.global_graph_enabled:
+                        terminal_reason = "invalid_graph_root_inference"
+                        return None
                     engine.expand_root(
                         np.ones(1089, dtype=np.float32) / 1089,
                         0.0,
@@ -1037,6 +1308,13 @@ class SelfPlayWorker:
                         legal_bytes,
                     )
             else:
+                if self.global_graph_enabled:
+                    logger.warning(
+                        "Worker %s: global graph model has no inference client; marking run invalid",
+                        self.worker_id,
+                    )
+                    terminal_reason = "invalid_graph_no_inference_client"
+                    return None
                 engine.expand_root(
                     np.ones(1089, dtype=np.float32) / 1089,
                     0.0,
@@ -1080,7 +1358,54 @@ class SelfPlayWorker:
                         batch_4d = np.array(batch_tensor)
 
                     if client is not None:
-                        if self.sparse_policy_enabled and self.sparse_prior_stage >= 2:
+                        if self.global_graph_enabled:
+                            meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
+                            if len(meta) != count:
+                                raise ValueError("global graph leaf expansion requires pending leaf metadata")
+                            graph_values = np.zeros(count, dtype=np.float32)
+                            legal_rows: list[np.ndarray] = []
+                            legal_logits: list[np.ndarray] = []
+                            max_width = 0
+                            t_forward = time.monotonic()
+                            for row, (_leaf_oq, _leaf_or, leaf_legal_bytes, leaf_history_bytes) in enumerate(meta):
+                                legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
+                                graph_batch = build_graph_batch_from_history(
+                                    bytes(leaf_history_bytes),
+                                    opp_legal_moves=[(int(q), int(r)) for q, r in legal],
+                                    radius=8,
+                                    max_pair_rows=0,
+                                    include_pair_rows=False,
+                                )
+                                graph_out = client.submit_graph(graph_batch)
+                                graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
+                                if graph_legal.shape != legal.shape or not np.array_equal(graph_legal, legal):
+                                    raise ValueError(
+                                        "graph inference legal_qr does not match Rust legal moves at leaf"
+                                    )
+                                logits = np.asarray(graph_out["policy_place"], dtype=np.float32)
+                                graph_values[row] = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
+                                legal_rows.append(graph_legal)
+                                legal_logits.append(logits)
+                                max_width = max(max_width, int(graph_legal.shape[0]))
+                            sparse_qr = np.zeros((count, max_width, 2), dtype=np.int32)
+                            sparse_logits = np.zeros((count, max_width), dtype=np.float32)
+                            sparse_counts = np.zeros(count, dtype=np.uint16)
+                            for row, (qr_rows, logits) in enumerate(zip(legal_rows, legal_logits)):
+                                width = int(qr_rows.shape[0])
+                                sparse_qr[row, :width] = qr_rows
+                                sparse_logits[row, :width] = logits[:width]
+                                sparse_counts[row] = width
+                            sparse_prior_forward_ms += (time.monotonic() - t_forward) * 1000.0
+                            engine.expand_and_backprop_with_sparse(
+                                np.zeros(count * 1089, dtype=np.float32),
+                                graph_values,
+                                sparse_qr,
+                                sparse_logits,
+                                sparse_counts,
+                                2,
+                                1.0,
+                            )
+                        elif self.sparse_policy_enabled and self.sparse_prior_stage >= 2:
                             meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
                             if len(meta) == count:
                                 cand_qr = np.zeros((count, self.candidate_budget, 2), dtype=np.int32)
@@ -1169,9 +1494,17 @@ class SelfPlayWorker:
                         move_idx,
                         exc,
                     )
+                    if self.global_graph_enabled:
+                        terminal_reason = "invalid_graph_leaf_inference"
+                        return None
                     break
 
             moves_q, moves_r, visits, root_value = engine.get_results()
+            pair_policy_v2 = _normalize_pair_visit_targets(
+                engine.root_pair_visit_targets()
+                if hasattr(engine, "root_pair_visit_targets")
+                else []
+            )
             prior_summary = (
                 engine.prior_source_summary()
                 if hasattr(engine, "prior_source_summary")
@@ -1203,17 +1536,31 @@ class SelfPlayWorker:
                     min_tree_visits = max(2, int(sims) // 16)
                     histories = engine.extract_tree_node_histories(min_tree_visits)
                     scored = []
-                    for history in histories:
+                    if histories and (not self.global_graph_enabled or client is None):
+                        logger.debug(
+                            "Worker %s: RGSC tree extraction skipped because no regret-network scorer is available",
+                            self.worker_id,
+                        )
+                    for history in histories if self.global_graph_enabled and client is not None else []:
                         if not history:
                             continue
                         move_bytes = encode_move_history(history)
-                        depth_score = float(len(history))
-                        scored.append((move_bytes, depth_score, depth_score))
-                    rgsc_tree_node_insertions = self.rgsc.observe_tree_node_candidates(
-                        scored,
-                        game_id=game_id,
-                        score_source="mcts_tree_node_depth_heuristic",
-                    )
+                        graph = build_graph_batch_from_history(
+                            move_bytes,
+                            radius=8,
+                            max_pair_rows=0,
+                            include_pair_rows=False,
+                        )
+                        out = client.submit_graph(graph)
+                        regret_rank = float(np.asarray(out.get("regret_rank", [0.0]), dtype=np.float32)[0])
+                        if regret_rank > 0.0 and np.isfinite(regret_rank):
+                            scored.append((move_bytes, regret_rank, regret_rank))
+                    if scored:
+                        rgsc_tree_node_insertions = self.rgsc.observe_tree_node_candidates(
+                            scored,
+                            game_id=game_id,
+                            score_source="graph_regret_rank",
+                        )
                 except Exception as exc:
                     logger.debug("Worker %s: RGSC tree extraction skipped: %s", self.worker_id, exc)
 
@@ -1222,7 +1569,7 @@ class SelfPlayWorker:
             if q is None:
                 q, r = 0, 0
             q, r = int(q), int(r)
-            selected_action_value = root_value
+            selected_action_value = None
             try:
                 q_values = list(engine.root_child_q_values())
                 for child_q, child_r, child_value in zip(moves_q, moves_r, q_values):
@@ -1230,7 +1577,7 @@ class SelfPlayWorker:
                         selected_action_value = float(child_value)
                         break
             except Exception:
-                selected_action_value = root_value
+                selected_action_value = None
 
             if HAS_ENGINE:
                 player = engine._game.current_player
@@ -1279,7 +1626,6 @@ class SelfPlayWorker:
                 open_four_cells=oracle.open_four_cells,
                 open_five_cells=oracle.open_five_cells,
             )
-            pair_policy_v2 = pair_policy_v2_from_place_target(policy_v2)
             pair_prior_applicable = move_idx > 0
             pair_prior_hit_frac = _prior_source_fraction(prior_summary, "pair", "root")
             pair_fallback_prior_use = (
@@ -1335,6 +1681,17 @@ class SelfPlayWorker:
                     candidate_recall_winning_move=candidate_probe.recall_winning_move,
                     candidate_recall_forced_block=candidate_probe.recall_forced_block,
                     candidate_recall_two_placement_cover=candidate_probe.recall_two_placement_cover,
+                    candidate_discovery_top1=candidate_probe.discovery_top1,
+                    candidate_discovery_top4=candidate_probe.discovery_top4,
+                    candidate_discovery_top8=candidate_probe.discovery_top8,
+                    candidate_discovery_winning_move=candidate_probe.discovery_winning_move,
+                    candidate_discovery_forced_block=candidate_probe.discovery_forced_block,
+                    candidate_discovery_two_placement_cover=candidate_probe.discovery_two_placement_cover,
+                    candidate_discovery_open_four=candidate_probe.discovery_open_four,
+                    candidate_discovery_open_five=candidate_probe.discovery_open_five,
+                    candidate_critical_count=candidate_probe.critical_count,
+                    candidate_critical_overflow_count=candidate_probe.critical_overflow_count,
+                    candidate_critical_overflow_examples=candidate_probe.critical_overflow_examples,
                     sparse_prior_stage=self.sparse_prior_stage,
                     sparse_prior_root_candidate_count=int(
                         prior_summary.get("root_sparse_candidate_count", 0)
@@ -1360,7 +1717,7 @@ class SelfPlayWorker:
                     sparse_prior_forward_ms=sparse_prior_forward_ms,
                     sparse_prior_candidate_build_ms=sparse_prior_candidate_build_ms,
                     pair_prior_candidate_count=int(
-                        prior_summary.get("root_pair_candidate_count", len(pair_policy_v2))
+                        prior_summary.get("root_pair_candidate_count", 0)
                     ),
                     pair_prior_hit_frac=pair_prior_hit_frac,
                     pair_fallback_prior_use=pair_fallback_prior_use,

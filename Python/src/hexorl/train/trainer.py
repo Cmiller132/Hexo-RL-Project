@@ -16,6 +16,7 @@ from pathlib import Path
 
 from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.config import Config
+from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.model.network import HexNet, load_model_state
 from hexorl.train.losses import compute_losses
 from hexorl.train.ema import ModelEMA
@@ -49,6 +50,7 @@ class Trainer:
                 device = torch.device("cpu")
         self.device = device
 
+        self._is_global_graph_model = isinstance(self.model, GlobalHexGraphNet)
         self.model = self.model.to(self.device)
         self._channels_last = (
             bool(getattr(cfg.runtime, "channels_last", True))
@@ -78,7 +80,22 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         self._loss_weights = dict(self.train_cfg.loss_weights)
-        self._n_bins = getattr(self.model, 'n_bins', 65)
+        if self._is_global_graph_model:
+            graph_defaults = {
+                "policy_place": self._loss_weights.get("policy", 1.0),
+                "policy_pair_first": self._loss_weights.get("pair_policy", 0.05),
+                "policy_pair_second": self._loss_weights.get("pair_policy", 0.05),
+                "policy_pair_joint": self._loss_weights.get("pair_policy", 0.05),
+                "opp_policy": self._loss_weights.get("opp_policy", 0.1),
+                "value": self._loss_weights.get("value", 1.0),
+                "regret_rank": self._loss_weights.get("regret_rank", 0.1),
+                "regret_value": self._loss_weights.get("regret_value", 0.1),
+                "moves_left": self._loss_weights.get("moves_left", 0.01),
+                "tactical": self._loss_weights.get("tactical", 0.05),
+            }
+            for name, value in graph_defaults.items():
+                self._loss_weights.setdefault(name, value)
+        self._n_bins = getattr(model, 'n_bins', getattr(self.model, 'n_bins', 65))
         # Lookahead horizon names derived from buffer config
         self._lookahead_keys = [
             f"lookahead_{h}" for h in getattr(cfg.buffer, 'lookahead_horizons', [])
@@ -218,14 +235,44 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            predictions = self.model(
-                tensors,
-                candidate_features=targets.get("candidate_features"),
-                candidate_indices=targets.get("candidate_indices"),
-                candidate_mask=targets.get("candidate_mask"),
-                pair_candidate_indices=targets.get("pair_candidate_indices"),
-                pair_candidate_mask=targets.get("pair_candidate_mask"),
-            )
+            if self._is_global_graph_model:
+                required = [
+                    "token_features",
+                    "token_type",
+                    "token_qr",
+                    "token_mask",
+                    "legal_token_indices",
+                    "legal_mask",
+                    "relation_type",
+                    "relation_bias",
+                ]
+                missing = [name for name in required if name not in targets]
+                if missing:
+                    raise ValueError(f"global graph training batch is missing graph tensors: {missing}")
+                predictions = self.model(
+                    token_features=targets["token_features"],
+                    token_type=targets["token_type"],
+                    token_qr=targets["token_qr"],
+                    token_mask=targets["token_mask"],
+                    legal_token_indices=targets["legal_token_indices"],
+                    legal_mask=targets["legal_mask"],
+                    opp_legal_qr=targets.get("opp_legal_qr"),
+                    opp_legal_mask=targets.get("opp_legal_mask"),
+                    pair_first_indices=targets.get("pair_first_indices"),
+                    pair_second_indices=targets.get("pair_second_indices"),
+                    pair_token_indices=targets.get("pair_token_indices"),
+                    relation_type=targets["relation_type"],
+                    relation_bias=targets["relation_bias"],
+                )
+            else:
+                predictions = self.model(
+                    tensors,
+                    candidate_features=targets.get("candidate_features"),
+                    candidate_indices=targets.get("candidate_indices"),
+                    candidate_mask=targets.get("candidate_mask"),
+                    pair_candidate_indices=targets.get("pair_candidate_indices"),
+                    pair_candidate_mask=targets.get("pair_candidate_mask"),
+                )
             total_loss, per_head = compute_losses(
                 predictions, targets,
                 loss_weights=self._loss_weights,

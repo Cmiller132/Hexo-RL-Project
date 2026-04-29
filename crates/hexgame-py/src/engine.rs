@@ -17,6 +17,73 @@ use std::time::Duration;
 
 use hexgame_core::encoder::{BOARD_AREA, BOARD_SIZE, NUM_CHANNELS};
 
+fn hex_to_tuple(h: Hex) -> (i32, i32) {
+    (h.q, h.r)
+}
+
+fn hex_vec_to_py(cells: Vec<Hex>) -> Vec<(i32, i32)> {
+    cells.into_iter().map(hex_to_tuple).collect()
+}
+
+fn pair_vec_to_py(pairs: Vec<(Hex, Hex)>) -> Vec<((i32, i32), (i32, i32))> {
+    pairs
+        .into_iter()
+        .map(|(a, b)| (hex_to_tuple(a), hex_to_tuple(b)))
+        .collect()
+}
+
+fn sort_dedup_hex(cells: &mut Vec<Hex>) {
+    cells.sort();
+    cells.dedup();
+}
+
+fn sort_dedup_pairs(pairs: &mut Vec<(Hex, Hex)>) {
+    for (a, b) in pairs.iter_mut() {
+        if *b < *a {
+            std::mem::swap(a, b);
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+}
+
+fn collect_hot_window_empties(
+    game: &HexGameState,
+    player: u8,
+    legal: &std::collections::HashSet<Hex>,
+    open_four: &mut Vec<Hex>,
+    open_five: &mut Vec<Hex>,
+) {
+    for key in game.eval().hot_windows(player) {
+        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
+        let mut empties = Vec::<Hex>::with_capacity(2);
+        for k in 0..WIN_LENGTH {
+            let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
+            if !game.stones().contains_key(&h) && legal.contains(&h) {
+                empties.push(h);
+            }
+        }
+        match empties.len() {
+            1 => open_five.extend(empties),
+            2 => open_four.extend(empties),
+            _ => {}
+        }
+    }
+}
+
+fn collect_all_hot_empties(
+    game: &HexGameState,
+    player: u8,
+    legal: &std::collections::HashSet<Hex>,
+    out: &mut Vec<Hex>,
+) {
+    let mut fours = Vec::new();
+    let mut fives = Vec::new();
+    collect_hot_window_empties(game, player, legal, &mut fours, &mut fives);
+    out.extend(fours);
+    out.extend(fives);
+}
+
 // -------------------------------------------------------------------------
 // Python-facing wrapper for HexGameState
 // -------------------------------------------------------------------------
@@ -198,6 +265,76 @@ impl PyHexGame {
             result.push(cells);
         }
         result
+    }
+
+    /// Engine-backed tactical oracle using the incremental hot-window index.
+    ///
+    /// This is intentionally bounded to hot-window empties and exact
+    /// `ThreatStatus` constraints instead of rescanning every legal cell.
+    #[pyo3(signature = (radius=8))]
+    fn tactical_oracle<'py>(&self, py: Python<'py>, radius: i32) -> PyResult<Bound<'py, PyDict>> {
+        let legal: std::collections::HashSet<Hex> = self
+            .inner
+            .legal_moves_near_sorted(radius)
+            .into_iter()
+            .collect();
+        let current = self.inner.current_player();
+        let opponent = 1 - current;
+
+        let mut win_now = Vec::<Hex>::new();
+        let mut forced = Vec::<Hex>::new();
+        let mut cover = Vec::<Hex>::new();
+        let mut cover_pairs = Vec::<(Hex, Hex)>::new();
+        let mut open_four = Vec::<Hex>::new();
+        let mut open_five = Vec::<Hex>::new();
+
+        collect_hot_window_empties(&self.inner, current, &legal, &mut open_four, &mut open_five);
+        let status_text = match threat_status(&self.inner) {
+            ThreatStatus::Quiet => "quiet",
+            ThreatStatus::Unblockable => {
+                collect_all_hot_empties(&self.inner, opponent, &legal, &mut forced);
+                cover.extend_from_slice(&forced);
+                "unblockable"
+            }
+            ThreatStatus::WinningTurn(t) => {
+                win_now.push(t.first());
+                if let Some(second) = t.second() {
+                    win_now.push(second);
+                }
+                "winning_turn"
+            }
+            ThreatStatus::MustBlock(blocks) => {
+                forced.extend_from_slice(blocks.cells());
+                cover.extend_from_slice(blocks.cells());
+                for &(a, b) in blocks.pairs() {
+                    forced.push(a);
+                    forced.push(b);
+                    cover.push(a);
+                    cover.push(b);
+                    cover_pairs.push((a, b));
+                }
+                "must_block"
+            }
+        };
+
+        sort_dedup_hex(&mut win_now);
+        sort_dedup_hex(&mut forced);
+        sort_dedup_hex(&mut cover);
+        sort_dedup_hex(&mut open_four);
+        sort_dedup_hex(&mut open_five);
+        sort_dedup_pairs(&mut cover_pairs);
+
+        let out = PyDict::new(py);
+        out.set_item("status", status_text)?;
+        out.set_item("current_player", current)?;
+        out.set_item("placements_remaining", self.inner.placements_remaining())?;
+        out.set_item("win_now_cells", hex_vec_to_py(win_now))?;
+        out.set_item("forced_block_cells", hex_vec_to_py(forced))?;
+        out.set_item("cover_cells", hex_vec_to_py(cover))?;
+        out.set_item("cover_pairs", pair_vec_to_py(cover_pairs))?;
+        out.set_item("open_four_cells", hex_vec_to_py(open_four))?;
+        out.set_item("open_five_cells", hex_vec_to_py(open_five))?;
+        Ok(out)
     }
 
     /// Dict-like list of all occupied cells: `[(q, r, player), ...]`.
@@ -725,6 +862,46 @@ impl PyMCTSEngine {
         Ok(())
     }
 
+    fn expand_root_with_global_priors<'py>(
+        &mut self,
+        legal_bytes: &[u8],
+        global_qr: PyReadonlyArray2<'py, i32>,
+        global_logits: PyReadonlyArray1<'py, f32>,
+        value: f32,
+    ) -> PyResult<()> {
+        if !legal_bytes.len().is_multiple_of(8) {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "legal_bytes length {} is not a multiple of 8",
+                legal_bytes.len()
+            )));
+        }
+        let qr = global_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 2 {
+            return Err(PyValueError::new_err("global_qr must have shape (N, 2)"));
+        }
+        let logits = global_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("global_logits array must be contiguous"))?;
+        if logits.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "global_logits length {} is smaller than global_qr rows {}",
+                logits.len(),
+                qr.shape()[0]
+            )));
+        }
+        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
+        for chunk in legal_bytes.chunks_exact(8) {
+            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            legal.push(Hex::new(q, r));
+        }
+        let global_actions: Vec<(i32, i32)> =
+            qr.outer_iter().map(|row| (row[0], row[1])).collect();
+        self.inner
+            .expand_root_with_global_priors(&legal, &global_actions, logits, value)
+            .map_err(PyValueError::new_err)
+    }
+
     fn apply_root_pair_priors<'py>(
         &mut self,
         pair_qr: PyReadonlyArray2<'py, i32>,
@@ -1010,6 +1187,10 @@ impl PyMCTSEngine {
 
     fn root_child_q_values(&self) -> Vec<f32> {
         self.inner.root_child_q_values()
+    }
+
+    fn root_pair_visit_targets(&self) -> Vec<(i32, i32, i32, i32, u32)> {
+        self.inner.root_pair_visit_targets()
     }
 
     #[pyo3(signature = (min_visits=1))]

@@ -350,8 +350,16 @@ def build_pair_candidate_batch(
         first = _as_qr(a)
         second = _as_qr(b)
         key = _canonical_pair(first, second)
-        if legal_set is not None and (key[0] not in legal_set or key[1] not in legal_set):
-            raise ValueError(f"pair policy target contains illegal action pair: {key}")
+        if legal_set is not None:
+            first_legal = first in legal_set
+            second_legal = second in legal_set
+            if not (first_legal and second_legal):
+                # Second-placement targets are ordered as
+                # `(known_first, legal_second)`. The known first stone is not a
+                # current legal move, so legacy candidate-pair scouts count it
+                # as missing mass instead of rejecting the record.
+                if first_legal == second_legal:
+                    raise ValueError(f"pair policy target contains illegal action pair: {key}")
         total_target_mass += float(prob)
         target_map[key] = target_map.get(key, 0.0) + float(prob)
         if key[0] in candidate_index and key[1] in candidate_index and key[0] != key[1]:

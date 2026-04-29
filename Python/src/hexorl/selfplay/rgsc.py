@@ -143,6 +143,8 @@ class RGSCRestartService:
         self.insertions = 0
         self.refreshes = 0
         self.tree_node_insertions = 0
+        self.last_ema_delta = 0.0
+        self.last_staleness = 0.0
 
     def maybe_restart(
         self,
@@ -205,7 +207,14 @@ class RGSCRestartService:
         if restart_entry_index is not None and record.positions:
             restart_pos = record.positions[0]
             if float(getattr(restart_pos, "regret_weight", 0.0)) > 0.0:
-                self.prb.update_regret(restart_entry_index, float(restart_pos.regret_value))
+                before = self.prb.get_entries()
+                sampled = before[restart_entry_index] if 0 <= restart_entry_index < len(before) else None
+                self.last_ema_delta = self.prb.update_regret(
+                    restart_entry_index,
+                    float(restart_pos.regret_value),
+                )
+                if sampled is not None:
+                    self.last_staleness = float(max(0, len(record.positions) - 1))
                 self.refreshes += 1
 
         candidate = self._best_observed_position(record.positions)
@@ -284,4 +293,29 @@ class RGSCRestartService:
             "rgsc_prb_insertions": float(self.insertions),
             "rgsc_prb_refreshes": float(self.refreshes),
             "rgsc_tree_node_insertions": float(self.tree_node_insertions),
+            "rgsc_last_ema_delta": float(self.last_ema_delta),
+            "rgsc_last_staleness": float(self.last_staleness),
         }
+
+    def snapshot_entries(self, limit: int = 32) -> list[dict[str, float | int | str]]:
+        entries = sorted(
+            self.prb.get_entries(),
+            key=lambda entry: (float(entry.regret), float(entry.rank_score)),
+            reverse=True,
+        )
+        return [
+            {
+                "entry_id": int(entry.entry_id),
+                "game_id": int(entry.game_id),
+                "move_count": int(len(entry.move_history) // HISTORY_STRIDE),
+                "ema_regret": float(entry.regret),
+                "observed_regret": float(entry.observed_regret),
+                "rank_score": float(entry.rank_score),
+                "refresh_count": int(entry.refresh_count),
+                "inserted_step": int(entry.inserted_step),
+                "last_sampled_step": int(entry.last_sampled_step),
+                "last_updated_step": int(entry.last_updated_step),
+                "source": str(entry.source),
+            }
+            for entry in entries[: max(0, int(limit))]
+        ]

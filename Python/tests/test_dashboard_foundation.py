@@ -319,6 +319,11 @@ def test_dashboard_debug_contract_and_graph_endpoints(tmp_path):
     assert d6["symmetry_count"] == 12
     assert len(d6["transforms"]) == 12
     assert all(item["graph"]["legal_count"] == item["legal_count"] for item in d6["transforms"])
+    first = d6["transforms"][0]["contracts"]
+    assert first["dense_legal_mask"]["legal_count"] == d6["transforms"][0]["legal_count"]
+    assert first["sparse_candidates"]["feature_version"] == CANDIDATE_FEATURE_VERSION
+    assert first["axis"]["prototype_count"] > 0
+    assert "graph_targets" in first
 
 
 def test_dashboard_pair_policy_inference_returns_pair_logits(tmp_path):

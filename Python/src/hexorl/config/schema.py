@@ -220,11 +220,13 @@ class Config(BaseModel):
                 "model lookahead heads must match buffer.lookahead_horizons; "
                 f"missing horizons for heads: {missing_horizons}"
             )
-        if (
-            ("sparse_policy" in self.model.heads or "pair_policy" in self.model.heads)
-            and not self.model.sparse_policy
-        ):
-            self.model.sparse_policy = True
+        if ("sparse_policy" in self.model.heads or "pair_policy" in self.model.heads) and not self.model.sparse_policy:
+            raise ValueError(
+                "model heads sparse_policy/pair_policy require explicit model.sparse_policy = true; "
+                "the config is not auto-mutated"
+            )
+        if "pair_policy" in self.model.heads and self.model.pair_prior_mix <= 0.0:
+            raise ValueError("pair_policy head requires model.pair_prior_mix > 0 so MCTS consumes pair priors")
         if self.model.sparse_policy and max(
             self.model.candidate_budget,
             self.selfplay.policy_target_top_k,
@@ -245,6 +247,30 @@ class Config(BaseModel):
             "axis_delta_norm",
             "moves_left",
         }
+        global_architectures = {
+            "global_graph_option1",
+            "global_xattn_0",
+            "global_line_window_0",
+            "global_pair_twostage_0",
+            "global_graph_full_0",
+            "global_hybrid_action_0",
+            "global_graph768_champion",
+        }
+        if self.model.architecture in global_architectures:
+            graph_defaults = {
+                "policy_place": self.train.loss_weights.get("policy", 1.0),
+                "policy_pair_first": self.train.loss_weights.get("pair_policy", 0.05),
+                "policy_pair_second": self.train.loss_weights.get("pair_policy", 0.05),
+                "policy_pair_joint": self.train.loss_weights.get("pair_policy", 0.05),
+                "opp_policy": self.train.loss_weights.get("opp_policy", 0.15),
+                "value": self.train.loss_weights.get("value", 1.0),
+                "regret_rank": self.train.loss_weights.get("regret_rank", 0.1),
+                "regret_value": self.train.loss_weights.get("regret_value", 0.1),
+                "moves_left": self.train.loss_weights.get("moves_left", 0.05),
+                "tactical": self.train.loss_weights.get("tactical", 0.05),
+            }
+            for name, weight in graph_defaults.items():
+                self.train.loss_weights.setdefault(name, weight)
         missing_or_inactive = sorted(
             head
             for head in self.model.heads

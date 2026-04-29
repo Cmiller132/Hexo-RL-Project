@@ -15,6 +15,8 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+
 
 GRAPH_SCHEMA_VERSION = 1
 GRAPH_FEATURE_DIM = 24
@@ -91,7 +93,9 @@ class GraphBatch:
     opp_legal_qr: np.ndarray
     opp_legal_mask: np.ndarray
     opp_policy_target: np.ndarray
+    pair_first_policy_target: np.ndarray
     pair_policy_target: np.ndarray
+    tactical_target: np.ndarray
     placements_remaining: int
     current_player: int
     schema_version: int = GRAPH_SCHEMA_VERSION
@@ -216,10 +220,12 @@ def current_turn_state(moves: Sequence[tuple[int, int, int]]) -> tuple[int, int]
 
 
 def legal_moves_for_stones(stones: dict[tuple[int, int], int], radius: int = 8) -> list[tuple[int, int]]:
+    if int(radius) != 8:
+        raise ValueError("global graph legal rows must use the Rust placement radius 8")
     if not stones:
         return [(0, 0)]
     legal: set[tuple[int, int]] = set()
-    radius = min(max(1, int(radius)), 8)
+    radius = 8
     for q, r in stones:
         for dq in range(-radius, radius + 1):
             for dr in range(-radius, radius + 1):
@@ -328,11 +334,18 @@ def build_graph_batch_from_history(
     radius: int = 8,
     max_pair_rows: int = PAIR_CHUNK_LIMIT,
     allow_pair_truncation: bool = False,
+    include_pair_rows: bool = True,
 ) -> GraphBatch:
+    if int(radius) != 8:
+        raise ValueError("global graph legal rows must preserve all Rust-legal moves; radius must be 8")
     moves = parse_history(history)
     stones = {(q, r): player for player, q, r in moves}
     current_player, placements_remaining = current_turn_state(moves)
-    legal = legal_moves_for_stones(stones, radius=radius)
+    engine_state = _engine_state_from_history(history)
+    if engine_state is not None:
+        legal, current_player, placements_remaining = engine_state
+    else:
+        legal = legal_moves_for_stones(stones, radius=radius)
     legal_index = {qr: i for i, qr in enumerate(legal)}
     windows = _active_windows(stones, legal)
     comp = _component_ids(stones)
@@ -421,7 +434,9 @@ def build_graph_batch_from_history(
     pair_first_indices: list[int] = []
     pair_second_indices: list[int] = []
     pair_context_first: tuple[int, int] | None = None
-    if placements_remaining >= 2:
+    if not include_pair_rows:
+        pass
+    elif placements_remaining >= 2:
         total_pair_rows = len(legal) * (len(legal) - 1) // 2
         if (
             max_pair_rows is not None
@@ -513,6 +528,17 @@ def build_graph_batch_from_history(
         placements_remaining=placements_remaining,
         pair_context_first=pair_context_first,
     )
+    pair_first_target = _pair_first_target_for_legal(
+        legal,
+        pair_policy_target,
+        placements_remaining=placements_remaining,
+    )
+    oracle = scan_tactical_oracle_from_history(
+        history,
+        legal,
+        near_radius=8,
+    )
+    tactical_target = _tactical_target_from_oracle(oracle)
 
     return GraphBatch(
         token_features=np.asarray(token_features, dtype=np.float32),
@@ -531,7 +557,9 @@ def build_graph_batch_from_history(
         opp_legal_qr=np.asarray(opp_legal, dtype=np.int32),
         opp_legal_mask=np.ones(len(opp_legal), dtype=np.bool_),
         opp_policy_target=opp_policy,
+        pair_first_policy_target=pair_first_target,
         pair_policy_target=pair_target,
+        tactical_target=tactical_target,
         placements_remaining=placements_remaining,
         current_player=current_player,
     )
@@ -576,7 +604,7 @@ def _target_for_pairs(
     token_to_legal = {tok: i for i, tok in enumerate(legal_token_indices)}
     legal_set = set(legal)
     positive_target = [row for row in target if float(row[2]) > 0.0]
-    if positive_target and not pair_first_indices:
+    if positive_target and len(pair_first_indices) == 0:
         raise ValueError("pair_policy_target provided when the pair-action table is empty")
     unordered_target_map: dict[frozenset[tuple[int, int]], float] = {}
     ordered_second_target_map: dict[tuple[int, int], float] = {}
@@ -617,6 +645,115 @@ def _target_for_pairs(
     return arr
 
 
+def _pair_first_target_for_legal(
+    legal: Sequence[tuple[int, int]],
+    target: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
+    *,
+    placements_remaining: int,
+) -> np.ndarray:
+    """Project joint pair targets onto legal first-placement rows."""
+    out = np.zeros(len(legal), dtype=np.float32)
+    if placements_remaining < 2:
+        return out
+    legal_index = {qr: i for i, qr in enumerate(legal)}
+    for first, second, prob in target:
+        if float(prob) <= 0.0:
+            continue
+        a = (int(first[0]), int(first[1]))
+        b = (int(second[0]), int(second[1]))
+        if a == b:
+            continue
+        if a in legal_index:
+            out[legal_index[a]] += float(prob)
+    total = float(out.sum())
+    if total > 0.0:
+        out /= total
+    return out
+
+
+def graph_batch_with_reference_pair_rows(
+    graph_batch: GraphBatch,
+    pair_policy_target: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
+) -> GraphBatch:
+    """Attach full legal pair rows without materializing pair tokens.
+
+    The transformer context keeps all legal action tokens but pair scoring can
+    be O(A^2).  For replay training, represent pair rows by references to the
+    relevant LEGAL/STONE token indices so the pair heads can train over the
+    complete table without adding tens of thousands of PAIR_ACTION tokens.
+    """
+
+    legal = [(int(q), int(r)) for q, r in np.asarray(graph_batch.legal_qr, dtype=np.int32).tolist()]
+    legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
+    if graph_batch.placements_remaining >= 2:
+        first_rows: list[int] = []
+        second_rows: list[int] = []
+        for a_idx in range(len(legal)):
+            for b_idx in range(a_idx + 1, len(legal)):
+                first_rows.append(int(legal_tokens[a_idx]))
+                second_rows.append(int(legal_tokens[b_idx]))
+        pair_first = np.asarray(first_rows, dtype=np.int64)
+        pair_second = np.asarray(second_rows, dtype=np.int64)
+        pair_context_first = None
+    elif graph_batch.placements_remaining == 1:
+        stone_tokens = np.flatnonzero(graph_batch.token_type == int(GraphTokenType.STONE))
+        if stone_tokens.size == 0:
+            pair_first = np.zeros(0, dtype=np.int64)
+            pair_second = np.zeros(0, dtype=np.int64)
+            pair_context_first = None
+        else:
+            first_token = int(stone_tokens[-1])
+            first_qr = tuple(int(x) for x in graph_batch.token_qr[first_token].tolist())
+            pair_first = np.full(len(legal), first_token, dtype=np.int64)
+            pair_second = legal_tokens.astype(np.int64, copy=True)
+            pair_context_first = first_qr
+    else:
+        pair_first = np.zeros(0, dtype=np.int64)
+        pair_second = np.zeros(0, dtype=np.int64)
+        pair_context_first = None
+
+    pair_target = _target_for_pairs(
+        pair_first,
+        pair_second,
+        legal_tokens,
+        legal,
+        pair_policy_target,
+        placements_remaining=int(graph_batch.placements_remaining),
+        pair_context_first=pair_context_first,
+    )
+    pair_first_target = _pair_first_target_for_legal(
+        legal,
+        pair_policy_target,
+        placements_remaining=int(graph_batch.placements_remaining),
+    )
+    pair_count = int(pair_first.shape[0])
+    return GraphBatch(
+        token_features=graph_batch.token_features,
+        token_type=graph_batch.token_type,
+        token_qr=graph_batch.token_qr,
+        token_mask=graph_batch.token_mask,
+        legal_token_indices=graph_batch.legal_token_indices,
+        legal_qr=graph_batch.legal_qr,
+        legal_mask=graph_batch.legal_mask,
+        pair_token_indices=np.zeros(pair_count, dtype=np.int64),
+        pair_first_indices=pair_first,
+        pair_second_indices=pair_second,
+        relation_bias=graph_batch.relation_bias,
+        relation_type=graph_batch.relation_type,
+        policy_target=graph_batch.policy_target,
+        opp_legal_qr=graph_batch.opp_legal_qr,
+        opp_legal_mask=graph_batch.opp_legal_mask,
+        opp_policy_target=graph_batch.opp_policy_target,
+        pair_first_policy_target=pair_first_target,
+        pair_policy_target=pair_target,
+        tactical_target=graph_batch.tactical_target,
+        placements_remaining=graph_batch.placements_remaining,
+        current_player=graph_batch.current_player,
+        schema_version=graph_batch.schema_version,
+        relation_schema_version=graph_batch.relation_schema_version,
+    )
+
+
 def _opponent_legal_after_passive_turn(
     stones: dict[tuple[int, int], int],
     legal: Sequence[tuple[int, int]],
@@ -632,6 +769,50 @@ def _opponent_legal_after_passive_turn(
     future = dict(stones)
     future[legal[0]] = current_player
     return legal_moves_for_stones(future, radius=radius)
+
+
+def _engine_state_from_history(history: bytes) -> tuple[list[tuple[int, int]], int, int] | None:
+    try:
+        import _engine  # type: ignore
+    except Exception:
+        return None
+    engine_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
+    if engine_cls is None:
+        return None
+    game = engine_cls()
+    for player, q, r in parse_history(history):
+        current = getattr(game, "current_player", player)
+        current = current() if callable(current) else current
+        if int(player) != int(current):
+            raise ValueError(f"invalid graph history: player {player} does not match engine current player {current}")
+        game.place(int(q), int(r))
+    legal = getattr(game, "legal_moves", lambda: [])()
+    current_player = getattr(game, "current_player", 0)
+    placements_remaining = getattr(game, "placements_remaining", 1)
+    if callable(current_player):
+        current_player = current_player()
+    if callable(placements_remaining):
+        placements_remaining = placements_remaining()
+    return (
+        _unique_qr((int(q), int(r)) for q, r in legal),
+        int(current_player),
+        int(placements_remaining),
+    )
+
+
+def _tactical_target_from_oracle(oracle) -> np.ndarray:
+    """State-level tactical labels: win, must-block, cover-pair, quiet."""
+    out = np.zeros(4, dtype=np.float32)
+    status = str(getattr(oracle, "status", "quiet"))
+    if getattr(oracle, "win_now_cells", ()):
+        out[0] = 1.0
+    if getattr(oracle, "forced_block_cells", ()):
+        out[1] = 1.0
+    if getattr(oracle, "cover_pairs", ()):
+        out[2] = 1.0
+    if status == "quiet" and out[:3].sum() == 0.0:
+        out[3] = 1.0
+    return out
 
 
 def _build_relations(
@@ -778,10 +959,12 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
     opp_legal_qr = pad((bsz, max_o, 2), np.int32)
     opp_legal_mask = pad((bsz, max_o), np.bool_)
     opp_policy_target = pad((bsz, max_o), np.float32)
+    pair_first_policy_target = pad((bsz, max_a), np.float32)
     pair_token_indices = pad((bsz, max_p), np.int64, -1)
     pair_first_indices = pad((bsz, max_p), np.int64, -1)
     pair_second_indices = pad((bsz, max_p), np.int64, -1)
     pair_policy_target = pad((bsz, max_p), np.float32)
+    tactical_target = pad((bsz, 4), np.float32)
 
     for row, batch in enumerate(batches):
         t = batch.token_features.shape[0]
@@ -801,10 +984,12 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
         opp_legal_qr[row, :o] = batch.opp_legal_qr
         opp_legal_mask[row, :o] = True
         opp_policy_target[row, :o] = batch.opp_policy_target
+        pair_first_policy_target[row, :a] = batch.pair_first_policy_target
         pair_token_indices[row, :p] = batch.pair_token_indices
         pair_first_indices[row, :p] = batch.pair_first_indices
         pair_second_indices[row, :p] = batch.pair_second_indices
         pair_policy_target[row, :p] = batch.pair_policy_target
+        tactical_target[row] = batch.tactical_target
 
     return GraphBatch(
         token_features=token_features,
@@ -823,7 +1008,9 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
         opp_legal_qr=opp_legal_qr,
         opp_legal_mask=opp_legal_mask,
         opp_policy_target=opp_policy_target,
+        pair_first_policy_target=pair_first_policy_target,
         pair_policy_target=pair_policy_target,
+        tactical_target=tactical_target,
         placements_remaining=-1,
         current_player=-1,
     )

@@ -29,6 +29,7 @@ def test_replay_endpoint_returns_policy_weights_regret_and_candidate_debug(tmp_p
                 "policy_target": {},
                 "debug": {
                     "is_full_search": False,
+                    "outcome": 0.0,
                     "selected_action_value": -0.5,
                     "value_weight": 0.0,
                     "policy_weight": 0.25,
@@ -61,6 +62,10 @@ def test_replay_endpoint_returns_policy_weights_regret_and_candidate_debug(tmp_p
 
     assert position["root_value"] == pytest.approx(0.25)
     assert position["selected_action_value"] == pytest.approx(-0.5)
+    assert position["final_outcome"] == pytest.approx(0.0)
+    assert position["per_step_error"] == pytest.approx(0.25)
+    assert position["regret_rank"] == pytest.approx(0.4)
+    assert position["regret_value"] == pytest.approx(0.4)
     assert position["value_weight"] == pytest.approx(0.0)
     assert position["policy_weight"] == pytest.approx(0.25)
     assert position["opp_policy_weight"] == pytest.approx(0.75)

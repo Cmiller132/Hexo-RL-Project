@@ -200,11 +200,11 @@ def test_d6_legal_mask_bijection_random_histories():
 def test_tactical_oracle_default_legal_generation_is_exact_placement_radius():
     legal = set(legal_moves_from_stones({(0, 0): 0}, near_radius=TACTICAL_SCAN_RADIUS))
 
-    assert TACTICAL_SCAN_RADIUS == PLACEMENT_RADIUS
-    assert (PLACEMENT_RADIUS, 0) in legal
-    assert (0, PLACEMENT_RADIUS) in legal
-    assert (PLACEMENT_RADIUS, -PLACEMENT_RADIUS) in legal
-    assert (PLACEMENT_RADIUS + 1, 0) not in legal
+    assert TACTICAL_SCAN_RADIUS == 3
+    assert (TACTICAL_SCAN_RADIUS, 0) in legal
+    assert (0, TACTICAL_SCAN_RADIUS) in legal
+    assert (TACTICAL_SCAN_RADIUS, -TACTICAL_SCAN_RADIUS) in legal
+    assert (TACTICAL_SCAN_RADIUS + 1, 0) not in legal
     assert (0, 0) not in legal
     assert len(legal) == 3 * TACTICAL_SCAN_RADIUS * (TACTICAL_SCAN_RADIUS + 1)
 
@@ -232,6 +232,40 @@ def test_tactical_oracle_default_radius_finds_forced_cover_pair_from_history():
     stones = _stones_from_moves(_unpack_history(history))
     for cell in result.critical_actions:
         assert min(_hex_distance(cell, stone) for stone in stones) <= TACTICAL_SCAN_RADIUS
+
+
+def test_tactical_oracle_outputs_are_d6_equivariant():
+    moves = [
+        (0, 0, 0),
+        (1, 0, -1),
+        (1, 0, -2),
+        (0, 1, 0),
+        (0, 2, 0),
+        (1, 1, -1),
+        (1, 1, -2),
+        (0, 3, 0),
+        (0, 2, -2),
+    ]
+    base = scan_tactical_oracle_from_history(_pack_history(moves), near_radius=TACTICAL_SCAN_RADIUS)
+
+    for sym in range(12):
+        transformed = scan_tactical_oracle_from_history(
+            _pack_history(_transform_history(moves, sym)),
+            near_radius=TACTICAL_SCAN_RADIUS,
+        )
+
+        assert transformed.status == base.status
+        assert set(transformed.win_now_cells) == {_d6(q, r, sym) for q, r in base.win_now_cells}
+        assert set(transformed.forced_block_cells) == {
+            _d6(q, r, sym) for q, r in base.forced_block_cells
+        }
+        assert set(transformed.cover_cells) == {_d6(q, r, sym) for q, r in base.cover_cells}
+        expected_pairs = {
+            tuple(sorted((_d6(a[0], a[1], sym), _d6(b[0], b[1], sym))))
+            for a, b in base.cover_pairs
+        }
+        actual_pairs = {tuple(sorted(pair)) for pair in transformed.cover_pairs}
+        assert actual_pairs == expected_pairs
 
 
 def _game_from_history(moves: Sequence[tuple[int, int, int]]):

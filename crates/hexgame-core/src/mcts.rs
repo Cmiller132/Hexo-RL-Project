@@ -711,6 +711,57 @@ impl MCTSEngine {
         self.arena[self.root_idx as usize].player = player;
     }
 
+    pub fn expand_root_with_global_priors(
+        &mut self,
+        legal: &[Hex],
+        global_actions: &[(i32, i32)],
+        global_logits: &[f32],
+        _value: f32,
+    ) -> Result<(), String> {
+        self.reset_prior_telemetry();
+        if legal.len() != global_actions.len() {
+            return Err(format!(
+                "global prior legal row count mismatch: legal={} global_actions={}",
+                legal.len(),
+                global_actions.len()
+            ));
+        }
+        if global_logits.len() < global_actions.len() {
+            return Err(format!(
+                "global prior logits length {} is smaller than legal rows {}",
+                global_logits.len(),
+                global_actions.len()
+            ));
+        }
+        for (idx, (legal_hex, &(q, r))) in legal.iter().zip(global_actions.iter()).enumerate() {
+            if legal_hex.q != q || legal_hex.r != r {
+                return Err(format!(
+                    "global prior legal row mismatch at {idx}: Rust legal=({}, {}) graph legal=({}, {})",
+                    legal_hex.q, legal_hex.r, q, r
+                ));
+            }
+        }
+        self.scratch_raw.clear();
+        self.scratch_raw.extend(global_logits.iter().take(global_actions.len()).copied());
+        if self.scratch_raw.iter().any(|value| !value.is_finite()) {
+            return Err("global prior logits contain non-finite values".to_string());
+        }
+        softmax_in_place(&mut self.scratch_raw, &mut self.scratch_priors);
+        if self.scratch_priors.len() != legal.len() {
+            return Err("global prior logits could not be normalized".to_string());
+        }
+        self.scratch_sources.clear();
+        self.scratch_sources
+            .extend(std::iter::repeat_n(PRIOR_SOURCE_SPARSE, legal.len()));
+        let player = self.game.current_player();
+        self.expand_node_with_priors(self.root_idx, legal, player);
+        self.root_prior_sources.clear();
+        self.root_prior_sources.extend_from_slice(&self.scratch_sources);
+        self.root_sparse_candidate_count = legal.len() as u32;
+        self.arena[self.root_idx as usize].player = player;
+        Ok(())
+    }
+
     /// Blend joint pair-action logits into root first-placement priors.
     ///
     /// `pair_actions` stores unordered pairs `(q1, r1, q2, r2)` keyed by
@@ -1480,6 +1531,44 @@ impl MCTSEngine {
                 }
             })
             .collect()
+    }
+
+    /// Return search-observed joint first/second placement targets at the root.
+    ///
+    /// Rows are `(first_q, first_r, second_q, second_r, visit_count)` and are
+    /// extracted from expanded root-child subtrees. This gives training a real
+    /// MCTS joint-pair signal instead of reconstructing a pair from the single
+    /// first move that happened to be sampled into the played trajectory.
+    pub fn root_pair_visit_targets(&self) -> Vec<(i32, i32, i32, i32, u32)> {
+        if self.game.placements_remaining() < 2 {
+            return Vec::new();
+        }
+        let root = &self.arena[self.root_idx as usize];
+        let start = root.children_start as usize;
+        let count = root.children_count as usize;
+        let mut rows = Vec::new();
+        for first_idx in start..start + count {
+            let first = &self.arena[first_idx];
+            if !first.is_expanded || first.children_count == 0 {
+                continue;
+            }
+            let second_start = first.children_start as usize;
+            let second_count = first.children_count as usize;
+            for second_idx in second_start..second_start + second_count {
+                let second = &self.arena[second_idx];
+                if second.visit_count == 0 {
+                    continue;
+                }
+                rows.push((
+                    first.action.0 as i32,
+                    first.action.1 as i32,
+                    second.action.0 as i32,
+                    second.action.1 as i32,
+                    second.visit_count,
+                ));
+            }
+        }
+        rows
     }
 
     // ── Training data extraction ───────────────────────────────────────

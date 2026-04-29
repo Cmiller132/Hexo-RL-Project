@@ -30,6 +30,8 @@ class PRBEntry:
     last_sampled_step: int = 0
     last_updated_step: int = 0
     source: str = "trajectory_observed_regret"
+    checkpoint_step: int = 0
+    eviction_reason: str = ""
 
 
 class PrioritizedRegretBuffer:
@@ -89,8 +91,12 @@ class PrioritizedRegretBuffer:
             self._next_entry_id += 1
             return True
 
-        min_idx = min(range(len(self._entries)), key=lambda i: self._entries[i].regret)
+        min_idx = min(
+            range(len(self._entries)),
+            key=lambda i: (self._entries[i].regret, self._entries[i].last_sampled_step),
+        )
         if regret > self._entries[min_idx].regret:
+            entry.eviction_reason = "replaced_lower_ema_regret"
             self._entries[min_idx] = entry
             self._next_entry_id += 1
             return True
@@ -105,10 +111,13 @@ class PrioritizedRegretBuffer:
         if not self._entries:
             return None
 
-        regrets = np.array([e.regret for e in self._entries], dtype=np.float64)
-        regrets = np.maximum(regrets, 1e-8)
+        ranks = np.array(
+            [e.rank_score if e.rank_score > 0.0 else e.regret for e in self._entries],
+            dtype=np.float64,
+        )
+        ranks = np.maximum(ranks, 1e-8)
         inv_temp = 1.0 / max(self.sampling_temperature, 1e-8)
-        weights = regrets ** inv_temp
+        weights = ranks ** inv_temp
         probs = weights / weights.sum()
 
         if rng is None:
@@ -128,7 +137,7 @@ class PrioritizedRegretBuffer:
         sampled = self.sample_with_index(rng)
         return sampled[1] if sampled is not None else None
 
-    def update_regret(self, entry_index: int, new_regret: float):
+    def update_regret(self, entry_index: int, new_regret: float) -> float:
         """Update an entry's regret via EMA.
 
         R_new = (1-α)*R_old + α*R_new_observed
@@ -142,6 +151,8 @@ class PrioritizedRegretBuffer:
             self._entries[entry_index].observed_regret = new_regret
             self._entries[entry_index].refresh_count += 1
             self._entries[entry_index].last_updated_step = self._step
+            return float(self._entries[entry_index].regret - old)
+        return 0.0
 
     def get_entries(self) -> List[PRBEntry]:
         return list(self._entries)

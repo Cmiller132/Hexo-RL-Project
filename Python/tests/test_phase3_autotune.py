@@ -1,3 +1,8 @@
+import importlib.util
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
 from hexorl.tuning.asha import ASHARungTable, DEFAULT_ASHA_RESOURCES, TrialObservation
 from hexorl.tuning.bohb import BOHBSampler, SearchSpace
 from hexorl.tuning.pb2 import PB2Observation, PB2Scheduler
@@ -159,6 +164,40 @@ def test_pb2_respects_conditional_parameters():
     assert event["final_values"]["pair_policy_loss"] == 0.1
 
 
+def test_phase3_sparse_candidate_gate_uses_discovery_metrics():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(candidate_recall_gate=0.95, target_epoch_seconds=100.0)
+    services = module.EvaluationServices.__new__(module.EvaluationServices)
+    services.args = supervisor.args
+    trial = SimpleNamespace(family=SimpleNamespace(sparse_policy=True), last_score=1.0, score_history=[])
+    buffer = {
+        "size": 10,
+        "avg_candidate_recall_mcts_top8": 1.0,
+        "avg_candidate_recall_winning_move": 1.0,
+        "avg_candidate_recall_forced_block": 1.0,
+        "avg_candidate_recall_two_placement_cover": 1.0,
+        "avg_candidate_discovery_top1": 0.2,
+        "avg_candidate_discovery_top4": 0.3,
+        "avg_candidate_discovery_top8": 0.4,
+        "avg_candidate_discovery_winning_move": 0.98,
+        "avg_candidate_discovery_forced_block": 1.0,
+        "avg_candidate_discovery_two_placement_cover": 1.0,
+    }
+
+    candidate = module.EvaluationServices.candidate_recall(services, trial, buffer)
+    reason = module.Phase3Supervisor._hard_prune_reason(
+        supervisor,
+        trial,
+        {"buffer": buffer, "selfplay": {"positions_done": 10}},
+    )
+
+    assert candidate["candidate_discovery_top8"] == 0.4
+    assert "candidate_recall_mcts_top8" not in candidate
+    assert candidate["gate_pass"] is False
+    assert reason == "candidate_discovery_below_gate:0.4000"
+
+
 def _obs(trial_id, resource, score, hard_failure=False):
     return TrialObservation(
         trial_id=trial_id,
@@ -204,3 +243,13 @@ def _pb2_with_observations():
             )
         )
     return scheduler
+
+
+def _load_phase3_autotune_module():
+    path = Path(__file__).resolve().parents[2] / "scripts" / "run_phase3_48h_autotune.py"
+    spec = importlib.util.spec_from_file_location("phase3_autotune_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module

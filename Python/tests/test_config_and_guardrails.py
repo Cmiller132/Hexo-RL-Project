@@ -1,3 +1,5 @@
+import multiprocessing as mp
+
 import pytest
 import torch
 
@@ -324,6 +326,7 @@ def test_pair_policy_head_forward_and_default_weight():
                 "blocks": 2,
                 "heads": ["policy", "value", "pair_policy"],
                 "candidate_budget": 8,
+                "sparse_policy": True,
             },
             "train": {
                 "loss_weights": {"policy": 1.0, "value": 1.5, "pair_policy": 0.05}
@@ -354,6 +357,27 @@ def test_pair_policy_head_forward_and_default_weight():
     assert torch.isfinite(out["pair_policy"][pair_candidate_mask]).all()
 
 
+def test_global_graph_selfplay_consumes_pair_priors_by_default():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_graph_option1",
+                "channels": 16,
+                "attention_heads": 4,
+                "graph_layers": 1,
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    queue = mp.Queue()
+    try:
+        worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
+        assert worker.global_graph_enabled is True
+        assert worker.pair_policy_enabled is True
+    finally:
+        queue.close()
+
+
 def test_restnet_config_rejects_invalid_attention_position():
     with pytest.raises(ValueError, match="attention_positions"):
         Config.model_validate(
@@ -373,7 +397,7 @@ def test_sparse_policy_config_requires_active_loss_for_sparse_policy_head():
 
     cfg = Config.model_validate(
         {
-            "model": {"heads": ["policy", "value", "sparse_policy"]},
+            "model": {"heads": ["policy", "value", "sparse_policy"], "sparse_policy": True},
             "train": {
                 "loss_weights": {"policy": 1.0, "value": 1.5, "sparse_policy": 0.25}
             },
@@ -385,7 +409,7 @@ def test_sparse_policy_config_requires_active_loss_for_sparse_policy_head():
 def test_sparse_policy_head_enables_sparse_data_contract():
     cfg = Config.model_validate(
         {
-            "model": {"heads": ["policy", "value", "sparse_policy"]},
+            "model": {"heads": ["policy", "value", "sparse_policy"], "sparse_policy": True},
             "train": {
                 "loss_weights": {"policy": 1.0, "value": 1.5, "sparse_policy": 0.25}
             },

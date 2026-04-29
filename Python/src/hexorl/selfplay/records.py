@@ -19,7 +19,7 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 7
+COMPACT_VERSION_V2 = 8
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
@@ -67,6 +67,7 @@ class PositionRecord:
     opp_policy_weight: float = 0.0
     policy_target_v2: PolicyTargetV2 = field(default_factory=list)
     opp_policy_target_v2: PolicyTargetV2 = field(default_factory=list)
+    opp_policy_legal_v2: List[Tuple[int, int]] = field(default_factory=list)
     pair_policy_target_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = field(default_factory=list)
     target_policy_mass_outside_window: float = 0.0
     missing_target_policy_mass: float = 0.0
@@ -76,6 +77,17 @@ class PositionRecord:
     candidate_recall_winning_move: float = 1.0
     candidate_recall_forced_block: float = 1.0
     candidate_recall_two_placement_cover: float = 1.0
+    candidate_discovery_top1: float = 1.0
+    candidate_discovery_top4: float = 1.0
+    candidate_discovery_top8: float = 1.0
+    candidate_discovery_winning_move: float = 1.0
+    candidate_discovery_forced_block: float = 1.0
+    candidate_discovery_two_placement_cover: float = 1.0
+    candidate_discovery_open_four: float = 1.0
+    candidate_discovery_open_five: float = 1.0
+    candidate_critical_count: int = 0
+    candidate_critical_overflow_count: int = 0
+    candidate_critical_overflow_examples: Tuple[Tuple[int, int], ...] = ()
     sparse_prior_stage: int = 0
     sparse_prior_root_candidate_count: int = 0
     sparse_prior_leaf_candidate_count: float = 0.0
@@ -219,6 +231,10 @@ class GameRecord:
             parts.extend(struct.pack("<H", len(opp_v2_entries)))
             for q, r, prob in opp_v2_entries:
                 parts.extend(struct.pack("<iif", int(q), int(r), float(prob)))
+            opp_legal_v2_entries = list(pos.opp_policy_legal_v2)
+            parts.extend(struct.pack("<H", len(opp_legal_v2_entries)))
+            for q, r in opp_legal_v2_entries:
+                parts.extend(struct.pack("<ii", int(q), int(r)))
             pair_v2_entries = list(pos.pair_policy_target_v2)
             parts.extend(struct.pack("<H", len(pair_v2_entries)))
             for first, second, prob in pair_v2_entries:
@@ -267,6 +283,23 @@ class GameRecord:
                 float(pos.pair_fallback_prior_use_on_mcts_top4),
                 float(pos.pair_fallback_prior_use_on_mcts_top8),
             ))
+            discovery_examples = list(pos.candidate_critical_overflow_examples[:8])
+            parts.extend(struct.pack(
+                "<8fHHH",
+                float(pos.candidate_discovery_top1),
+                float(pos.candidate_discovery_top4),
+                float(pos.candidate_discovery_top8),
+                float(pos.candidate_discovery_winning_move),
+                float(pos.candidate_discovery_forced_block),
+                float(pos.candidate_discovery_two_placement_cover),
+                float(pos.candidate_discovery_open_four),
+                float(pos.candidate_discovery_open_five),
+                int(pos.candidate_critical_count),
+                int(pos.candidate_critical_overflow_count),
+                len(discovery_examples),
+            ))
+            for q, r in discovery_examples:
+                parts.extend(struct.pack("<ii", int(q), int(r)))
 
         return bytes(parts)
 
@@ -331,6 +364,7 @@ class GameRecord:
             opp_policy = {}
             policy_v2: PolicyTargetV2 = []
             opp_policy_v2: PolicyTargetV2 = []
+            opp_policy_legal_v2: List[Tuple[int, int]] = []
             pair_policy_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
             target_policy_mass_outside_window = 0.0
             missing_target_policy_mass = 0.0
@@ -340,6 +374,17 @@ class GameRecord:
             candidate_recall_winning_move = 1.0
             candidate_recall_forced_block = 1.0
             candidate_recall_two_placement_cover = 1.0
+            candidate_discovery_top1 = 1.0
+            candidate_discovery_top4 = 1.0
+            candidate_discovery_top8 = 1.0
+            candidate_discovery_winning_move = 1.0
+            candidate_discovery_forced_block = 1.0
+            candidate_discovery_two_placement_cover = 1.0
+            candidate_discovery_open_four = 1.0
+            candidate_discovery_open_five = 1.0
+            candidate_critical_count = 0
+            candidate_critical_overflow_count = 0
+            candidate_critical_overflow_examples: Tuple[Tuple[int, int], ...] = ()
             sparse_prior_stage = 0
             sparse_prior_root_candidate_count = 0
             sparse_prior_leaf_candidate_count = 0.0
@@ -387,6 +432,13 @@ class GameRecord:
                         q, r, prob = struct.unpack_from("<iif", data, offset)
                         offset += struct.calcsize("<iif")
                         opp_policy_v2.append((int(q), int(r), float(prob)))
+                    if version >= 8:
+                        num_opp_legal_v2_entries = struct.unpack_from("<H", data, offset)[0]
+                        offset += 2
+                        for _ in range(num_opp_legal_v2_entries):
+                            q, r = struct.unpack_from("<ii", data, offset)
+                            offset += struct.calcsize("<ii")
+                            opp_policy_legal_v2.append((int(q), int(r)))
                     if version >= 3:
                         num_pair_v2_entries = struct.unpack_from("<H", data, offset)[0]
                         offset += 2
@@ -454,6 +506,27 @@ class GameRecord:
                     sparse_prior_stage = int(sparse_prior_stage_f)
                     sparse_prior_root_candidate_count = int(sparse_prior_root_candidate_count_f)
                     pair_prior_candidate_count = int(pair_prior_candidate_count_f)
+                if is_v2 and version >= 8:
+                    (
+                        candidate_discovery_top1,
+                        candidate_discovery_top4,
+                        candidate_discovery_top8,
+                        candidate_discovery_winning_move,
+                        candidate_discovery_forced_block,
+                        candidate_discovery_two_placement_cover,
+                        candidate_discovery_open_four,
+                        candidate_discovery_open_five,
+                        candidate_critical_count,
+                        candidate_critical_overflow_count,
+                        overflow_example_count,
+                    ) = struct.unpack_from("<8fHHH", data, offset)
+                    offset += struct.calcsize("<8fHHH")
+                    examples = []
+                    for _ in range(overflow_example_count):
+                        q, r = struct.unpack_from("<ii", data, offset)
+                        offset += struct.calcsize("<ii")
+                        examples.append((int(q), int(r)))
+                    candidate_critical_overflow_examples = tuple(examples)
 
             positions.append(PositionRecord(
                 move_history=move_history,
@@ -470,6 +543,7 @@ class GameRecord:
                 value_weight=value_weight,
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
+                opp_policy_legal_v2=opp_policy_legal_v2,
                 pair_policy_target_v2=pair_policy_v2,
                 target_policy_mass_outside_window=target_policy_mass_outside_window,
                 missing_target_policy_mass=missing_target_policy_mass,
@@ -479,6 +553,17 @@ class GameRecord:
                 candidate_recall_winning_move=candidate_recall_winning_move,
                 candidate_recall_forced_block=candidate_recall_forced_block,
                 candidate_recall_two_placement_cover=candidate_recall_two_placement_cover,
+                candidate_discovery_top1=candidate_discovery_top1,
+                candidate_discovery_top4=candidate_discovery_top4,
+                candidate_discovery_top8=candidate_discovery_top8,
+                candidate_discovery_winning_move=candidate_discovery_winning_move,
+                candidate_discovery_forced_block=candidate_discovery_forced_block,
+                candidate_discovery_two_placement_cover=candidate_discovery_two_placement_cover,
+                candidate_discovery_open_four=candidate_discovery_open_four,
+                candidate_discovery_open_five=candidate_discovery_open_five,
+                candidate_critical_count=int(candidate_critical_count),
+                candidate_critical_overflow_count=int(candidate_critical_overflow_count),
+                candidate_critical_overflow_examples=candidate_critical_overflow_examples,
                 sparse_prior_stage=sparse_prior_stage,
                 sparse_prior_root_candidate_count=sparse_prior_root_candidate_count,
                 sparse_prior_leaf_candidate_count=sparse_prior_leaf_candidate_count,
@@ -645,11 +730,11 @@ def pair_policy_v2_from_place_target(
     *,
     top_k: Optional[int] = None,
 ) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
-    """Build an unordered full-turn pair target from place-action probabilities.
+    """Diagnostic-only synthetic pair target from place-action probabilities.
 
-    By default this consumes every global policy_v2 row. ``top_k`` is retained
-    only for explicit tests or debug callers that need a deliberately bounded
-    synthetic target.
+    Production training must use search-observed pair targets assigned in
+    ``hexorl.buffer.targets``. This helper is retained for legacy tests and
+    diagnostics that explicitly want the synthetic product baseline.
     """
     merged: dict[tuple[int, int], float] = {}
     for q, r, prob in policy_v2:
