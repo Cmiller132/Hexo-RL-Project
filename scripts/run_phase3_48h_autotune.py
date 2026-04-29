@@ -57,6 +57,23 @@ from hexorl.tuning import (
 
 LOGGER = logging.getLogger("phase3_autotune")
 FULL_GLOBAL_POLICY_ROWS = BOARD_AREA
+REPLAY_POLICY_WIDTH_CAP = 512
+GLOBAL_GRAPH_SCOUT_FAMILIES = (
+    "global_xattn_0",
+    "global_line_window_0",
+    "global_pair_twostage_0",
+    "global_graph_full_0",
+)
+GLOBAL_GRAPH_ARCHITECTURES = {
+    "global_graph_option1",
+    "global_xattn_0",
+    "global_line_window_0",
+    "global_pair_twostage_0",
+    "global_graph_full_0",
+    "global_hybrid_action_0",
+    "global_graph768_champion",
+}
+GLOBAL_GRAPH_PAIR_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
 
 
 HEAD_BUNDLES: dict[str, list[str]] = {
@@ -191,6 +208,7 @@ class FamilySpec:
     sparse_policy: bool = False
     attention_positions: tuple[int, ...] = ()
     graph: bool = False
+    global_graph: bool = False
     available: bool = True
 
     @property
@@ -202,6 +220,7 @@ class FamilySpec:
             self.sparse_policy,
             self.attention_positions,
             self.graph,
+            self.global_graph,
         )
 
 
@@ -543,6 +562,48 @@ class Phase3Supervisor:
 
     # ── Trial Operations ────────────────────────────────────────────────
 
+    def _replay_policy_v2_width(self, cfg: Config, family: FamilySpec) -> int:
+        base_width = max(
+            1,
+            int(cfg.selfplay.policy_target_top_k),
+            int(getattr(cfg.model, "candidate_budget", 256)),
+        )
+        if family.global_graph:
+            return max(base_width, FULL_GLOBAL_POLICY_ROWS)
+        return min(base_width, REPLAY_POLICY_WIDTH_CAP)
+
+    def _replay_feature_flags(self, cfg: Config, family: FamilySpec) -> dict[str, bool]:
+        heads = set(getattr(cfg.model, "heads", []))
+        pair_heads = {"pair_policy"} | GLOBAL_GRAPH_PAIR_HEADS
+        return {
+            "store_opp_policy": "opp_policy" in heads,
+            "store_pair_policy": bool(heads & pair_heads),
+            "store_sparse_diagnostics": True,
+        }
+
+    def _make_replay_buffer(
+        self,
+        cfg: Config,
+        family: FamilySpec,
+        *,
+        capacity: int | None = None,
+    ) -> RingBuffer:
+        return RingBuffer(
+            capacity=int(capacity or cfg.buffer.capacity),
+            max_policy_entries=int(cfg.selfplay.policy_target_top_k),
+            max_policy_v2_entries=self._replay_policy_v2_width(cfg, family),
+            recency_decay=cfg.buffer.recency_decay,
+            num_lookahead=len(cfg.buffer.lookahead_horizons),
+            **self._replay_feature_flags(cfg, family),
+        )
+
+    def _replay_memory_estimate(self, replay: RingBuffer, family: FamilySpec) -> dict[str, Any]:
+        estimate = replay.memory_estimate() if hasattr(replay, "memory_estimate") else {}
+        estimate["policy_width_mode"] = "global_legal_rows" if family.global_graph else "candidate_capped"
+        estimate["full_global_policy_rows"] = FULL_GLOBAL_POLICY_ROWS
+        estimate["non_global_policy_width_cap"] = REPLAY_POLICY_WIDTH_CAP
+        return estimate
+
     def _create_trial(
         self,
         trial_id: str,
@@ -554,13 +615,7 @@ class Phase3Supervisor:
         run_dir = self.output_root / "trials" / trial_id
         cfg = self._make_config(family, recipe, dynamic, run_dir, stage)
         recorder = RunRecorder.for_run_dir(run_dir, run_id=trial_id)
-        replay = RingBuffer(
-            capacity=cfg.buffer.capacity,
-            max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, FULL_GLOBAL_POLICY_ROWS),
-            recency_decay=cfg.buffer.recency_decay,
-            num_lookahead=len(cfg.buffer.lookahead_horizons),
-        )
+        replay = self._make_replay_buffer(cfg, family)
         trial = TrialState(
             trial_id=trial_id,
             family=family,
@@ -737,17 +792,7 @@ class Phase3Supervisor:
         self.log.write("pbt_baseline_explore", event)
 
     def _fresh_replay_for_trial(self, trial: TrialState) -> RingBuffer:
-        return RingBuffer(
-            capacity=trial.cfg.buffer.capacity,
-            max_policy_entries=trial.cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(
-                trial.cfg.selfplay.policy_target_top_k,
-                trial.cfg.model.candidate_budget,
-                FULL_GLOBAL_POLICY_ROWS,
-            ),
-            recency_decay=trial.cfg.buffer.recency_decay,
-            num_lookahead=len(trial.cfg.buffer.lookahead_horizons),
-        )
+        return self._make_replay_buffer(trial.cfg, trial.family)
 
     def _release_trial_runtime(self, trial: TrialState, *, reason: str) -> None:
         replay_capacity = int(getattr(trial.replay, "capacity", 0) or 0)
@@ -755,13 +800,7 @@ class Phase3Supervisor:
             return
         trial.trainer = None
         try:
-            trial.replay = RingBuffer(
-                capacity=1,
-                max_policy_entries=max(1, int(trial.cfg.selfplay.policy_target_top_k)),
-                max_policy_v2_entries=max(1, int(trial.cfg.model.candidate_budget), FULL_GLOBAL_POLICY_ROWS),
-                recency_decay=trial.cfg.buffer.recency_decay,
-                num_lookahead=len(trial.cfg.buffer.lookahead_horizons),
-            )
+            trial.replay = self._make_replay_buffer(trial.cfg, trial.family, capacity=1)
         except Exception:
             pass
         gc.collect()
@@ -791,6 +830,24 @@ class Phase3Supervisor:
             dynamic.lr = min(dynamic.lr, 3e-4)
         return dynamic
 
+    @staticmethod
+    def _is_global_graph_architecture(architecture: str) -> bool:
+        return str(architecture).lower() in GLOBAL_GRAPH_ARCHITECTURES
+
+    def _heads_for_recipe(self, family: FamilySpec, recipe: StaticRecipe) -> list[str]:
+        if not family.global_graph:
+            return list(HEAD_BUNDLES[recipe.head_bundle])
+        heads = ["policy_place", "value", "lookahead_4", "lookahead_12", "lookahead_36", "legal_token_quality"]
+        if recipe.head_bundle in {"prediction", "full_aux_light", "graph_tactical"}:
+            heads.extend(["opp_policy", "moves_left"])
+        if recipe.head_bundle in {"regret", "full_aux_light", "graph_tactical"}:
+            heads.extend(["regret_rank", "regret_value"])
+        if recipe.head_bundle == "graph_tactical" or family.architecture in {"global_pair_twostage_0", "global_graph_full_0"}:
+            heads.extend(["policy_pair_first", "policy_pair_second", "policy_pair_joint", "tactical"])
+        elif family.architecture in {"global_line_window_0", "global_graph_full_0"}:
+            heads.append("tactical")
+        return list(dict.fromkeys(heads))
+
     def _make_config(
         self,
         family: FamilySpec,
@@ -808,14 +865,16 @@ class Phase3Supervisor:
         cfg.model.blocks = family.blocks
         cfg.model.attention_positions = list(family.attention_positions)
         cfg.model.attention_heads = 8
-        cfg.model.sparse_policy = bool(family.sparse_policy or family.graph)
+        cfg.model.sparse_policy = bool(family.sparse_policy or (family.graph and not family.global_graph))
         cfg.model.graph_token_set = recipe.graph_token_set
         cfg.model.graph_token_budget = recipe.graph_token_budget
         cfg.model.graph_layers = recipe.graph_layers
-        cfg.model.sparse_prior_stage = int(recipe.sparse_prior_stage)
-        cfg.model.sparse_prior_mix = 0.25
+        cfg.model.sparse_prior_stage = 0 if family.global_graph else int(recipe.sparse_prior_stage)
+        cfg.model.sparse_prior_mix = 0.0 if family.global_graph else 0.25
         cfg.model.candidate_budget = recipe.candidate_budget if (family.sparse_policy or family.graph) else 256
-        cfg.model.heads = list(HEAD_BUNDLES[recipe.head_bundle])
+        cfg.model.heads = self._heads_for_recipe(family, recipe)
+        if family.global_graph and not (set(cfg.model.heads) & GLOBAL_GRAPH_PAIR_HEADS):
+            cfg.model.pair_prior_mix = 0.0
         cfg.buffer.lookahead_horizons = [4, 12, 36]
         cfg.buffer.lookahead_lambdas = [0.75, 0.90, 0.97]
         cfg.selfplay.mcts_simulations = recipe.full_sims
@@ -886,31 +945,49 @@ class Phase3Supervisor:
         return Config.model_validate(cfg.model_dump())
 
     def _apply_head_bundle_weights(self, cfg: Config, recipe: StaticRecipe, dynamic: DynamicParams) -> None:
+        heads = set(getattr(cfg.model, "heads", []))
+        is_global_graph = self._is_global_graph_architecture(getattr(cfg.model, "architecture", "cnn"))
         aux = (
             dynamic.graph_aux_multiplier
-            if getattr(cfg.model, "architecture", "cnn") in {"graph", "graph_hybrid_0"}
+            if getattr(cfg.model, "architecture", "cnn") in {"graph", "graph_hybrid_0"} or is_global_graph
             else dynamic.aux_multiplier
         )
-        weights = {
-            "policy": 1.0,
-            "value": dynamic.value_loss_weight,
-            "lookahead_4": 0.2 * aux,
-            "lookahead_12": 0.2 * aux,
-            "lookahead_36": 0.1 * aux,
-            "axis": 0.05 * aux,
-        }
-        if "opp_policy" in HEAD_BUNDLES[recipe.head_bundle]:
+        if is_global_graph:
+            weights = {
+                "policy_place": 1.0,
+                "value": dynamic.value_loss_weight,
+                "lookahead_4": 0.2 * aux,
+                "lookahead_12": 0.2 * aux,
+                "lookahead_36": 0.1 * aux,
+                "legal_token_quality": 0.05 * aux,
+            }
+        else:
+            weights = {
+                "policy": 1.0,
+                "value": dynamic.value_loss_weight,
+                "lookahead_4": 0.2 * aux,
+                "lookahead_12": 0.2 * aux,
+                "lookahead_36": 0.1 * aux,
+                "axis": 0.05 * aux,
+            }
+        if "opp_policy" in heads:
             weights["opp_policy"] = 0.15 * aux
-        if "moves_left" in HEAD_BUNDLES[recipe.head_bundle]:
+        if "moves_left" in heads:
             weights["moves_left"] = 0.05 * aux
-        if "regret_rank" in HEAD_BUNDLES[recipe.head_bundle]:
+        if "regret_rank" in heads:
             weights["regret_rank"] = 0.1 * aux
-        if "regret_value" in HEAD_BUNDLES[recipe.head_bundle]:
+        if "regret_value" in heads:
             weights["regret_value"] = 0.1 * aux
         if cfg.model.sparse_policy:
             weights["sparse_policy"] = dynamic.sparse_policy_loss
-        if "pair_policy" in HEAD_BUNDLES[recipe.head_bundle]:
+        if "pair_policy" in heads:
             weights["pair_policy"] = dynamic.pair_policy_loss
+        if heads & GLOBAL_GRAPH_PAIR_HEADS:
+            weights["policy_pair_first"] = dynamic.pair_policy_loss
+            weights["policy_pair_second"] = dynamic.pair_policy_loss
+            weights["policy_pair_joint"] = dynamic.pair_policy_loss
+        if "tactical" in heads:
+            weights["tactical"] = 0.05 * aux
         cfg.train.loss_weights = weights
 
     def _apply_dynamic_to_config(self, trial: TrialState) -> None:
@@ -930,7 +1007,10 @@ class Phase3Supervisor:
         cfg.selfplay.c_puct_init = float(dynamic.c_puct_init)
         cfg.selfplay.dirichlet_fraction = float(dynamic.dirichlet_fraction)
         if dynamic.dirichlet_alpha_mode == "scaled_total":
-            root_width = recipe.candidate_budget if (family.sparse_policy or family.graph) else recipe.policy_top_k
+            if family.global_graph:
+                root_width = FULL_GLOBAL_POLICY_ROWS
+            else:
+                root_width = recipe.candidate_budget if (family.sparse_policy or family.graph) else recipe.policy_top_k
             cfg.selfplay.dirichlet_alpha = float(dynamic.scaled_alpha_total) / max(float(root_width), 1.0)
         else:
             cfg.selfplay.dirichlet_alpha = float(dynamic.dirichlet_alpha)
@@ -1141,17 +1221,7 @@ class Phase3Supervisor:
         probe_cfg = Config.model_validate(probe_cfg.model_dump())
 
         recorder = RunRecorder.for_run_dir(probe_dir, run_id=f"{trial.trial_id}_runtime_sweep_{index:02d}")
-        probe_buffer = RingBuffer(
-            capacity=probe_cfg.buffer.capacity,
-            max_policy_entries=probe_cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(
-                probe_cfg.selfplay.policy_target_top_k,
-                probe_cfg.model.candidate_budget,
-                FULL_GLOBAL_POLICY_ROWS,
-            ),
-            recency_decay=probe_cfg.buffer.recency_decay,
-            num_lookahead=len(probe_cfg.buffer.lookahead_horizons),
-        )
+        probe_buffer = self._make_replay_buffer(probe_cfg, trial.family)
         model = trial.trainer.model if trial.trainer is not None else None
         gpu_before = self._nvidia_smi_snapshot()
         mem_before = self._system_memory_snapshot()
@@ -1199,6 +1269,7 @@ class Phase3Supervisor:
                 "gpu_before": gpu_before,
                 "gpu_after": gpu_after,
                 "memory": memory,
+                "replay_memory": self._replay_memory_estimate(probe_buffer, trial.family),
                 "selfplay": selfplay,
             }
         except Exception as exc:
@@ -1210,6 +1281,7 @@ class Phase3Supervisor:
                 "gpu_before": gpu_before,
                 "gpu_after": self._nvidia_smi_snapshot(),
                 "memory": self._summarize_runtime_memory(mem_before, self._system_memory_snapshot(), mem_samples),
+                "replay_memory": self._replay_memory_estimate(probe_buffer, trial.family),
             }
         finally:
             stop_memory_poll.set()
@@ -1231,12 +1303,10 @@ class Phase3Supervisor:
             worker_values = [max(1, base_workers - 1), base_workers, base_workers + 1]
         graph_low_memory = bool(trial.family.graph and self._low_memory_cuda_host())
         if graph_low_memory:
-            # A 2-worker graph probe can look like a useful comparison while
-            # pushing WSL into swap and poisoning the real epoch that follows.
-            # On the 24 GB / 12 GB host, keep graph sweeps to one worker and
-            # use wait-time variants as the cheap second comparison.
+            # Probe a narrow 1/2-worker lane after replay-width fixes, then let
+            # the runtime memory summary reject unsafe candidates.
             base_workers = 1
-            worker_values = [1]
+            worker_values = [1, 2]
         high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
         if high_search_non_graph:
             # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
@@ -1247,13 +1317,16 @@ class Phase3Supervisor:
             worker_values = sorted(set(worker_values + [2, 3, 4, 5, 6]))
             if self._low_memory_cuda_host():
                 base_workers = 1
-                worker_values = [1]
+                if getattr(trial.family, "architecture", "") == "restnet":
+                    worker_values = [1, 2]
+                else:
+                    worker_values = [1, 2, 3]
         worker_budget = max(1, int(self.host.logical_cpus) - max(1, int(cfg.runtime.selfplay_cpu_reserve)))
         max_workers = min(worker_budget, max(worker_values + [base_workers]))
         if high_search_non_graph and self._low_memory_cuda_host() and worker_values:
             max_workers = min(max_workers, max(worker_values))
         if graph_low_memory:
-            max_workers = 1
+            max_workers = min(max_workers, 2)
 
         candidates: list[dict[str, int]] = []
 
@@ -1505,6 +1578,9 @@ class Phase3Supervisor:
         family_names = [family.name for family in self._eligible_families()]
         if not family_names:
             family_names = [family.name for family in self.families]
+        graph_family_names = [family.name for family in self._eligible_families() if family.graph]
+        if not graph_family_names:
+            graph_family_names = ["graph_hybrid_0", *GLOBAL_GRAPH_SCOUT_FAMILIES]
         return SearchSpace(
             {
                 "model_family": {"type": "categorical", "choices": family_names},
@@ -1517,12 +1593,12 @@ class Phase3Supervisor:
                 "graph_token_budget": {
                     "type": "categorical",
                     "choices": [256, 384, 512],
-                    "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
+                    "condition": {"key": "model_family", "values": graph_family_names},
                 },
                 "graph_layers": {
                     "type": "categorical",
                     "choices": [1, 2, 3],
-                    "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
+                    "condition": {"key": "model_family", "values": graph_family_names},
                 },
                 "sparse_prior_stage": {
                     "type": "categorical",
@@ -1533,12 +1609,12 @@ class Phase3Supervisor:
         )
 
     def _static_recipe_from_bohb_config(self, family: FamilySpec, config: dict[str, Any]) -> StaticRecipe:
-        full_sims = int(config.get("full_sims", 256 if family.graph else 800))
+        full_sims = int(config.get("full_sims", 384 if family.global_graph else 256 if family.graph else 800))
         full_sims = self._host_safe_full_sims(family, full_sims)
         graph_budget = int(config.get("graph_token_budget", 256))
         graph_layers = int(config.get("graph_layers", 1))
         sparse_stage = int(config.get("sparse_prior_stage", 0 if not family.graph else 0))
-        if not family.graph:
+        if not family.graph or family.global_graph:
             sparse_stage = 0
         if family.graph:
             token_set = {
@@ -1546,12 +1622,16 @@ class Phase3Supervisor:
                 384: "graph384_windows",
                 512: "graph512_cover",
             }.get(graph_budget, "graph256_cells")
+            if family.global_graph and family.architecture in {"global_pair_twostage_0", "global_graph_full_0"} and graph_budget >= 512:
+                token_set = "graph512_turn_pair_prior"
         else:
             token_set = "graph256_cells"
             graph_budget = 256
             graph_layers = 1
         head_bundle = str(config.get("head_bundle", "structural"))
-        if family.graph and head_bundle not in {"graph_tactical", "full_aux_light", "structural"}:
+        if family.graph and not family.global_graph and head_bundle not in {"graph_tactical", "full_aux_light", "structural"}:
+            head_bundle = "graph_tactical"
+        if family.global_graph and family.architecture in {"global_pair_twostage_0", "global_graph_full_0"}:
             head_bundle = "graph_tactical"
         if not family.graph and head_bundle == "graph_tactical":
             head_bundle = "full_aux_light"
@@ -1593,6 +1673,27 @@ class Phase3Supervisor:
         return ladder
 
     def _recommended_recipe(self, family: FamilySpec) -> StaticRecipe:
+        if family.global_graph:
+            pair_scout = family.architecture in {"global_pair_twostage_0", "global_graph_full_0"}
+            token_budget = 384 if family.architecture == "global_line_window_0" else 256
+            token_set = "graph384_windows" if token_budget == 384 else "graph256_cells"
+            if family.architecture == "global_graph_full_0":
+                token_budget = 512
+                token_set = "graph512_turn_pair_prior"
+            return StaticRecipe(
+                full_sims=self._host_safe_full_sims(family, 384),
+                pcr_low_sims=128,
+                policy_top_k=96,
+                candidate_budget=min(token_budget, 512),
+                head_bundle="graph_tactical" if pair_scout else "structural",
+                temperature_family="slow_cool",
+                subtree_reuse=True,
+                graph_token_set=token_set,
+                graph_token_budget=token_budget,
+                graph_layers=1 if token_budget <= 384 else 2,
+                sparse_prior_stage=0,
+                train_batch_size=self._host_safe_train_batch_size(family, 128),
+            )
         if family.graph:
             return StaticRecipe(
                 full_sims=512,
@@ -1636,6 +1737,8 @@ class Phase3Supervisor:
         if not self._low_memory_cuda_host():
             return full_sims
         if family.architecture == "restnet":
+            return min(full_sims, 512)
+        if family.global_graph:
             return min(full_sims, 512)
         return full_sims
 
@@ -2334,6 +2437,38 @@ class Phase3Supervisor:
                 sparse_policy=True,
                 available=True,
             ),
+            FamilySpec(
+                "global_xattn_0",
+                "Staged global cross-attention legal-row graph scout.",
+                "global_xattn_0",
+                graph=True,
+                global_graph=True,
+                available=True,
+            ),
+            FamilySpec(
+                "global_line_window_0",
+                "Staged global line/window legal-row graph scout.",
+                "global_line_window_0",
+                graph=True,
+                global_graph=True,
+                available=True,
+            ),
+            FamilySpec(
+                "global_pair_twostage_0",
+                "Staged global two-stage pair-policy graph scout.",
+                "global_pair_twostage_0",
+                graph=True,
+                global_graph=True,
+                available=True,
+            ),
+            FamilySpec(
+                "global_graph_full_0",
+                "Staged full global graph scout below champion scale.",
+                "global_graph_full_0",
+                graph=True,
+                global_graph=True,
+                available=True,
+            ),
         ]
 
     def _reference_checkpoints(self) -> list[dict[str, Any]]:
@@ -2417,6 +2552,7 @@ class Phase3Supervisor:
             "pruned": trial.pruned,
             "prune_reason": trial.prune_reason,
             "heads": list(trial.cfg.model.heads),
+            "replay_memory": self._replay_memory_estimate(trial.replay, trial.family),
         }
 
     def _write_report(self, *, final: bool) -> None:

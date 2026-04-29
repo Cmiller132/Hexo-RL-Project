@@ -335,7 +335,7 @@ def test_selfplay_no_positions_does_not_quarantine_family():
     assert supervisor.log.events[-1][0] == "family_quarantine_skipped"
 
 
-def test_graph_low_memory_runtime_sweep_avoids_two_worker_probe():
+def test_graph_low_memory_runtime_sweep_retests_one_and_two_workers():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
     supervisor.args = SimpleNamespace(runtime_sweep_workers="2,3", runtime_sweep_max_candidates=2)
@@ -354,11 +354,11 @@ def test_graph_low_memory_runtime_sweep_avoids_two_worker_probe():
 
     candidates = module.Phase3Supervisor._runtime_sweep_candidates(supervisor, trial)
 
-    assert [candidate["workers"] for candidate in candidates] == [1, 1]
-    assert [candidate["max_wait_us"] for candidate in candidates] == [500, 800]
+    assert [candidate["workers"] for candidate in candidates] == [1, 2]
+    assert [candidate["max_wait_us"] for candidate in candidates] == [500, 500]
 
 
-def test_high_search_low_memory_runtime_sweep_uses_one_worker():
+def test_high_search_low_memory_runtime_sweep_retests_safe_workers():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
     supervisor.args = SimpleNamespace(runtime_sweep_workers="2,3", runtime_sweep_max_candidates=2)
@@ -377,9 +377,9 @@ def test_high_search_low_memory_runtime_sweep_uses_one_worker():
 
     candidates = module.Phase3Supervisor._runtime_sweep_candidates(supervisor, trial)
 
-    assert [candidate["workers"] for candidate in candidates] == [1, 1]
+    assert [candidate["workers"] for candidate in candidates] == [1, 2]
     assert [candidate["batch_size_per_worker"] for candidate in candidates] == [8, 8]
-    assert [candidate["max_wait_us"] for candidate in candidates] == [500, 800]
+    assert [candidate["max_wait_us"] for candidate in candidates] == [500, 500]
 
 
 def test_runtime_sweep_memory_summary_rejects_marginal_wsl_headroom():
@@ -468,6 +468,144 @@ def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
     ).full_sims == 800
 
 
+def test_finalist_pool_includes_staged_global_graph_scouts():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+
+    families = module.Phase3Supervisor._finalist_pool(supervisor)
+    by_name = {family.name: family for family in families}
+
+    assert set(module.GLOBAL_GRAPH_SCOUT_FAMILIES) <= set(by_name)
+    assert "global_graph768_champion" not in by_name
+    for name in module.GLOBAL_GRAPH_SCOUT_FAMILIES:
+        assert by_name[name].graph is True
+        assert by_name[name].global_graph is True
+        assert by_name[name].sparse_policy is False
+
+
+def test_global_graph_config_uses_graph_native_heads_and_legal_replay_width(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.base_cfg = module.Config()
+    supervisor.host = SimpleNamespace(
+        logical_cpus=32,
+        physical_cpus=16,
+        system="linux",
+        cuda_available=True,
+        cuda_name="test-gpu",
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+    )
+    supervisor.args = SimpleNamespace(seed=9300, train_batches=4, max_game_moves=64)
+    family = module.FamilySpec(
+        name="global_xattn_0",
+        description="global",
+        architecture="global_xattn_0",
+        graph=True,
+        global_graph=True,
+        available=True,
+    )
+    recipe = module.Phase3Supervisor._recommended_recipe(supervisor, family)
+
+    cfg = module.Phase3Supervisor._make_config(
+        supervisor,
+        family,
+        recipe,
+        module.DynamicParams(),
+        tmp_path,
+        "3A_calibration",
+    )
+    replay = module.Phase3Supervisor._make_replay_buffer(supervisor, cfg, family)
+
+    assert cfg.model.architecture == "global_xattn_0"
+    assert cfg.model.sparse_policy is False
+    assert "policy_place" in cfg.model.heads
+    assert "policy" not in cfg.model.heads
+    assert replay.max_policy_v2_entries == module.FULL_GLOBAL_POLICY_ROWS
+    assert replay.memory_estimate()["feature_groups"]["opp_policy"] is False
+
+
+def test_crop_replay_width_is_capped_below_full_global_rows(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.base_cfg = module.Config()
+    supervisor.host = SimpleNamespace(
+        logical_cpus=32,
+        physical_cpus=16,
+        system="linux",
+        cuda_available=True,
+        cuda_name="test-gpu",
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+    )
+    supervisor.args = SimpleNamespace(seed=9300, train_batches=4, max_game_moves=64)
+    family = module.FamilySpec("best_current_33", "cnn", "cnn", available=True)
+    recipe = module.StaticRecipe(
+        full_sims=512,
+        pcr_low_sims=128,
+        policy_top_k=96,
+        candidate_budget=256,
+        head_bundle="structural",
+        temperature_family="slow_cool",
+        train_batch_size=128,
+    )
+
+    cfg = module.Phase3Supervisor._make_config(
+        supervisor,
+        family,
+        recipe,
+        module.DynamicParams(),
+        tmp_path,
+        "3A_calibration",
+    )
+    replay = module.Phase3Supervisor._make_replay_buffer(supervisor, cfg, family)
+
+    assert replay.max_policy_v2_entries == 256
+    assert replay.max_policy_v2_entries < module.FULL_GLOBAL_POLICY_ROWS
+    assert replay.memory_estimate()["feature_groups"]["pair_policy"] is False
+
+
+def test_replay_buffer_skips_disabled_opp_and_pair_arrays():
+    module = _load_phase3_autotune_module()
+
+    replay = module.RingBuffer(
+        capacity=4,
+        max_policy_entries=2,
+        max_policy_v2_entries=16,
+        store_opp_policy=False,
+        store_pair_policy=False,
+    )
+
+    assert replay._opp_policy_v2_q is None
+    assert replay._opp_policies is None
+    assert replay._pair_policy_v2_q1 is None
+    assert replay.memory_estimate()["feature_groups"] == {
+        "opp_policy": False,
+        "pair_policy": False,
+        "sparse_diagnostics": True,
+    }
+
+
+def test_global_graph_candidate_recall_is_not_sparse_penalized():
+    module = _load_phase3_autotune_module()
+    services = module.EvaluationServices.__new__(module.EvaluationServices)
+    services.args = SimpleNamespace(candidate_recall_gate=0.95)
+    trial = SimpleNamespace(family=SimpleNamespace(sparse_policy=False, global_graph=True))
+
+    candidate = module.EvaluationServices.candidate_recall(
+        services,
+        trial,
+        {
+            "candidate_discovery_top8": 0.0,
+            "candidate_discovery_winning_move": 0.0,
+            "candidate_discovery_forced_block": 0.0,
+            "candidate_discovery_two_placement_cover": 0.0,
+        },
+    )
+
+    assert candidate == {"applicable": False, "score": 1.0}
+
+
 def test_static_candidates_are_family_balanced(tmp_path):
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
@@ -518,6 +656,56 @@ def test_static_candidates_are_family_balanced(tmp_path):
 
     assert counts == {"best_current_33": 4, "best_restnet_33": 4, "graph_hybrid_0": 4}
     assert supervisor.log.events[-1][0] == "static_candidates_generated"
+    assert supervisor.log.events[-1][1]["family_balanced"] is True
+
+
+def test_static_candidates_stay_balanced_with_global_graph_families(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(seed=9300)
+    supervisor.output_root = tmp_path
+    supervisor.log = _CaptureLog()
+    supervisor.host = SimpleNamespace(
+        cuda_available=True,
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+        physical_cpus=16,
+    )
+    supervisor.blocked_families = {}
+    supervisor.families = [
+        module.FamilySpec("best_current_33", "cnn", "cnn", available=True),
+        module.FamilySpec(
+            "best_restnet_33",
+            "restnet",
+            "restnet",
+            attention_positions=(5, 10, 14),
+            available=True,
+        ),
+        module.FamilySpec(
+            "graph_hybrid_0",
+            "graph",
+            "graph_hybrid_0",
+            graph=True,
+            sparse_policy=True,
+            available=True,
+        ),
+    ] + [
+        module.FamilySpec(name, "global", name, graph=True, global_graph=True, available=True)
+        for name in module.GLOBAL_GRAPH_SCOUT_FAMILIES
+    ]
+    supervisor.bohb_sampler = BOHBSampler(
+        module.Phase3Supervisor._bohb_search_space(supervisor),
+        min_resource=8,
+        max_resource=14,
+        warmup_points=6,
+    )
+
+    candidates = module.Phase3Supervisor._generate_static_candidates(supervisor, 14)
+    counts = {}
+    for family, _recipe in candidates:
+        counts[family.name] = counts.get(family.name, 0) + 1
+
+    assert counts == {family.name: 2 for family in supervisor.families}
     assert supervisor.log.events[-1][1]["family_balanced"] is True
 
 

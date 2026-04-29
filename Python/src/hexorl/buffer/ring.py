@@ -26,6 +26,9 @@ class RingBuffer:
         recency_decay: float = 0.99,
         num_lookahead: int = 0,
         max_policy_v2_entries: int | None = None,
+        store_opp_policy: bool = True,
+        store_pair_policy: bool = True,
+        store_sparse_diagnostics: bool = True,
     ):
         if capacity <= 0:
             raise ValueError("RingBuffer capacity must be positive")
@@ -39,6 +42,9 @@ class RingBuffer:
         self.max_policy_v2_entries = int(max_policy_v2_entries or max_policy_entries)
         self.recency_decay = recency_decay
         self.num_lookahead = num_lookahead
+        self.store_opp_policy = bool(store_opp_policy)
+        self.store_pair_policy = bool(store_pair_policy)
+        self.store_sparse_diagnostics = bool(store_sparse_diagnostics)
 
         # Storage arrays — struct of arrays
         self._histories: List[Optional[bytes]] = [None] * capacity
@@ -49,18 +55,58 @@ class RingBuffer:
         self._policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
         self._policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
-        self._opp_policy_v2_q = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._opp_policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._opp_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+        self._opp_policy_v2_q = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_opp_policy
+            else None
+        )
+        self._opp_policy_v2_r = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_opp_policy
+            else None
+        )
+        self._opp_policy_v2_probs = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+            if self.store_opp_policy
+            else None
+        )
         self._opp_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
-        self._opp_policy_legal_v2_q = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._opp_policy_legal_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_legal_v2_q = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_opp_policy
+            else None
+        )
+        self._opp_policy_legal_v2_r = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_opp_policy
+            else None
+        )
         self._opp_policy_legal_v2_counts = np.zeros(capacity, dtype=np.uint16)
-        self._pair_policy_v2_q1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._pair_policy_v2_r1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._pair_policy_v2_q2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._pair_policy_v2_r2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
-        self._pair_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+        self._pair_policy_v2_q1 = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_pair_policy
+            else None
+        )
+        self._pair_policy_v2_r1 = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_pair_policy
+            else None
+        )
+        self._pair_policy_v2_q2 = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_pair_policy
+            else None
+        )
+        self._pair_policy_v2_r2 = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+            if self.store_pair_policy
+            else None
+        )
+        self._pair_policy_v2_probs = (
+            np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
+            if self.store_pair_policy
+            else None
+        )
         self._pair_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
         self._policy_v2_exact: List[List[tuple[int, int, float]]] = [[] for _ in range(capacity)]
         self._opp_policy_v2_exact: List[List[tuple[int, int, float]]] = [[] for _ in range(capacity)]
@@ -115,8 +161,16 @@ class RingBuffer:
         self._regret_weights = np.zeros(capacity, dtype=np.float32)
         self._axis = np.full(capacity, -1, dtype=np.int16)
         self._moves_left = np.zeros(capacity, dtype=np.float32)
-        self._opp_policies = np.zeros((capacity, max_policy_entries), dtype=np.uint16)
-        self._opp_policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
+        self._opp_policies = (
+            np.zeros((capacity, max_policy_entries), dtype=np.uint16)
+            if self.store_opp_policy
+            else None
+        )
+        self._opp_policy_probs = (
+            np.zeros((capacity, max_policy_entries), dtype=np.float32)
+            if self.store_opp_policy
+            else None
+        )
         self._opp_policy_counts = np.zeros(capacity, dtype=np.uint16)
         self._opp_policy_weights = np.zeros(capacity, dtype=np.float32)
         self._game_ids = np.zeros(capacity, dtype=np.uint32)
@@ -151,6 +205,36 @@ class RingBuffer:
     @property
     def is_full(self) -> bool:
         return self._size == self.capacity
+
+    def memory_estimate(self) -> dict:
+        """Return an allocation estimate for replay telemetry."""
+        numpy_bytes = 0
+        arrays: dict[str, int] = {}
+        for name, value in self.__dict__.items():
+            if isinstance(value, np.ndarray):
+                arrays[name] = int(value.nbytes)
+                numpy_bytes += int(value.nbytes)
+        python_list_bytes = (
+            self.capacity * 8 * 5
+            + len(self._histories) * 8
+        )
+        return {
+            "capacity": int(self.capacity),
+            "max_policy_entries": int(self.max_policy_entries),
+            "max_policy_v2_entries": int(self.max_policy_v2_entries),
+            "feature_groups": {
+                "opp_policy": bool(self.store_opp_policy),
+                "pair_policy": bool(self.store_pair_policy),
+                "sparse_diagnostics": bool(self.store_sparse_diagnostics),
+            },
+            "allocated_numpy_mib": round(numpy_bytes / (1024.0 * 1024.0), 3),
+            "estimated_python_list_mib": round(python_list_bytes / (1024.0 * 1024.0), 3),
+            "estimated_total_mib": round((numpy_bytes + python_list_bytes) / (1024.0 * 1024.0), 3),
+            "largest_arrays_mib": {
+                name: round(size / (1024.0 * 1024.0), 3)
+                for name, size in sorted(arrays.items(), key=lambda item: item[1], reverse=True)[:8]
+            },
+        }
 
     def append(self, record: PositionRecord):
         """Append one position record. Thread-safe."""
@@ -320,16 +404,17 @@ class RingBuffer:
             if self._lookahead is not None:
                 lv = self._lookahead[idx].tolist()
             opp_policy = {}
-            n_opp = int(self._opp_policy_counts[idx])
-            for j in range(n_opp):
-                action_idx = int(self._opp_policies[idx, j])
-                prob = float(self._opp_policy_probs[idx, j])
-                if prob > 0:
-                    opp_policy[action_idx] = prob
+            if self.store_opp_policy and self._opp_policies is not None and self._opp_policy_probs is not None:
+                n_opp = int(self._opp_policy_counts[idx])
+                for j in range(n_opp):
+                    action_idx = int(self._opp_policies[idx, j])
+                    prob = float(self._opp_policy_probs[idx, j])
+                    if prob > 0:
+                        opp_policy[action_idx] = prob
             policy_v2 = list(self._policy_v2_exact[idx])
-            opp_policy_v2 = list(self._opp_policy_v2_exact[idx])
-            opp_policy_legal_v2 = list(self._opp_policy_legal_v2_exact[idx])
-            pair_policy_v2 = list(self._pair_policy_v2_exact[idx])
+            opp_policy_v2 = list(self._opp_policy_v2_exact[idx]) if self.store_opp_policy else []
+            opp_policy_legal_v2 = list(self._opp_policy_legal_v2_exact[idx]) if self.store_opp_policy else []
+            pair_policy_v2 = list(self._pair_policy_v2_exact[idx]) if self.store_pair_policy else []
 
             return PositionRecord(
                 move_history=self._histories[idx],
@@ -346,7 +431,7 @@ class RingBuffer:
                 outcome=outcome,
                 lookahead_values=lv,
                 opp_policy_target=opp_policy,
-                opp_policy_weight=float(self._opp_policy_weights[idx]),
+                opp_policy_weight=float(self._opp_policy_weights[idx]) if self.store_opp_policy else 0.0,
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
                 opp_policy_legal_v2=opp_policy_legal_v2,
@@ -607,18 +692,28 @@ class RingBuffer:
             self._policy_v2_r.fill(0)
             self._policy_v2_probs.fill(0.0)
             self._policy_v2_counts.fill(0)
-            self._opp_policy_v2_q.fill(0)
-            self._opp_policy_v2_r.fill(0)
-            self._opp_policy_v2_probs.fill(0.0)
+            if self._opp_policy_v2_q is not None:
+                self._opp_policy_v2_q.fill(0)
+            if self._opp_policy_v2_r is not None:
+                self._opp_policy_v2_r.fill(0)
+            if self._opp_policy_v2_probs is not None:
+                self._opp_policy_v2_probs.fill(0.0)
             self._opp_policy_v2_counts.fill(0)
-            self._opp_policy_legal_v2_q.fill(0)
-            self._opp_policy_legal_v2_r.fill(0)
+            if self._opp_policy_legal_v2_q is not None:
+                self._opp_policy_legal_v2_q.fill(0)
+            if self._opp_policy_legal_v2_r is not None:
+                self._opp_policy_legal_v2_r.fill(0)
             self._opp_policy_legal_v2_counts.fill(0)
-            self._pair_policy_v2_q1.fill(0)
-            self._pair_policy_v2_r1.fill(0)
-            self._pair_policy_v2_q2.fill(0)
-            self._pair_policy_v2_r2.fill(0)
-            self._pair_policy_v2_probs.fill(0.0)
+            if self._pair_policy_v2_q1 is not None:
+                self._pair_policy_v2_q1.fill(0)
+            if self._pair_policy_v2_r1 is not None:
+                self._pair_policy_v2_r1.fill(0)
+            if self._pair_policy_v2_q2 is not None:
+                self._pair_policy_v2_q2.fill(0)
+            if self._pair_policy_v2_r2 is not None:
+                self._pair_policy_v2_r2.fill(0)
+            if self._pair_policy_v2_probs is not None:
+                self._pair_policy_v2_probs.fill(0.0)
             self._pair_policy_v2_counts.fill(0)
             for store in (
                 self._policy_v2_exact,
@@ -675,8 +770,10 @@ class RingBuffer:
             self._regret_weights.fill(0.0)
             self._axis.fill(-1)
             self._moves_left.fill(0.0)
-            self._opp_policies.fill(0)
-            self._opp_policy_probs.fill(0.0)
+            if self._opp_policies is not None:
+                self._opp_policies.fill(0)
+            if self._opp_policy_probs is not None:
+                self._opp_policy_probs.fill(0.0)
             self._opp_policy_counts.fill(0)
             self._opp_policy_weights.fill(0.0)
             self._game_ids.fill(0)
@@ -696,8 +793,11 @@ class RingBuffer:
         self._regret_weights[idx] = record.regret_weight
         self._axis[idx] = record.axis_label
         self._moves_left[idx] = record.moves_left
-        self._opp_policy_weights[idx] = record.opp_policy_weight
+        self._opp_policy_weights[idx] = record.opp_policy_weight if self.store_opp_policy else 0.0
 
+        if not self.store_opp_policy or self._opp_policies is None or self._opp_policy_probs is None:
+            self._opp_policy_counts[idx] = 0
+            return
         opp_entries = list(record.opp_policy_target.items())
         n_opp = min(len(opp_entries), self.max_policy_entries)
         self._opp_policy_counts[idx] = n_opp
@@ -725,56 +825,86 @@ class RingBuffer:
             self._policy_v2_r[idx, j] = int(r)
             self._policy_v2_probs[idx, j] = float(prob)
 
-        opp_entries = list(record.opp_policy_target_v2)
-        self._opp_policy_v2_exact[idx] = [
-            (int(q), int(r), float(prob))
-            for q, r, prob in opp_entries
-            if float(prob) > 0.0
-        ]
-        n_opp = min(len(opp_entries), self.max_policy_v2_entries)
-        self._opp_policy_v2_counts[idx] = n_opp
-        self._opp_policy_v2_q[idx].fill(0)
-        self._opp_policy_v2_r[idx].fill(0)
-        self._opp_policy_v2_probs[idx].fill(0.0)
-        for j, (q, r, prob) in enumerate(opp_entries[:n_opp]):
-            self._opp_policy_v2_q[idx, j] = int(q)
-            self._opp_policy_v2_r[idx, j] = int(r)
-            self._opp_policy_v2_probs[idx, j] = float(prob)
+        if self.store_opp_policy:
+            opp_entries = list(record.opp_policy_target_v2)
+            self._opp_policy_v2_exact[idx] = [
+                (int(q), int(r), float(prob))
+                for q, r, prob in opp_entries
+                if float(prob) > 0.0
+            ]
+            n_opp = min(len(opp_entries), self.max_policy_v2_entries)
+            self._opp_policy_v2_counts[idx] = n_opp
+            if self._opp_policy_v2_q is not None:
+                self._opp_policy_v2_q[idx].fill(0)
+            if self._opp_policy_v2_r is not None:
+                self._opp_policy_v2_r[idx].fill(0)
+            if self._opp_policy_v2_probs is not None:
+                self._opp_policy_v2_probs[idx].fill(0.0)
+            for j, (q, r, prob) in enumerate(opp_entries[:n_opp]):
+                if self._opp_policy_v2_q is not None:
+                    self._opp_policy_v2_q[idx, j] = int(q)
+                if self._opp_policy_v2_r is not None:
+                    self._opp_policy_v2_r[idx, j] = int(r)
+                if self._opp_policy_v2_probs is not None:
+                    self._opp_policy_v2_probs[idx, j] = float(prob)
 
-        opp_legal_entries = list(record.opp_policy_legal_v2)
-        self._opp_policy_legal_v2_exact[idx] = [
-            (int(q), int(r))
-            for q, r in opp_legal_entries
-        ]
-        n_opp_legal = min(len(opp_legal_entries), self.max_policy_v2_entries)
-        self._opp_policy_legal_v2_counts[idx] = n_opp_legal
-        self._opp_policy_legal_v2_q[idx].fill(0)
-        self._opp_policy_legal_v2_r[idx].fill(0)
-        for j, (q, r) in enumerate(opp_legal_entries[:n_opp_legal]):
-            self._opp_policy_legal_v2_q[idx, j] = int(q)
-            self._opp_policy_legal_v2_r[idx, j] = int(r)
+            opp_legal_entries = list(record.opp_policy_legal_v2)
+            self._opp_policy_legal_v2_exact[idx] = [
+                (int(q), int(r))
+                for q, r in opp_legal_entries
+            ]
+            n_opp_legal = min(len(opp_legal_entries), self.max_policy_v2_entries)
+            self._opp_policy_legal_v2_counts[idx] = n_opp_legal
+            if self._opp_policy_legal_v2_q is not None:
+                self._opp_policy_legal_v2_q[idx].fill(0)
+            if self._opp_policy_legal_v2_r is not None:
+                self._opp_policy_legal_v2_r[idx].fill(0)
+            for j, (q, r) in enumerate(opp_legal_entries[:n_opp_legal]):
+                if self._opp_policy_legal_v2_q is not None:
+                    self._opp_policy_legal_v2_q[idx, j] = int(q)
+                if self._opp_policy_legal_v2_r is not None:
+                    self._opp_policy_legal_v2_r[idx, j] = int(r)
+        else:
+            self._opp_policy_v2_exact[idx] = []
+            self._opp_policy_legal_v2_exact[idx] = []
+            self._opp_policy_v2_counts[idx] = 0
+            self._opp_policy_legal_v2_counts[idx] = 0
 
-        pair_entries = list(record.pair_policy_target_v2)
-        self._pair_policy_v2_exact[idx] = [
-            ((int(first[0]), int(first[1])), (int(second[0]), int(second[1])), float(prob))
-            for first, second, prob in pair_entries
-            if float(prob) > 0.0
-        ]
-        n_pair = min(len(pair_entries), self.max_policy_v2_entries)
-        self._pair_policy_v2_counts[idx] = n_pair
-        self._pair_policy_v2_q1[idx].fill(0)
-        self._pair_policy_v2_r1[idx].fill(0)
-        self._pair_policy_v2_q2[idx].fill(0)
-        self._pair_policy_v2_r2[idx].fill(0)
-        self._pair_policy_v2_probs[idx].fill(0.0)
-        for j, (first, second, prob) in enumerate(pair_entries[:n_pair]):
-            q1, r1 = first
-            q2, r2 = second
-            self._pair_policy_v2_q1[idx, j] = int(q1)
-            self._pair_policy_v2_r1[idx, j] = int(r1)
-            self._pair_policy_v2_q2[idx, j] = int(q2)
-            self._pair_policy_v2_r2[idx, j] = int(r2)
-            self._pair_policy_v2_probs[idx, j] = float(prob)
+        if self.store_pair_policy:
+            pair_entries = list(record.pair_policy_target_v2)
+            self._pair_policy_v2_exact[idx] = [
+                ((int(first[0]), int(first[1])), (int(second[0]), int(second[1])), float(prob))
+                for first, second, prob in pair_entries
+                if float(prob) > 0.0
+            ]
+            n_pair = min(len(pair_entries), self.max_policy_v2_entries)
+            self._pair_policy_v2_counts[idx] = n_pair
+            if self._pair_policy_v2_q1 is not None:
+                self._pair_policy_v2_q1[idx].fill(0)
+            if self._pair_policy_v2_r1 is not None:
+                self._pair_policy_v2_r1[idx].fill(0)
+            if self._pair_policy_v2_q2 is not None:
+                self._pair_policy_v2_q2[idx].fill(0)
+            if self._pair_policy_v2_r2 is not None:
+                self._pair_policy_v2_r2[idx].fill(0)
+            if self._pair_policy_v2_probs is not None:
+                self._pair_policy_v2_probs[idx].fill(0.0)
+            for j, (first, second, prob) in enumerate(pair_entries[:n_pair]):
+                q1, r1 = first
+                q2, r2 = second
+                if self._pair_policy_v2_q1 is not None:
+                    self._pair_policy_v2_q1[idx, j] = int(q1)
+                if self._pair_policy_v2_r1 is not None:
+                    self._pair_policy_v2_r1[idx, j] = int(r1)
+                if self._pair_policy_v2_q2 is not None:
+                    self._pair_policy_v2_q2[idx, j] = int(q2)
+                if self._pair_policy_v2_r2 is not None:
+                    self._pair_policy_v2_r2[idx, j] = int(r2)
+                if self._pair_policy_v2_probs is not None:
+                    self._pair_policy_v2_probs[idx, j] = float(prob)
+        else:
+            self._pair_policy_v2_exact[idx] = []
+            self._pair_policy_v2_counts[idx] = 0
 
         dropped_mass = sum(float(prob) for _q, _r, prob in entries[n:])
         self._outside_policy_mass[idx] = float(record.target_policy_mass_outside_window)
