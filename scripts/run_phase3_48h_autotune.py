@@ -825,6 +825,7 @@ class Phase3Supervisor:
         cfg.selfplay.train_policy_on_full_search_only = True
         cfg.selfplay.train_on_truncated_games = True
         cfg.selfplay.max_game_moves = self._max_game_moves_for_stage(stage)
+        cfg.buffer.capacity = self._host_safe_buffer_capacity()
         cfg.runtime.autotune = True
         cfg.selfplay.num_workers = 0
         cfg.selfplay.batch_size_per_worker = 0
@@ -1646,6 +1647,17 @@ class Phase3Supervisor:
         if memory_hungry:
             return min(batch_size, 128)
         return min(batch_size, 256)
+
+    def _host_safe_buffer_capacity(self) -> int:
+        capacity = max(1, int(self.base_cfg.buffer.capacity))
+        if not self._low_memory_cuda_host():
+            return capacity
+        # The full policy-v2 replay schema preallocates many board-area-wide
+        # arrays. A 100k-capacity buffer is useful for long standalone training,
+        # but it touches tens of GiB during multi-epoch ASHA screening on this
+        # WSL host. Keep enough recent positions for 384-move, 8-14 epoch
+        # comparisons while avoiding the memory cliff.
+        return min(capacity, 8192)
 
     @staticmethod
     def _pcr_low_sims_for_full_sims(full_sims: int) -> int:

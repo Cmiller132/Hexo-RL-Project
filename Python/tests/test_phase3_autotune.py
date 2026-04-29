@@ -500,6 +500,7 @@ def test_low_memory_graph_config_extends_inference_start_timeout(tmp_path):
     )
 
     assert cfg.runtime.inference_start_timeout_s == 90.0
+    assert cfg.buffer.capacity == 8192
 
 
 def test_runtime_sweep_prunes_when_all_candidates_fail(tmp_path):
