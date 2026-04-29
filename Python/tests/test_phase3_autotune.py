@@ -272,7 +272,7 @@ def test_selfplay_no_positions_does_not_quarantine_family():
     assert supervisor.log.events[-1][0] == "family_quarantine_skipped"
 
 
-def test_graph_low_memory_runtime_sweep_includes_one_worker():
+def test_graph_low_memory_runtime_sweep_avoids_two_worker_probe():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
     supervisor.args = SimpleNamespace(runtime_sweep_workers="2,3", runtime_sweep_max_candidates=2)
@@ -291,7 +291,22 @@ def test_graph_low_memory_runtime_sweep_includes_one_worker():
 
     candidates = module.Phase3Supervisor._runtime_sweep_candidates(supervisor, trial)
 
-    assert [candidate["workers"] for candidate in candidates] == [1, 2]
+    assert [candidate["workers"] for candidate in candidates] == [1, 1]
+    assert [candidate["max_wait_us"] for candidate in candidates] == [500, 800]
+
+
+def test_runtime_sweep_memory_summary_rejects_marginal_wsl_headroom():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+
+    summary = module.Phase3Supervisor._summarize_runtime_memory(
+        supervisor,
+        {"total_gb": 23.5, "available_gb": 8.0, "used_gb": 15.5, "swap_used_gb": 0.0},
+        {"total_gb": 23.5, "available_gb": 5.5, "used_gb": 18.0, "swap_used_gb": 0.2},
+        [{"total_gb": 23.5, "available_gb": 3.5, "used_gb": 20.0, "swap_used_gb": 0.2}],
+    )
+
+    assert summary["unsafe"] is True
 
 
 def test_low_memory_restnet_recommended_recipe_caps_train_batch():

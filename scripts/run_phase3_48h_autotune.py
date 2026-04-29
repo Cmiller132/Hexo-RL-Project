@@ -1217,6 +1217,8 @@ class Phase3Supervisor:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
 
     def _runtime_sweep_candidates(self, trial: TrialState) -> list[dict[str, int]]:
         cfg = trial.cfg
@@ -1228,7 +1230,12 @@ class Phase3Supervisor:
             worker_values = [max(1, base_workers - 1), base_workers, base_workers + 1]
         graph_low_memory = bool(trial.family.graph and self._low_memory_cuda_host())
         if graph_low_memory:
-            worker_values = sorted(set([1, 2] + [value for value in worker_values if value <= 2]))
+            # A 2-worker graph probe can look like a useful comparison while
+            # pushing WSL into swap and poisoning the real epoch that follows.
+            # On the 24 GB / 12 GB host, keep graph sweeps to one worker and
+            # use wait-time variants as the cheap second comparison.
+            base_workers = 1
+            worker_values = [1]
         high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
         if high_search_non_graph:
             # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
@@ -1241,6 +1248,8 @@ class Phase3Supervisor:
         max_workers = min(worker_budget, max(worker_values + [base_workers]))
         if high_search_non_graph and self._low_memory_cuda_host() and worker_values:
             max_workers = min(max_workers, max(worker_values))
+        if graph_low_memory:
+            max_workers = 1
 
         candidates: list[dict[str, int]] = []
 
@@ -1364,8 +1373,8 @@ class Phase3Supervisor:
         swap_before_gb = float(before.get("swap_used_gb", 0.0) or 0.0) if before else 0.0
         min_available_fraction = min_available_gb / max(total_gb, 1e-6)
         unsafe = bool(
-            min_available_gb < max(2.5, total_gb * 0.12)
-            or min_available_fraction < 0.10
+            min_available_gb < max(4.0, total_gb * 0.15)
+            or min_available_fraction < 0.14
             or max_swap_used_gb > max(swap_before_gb + 0.50, 1.0)
         )
         return {
