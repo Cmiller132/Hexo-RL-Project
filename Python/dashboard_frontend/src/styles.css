@@ -192,7 +192,7 @@ h1 {
 
 .suiteHero {
   display: grid;
-  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  grid-template-columns: repeat(6, minmax(128px, 1fr));
   gap: 8px;
 }
 
@@ -392,6 +392,32 @@ h1 {
 .tableWrap {
   overflow: auto;
   max-height: 68vh;
+}
+
+.tableWrap.recentTable {
+  max-height: 340px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+}
+
+.tableWrap.mediumTable {
+  max-height: 420px;
+}
+
+.tableWrap.suiteTable {
+  max-height: 520px;
+}
+
+.tableWrap.recentTable table {
+  min-width: 980px;
+}
+
+.tableWrap.suiteTable table {
+  min-width: 1320px;
+}
+
+.tableWrap.mediumTable table {
+  min-width: 1100px;
 }
 
 table {

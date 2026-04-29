@@ -2,6 +2,8 @@
 
 import argparse
 import logging
+import platform
+import sys
 from pathlib import Path
 
 from hexorl.config import load_config
@@ -123,9 +125,36 @@ def main():
 
         from hexorl.dashboard.app import create_app
 
+        logging.info(
+            "Dashboard startup db=%s run_root=%s host=%s port=%s python=%s platform=%s",
+            args.db,
+            args.run_root,
+            args.host,
+            args.port,
+            sys.version.split()[0],
+            platform.platform(),
+        )
         app = create_app(args.db, run_root=args.run_root)
-        print(f"Serving dashboard at http://{args.host}:{args.port}")
-        uvicorn.run(app, host=args.host, port=args.port)
+        try:
+            print(f"Serving dashboard at http://{args.host}:{args.port}", flush=True)
+            uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        except BaseException:
+            logging.exception(
+                "Dashboard server exited with an exception db=%s run_root=%s host=%s port=%s",
+                args.db,
+                args.run_root,
+                args.host,
+                args.port,
+            )
+            raise
+        finally:
+            logging.info(
+                "Dashboard server stopped db=%s run_root=%s host=%s port=%s",
+                args.db,
+                args.run_root,
+                args.host,
+                args.port,
+            )
     elif args.command == "index-checkpoints":
         store = DashboardStore(args.db)
         results = scan_checkpoints(args.path, store, run_id=args.run_id)

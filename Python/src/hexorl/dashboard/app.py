@@ -525,11 +525,7 @@ def _suite_games(run_root: Path, *, run_id: str | None = None, limit: int = 200)
 def _suite_checkpoints(run_root: Path, *, run_id: str | None = None) -> list[dict[str, Any]]:
     trial_dirs = [run_root / "trials" / run_id] if run_id else _suite_trial_dirs(run_root)
     rows: list[dict[str, Any]] = []
-    score_by_trial = {
-        trial["trial_id"]: _finite_or_none(trial.get("last_score"))
-        for trial in _suite_state(run_root).get("trials", [])
-        if trial.get("trial_id")
-    }
+    score_by_trial = _suite_score_by_trial(run_root)
     for trial_dir in trial_dirs:
         db = trial_dir / "dashboard.sqlite3"
         if not db.exists():
@@ -550,6 +546,7 @@ def _suite_checkpoints(run_root: Path, *, run_id: str | None = None) -> list[dic
             row["trial_id"] = trial_id
             row["source_db"] = str(db)
             row["score"] = score_by_trial.get(trial_id)
+            row["scheduler_score"] = row["score"]
             rows.append(row)
     rows.sort(
         key=lambda row: (
@@ -590,6 +587,7 @@ def _suite_best_checkpoints(run_root: Path, *, limit: int = 50) -> list[dict[str
 
 def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
     state_trials = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
+    score_by_trial = _suite_score_by_trial(run_root)
     rows: list[dict[str, Any]] = []
     for trial_dir in _suite_trial_dirs(run_root):
         trial_id = trial_dir.name
@@ -601,7 +599,7 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
         counts = _suite_trial_counts(trial_dir)
         latest_selfplay = latest.get("selfplay") or {}
         latest_train = latest.get("train") or {}
-        score = state.get("last_score")
+        score = score_by_trial.get(trial_id, state.get("last_score"))
         if (score is None or score == "-inf") and scores:
             score = scores[-1].get("scheduler_score")
         row = {
@@ -647,11 +645,7 @@ def _suite_status(run_root: Path) -> dict[str, Any]:
     state = _suite_state(run_root)
     events = _jsonl_tail(run_root / "events.jsonl", limit=100)
     trials = _suite_trials(run_root)
-    latest_stage = ""
-    for event in reversed(events):
-        if event.get("event") == "stage_start":
-            latest_stage = str(event.get("stage") or "")
-            break
+    latest_stage = _latest_suite_stage(state, events, trials)
     total_games = sum(int(trial.get("games") or 0) for trial in trials)
     total_positions = sum(int(trial.get("positions") or 0) for trial in trials)
     best = next((trial for trial in trials if not trial.get("pruned") and trial.get("score") is not None), None)
@@ -675,6 +669,9 @@ def _suite_status(run_root: Path) -> dict[str, Any]:
         "current_trial_id": activity.get("trial_id"),
         "current_model": activity.get("model"),
         "current_positions_per_sec": activity.get("positions_per_sec"),
+        "current_stage": activity.get("stage") or latest_stage,
+        "last_event_name": (events[-1] if events else {}).get("event"),
+        "last_event_time": (events[-1] if events else {}).get("time"),
     }
 
 
@@ -753,6 +750,44 @@ def _suite_trial_counts(trial_dir: Path) -> dict[str, int]:
     return counts
 
 
+def _suite_score_by_trial(run_root: Path) -> dict[str, float | None]:
+    scores: dict[str, float | None] = {}
+    for trial in _suite_state(run_root).get("trials", []):
+        trial_id = trial.get("trial_id")
+        if not trial_id:
+            continue
+        scores[str(trial_id)] = _finite_or_none(trial.get("last_score"))
+    for trial_dir in _suite_trial_dirs(run_root):
+        trial_id = trial_dir.name
+        if scores.get(trial_id) is not None:
+            continue
+        for row in reversed(_jsonl_tail(trial_dir / "scores.jsonl", limit=32)):
+            score = _finite_or_none(row.get("scheduler_score"))
+            if score is None:
+                score = _finite_or_none(row.get("score"))
+            if score is not None:
+                scores[trial_id] = score
+                break
+    return scores
+
+
+def _latest_suite_stage(
+    state: dict[str, Any],
+    events: list[dict[str, Any]],
+    trials: list[dict[str, Any]],
+) -> str:
+    for key in ("stage", "current_stage", "latest_stage"):
+        if state.get(key):
+            return str(state[key])
+    for event in reversed(events):
+        if event.get("stage"):
+            return str(event["stage"])
+    for trial in sorted(trials, key=lambda row: float(row.get("updated_at") or 0.0), reverse=True):
+        if trial.get("stage"):
+            return str(trial["stage"])
+    return ""
+
+
 def _jsonl_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -798,10 +833,12 @@ def _supervisor_activity(
         action = f"Self-play running, {progress['progress_pct']:.1f}% of current epoch"
     elif latest_event.get("event"):
         action = _event_blurb(str(latest_event.get("event")))
+    stage = latest_event.get("stage") or trial.get("stage") or ""
     return {
         "trial_id": latest_trial_id or None,
         "model": trial.get("family") or latest_event.get("family") or None,
         "architecture": trial.get("architecture") or None,
+        "stage": stage,
         "action": action,
         "positions_per_sec": positions_per_sec,
         "progress": progress,

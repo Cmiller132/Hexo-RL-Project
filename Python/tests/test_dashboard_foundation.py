@@ -1,3 +1,4 @@
+import json
 import struct
 
 import numpy as np
@@ -265,6 +266,72 @@ def test_fastapi_dashboard_smoke(tmp_path):
     ).json()
     assert spread["cells"]
     assert spread["debug_terms"]["legal_cells_scored"] > 0
+
+
+def test_suite_dashboard_scores_and_stage_fallback(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "trial-a"
+    trial_dir.mkdir(parents=True)
+    store = DashboardStore(trial_dir / "dashboard.sqlite3")
+    ckpt = trial_dir / "epoch_0002.pt"
+    ckpt.write_bytes(b"fake")
+    store.upsert_checkpoint(
+        path=ckpt,
+        sha256="abc",
+        run_id="trial-a",
+        epoch=2,
+        global_step=20,
+        is_loadable=True,
+    )
+    (trial_dir / "trial.json").write_text(
+        json.dumps(
+            {
+                "trial_id": "trial-a",
+                "family": {"name": "best_current_33", "architecture": "cnn"},
+                "static": {"full_sims": 800, "pcr_low_sims": 192},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trial_dir / "LATEST.json").write_text(
+        json.dumps(
+            {
+                "stage": "3B_static_asha",
+                "epoch": 2,
+                "train": {"loss_total": 1.5},
+                "selfplay": {"positions_per_min": 600.0},
+                "checkpoint_path": str(ckpt),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trial_dir / "scores.jsonl").write_text(
+        json.dumps({"scheduler_score": 0.4242, "stage": "3B_static_asha"}) + "\n",
+        encoding="utf-8",
+    )
+    (run_root / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "stage_start", "stage": "3A_calibration", "time": 1.0}),
+                json.dumps({"event": "trial_epoch_complete", "stage": "3B_static_asha", "trial_id": "trial-a", "time": 2.0}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_root / "manifest.json").write_text(json.dumps({"args": {"max_game_moves": 384}}), encoding="utf-8")
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+
+    best = client.get("/api/suite/best-checkpoints").json()
+    assert best[0]["score"] == pytest.approx(0.4242)
+    status = client.get("/api/suite/status").json()
+    assert status["latest_stage"] == "3B_static_asha"
+    assert status["best_score"] == pytest.approx(0.4242)
 
 
 def test_noisy_model_player_reproducible_without_engine():

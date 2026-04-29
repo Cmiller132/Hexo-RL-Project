@@ -26,6 +26,7 @@ import random
 import shutil
 import statistics
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -97,8 +98,8 @@ HEAD_BUNDLES: dict[str, list[str]] = {
 
 
 STATIC_SPACE = {
-    "full_sims": [800, 1200, 1600],
-    "pcr_low_sims": [192, 256, 384],
+    "full_sims": [512, 800, 1200, 1600],
+    "pcr_low_sims": [128, 192, 256, 384],
     "policy_top_k": [64, 96, 128],
     "candidate_budget": [128, 256, 384],
     "temperature_family": ["fast_cool", "slow_cool"],
@@ -413,9 +414,10 @@ class Phase3Supervisor:
                 break
             self.log.write("asha_rung_start", {"resource": resource, "trial_ids": [t.trial_id for t in current]})
             for trial in current:
-                while trial.epoch < resource and self._within_stage(stage):
+                while trial.epoch < resource and not trial.pruned and self._within_stage(stage):
                     self._train_trial_epoch(trial, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
-                self._evaluate_trial(trial, stage=stage, force=True)
+                if not trial.pruned:
+                    self._evaluate_trial(trial, stage=stage, force=True)
             current = self._promote_top_fraction(current, stage=stage)
         self._save_state()
 
@@ -431,10 +433,11 @@ class Phase3Supervisor:
                 if trial.pruned:
                     continue
                 for _ in range(self.args.perturb_interval):
-                    if not self._within_stage(stage):
+                    if trial.pruned or not self._within_stage(stage):
                         break
                     self._train_trial_epoch(trial, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
-                self._evaluate_trial(trial, stage=stage, force=True)
+                if not trial.pruned:
+                    self._evaluate_trial(trial, stage=stage, force=True)
             self._score_population(population, stage=stage)
             self._pbt_exploit_explore(population, generation)
             self._save_state()
@@ -460,11 +463,13 @@ class Phase3Supervisor:
         self.log.write("stage_start", {"stage": stage, "champion": champion.trial_id})
         # Continue the selected trial; this protects champion time by avoiding
         # further broad exploration once Phase 3D starts.
-        while self._within_stage(stage) and time.monotonic() < self.deadline:
+        while not champion.pruned and self._within_stage(stage) and time.monotonic() < self.deadline:
             self._train_trial_epoch(champion, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
             if champion.epoch % 2 == 0:
                 self._evaluate_trial(champion, stage=stage, force=True)
             self._save_state()
+        if champion.pruned:
+            self.log.write("champion_pruned", {"stage": stage, "trial_id": champion.trial_id, "reason": champion.prune_reason})
 
     def phase_3e_final(self) -> None:
         stage = "3E_final"
@@ -534,6 +539,8 @@ class Phase3Supervisor:
         self._apply_dynamic_to_config(trial)
         self._apply_dynamic_to_trainer(trial)
         self._ensure_runtime_sweep(trial, stage=stage)
+        if trial.pruned:
+            return
         started = time.monotonic()
         try:
             result = run_epoch(
@@ -745,7 +752,8 @@ class Phase3Supervisor:
         self._apply_head_bundle_weights(cfg, recipe, dynamic)
         self._apply_dynamic_values(cfg, recipe, dynamic, family)
         autotune_config(cfg, self.host, selfplay_enabled=True)
-        if self.host.cuda_available and self.host.cuda_memory_gb < 16.0:
+        high_search_non_graph = bool(not family.graph and not family.sparse_policy and recipe.full_sims >= 512)
+        if self.host.cuda_available and self.host.cuda_memory_gb < 16.0 and not high_search_non_graph:
             cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 3)
             cfg.selfplay.batch_size_per_worker = min(int(cfg.selfplay.batch_size_per_worker), 8)
             cfg.inference.max_batch_size = min(
@@ -753,7 +761,15 @@ class Phase3Supervisor:
                 max(64, cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
-        if family.graph or family.architecture == "restnet" or family.sparse_policy:
+        elif self.host.cuda_available and self.host.cuda_memory_gb < 16.0 and high_search_non_graph:
+            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 6)
+            cfg.selfplay.batch_size_per_worker = min(max(int(cfg.selfplay.batch_size_per_worker), 16), 16)
+            cfg.inference.max_batch_size = min(
+                max(int(cfg.inference.max_batch_size), cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
+                192,
+            )
+            cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
+        if family.graph or family.sparse_policy or (family.architecture == "restnet" and not high_search_non_graph):
             if family.graph:
                 latency_scale = max(1.0, (recipe.graph_token_budget / 256.0) * max(recipe.graph_layers, 1))
                 if recipe.sparse_prior_stage > 0:
@@ -770,12 +786,12 @@ class Phase3Supervisor:
                 max(64, cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
-        elif stage != "3A_calibration" and recipe.full_sims >= 800:
-            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 4)
-            cfg.selfplay.batch_size_per_worker = min(int(cfg.selfplay.batch_size_per_worker), 8)
+        elif stage != "3A_calibration" and recipe.full_sims >= 512:
+            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 6)
+            cfg.selfplay.batch_size_per_worker = min(max(int(cfg.selfplay.batch_size_per_worker), 16), 16)
             cfg.inference.max_batch_size = min(
-                int(cfg.inference.max_batch_size),
-                max(64, cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
+                max(int(cfg.inference.max_batch_size), cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
+                192,
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
         configure_torch_runtime(cfg, self.host)
@@ -888,7 +904,7 @@ class Phase3Supervisor:
             return
         key = self._runtime_sweep_key(trial)
         cached = self.runtime_sweep_cache.get(key)
-        if cached and cached.get("selected"):
+        if cached and cached.get("selected") and self._runtime_sweep_cached_selection_safe(trial, cached):
             selected = dict(cached["selected"])
             self._apply_runtime_candidate(trial.cfg, selected)
             trial.runtime_sweep = {
@@ -899,6 +915,18 @@ class Phase3Supervisor:
             }
             self.log.write("runtime_sweep_cached", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
             return
+        if cached and cached.get("selected"):
+            self.log.write(
+                "runtime_sweep_cache_ignored",
+                {
+                    "trial_id": trial.trial_id,
+                    "stage": stage,
+                    "key": key,
+                    "reason": "missing_or_unsafe_memory_telemetry",
+                    "cached_selected": cached.get("selected"),
+                    "cached_selected_record": cached.get("selected_record"),
+                },
+            )
 
         candidates = self._runtime_sweep_candidates(trial)
         if not candidates:
@@ -917,10 +945,26 @@ class Phase3Supervisor:
             },
         )
         results: list[dict[str, Any]] = []
+        memory_unsafe_worker_floor: int | None = None
         for idx, candidate in enumerate(candidates):
             if not self._within_stage(stage):
                 results.append({"candidate": candidate, "error": "stage_deadline_reached"})
                 break
+            workers = int(candidate.get("workers", 0) or 0)
+            if memory_unsafe_worker_floor is not None and workers >= memory_unsafe_worker_floor:
+                row = {
+                    "candidate": candidate,
+                    "ok": False,
+                    "positions": 0,
+                    "positions_per_min": 0.0,
+                    "score": 0.0,
+                    "error": "skipped_after_memory_unsafe_candidate",
+                    "memory_unsafe_worker_floor": memory_unsafe_worker_floor,
+                }
+                results.append(row)
+                self.log.write("runtime_sweep_result", {"trial_id": trial.trial_id, "stage": stage, **row})
+                _append_jsonl(self.output_root / "runtime_sweep_results.jsonl", {"trial_id": trial.trial_id, "stage": stage, **row})
+                continue
             probe_dir = trial.run_dir / "runtime_sweep" / f"candidate_{idx:02d}"
             row = self._run_runtime_sweep_candidate(
                 trial,
@@ -933,15 +977,23 @@ class Phase3Supervisor:
             results.append(row)
             self.log.write("runtime_sweep_result", {"trial_id": trial.trial_id, "stage": stage, **row})
             _append_jsonl(self.output_root / "runtime_sweep_results.jsonl", {"trial_id": trial.trial_id, "stage": stage, **row})
+            if self._runtime_sweep_memory_unsafe(row):
+                memory_unsafe_worker_floor = min(memory_unsafe_worker_floor or workers, workers)
 
-        valid = [row for row in results if row.get("ok") and float(row.get("positions_per_min", 0.0) or 0.0) > 0.0]
+        valid = [
+            row
+            for row in results
+            if row.get("ok")
+            and float(row.get("positions_per_min", 0.0) or 0.0) > 0.0
+            and not self._runtime_sweep_memory_unsafe(row)
+        ]
         if not valid:
-            selected = dict(candidates[0])
+            selected = dict(min(candidates, key=lambda row: int(row.get("workers", 9999))))
             selected_record = {
                 "candidate": selected,
                 "positions_per_min": 0.0,
                 "fallback": True,
-                "reason": "all_probe_candidates_failed",
+                "reason": "all_probe_candidates_failed_or_memory_unsafe",
             }
         else:
             selected_record = max(valid, key=lambda row: float(row.get("score", row.get("positions_per_min", 0.0)) or 0.0))
@@ -999,6 +1051,19 @@ class Phase3Supervisor:
         )
         model = trial.trainer.model if trial.trainer is not None else None
         gpu_before = self._nvidia_smi_snapshot()
+        mem_before = self._system_memory_snapshot()
+        mem_samples: list[dict[str, float]] = []
+        stop_memory_poll = threading.Event()
+
+        def poll_memory() -> None:
+            while not stop_memory_poll.is_set():
+                sample = self._system_memory_snapshot()
+                if sample:
+                    mem_samples.append(sample)
+                stop_memory_poll.wait(1.0)
+
+        memory_thread = threading.Thread(target=poll_memory, daemon=True)
+        memory_thread.start()
         started = time.monotonic()
         try:
             result = run_epoch(
@@ -1016,8 +1081,11 @@ class Phase3Supervisor:
             positions = int(selfplay.get("positions_done") or result.buffer_stats.get("size") or 0)
             positions_per_min = float(selfplay.get("positions_per_min") or (positions / elapsed_s * 60.0))
             gpu_after = self._nvidia_smi_snapshot()
+            mem_after = self._system_memory_snapshot()
+            memory = self._summarize_runtime_memory(mem_before, mem_after, mem_samples)
             gpu_util = float(gpu_after.get("gpu_util_pct", 0.0) or 0.0)
-            score = positions_per_min * (1.0 + min(gpu_util, 95.0) / 2000.0)
+            memory_penalty = 0.35 if memory.get("unsafe") else 1.0
+            score = positions_per_min * (1.0 + min(gpu_util, 95.0) / 2000.0) * memory_penalty
             return {
                 "ok": positions > 0,
                 "candidate": candidate,
@@ -1027,6 +1095,7 @@ class Phase3Supervisor:
                 "score": score,
                 "gpu_before": gpu_before,
                 "gpu_after": gpu_after,
+                "memory": memory,
                 "selfplay": selfplay,
             }
         except Exception as exc:
@@ -1037,8 +1106,11 @@ class Phase3Supervisor:
                 "error": f"{type(exc).__name__}:{exc}",
                 "gpu_before": gpu_before,
                 "gpu_after": self._nvidia_smi_snapshot(),
+                "memory": self._summarize_runtime_memory(mem_before, self._system_memory_snapshot(), mem_samples),
             }
         finally:
+            stop_memory_poll.set()
+            memory_thread.join(timeout=2.0)
             self._cleanup_shared_memory()
             gc.collect()
             if torch.cuda.is_available():
@@ -1052,17 +1124,29 @@ class Phase3Supervisor:
         worker_values = _parse_int_list(getattr(self.args, "runtime_sweep_workers", ""))
         if not worker_values:
             worker_values = [max(1, base_workers - 1), base_workers, base_workers + 1]
+        high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
+        if high_search_non_graph:
+            # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
+            # heavy. Sweep enough workers to feed the GPU, but keep low-memory
+            # WSL hosts below the observed 6-worker RAM cliff.
+            worker_values = sorted(set(worker_values + [2, 3, 4, 5, 6]))
+            if self._low_memory_cuda_host():
+                worker_values = [value for value in worker_values if value <= 5]
         worker_budget = max(1, int(self.host.logical_cpus) - max(1, int(cfg.runtime.selfplay_cpu_reserve)))
         max_workers = min(worker_budget, max(worker_values + [base_workers]))
+        if high_search_non_graph and self._low_memory_cuda_host() and worker_values:
+            max_workers = min(max_workers, max(worker_values))
 
         candidates: list[dict[str, int]] = []
 
         def add(workers: int, wait_us: int) -> None:
             workers = max(1, min(int(workers), max_workers))
             batch_per_worker = base_bpw
+            if not trial.family.graph and int(trial.static.full_sims) >= 512:
+                batch_per_worker = max(batch_per_worker, 16)
             max_batch = max(64, workers * batch_per_worker + 64)
             if self.host.cuda_available and self.host.cuda_memory_gb < 16.0:
-                max_batch = min(max_batch, 128)
+                max_batch = min(max_batch, 192 if (not trial.family.graph and int(trial.static.full_sims) >= 512) else 128)
             candidate = {
                 "workers": workers,
                 "batch_size_per_worker": batch_per_worker,
@@ -1072,7 +1156,8 @@ class Phase3Supervisor:
             if candidate not in candidates:
                 candidates.append(candidate)
 
-        add(base_workers, base_wait)
+        if not high_search_non_graph:
+            add(base_workers, base_wait)
         for workers in sorted(set(worker_values)):
             add(workers, base_wait)
         if len(candidates) < int(self.args.runtime_sweep_max_candidates):
@@ -1114,6 +1199,78 @@ class Phase3Supervisor:
     def _save_runtime_sweep_cache(self) -> None:
         _write_json(self.output_root / "runtime_sweep_cache.json", self.runtime_sweep_cache)
 
+    def _runtime_sweep_cached_selection_safe(self, trial: TrialState, cached: dict[str, Any]) -> bool:
+        record = cached.get("selected_record")
+        # Older cache entries did not include system-memory telemetry. They are
+        # not safe for high-search dense/ResTNet runs because a candidate can
+        # look fast while pushing WSL into OOM reset territory.
+        high_search_non_graph = bool(not trial.family.graph and not trial.family.sparse_policy and trial.static.full_sims >= 512)
+        if isinstance(record, dict):
+            if "memory" not in record:
+                return not high_search_non_graph
+            return not self._runtime_sweep_memory_unsafe(record)
+        return not high_search_non_graph
+
+    def _runtime_sweep_memory_unsafe(self, row: dict[str, Any]) -> bool:
+        memory = row.get("memory") or {}
+        if not isinstance(memory, dict):
+            return False
+        return bool(memory.get("unsafe"))
+
+    def _system_memory_snapshot(self) -> dict[str, float]:
+        try:
+            with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+                values: dict[str, float] = {}
+                for line in handle:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].endswith(":"):
+                        values[parts[0][:-1]] = float(parts[1]) / (1024.0 * 1024.0)
+        except Exception:
+            return {}
+        total = float(values.get("MemTotal", 0.0))
+        available = float(values.get("MemAvailable", values.get("MemFree", 0.0)))
+        swap_total = float(values.get("SwapTotal", 0.0))
+        swap_free = float(values.get("SwapFree", 0.0))
+        return {
+            "total_gb": total,
+            "available_gb": available,
+            "used_gb": max(0.0, total - available),
+            "swap_total_gb": swap_total,
+            "swap_used_gb": max(0.0, swap_total - swap_free),
+        }
+
+    def _summarize_runtime_memory(
+        self,
+        before: dict[str, float],
+        after: dict[str, float],
+        samples: list[dict[str, float]],
+    ) -> dict[str, Any]:
+        all_samples = [sample for sample in [before, *samples, after] if sample]
+        if not all_samples:
+            return {}
+        total_gb = max(float(sample.get("total_gb", 0.0) or 0.0) for sample in all_samples)
+        min_available_gb = min(float(sample.get("available_gb", total_gb) or 0.0) for sample in all_samples)
+        max_used_gb = max(float(sample.get("used_gb", 0.0) or 0.0) for sample in all_samples)
+        max_swap_used_gb = max(float(sample.get("swap_used_gb", 0.0) or 0.0) for sample in all_samples)
+        swap_before_gb = float(before.get("swap_used_gb", 0.0) or 0.0) if before else 0.0
+        min_available_fraction = min_available_gb / max(total_gb, 1e-6)
+        unsafe = bool(
+            min_available_gb < max(2.5, total_gb * 0.12)
+            or min_available_fraction < 0.10
+            or max_swap_used_gb > max(swap_before_gb + 0.50, 1.0)
+        )
+        return {
+            "before": before,
+            "after": after,
+            "sample_count": len(all_samples),
+            "total_gb": total_gb,
+            "min_available_gb": min_available_gb,
+            "min_available_fraction": min_available_fraction,
+            "max_used_gb": max_used_gb,
+            "max_swap_used_gb": max_swap_used_gb,
+            "unsafe": unsafe,
+        }
+
     def _nvidia_smi_snapshot(self) -> dict[str, Any]:
         try:
             proc = subprocess.run(
@@ -1149,7 +1306,7 @@ class Phase3Supervisor:
 
     def _generate_static_candidates(self, max_trials: int) -> list[tuple[FamilySpec, StaticRecipe]]:
         available = self._eligible_families()
-        combos: list[tuple[FamilySpec, StaticRecipe]] = []
+        by_family: dict[str, list[tuple[FamilySpec, StaticRecipe]]] = {}
         for family in available:
             bundles = ["structural", "full_aux_light"]
             if family.graph:
@@ -1157,12 +1314,13 @@ class Phase3Supervisor:
             if family.sparse_policy:
                 bundles.append("prediction")
             graph_ladder = self._graph_static_ladder() if family.graph else [("graph256_cells", 256, 1, 0)]
-            full_sim_options = [256, 384] if family.graph else [800, 1200]
+            full_sim_options = [512, 800, 1200, 1600]
+            family_combos: list[tuple[FamilySpec, StaticRecipe]] = [(family, self._recommended_recipe(family))]
             for full_sims in full_sim_options:
                 for token_set, token_budget, graph_layers, sparse_stage in graph_ladder:
                     recipe = StaticRecipe(
                         full_sims=full_sims,
-                        pcr_low_sims=96 if full_sims <= 256 else (128 if family.graph else (256 if full_sims >= 1200 else 192)),
+                        pcr_low_sims=self._pcr_low_sims_for_full_sims(full_sims),
                         policy_top_k=96,
                         candidate_budget=token_budget
                         if family.graph
@@ -1175,8 +1333,38 @@ class Phase3Supervisor:
                         graph_layers=graph_layers,
                         sparse_prior_stage=sparse_stage,
                     )
-                    combos.append((family, recipe))
-        self.rng.shuffle(combos)
+                    family_combos.append((family, recipe))
+            # Deduplicate recommended recipes that also appear in the ladder,
+            # then shuffle within the family. The outer scheduler below keeps
+            # the active pool family-balanced.
+            deduped: dict[tuple[Any, ...], tuple[FamilySpec, StaticRecipe]] = {}
+            for item_family, item_recipe in family_combos:
+                deduped[
+                    (
+                        item_recipe.full_sims,
+                        item_recipe.pcr_low_sims,
+                        item_recipe.policy_top_k,
+                        item_recipe.candidate_budget,
+                        item_recipe.head_bundle,
+                        item_recipe.temperature_family,
+                        item_recipe.graph_token_set,
+                        item_recipe.graph_token_budget,
+                        item_recipe.graph_layers,
+                        item_recipe.sparse_prior_stage,
+                    )
+                ] = (item_family, item_recipe)
+            family_items = list(deduped.values())
+            self.rng.shuffle(family_items)
+            by_family[family.name] = family_items
+        combos: list[tuple[FamilySpec, StaticRecipe]] = []
+        family_names = [family.name for family in available]
+        cursor = 0
+        while len(combos) < max_trials and any(by_family.get(name) for name in family_names):
+            name = family_names[cursor % max(1, len(family_names))]
+            bucket = by_family.get(name) or []
+            if bucket:
+                combos.append(bucket.pop(0))
+            cursor += 1
         # Ensure every documented discrete value is represented in the manifest,
         # while ASHA keeps the active pool small as required by the plan.
         _write_json(self.output_root / "static_search_space.json", STATIC_SPACE)
@@ -1206,8 +1394,8 @@ class Phase3Supervisor:
     def _recommended_recipe(self, family: FamilySpec) -> StaticRecipe:
         if family.graph:
             return StaticRecipe(
-                full_sims=256,
-                pcr_low_sims=96,
+                full_sims=512,
+                pcr_low_sims=128,
                 policy_top_k=96,
                 candidate_budget=256,
                 head_bundle="structural",
@@ -1237,6 +1425,16 @@ class Phase3Supervisor:
             temperature_family="slow_cool",
             subtree_reuse=True,
         )
+
+    @staticmethod
+    def _pcr_low_sims_for_full_sims(full_sims: int) -> int:
+        if full_sims <= 512:
+            return 128
+        if full_sims <= 800:
+            return 192
+        if full_sims <= 1200:
+            return 256
+        return 384
 
     def _eligible_families(self) -> list[FamilySpec]:
         return [f for f in self.families if f.available and f.name not in self.blocked_families]
@@ -1312,18 +1510,15 @@ class Phase3Supervisor:
             if rate >= best_rate * gate:
                 continue
             reason = f"calibration_throughput_below_gate:{rate:.1f}_vs_best_{best_rate:.1f}_gate_{gate:.2f}"
-            self.blocked_families[family.name] = reason
-            object.__setattr__(family, "available", False)
             self.log.write(
-                "family_quarantined",
+                "family_throughput_below_gate",
                 {
                     "stage": stage,
                     "family": family.name,
                     "reason": reason,
-                    "effect": "calibrated_but_excluded_from_long_asha_pbt_champion_selection",
+                    "effect": "kept_for_fair_comparison_but_throughput_penalized_in_scores",
                 },
             )
-            self._prune_trials_for_family(family, reason, stage=stage)
 
     def _quarantine_family(self, family: FamilySpec, reason: str, *, stage: str) -> None:
         hard_reasons = (
@@ -1355,14 +1550,30 @@ class Phase3Supervisor:
         live.sort(key=lambda t: t.last_score, reverse=True)
         fraction = max(0.05, min(1.0, float(self.args.asha_promote_fraction)))
         keep_n = max(1, math.ceil(len(live) * fraction))
-        promoted = live[:keep_n]
+        promoted_by_id: dict[str, TrialState] = {t.trial_id: t for t in live[:keep_n]}
+        by_family: dict[str, list[TrialState]] = {}
+        for trial in live:
+            by_family.setdefault(trial.family.name, []).append(trial)
+        for family_trials in by_family.values():
+            best = max(family_trials, key=lambda t: t.last_score)
+            promoted_by_id.setdefault(best.trial_id, best)
+        promoted = sorted(promoted_by_id.values(), key=lambda t: t.last_score, reverse=True)
         pruned = live[keep_n:]
         for trial in pruned:
+            if trial.trial_id in promoted_by_id:
+                continue
             trial.pruned = True
             trial.prune_reason = f"asha_not_promoted_{stage}"
             self.log.write("trial_pruned", {"trial_id": trial.trial_id, "reason": trial.prune_reason})
             self._release_trial_runtime(trial, reason=trial.prune_reason)
-        self.log.write("asha_promoted", {"stage": stage, "trial_ids": [t.trial_id for t in promoted]})
+        self.log.write(
+            "asha_promoted",
+            {
+                "stage": stage,
+                "trial_ids": [t.trial_id for t in promoted],
+                "family_floor": True,
+            },
+        )
         return promoted
 
     def _seed_pbt_population(self) -> list[TrialState]:
@@ -1373,9 +1584,19 @@ class Phase3Supervisor:
             if not t.pruned and t.checkpoint_path and t.family.name in eligible_names
         ]
         live.sort(key=lambda t: t.last_score, reverse=True)
+        asha_survivors = [t for t in live if t.trial_id.startswith("asha_")]
+        if asha_survivors:
+            # PBT is a refinement stage for ASHA survivors. Calibration-only
+            # controls are useful baselines, but pulling them into long 192-move
+            # PBT can resurrect slow families that ASHA never promoted.
+            live = asha_survivors
+            self.log.write(
+                "pbt_seed_restricted_to_asha_survivors",
+                {"trial_ids": [t.trial_id for t in live]},
+            )
         population = live[: self.args.pbt_population]
         eligible = self._eligible_families()
-        while len(population) < min(self.args.pbt_population, len(eligible)):
+        while not asha_survivors and len(population) < min(self.args.pbt_population, len(eligible)):
             family = eligible[len(population)]
             recipe = self._recommended_recipe(family)
             trial = self._create_trial(f"pbt_seed_{len(population):02d}_{family.name}", family, recipe, self._initial_dynamic(family), "3C_pbt")
@@ -1471,9 +1692,7 @@ class Phase3Supervisor:
         ref = max(float(self.args.target_epoch_seconds), 1.0)
         last_score = trial.last_score
         stage = str(record.get("stage") or getattr(trial, "stage", ""))
-        if stage in {"3B_static_asha", "3C_pbt"} and elapsed > 1.20 * ref:
-            return f"epoch_time_above_budget:{elapsed:.1f}s_vs_{ref:.1f}s"
-        if elapsed > 2.5 * ref and (not math.isfinite(last_score) or last_score < 0.0):
+        if elapsed > 3.0 * ref and (not math.isfinite(last_score) or last_score < 0.0):
             return f"epoch_time_too_slow:{elapsed:.1f}s"
         if trial.score_history:
             illegal = float(trial.score_history[-1].get("illegal_or_crash_rate", 0.0))

@@ -64,8 +64,12 @@ function App() {
   const [suiteGames, setSuiteGames] = useState<AnyRow[]>([]);
   const [error, setError] = useState<string>("");
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const loadInFlight = useRef(false);
+  const runDetailInFlight = useRef(false);
 
   const load = async () => {
+    if (loadInFlight.current) return;
+    loadInFlight.current = true;
     try {
       setError("");
       const [h, r, a, p, s, t, b, e, sg] = await Promise.all([
@@ -76,7 +80,7 @@ function App() {
         api<AnyRow>("/api/suite/status"),
         api<AnyRow[]>("/api/suite/trials"),
         api<AnyRow[]>("/api/suite/best-checkpoints"),
-        api<AnyRow[]>("/api/suite/events"),
+        api<AnyRow[]>("/api/suite/events?limit=64"),
         api<AnyRow[]>("/api/games?limit=32")
       ]);
       setHealth(h);
@@ -91,12 +95,22 @@ function App() {
       if (!selectedRun && r.length) setSelectedRun(r[0].run_id);
     } catch (e: any) {
       setError(e.message);
+    } finally {
+      loadInFlight.current = false;
     }
   };
 
   useEffect(() => {
     load();
   }, []);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      load();
+      setRefreshNonce((n) => n + 1);
+    }, 15000);
+    return () => window.clearInterval(id);
+  }, [selectedRun]);
 
   const reload = () => {
     load();
@@ -105,10 +119,12 @@ function App() {
 
   useEffect(() => {
     if (!selectedRun) return;
+    if (runDetailInFlight.current) return;
+    runDetailInFlight.current = true;
     const run = encodeURIComponent(selectedRun);
     Promise.all([
       api<AnyRow[]>(`/api/metrics/${run}`),
-      api<AnyRow[]>(`/api/games?run_id=${run}`),
+      api<AnyRow[]>(`/api/games?run_id=${run}&limit=64`),
       api<AnyRow[]>(`/api/checkpoints?run_id=${run}`)
     ])
       .then(([nextMetrics, nextGames, nextCheckpoints]) => {
@@ -120,7 +136,10 @@ function App() {
           return nextGames[0]?.game_id ?? null;
         });
       })
-      .catch((e) => setError(e.message));
+      .catch((e) => setError(e.message))
+      .finally(() => {
+        runDetailInFlight.current = false;
+      });
   }, [selectedRun, refreshNonce]);
 
   useEffect(() => {
@@ -290,7 +309,9 @@ function SuitePanel({
   const lastEvent = status?.last_event || {};
   const activity = status?.current_activity || {};
   const activeTrials = trials.filter((trial) => !trial.pruned);
-  const recentEvents = events.slice(-16).reverse();
+  const recentEvents = events.slice(-64).reverse();
+  const lastEventLabel = status?.last_event_name || lastEvent.event || "-";
+  const progress = activity.progress || {};
   const [selectedTrialId, setSelectedTrialId] = useState<string>("");
   const [trialDetail, setTrialDetail] = useState<AnyRow | null>(null);
   useEffect(() => {
@@ -316,7 +337,11 @@ function SuitePanel({
         <div className="suiteHero">
           <div>
             <span>Stage</span>
-            <strong>{status?.latest_stage || lastEvent.stage || "-"}</strong>
+            <strong>{status?.current_stage || status?.latest_stage || lastEvent.stage || "-"}</strong>
+          </div>
+          <div>
+            <span>Current Trial</span>
+            <strong>{status?.current_trial_id || activity.trial_id || "-"}</strong>
           </div>
           <div>
             <span>Best Trial</span>
@@ -333,6 +358,26 @@ function SuitePanel({
           <div>
             <span>Positions/sec</span>
             <strong>{formatRate(status?.current_positions_per_sec)}</strong>
+          </div>
+          <div>
+            <span>Total Positions</span>
+            <strong>{formatCount(status?.total_positions)}</strong>
+          </div>
+          <div>
+            <span>Total Games</span>
+            <strong>{formatCount(status?.total_games)}</strong>
+          </div>
+          <div>
+            <span>Workers</span>
+            <strong>{progress.workers_total !== undefined ? `${progress.workers_alive}/${progress.workers_total}` : "-"}</strong>
+          </div>
+          <div>
+            <span>Last Event</span>
+            <strong>{lastEventLabel}</strong>
+          </div>
+          <div>
+            <span>Event Time</span>
+            <strong>{formatTimestamp(status?.last_event_time || lastEvent.time)}</strong>
           </div>
           <div>
             <span>Live Trials</span>
@@ -359,8 +404,9 @@ function SuitePanel({
       >
         <Table
           rows={bestCheckpoints}
-          columns={["rank", "trial_id", "score", "epoch", "global_step", "is_loadable", "path"]}
+          columns={["rank", "trial_id", "score", "scheduler_score", "epoch", "global_step", "is_loadable", "path"]}
           onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
+          className="mediumTable"
         />
       </Panel>
 
@@ -399,6 +445,7 @@ function SuitePanel({
           ]}
           onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
           selected={(row) => row.trial_id === selectedTrialId}
+          className="suiteTable"
         />
       </Panel>
 
@@ -407,13 +454,15 @@ function SuitePanel({
           rows={games}
           columns={["game_id", "trial_id", "source", "epoch", "move_count", "terminal_reason", "truncated", "created_at"]}
           onRow={openGame}
+          className="recentTable"
         />
       </Panel>
 
       <Panel title="Recent Suite Events" hint="Supervisor decisions such as sweeps, pruning, epoch completions, and stage changes.">
         <Table
           rows={recentEvents}
-          columns={["event", "stage", "trial_id", "reason", "score", "elapsed_s", "time"]}
+          columns={["event", "stage", "trial_id", "reason", "score", "selected_positions_per_min", "elapsed_s", "time"]}
+          className="recentTable"
         />
       </Panel>
     </section>
@@ -1441,14 +1490,15 @@ function Panel({ title, hint, children }: { title: string; hint?: string; childr
   );
 }
 
-function Table({ rows, columns, onRow, selected }: {
+function Table({ rows, columns, onRow, selected, className = "" }: {
   rows: AnyRow[];
   columns: string[];
   onRow?: (row: AnyRow) => void;
   selected?: (row: AnyRow) => boolean;
+  className?: string;
 }) {
   return (
-    <div className="tableWrap">
+    <div className={`tableWrap ${className}`}>
       <table>
         <thead>
           <tr>{columns.map((c) => <th key={c}>{labelFor(c)}</th>)}</tr>

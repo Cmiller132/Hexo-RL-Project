@@ -7,6 +7,7 @@ cd "${REPO_ROOT}"
 
 RUN_ROOT="${1:-runs/phase3_48h_autotune_20260428}"
 RUN_MODE="${2:-background}"
+LAUNCH_LOG="${RUN_ROOT}/launcher.log"
 DURATION_HOURS="${DURATION_HOURS:-48}"
 TARGET_EPOCH_SECONDS="${TARGET_EPOCH_SECONDS:-600}"
 CALIBRATION_EPOCH_SECONDS="${CALIBRATION_EPOCH_SECONDS:-240}"
@@ -14,8 +15,8 @@ CALIBRATION_STATES="${CALIBRATION_STATES:-1024}"
 CALIBRATION_TRAIN_BATCHES="${CALIBRATION_TRAIN_BATCHES:-50}"
 CALIBRATION_THROUGHPUT_GATE="${CALIBRATION_THROUGHPUT_GATE:-0.35}"
 TRAIN_BATCHES="${TRAIN_BATCHES:-100}"
-MAX_GAME_MOVES="${MAX_GAME_MOVES:-192}"
-RUNTIME_SWEEP_STATES="${RUNTIME_SWEEP_STATES:-384}"
+MAX_GAME_MOVES="${MAX_GAME_MOVES:-384}"
+RUNTIME_SWEEP_STATES="${RUNTIME_SWEEP_STATES:-768}"
 RUNTIME_SWEEP_WORKERS="${RUNTIME_SWEEP_WORKERS:-2,3,4,5}"
 RUNTIME_SWEEP_MAX_CANDIDATES="${RUNTIME_SWEEP_MAX_CANDIDATES:-4}"
 MAX_ACTIVE_TRIALS="${MAX_ACTIVE_TRIALS:-8}"
@@ -30,16 +31,34 @@ FINAL_EVAL_GAMES="${FINAL_EVAL_GAMES:-12}"
 
 mkdir -p "${RUN_ROOT}"
 
+log_launch() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LAUNCH_LOG}"
+}
+
+log_launch "launch requested mode=${RUN_MODE} cwd=${PWD} shell_pid=$$"
+log_launch "settings duration=${DURATION_HOURS} target_epoch_seconds=${TARGET_EPOCH_SECONDS} calibration_epoch_seconds=${CALIBRATION_EPOCH_SECONDS} calibration_states=${CALIBRATION_STATES} train_batches=${TRAIN_BATCHES} max_game_moves=${MAX_GAME_MOVES} runtime_sweep_states=${RUNTIME_SWEEP_STATES} runtime_sweep_workers=${RUNTIME_SWEEP_WORKERS} runtime_sweep_max_candidates=${RUNTIME_SWEEP_MAX_CANDIDATES} max_active_trials=${MAX_ACTIVE_TRIALS} asha_resources=${ASHA_RESOURCES} pbt_population=${PBT_POPULATION} champion_min_epochs=${CHAMPION_MIN_EPOCHS}"
+if command -v free >/dev/null 2>&1; then
+    log_launch "memory $(free -h | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+fi
+if command -v nvidia-smi >/dev/null 2>&1; then
+    log_launch "gpu $(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
+fi
+
 if [[ -f "${RUN_ROOT}/supervisor.pid" ]]; then
     old_pid="$(cat "${RUN_ROOT}/supervisor.pid" 2>/dev/null || true)"
     if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
+        old_args="$(ps -p "${old_pid}" -o args= 2>/dev/null || true)"
+        log_launch "existing supervisor still alive pid=${old_pid} args=${old_args}"
         echo "${old_pid}"
         exit 0
     fi
+    log_launch "stale supervisor pid file pid=${old_pid:-empty}; replacing"
 fi
 
 if [[ -s "${RUN_ROOT}/supervisor.log" ]]; then
-    mv "${RUN_ROOT}/supervisor.log" "${RUN_ROOT}/supervisor.log.$(date +%Y%m%d_%H%M%S)"
+    rotated="${RUN_ROOT}/supervisor.log.$(date +%Y%m%d_%H%M%S)"
+    mv "${RUN_ROOT}/supervisor.log" "${rotated}"
+    log_launch "rotated supervisor log to ${rotated}"
 fi
 
 if [[ -f .venv-wsl/bin/activate ]]; then
@@ -86,9 +105,11 @@ fi
 
 if [[ "${RUN_MODE}" == "--foreground" || "${RUN_MODE}" == "foreground" ]]; then
     echo "$$" > "${RUN_ROOT}/supervisor.pid"
+    log_launch "starting foreground supervisor pid=$$ command=python ${args[*]}"
     exec env PYTHONUNBUFFERED=1 python "${args[@]}" > "${RUN_ROOT}/supervisor.log" 2>&1
 fi
 
+log_launch "starting background supervisor command=python ${args[*]}"
 if command -v setsid >/dev/null 2>&1; then
     setsid nohup env PYTHONUNBUFFERED=1 python "${args[@]}" > "${RUN_ROOT}/supervisor.log" 2>&1 < /dev/null &
 else
@@ -96,4 +117,5 @@ else
 fi
 pid="$!"
 echo "${pid}" > "${RUN_ROOT}/supervisor.pid"
+log_launch "background supervisor started pid=${pid}"
 echo "${pid}"
