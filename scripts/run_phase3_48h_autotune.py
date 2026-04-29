@@ -1654,10 +1654,11 @@ class Phase3Supervisor:
             return capacity
         # The full policy-v2 replay schema preallocates many board-area-wide
         # arrays. A 100k-capacity buffer is useful for long standalone training,
-        # but it touches tens of GiB during multi-epoch ASHA screening on this
-        # WSL host. Keep enough recent positions for 384-move, 8-14 epoch
-        # comparisons while avoiding the memory cliff.
-        return min(capacity, 8192)
+        # but even an 8k buffer touched enough memory to fill RAM+swap during
+        # 384-move ASHA screening on this WSL host. Keep enough room for the
+        # observed ~2.8k-position dense ASHA epochs with margin, without
+        # carrying a buffer that can starve the dashboard and inference server.
+        return min(capacity, 4096)
 
     @staticmethod
     def _pcr_low_sims_for_full_sims(full_sims: int) -> int:
