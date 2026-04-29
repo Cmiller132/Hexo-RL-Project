@@ -1533,6 +1533,7 @@ class Phase3Supervisor:
 
     def _static_recipe_from_bohb_config(self, family: FamilySpec, config: dict[str, Any]) -> StaticRecipe:
         full_sims = int(config.get("full_sims", 256 if family.graph else 800))
+        full_sims = self._host_safe_full_sims(family, full_sims)
         graph_budget = int(config.get("graph_token_budget", 256))
         graph_layers = int(config.get("graph_layers", 1))
         sparse_stage = int(config.get("sparse_prior_stage", 0 if not family.graph else 0))
@@ -1606,10 +1607,11 @@ class Phase3Supervisor:
                 sparse_prior_stage=0,
                 train_batch_size=self._host_safe_train_batch_size(family, 256),
             )
+        full_sims = self._host_safe_full_sims(family, 800)
         if family.sparse_policy:
             return StaticRecipe(
-                full_sims=800,
-                pcr_low_sims=192,
+                full_sims=full_sims,
+                pcr_low_sims=self._pcr_low_sims_for_full_sims(full_sims),
                 policy_top_k=96,
                 candidate_budget=256,
                 head_bundle="structural",
@@ -1618,8 +1620,8 @@ class Phase3Supervisor:
                 train_batch_size=self._host_safe_train_batch_size(family, 256),
             )
         return StaticRecipe(
-            full_sims=800,
-            pcr_low_sims=192,
+            full_sims=full_sims,
+            pcr_low_sims=self._pcr_low_sims_for_full_sims(full_sims),
             policy_top_k=96,
             candidate_budget=256,
             head_bundle="structural",
@@ -1627,6 +1629,14 @@ class Phase3Supervisor:
             subtree_reuse=True,
             train_batch_size=self._host_safe_train_batch_size(family, 256),
         )
+
+    def _host_safe_full_sims(self, family: FamilySpec, requested: int) -> int:
+        full_sims = max(1, int(requested))
+        if not self._low_memory_cuda_host():
+            return full_sims
+        if family.architecture == "restnet":
+            return min(full_sims, 512)
+        return full_sims
 
     def _host_safe_train_batch_size(self, family: FamilySpec, requested: int) -> int:
         batch_size = max(1, int(requested))

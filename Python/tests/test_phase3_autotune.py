@@ -353,6 +353,8 @@ def test_low_memory_restnet_recommended_recipe_caps_train_batch():
     recipe = module.Phase3Supervisor._recommended_recipe(supervisor, family)
 
     assert recipe.train_batch_size == 128
+    assert recipe.full_sims == 512
+    assert recipe.pcr_low_sims == 128
 
 
 def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
@@ -390,11 +392,17 @@ def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
         supervisor, restnet, {"full_sims": 800, "train_batch_size": 384}
     ).train_batch_size == 128
     assert module.Phase3Supervisor._static_recipe_from_bohb_config(
+        supervisor, restnet, {"full_sims": 800, "train_batch_size": 384}
+    ).full_sims == 512
+    assert module.Phase3Supervisor._static_recipe_from_bohb_config(
         supervisor, graph, {"full_sims": 512, "train_batch_size": 384}
     ).train_batch_size == 128
     assert module.Phase3Supervisor._static_recipe_from_bohb_config(
         supervisor, dense, {"full_sims": 800, "train_batch_size": 384}
     ).train_batch_size == 256
+    assert module.Phase3Supervisor._static_recipe_from_bohb_config(
+        supervisor, dense, {"full_sims": 800, "train_batch_size": 384}
+    ).full_sims == 800
 
 
 def test_static_candidates_are_family_balanced(tmp_path):
