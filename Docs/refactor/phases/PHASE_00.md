@@ -1,31 +1,38 @@
 # Phase 00 — Program Setup and Baseline Freeze
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Capture baseline for cargo/pytest/bench/CI timing.
-- Inventory architecture-string conditionals and legacy fallback paths.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Establish an immutable baseline before any breaking refactor work. This phase creates the evidence set that all later phases compare against.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Inputs from V2 Spec
+- Worker currently mixes lifecycle, inference, candidates, graph, pair, MCTS, telemetry responsibilities.
+- Model construction centralized in `model/network.py` and `model/global_graph.py`.
+- Config schema overload and architecture-string coupling.
+- Rust/Python rule boundary ambiguity and pair policy performance risks.
+
+## In-Scope Repository Context
+- Python hotspots: `selfplay/worker.py`, `model/network.py`, `model/global_graph.py`, `config/schema.py`.
+- Existing package families: `inference/`, `selfplay/`, `graph/`, `train/`, `eval/`, `dashboard/`, `tuning/`.
+- Rust rule source: `crates/hexgame-core/`, `crates/hexgame-py/`.
+
+## Required Deliverables
+1. Baseline behavior report (functional + perf + CI timings).
+2. Architecture-string dependency inventory (where behavior is inferred from names).
+3. Legacy fallback inventory (Python legal/history/candidate/pair fallback paths).
+4. Refactor artifact directory conventions under `Docs/refactor/artifacts/phase_00/`.
+
+## Parallel Subagent Split
+- S1 Contracts/Schema: enumerate all shared data shapes currently implicit.
+- S2 Engine/Runtime: map Rust vs Python ownership boundaries.
+- S3 Models/Search: inventory model family checks and pair-policy coupling points.
+- S4 Data/Train/Eval: baseline replay->sampler->trainer path and known invariants.
+- S5 Quality/Obs/Docs: establish metrics dashboard and evidence template.
 
 ## Mandatory Checks
-- cargo test --workspace
-- pytest -q Python/tests
-- python -m hexorl.cli --help
-- CI jobs touching changed paths must be green on two consecutive runs.
+- `cargo test --workspace`
+- `pytest -q Python/tests`
+- `python -m hexorl.cli --help`
+- Baseline perf commands used by team (selfplay/inference/training smoke benches).
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_00/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Exit Criteria
+- Baseline reports archived and signed by orchestrator.
+- All critical coupling/fallback points are cataloged with owning phase mapping.

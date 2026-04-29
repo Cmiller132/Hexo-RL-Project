@@ -1,31 +1,34 @@
 # Phase 09 — Deletion Sweep and CI Hardening
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Delete deprecated action_contract/buffer runtime paths and stale aliases.
-- Enforce CI policy gates for parity/contracts/import hygiene.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Finalize the refactor by removing legacy paths and enforcing architecture invariants in CI.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Required Deletions and Finalization
+- Delete deprecated runtime modules/aliases (`action_contract/` path remnants, `buffer/` runtime path, legacy model/search shims once cutover complete).
+- Remove old architecture aliases that preserve deprecated behavior.
+- Ensure no production imports rely on compatibility facades.
 
-## Mandatory Checks
-- Full matrix test pass
-- No legacy import graph check
-- Final end-to-end smoke + rollback drill
-- CI jobs touching changed paths must be green on two consecutive runs.
+## CI Policy Gates to Add
+- Contract schema stability and validation suite.
+- Rust/Python parity suite.
+- Inference protocol compatibility suite.
+- Registry/capability behavior suite.
+- Import hygiene checks (no banned legacy module paths).
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_09/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: schema/alias removal and migration notes.
+- S2: runtime import cleanup and dead path deletion.
+- S3: model/search legacy utility removal.
+- S4: replay/train/eval legacy path cleanup.
+- S5: CI policy jobs + final conformance report.
+
+## Mandatory Tests
+- Full test matrix (Rust + Python) green.
+- Import graph check for banned modules/paths.
+- End-to-end smoke run covering self-play->replay->train->eval->dashboard.
+- Rollback drill from final cut tag.
+
+## Exit Criteria
+- No compatibility shims in main runtime path.
+- CI automatically enforces all architecture invariants.
+- Final signoff report confirms complete, spec-compliant delivery.

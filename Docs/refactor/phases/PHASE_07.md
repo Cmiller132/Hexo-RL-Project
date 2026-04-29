@@ -1,31 +1,31 @@
 # Phase 07 — Replay/Training/Eval Convergence
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Introduce replay/ canonical codec/storage/sampler/projector pipeline.
-- Migrate training/eval to consume shared PositionContract projections.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Unify replay and learning/evaluation data flow around shared contracts and canonical projection.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Target Modules
+- `replay/codec.py`, `storage.py`, `sampler.py`, `projector.py`, `fixtures.py`
+- `train/adapters.py`, `trainer.py`, `losses.py`, `schedules.py`
+- `eval/policy_player.py`, `players.py`, `arena.py`, `scorecard.py`, `league.py`
 
-## Mandatory Checks
-- Sample->batch->loss E2E smoke
-- Legacy/new projector parity
-- Data quality drift checks
-- CI jobs touching changed paths must be green on two consecutive runs.
+## V2 Requirements
+- `replay/` becomes canonical runtime path; no parallel `buffer/` production path.
+- Training projection consumes `PositionContract` + legal/candidate/pair contracts.
+- Eval/debug tools inspect same projected contract forms.
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_07/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: replay contract versioning and migration tools.
+- S2: write/read integration from self-play runtime.
+- S3: model-facing batch adapters from canonical projection.
+- S4: sample->batch->loss and eval-player integration.
+- S5: parity and drift checks for learning data quality.
+
+## Mandatory Tests
+- End-to-end sample-to-loss smoke.
+- Legacy-vs-new projector parity on fixed dataset.
+- Eval player correctness with unified policy provider.
+- Storage codec compatibility tests and corruption handling.
+
+## Exit Criteria
+- Train/eval/replay all consume one contract projection path.
+- Legacy `buffer/` runtime path removed from active flow (pending final deletion phase).

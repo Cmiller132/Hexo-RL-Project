@@ -1,31 +1,35 @@
 # Phase 02 — Engine Boundary and Rust/Python Parity
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Create Python/src/hexorl/engine/* boundary over crates/hexgame-py.
-- Route legal/history decode to engine boundary; block production Python fallbacks.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Make Rust the authoritative source for legal state and replay legality through a strict Python boundary.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Target Modules
+Create `Python/src/hexorl/engine/`:
+- `rust.py` (PyO3 bridge calls)
+- `legal.py`
+- `history.py`
+- `encoding.py`
+- `parity.py`
 
-## Mandatory Checks
-- Golden legal row parity corpus
-- History decode parity corpus
-- Fallback usage test must fail in production mode
-- CI jobs touching changed paths must be green on two consecutive runs.
+## V2 Requirements to Implement
+- Production legal rows originate from Rust boundary only.
+- Python legal fallback allowed only for explicit test fixtures (`source='fixture'`).
+- Replay/history decode parity against Rust golden corpora.
+- Telemetry must expose degraded/fallback source usage.
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_02/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: parity contract schema definitions and mismatch taxonomy.
+- S2: engine API implementation and runtime integration.
+- S3: update search/model prep paths to use engine legal tables.
+- S4: replay ingestion parity and decode validation.
+- S5: parity harness automation and artifact publishing.
+
+## Mandatory Tests
+- Golden corpus: legal row parity (ordering, radius, occupied count, hash).
+- Golden corpus: compact-history decode parity.
+- Negative tests for invalid history ordering/player/duplicate cells.
+- Guardrail test that production mode cannot use Python fallback.
+
+## Exit Criteria
+- Zero critical parity mismatches.
+- Runtime paths consume engine boundary for legal/history in production.

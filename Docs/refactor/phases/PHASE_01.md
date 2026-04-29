@@ -1,31 +1,37 @@
 # Phase 01 — Contracts Foundation
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Create Python/src/hexorl/contracts/* modules (history/legal/candidates/pairs/replay/telemetry).
-- Introduce versioned dataclasses + validation + contract hashing.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Create canonical, versioned Python contracts that replace implicit cross-subsystem assumptions.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Required V2 Contract Set
+Implement `Python/src/hexorl/contracts/` with owners and invariants:
+- `identity.py`
+- `history.py` (`MoveHistory` + compact-history decoding invariants)
+- `symmetry.py` (D6 transform APIs + compose/inverse/mass preservation)
+- `legal.py` (`LegalActionTable` and ordering/hash/source invariants)
+- `candidates.py` (`CandidateTable` + recall/diagnostics/missing mass)
+- `pairs.py` (`PairActionTable` for phase-specific pair semantics)
+- `replay.py`, `targets.py`, `tactical.py`, `telemetry.py`, `validation.py`, `debug.py`
 
-## Mandatory Checks
-- Contract unit tests (shape/validation/hash)
-- Symmetry round-trip invariants
-- Static import checks to keep contracts pure
-- CI jobs touching changed paths must be green on two consecutive runs.
+## Critical Invariants From V2
+- Contracts are plain typed data, versioned, comparable/hashable.
+- No imports of model/inference/search/train/dashboard orchestration into contracts.
+- Hot-path rule: contract APIs can support zero-copy/cached views.
+- `MoveHistory` is single compact-history owner; invalid histories rejected at decode.
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_01/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: dataclasses/types/version policy/validation and hash methods.
+- S2: adapters at call boundaries that instantiate contracts (no cutover yet).
+- S3: model/search requirements mapped to contract fields.
+- S4: replay/training fixture payloads migrated to contracts.
+- S5: contract-focused tests and docs.
+
+## Mandatory Tests
+- Validation failure tests for each contract.
+- Equality/hash stability tests.
+- D6 unit invariants: composition, inverse, mass preservation.
+- Contract purity test: no forbidden dependency imports.
+
+## Exit Criteria
+- Contracts package complete and tested.
+- No runtime subsystem-specific private contract clones introduced.

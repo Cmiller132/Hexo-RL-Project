@@ -1,31 +1,29 @@
 # Phase 06 — Self-Play Decomposition
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Split selfplay/worker.py into game_runner responsibilities and orchestration wiring.
-- Move contract construction to dedicated builders; worker becomes coordinator.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Refactor self-play worker into composable services that do not own unrelated architecture logic.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Target Modules
+- `selfplay/game_runner.py`, `worker.py`, `orchestrator.py`, `records.py`, `record_writer.py`, `telemetry.py`, `rgsc.py`
 
-## Mandatory Checks
-- Seeded determinism regression
-- Replay row completeness checks
-- Tactical annotation parity checks
-- CI jobs touching changed paths must be green on two consecutive runs.
+## V2 Requirements
+- Worker coordinates; it does not privately build legal rows, D6 transforms, candidates, pair rows, graph rows, or checkpoint cleanup.
+- Game runner executes lifecycle without model-family special-casing.
+- MCTS/search integration uses `search/` interfaces exclusively.
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_06/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: define self-play contract boundaries and handoff objects.
+- S2: lifecycle split and orchestrator wiring.
+- S3: search/policy-provider integration cleanup.
+- S4: replay record completeness and schema alignment.
+- S5: deterministic and robustness regression suites.
+
+## Mandatory Tests
+- Seeded deterministic game sequence equivalence.
+- Replay record field completeness/validation.
+- Tactical/candidate/pair telemetry presence and consistency.
+- RGSC restart/service continuity tests.
+
+## Exit Criteria
+- Worker responsibilities reduced to orchestration.
+- All heavy logic delegated to contracts/engine/search/inference components.

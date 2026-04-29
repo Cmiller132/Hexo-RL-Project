@@ -1,31 +1,29 @@
 # Phase 05 — Search and Pair Strategy Isolation
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Add explicit PairStrategySpec and strategy implementations under search/.
-- Remove architecture-side effects that trigger pair scoring implicitly.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Move pair-action consumption from implicit side effects to explicit search strategy policy.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Target Modules
+- `search/context.py`, `policy_provider.py`, `pair_strategy.py`, `priors.py`, `expansion.py`, `mcts_runner.py`, `engine_adapter.py`
 
-## Mandatory Checks
-- Strategy none => zero pair scoring tests
-- Capped enumeration tests (top-k/two-stage)
-- Telemetry assertions for pair generation source/caps
-- CI jobs touching changed paths must be green on two consecutive runs.
+## V2 Requirements
+- Default pair strategy is `none` (including global graph families).
+- Full pair enumeration allowed only with named strategy and hard caps.
+- Pair scoring no longer implied by `pair_prior_mix`, `pair_head_present`, or architecture prefix.
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_05/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: `PairStrategySpec` schema + validation rules.
+- S2: runtime context wiring for explicit strategy selection.
+- S3: strategy implementations (none/top-k/two-stage/capped exhaustive diagnostic).
+- S4: replay/targets plumbing for pair metadata.
+- S5: regressions proving no implicit pair work.
+
+## Mandatory Tests
+- `strategy=none` must emit zero pair generation/scoring calls.
+- Capped strategies enforce max pair rows and telemetry counters.
+- Search priors tests ensure policy source traceability.
+- MCTS integration tests validate strategy outputs consumed correctly.
+
+## Exit Criteria
+- Pair behavior entirely policy-driven and observable.
+- No architecture/config side-effect toggles remain in search path.

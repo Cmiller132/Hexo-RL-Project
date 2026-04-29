@@ -1,31 +1,30 @@
 # Phase 08 — Dashboard and Debug Convergence
-## Phase Intent
-Complete this phase with production-ready behavior only; partial or scaffold-only delivery is not allowed.
-## Scope
-- Dashboard consumes canonical contracts, not private reconstruction.
-- Add contract/model/graph inspectors from shared projections.
 
-## Parallel Subagent Split (5-way)
-- **S1 Contracts/Schema:** define interfaces, validation, and versioning constraints for this phase.
-- **S2 Engine/Runtime:** runtime integration and cutover mechanics.
-- **S3 Models/Search:** model/search-facing adaptation and capability compliance.
-- **S4 Data/Train/Eval:** downstream data-path compatibility and regression checks.
-- **S5 Quality/Obs/Docs:** test suites, telemetry assertions, artifact curation, and docs updates.
+## Purpose
+Ensure dashboard and debugging surfaces inspect the same contracts as runtime/training.
 
-## Orchestrator Gate Reviews
-1. **Design Gate:** contracts/interfaces approved before branch merges.
-2. **Integration Gate:** all consumers migrated within phase scope; no hybrid hidden paths.
-3. **Evidence Gate:** required tests pass with stored artifacts.
-4. **Strictness Gate:** no TODO/FIXME, no spec gaps, no feature-incomplete behavior.
-5. **Rollback Gate:** rollback tag exists and recovery smoke is verified.
+## Target Modules
+- `dashboard/contract_inspector.py`, `model_inspector.py`, `graph_inspector.py`, `replay_views.py`
+- existing dashboard services/routes updated to consume canonical contracts
 
-## Mandatory Checks
-- Dashboard fixture agreement tests
-- Replay inspection parity checks
-- Frontend/backend smoke for inspector routes
-- CI jobs touching changed paths must be green on two consecutive runs.
+## V2 Requirements
+- Dashboard must not privately rebuild legal/candidate/pair/graph inputs.
+- Replay inspection must display contract hashes/source/version for traceability.
+- Debug UX should localize mismatches to one builder/adapter quickly.
 
-## Completion Criteria
-- Phase deliverables merged and operational.
-- All mandatory checks pass with logs under `Docs/refactor/artifacts/phase_08/`.
-- Orchestrator signs a phase-close note confirming no half-implementation remains.
+## Parallel Subagent Work
+- S1: inspector contract schemas and display metadata set.
+- S2: backend route migration to canonical projection providers.
+- S3: model/graph introspection alignment with new registry/adapters.
+- S4: eval/debug tool alignment with replay contract shapes.
+- S5: fixture-driven dashboard correctness tests.
+
+## Mandatory Tests
+- Dashboard fixture parity tests with sampler/trainer contract views.
+- Route-level integration tests for replay and model inspectors.
+- Contract hash/source/version display assertions.
+- Smoke test for dashboard startup and inspection workflows.
+
+## Exit Criteria
+- Dashboard reconstructors removed from migrated scope.
+- Debug outputs match runtime/training contract facts.
