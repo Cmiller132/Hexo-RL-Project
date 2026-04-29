@@ -164,7 +164,7 @@ def test_pb2_respects_conditional_parameters():
     assert event["final_values"]["pair_policy_loss"] == 0.1
 
 
-def test_phase3_sparse_candidate_gate_uses_discovery_metrics():
+def test_phase3_sparse_decisive_candidate_gate_uses_discovery_metrics():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
     supervisor.args = SimpleNamespace(candidate_recall_gate=0.95, target_epoch_seconds=100.0)
@@ -195,7 +195,29 @@ def test_phase3_sparse_candidate_gate_uses_discovery_metrics():
     assert candidate["candidate_discovery_top8"] == 0.4
     assert "candidate_recall_mcts_top8" not in candidate
     assert candidate["gate_pass"] is False
-    assert reason == "candidate_discovery_below_gate:0.4000"
+    assert reason == "decisive_candidate_discovery_below_gate:0.9800"
+
+
+def test_phase3_sparse_calibration_top8_candidate_gate_is_score_only():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(candidate_recall_gate=0.95, target_epoch_seconds=100.0)
+    trial = SimpleNamespace(family=SimpleNamespace(sparse_policy=True), last_score=1.0, score_history=[])
+    buffer = {
+        "size": 10,
+        "candidate_discovery_top8": 0.4,
+        "candidate_discovery_winning_move": 1.0,
+        "candidate_discovery_forced_block": 1.0,
+        "candidate_discovery_two_placement_cover": 1.0,
+    }
+
+    reason = module.Phase3Supervisor._hard_prune_reason(
+        supervisor,
+        trial,
+        {"stage": "3A_calibration", "buffer": buffer, "selfplay": {"positions_done": 10}},
+    )
+
+    assert reason == ""
 
 
 def test_transient_train_exception_does_not_quarantine_family():
@@ -222,6 +244,31 @@ def test_transient_train_exception_does_not_quarantine_family():
 
     assert family.available is True
     assert "graph_hybrid_0" not in supervisor.blocked_families
+    assert supervisor.log.events[-1][0] == "family_quarantine_skipped"
+
+
+def test_selfplay_no_positions_does_not_quarantine_family():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.blocked_families = {}
+    supervisor.trials = []
+    supervisor.log = _CaptureLog()
+    family = module.FamilySpec(
+        name="best_restnet_33",
+        description="restnet",
+        architecture="restnet",
+        available=True,
+    )
+
+    module.Phase3Supervisor._quarantine_family(
+        supervisor,
+        family,
+        "selfplay_generated_no_positions",
+        stage="3A_calibration",
+    )
+
+    assert family.available is True
+    assert "best_restnet_33" not in supervisor.blocked_families
     assert supervisor.log.events[-1][0] == "family_quarantine_skipped"
 
 

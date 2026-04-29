@@ -1694,9 +1694,7 @@ class Phase3Supervisor:
 
     def _quarantine_family(self, family: FamilySpec, reason: str, *, stage: str) -> None:
         hard_reasons = (
-            "selfplay_generated_no_positions",
             "policy_target_mass_silently_dropped",
-            "candidate_discovery_below_gate",
             "decisive_candidate_discovery_below_gate",
             "non_finite_train_metric",
             "illegal_or_crash_rate",
@@ -2054,8 +2052,6 @@ class Phase3Supervisor:
             return "policy_target_mass_silently_dropped"
         if trial.family.sparse_policy:
             discovery = float(buffer.get("candidate_discovery_top8", 0.0) or 0.0)
-            if record.get("buffer", {}).get("size", 0) > 0 and discovery < self.args.candidate_recall_gate:
-                return f"candidate_discovery_below_gate:{discovery:.4f}"
             decisive = min(
                 float(buffer.get("candidate_discovery_winning_move", 0.0) or 0.0),
                 float(buffer.get("candidate_discovery_forced_block", 0.0) or 0.0),
@@ -2063,6 +2059,21 @@ class Phase3Supervisor:
             )
             if record.get("buffer", {}).get("size", 0) > 0 and decisive < 0.995:
                 return f"decisive_candidate_discovery_below_gate:{decisive:.4f}"
+            if (
+                record.get("buffer", {}).get("size", 0) > 0
+                and discovery < self.args.candidate_recall_gate
+                and record.get("stage") != "3A_calibration"
+            ):
+                self.log.write(
+                    "candidate_discovery_below_gate",
+                    {
+                        "trial_id": trial.trial_id,
+                        "stage": record.get("stage"),
+                        "candidate_discovery_top8": discovery,
+                        "gate": self.args.candidate_recall_gate,
+                        "effect": "score_penalty_not_calibration_hard_prune",
+                    },
+                )
         elapsed = float(record.get("epoch_elapsed_s", 0.0) or 0.0)
         ref = max(float(self.args.target_epoch_seconds), 1.0)
         last_score = trial.last_score

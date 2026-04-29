@@ -74,16 +74,22 @@ def binned_value_loss(
         Scalar loss.
     """
     logits = pred_logits.float()
-    values = target_values.to(device=logits.device, dtype=logits.dtype).clamp(-1.0, 1.0)
+    raw_values = target_values.to(device=logits.device, dtype=logits.dtype)
+    finite = torch.isfinite(raw_values)
+    values = torch.nan_to_num(raw_values, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
     target_bins = value_to_bins_torch(values, n_bins=n_bins)
     log_probs = F.log_softmax(logits, dim=-1)
     loss = -(target_bins * log_probs).sum(dim=-1)
     if weight is not None:
         weight = weight.to(device=loss.device, dtype=loss.dtype)
+        weight = weight * finite.to(dtype=weight.dtype)
         valid = weight > 0
         if not torch.any(valid):
             return pred_logits.sum() * 0.0
         return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
+    if not torch.any(finite):
+        return pred_logits.sum() * 0.0
+    loss = loss[finite]
     return loss.mean()
 
 
@@ -137,17 +143,23 @@ def regret_value_loss(
         Scalar loss.
     """
     logits = pred_logits.float()
-    regret = target_regret.to(device=logits.device, dtype=logits.dtype)
+    raw_regret = target_regret.to(device=logits.device, dtype=logits.dtype)
+    finite = torch.isfinite(raw_regret)
+    regret = torch.nan_to_num(raw_regret, nan=0.0, posinf=4.0, neginf=0.0)
     target_bins = scalar_to_bins_torch(regret, n_bins=n_bins, min_value=0.0, max_value=4.0)
     log_probs = F.log_softmax(logits, dim=-1)
     loss = -(target_bins * log_probs).sum(dim=-1)
     if weight is not None:
         row_weight = weight.to(device=loss.device, dtype=loss.dtype)
+        row_weight = row_weight * finite.to(dtype=row_weight.dtype)
         valid = row_weight > 0
         if not torch.any(valid):
             return pred_logits.sum() * 0.0
         row_weight = row_weight * valid.to(dtype=row_weight.dtype)
         return (loss * row_weight).sum() / row_weight.sum().clamp(min=1e-6)
+    if not torch.any(finite):
+        return pred_logits.sum() * 0.0
+    loss = loss[finite]
     return loss.mean()
 
 

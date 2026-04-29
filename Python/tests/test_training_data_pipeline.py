@@ -1530,6 +1530,19 @@ def test_value_loss_can_be_masked_for_truncated_games():
     assert per_head["value"].item() == 0.0
 
 
+def test_value_loss_ignores_non_finite_targets_with_zero_weight():
+    predictions = {"value": torch.zeros(2, 65, requires_grad=True)}
+    targets = {
+        "value": torch.tensor([float("nan"), 1.0]),
+        "value_weight": torch.tensor([0.0, 1.0]),
+    }
+
+    total, per_head = compute_losses(predictions, targets, {"value": 1.0})
+
+    assert torch.isfinite(total)
+    assert torch.isfinite(per_head["value"])
+
+
 def test_regret_losses_can_be_masked_by_regret_weight():
     predictions = {
         "regret_rank": torch.zeros(2, 1, requires_grad=True),
