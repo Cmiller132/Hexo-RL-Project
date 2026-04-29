@@ -206,6 +206,18 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
             pos.opp_policy_weight = 0.0
         if not pos.pair_policy_target_v2:
             pos.pair_policy_target_v2 = _real_pair_policy_target(positions, i)
+        if pos.pair_policy_target_v2 and _is_first_placement_turn_start(positions, i):
+            legal = set(_legal_qr_from_history(pos.move_history))
+            expected_pairs = len(legal) * max(len(legal) - 1, 0) // 2
+            seen_pairs = {
+                frozenset({(int(first[0]), int(first[1])), (int(second[0]), int(second[1]))})
+                for first, second, prob in pos.pair_policy_target_v2
+                if float(prob) > 0.0
+                and (int(first[0]), int(first[1])) in legal
+                and (int(second[0]), int(second[1])) in legal
+                and (int(first[0]), int(first[1])) != (int(second[0]), int(second[1]))
+            }
+            pos.pair_policy_complete = bool(expected_pairs == 0 or len(seen_pairs) == expected_pairs)
         tail = positions[i:]
         regret_weight = 0.0 if getattr(record, "truncated", False) else 1.0
         if any(p.selected_action_value is None for p in tail):
@@ -277,10 +289,17 @@ def _real_pair_policy_target(
             if float(prob) > 0.0 and (int(q), int(r)) in legal and (int(q), int(r)) != first
         ]
     # First-placement joint pair targets must come from the root MCTS joint
-    # table recorded during self-play.  Reconstructing them from the sampled
+    # table recorded during self-play. Reconstructing them from the sampled
     # next state only labels one observed first move and is not an all-legal
-    # joint prior.
+    # joint prior, so absence remains an explicit incomplete contract.
     return []
+
+
+def _is_first_placement_turn_start(positions: List[PositionRecord], index: int) -> bool:
+    pos = positions[index]
+    if index > 0 and positions[index - 1].player == pos.player:
+        return False
+    return _history_len(pos.move_history) > 0
 
 
 def _next_full_search_opponent_turn_start(

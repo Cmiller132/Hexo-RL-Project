@@ -1,7 +1,7 @@
 """Tactical oracle adapters for Hexo candidate construction.
 
-Production callers prefer the Rust engine hot-window oracle.  The Python
-scanner remains as a deterministic fallback and fixture helper.
+Production callers use the Rust engine hot-window oracle.  The Python scanner
+remains available only as an explicit fixture/diagnostic helper.
 """
 
 from __future__ import annotations
@@ -118,6 +118,7 @@ def scan_tactical_oracle_from_history(
     offset_q: int = -16,
     offset_r: int = -16,
     near_radius: int = TACTICAL_SCAN_RADIUS,
+    allow_python_fallback: bool = False,
 ) -> TacticalOracleResult:
     game = engine_game_from_history(history_bytes)
     if game is not None and hasattr(game, "tactical_oracle"):
@@ -128,6 +129,10 @@ def scan_tactical_oracle_from_history(
             offset_r=offset_r,
             near_radius=near_radius,
         )
+    if not allow_python_fallback:
+        if game is None:
+            raise RuntimeError("engine tactical oracle is required but the Rust engine is unavailable")
+        raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
     stones, current_player, _placements_remaining = parse_history_state(history_bytes)
     legal = legal_moves if legal_moves is not None else legal_moves_from_stones(stones, near_radius)
     return scan_tactical_oracle(
@@ -146,6 +151,7 @@ def scan_tactical_oracle_from_game(
     offset_q: int = -16,
     offset_r: int = -16,
     near_radius: int = TACTICAL_SCAN_RADIUS,
+    allow_python_fallback: bool = False,
 ) -> TacticalOracleResult:
     """Return the engine-backed tactical oracle for an already-restored game."""
     pieces = getattr(game, "board_pieces", lambda: [])()
@@ -159,6 +165,9 @@ def scan_tactical_oracle_from_game(
         if legal_moves is None:
             return result
         return _filter_result_to_legal(result, legal_moves)
+
+    if not allow_python_fallback:
+        raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
 
     if hasattr(game, "legal_moves_near"):
         legal_moves = game.legal_moves_near(int(near_radius))

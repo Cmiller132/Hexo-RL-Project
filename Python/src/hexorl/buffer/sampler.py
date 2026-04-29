@@ -844,6 +844,7 @@ class ReplayDataset(_IterableDataset):
                             budget=candidate_width,
                             candidate_mask=cand.mask[:width],
                             legal_moves=legal_list,
+                            known_first=known_first,
                         )
                         aux_targets["pair_candidate_row_indices"][i, :candidate_width] = aux_targets["candidate_indices"][i, :candidate_width]
                         aux_targets["pair_candidate_features"][i, :candidate_width] = aux_targets["candidate_features"][i, :candidate_width]
@@ -866,6 +867,15 @@ class ReplayDataset(_IterableDataset):
                     radius=8,
                     include_pair_rows=False,
                 )
+                if (
+                    self.include_pair_policy
+                    and int(graph.placements_remaining) >= 2
+                    and not bool(getattr(rec, "pair_policy_complete", False))
+                ):
+                    raise ValueError(
+                        "graph pair-policy training requires complete search-observed "
+                        "first-placement joint pair targets; no synthetic product fallback is allowed"
+                    )
                 if pair_policy_v2:
                     graph = graph_batch_with_reference_pair_rows(graph, pair_policy_v2)
                 graph_batch = aux_targets.setdefault("_graph_batches", [])

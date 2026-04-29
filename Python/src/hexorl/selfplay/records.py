@@ -19,7 +19,7 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 8
+COMPACT_VERSION_V2 = 9
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
@@ -69,6 +69,7 @@ class PositionRecord:
     opp_policy_target_v2: PolicyTargetV2 = field(default_factory=list)
     opp_policy_legal_v2: List[Tuple[int, int]] = field(default_factory=list)
     pair_policy_target_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = field(default_factory=list)
+    pair_policy_complete: bool = False
     target_policy_mass_outside_window: float = 0.0
     missing_target_policy_mass: float = 0.0
     candidate_recall_mcts_top1: float = 1.0
@@ -241,6 +242,7 @@ class GameRecord:
                 q1, r1 = first
                 q2, r2 = second
                 parts.extend(struct.pack("<iiiif", int(q1), int(r1), int(q2), int(r2), float(prob)))
+            parts.extend(struct.pack("<B", int(bool(pos.pair_policy_complete))))
             parts.extend(struct.pack(
                 "<ffffffff",
                 float(pos.target_policy_mass_outside_window),
@@ -366,6 +368,7 @@ class GameRecord:
             opp_policy_v2: PolicyTargetV2 = []
             opp_policy_legal_v2: List[Tuple[int, int]] = []
             pair_policy_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
+            pair_policy_complete = False
             target_policy_mass_outside_window = 0.0
             missing_target_policy_mass = 0.0
             candidate_recall_mcts_top1 = 1.0
@@ -446,6 +449,11 @@ class GameRecord:
                             q1, r1, q2, r2, prob = struct.unpack_from("<iiiif", data, offset)
                             offset += struct.calcsize("<iiiif")
                             pair_policy_v2.append(((int(q1), int(r1)), (int(q2), int(r2)), float(prob)))
+                        if version >= 9:
+                            pair_policy_complete = bool(struct.unpack_from("<B", data, offset)[0])
+                            offset += 1
+                        else:
+                            pair_policy_complete = bool(pair_policy_v2)
                         (
                             target_policy_mass_outside_window,
                             missing_target_policy_mass,
@@ -545,6 +553,7 @@ class GameRecord:
                 opp_policy_target_v2=opp_policy_v2,
                 opp_policy_legal_v2=opp_policy_legal_v2,
                 pair_policy_target_v2=pair_policy_v2,
+                pair_policy_complete=pair_policy_complete,
                 target_policy_mass_outside_window=target_policy_mass_outside_window,
                 missing_target_policy_mass=missing_target_policy_mass,
                 candidate_recall_mcts_top1=candidate_recall_mcts_top1,
@@ -643,6 +652,7 @@ class GameRecord:
                 policy_target=policy,
                 policy_target_v2=policy_targets_v2[i] if i < len(policy_targets_v2) else [],
                 pair_policy_target_v2=pair_policy_targets_v2[i] if i < len(pair_policy_targets_v2) else [],
+                pair_policy_complete=bool(pair_policy_targets_v2[i]) if i < len(pair_policy_targets_v2) else False,
                 root_value=rv,
                 selected_action_value=rv,
                 player=player,

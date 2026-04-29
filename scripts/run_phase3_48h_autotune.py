@@ -2026,6 +2026,8 @@ class Phase3Supervisor:
             "epoch_seconds",
             "truncation_rate",
             "illegal_or_crash_rate",
+            "fallback_prior_use_on_mcts_topk",
+            "pair_fallback_prior_use_on_mcts_topk",
         ]
         z = {key: _zscore_map(rows, key) for key in keys}
         for trial in trials:
@@ -2063,6 +2065,8 @@ class Phase3Supervisor:
                 - 0.10 * z["epoch_seconds"].get(id(row), 0.0)
                 - 0.10 * z["truncation_rate"].get(id(row), 0.0)
                 - 0.20 * z["illegal_or_crash_rate"].get(id(row), 0.0)
+                - 0.10 * z["fallback_prior_use_on_mcts_topk"].get(id(row), 0.0)
+                - 0.10 * z["pair_fallback_prior_use_on_mcts_topk"].get(id(row), 0.0)
             )
             row["strength_score"] = strength
             row["scheduler_score"] = scheduler
@@ -2529,6 +2533,20 @@ class EvaluationServices:
             "epoch_seconds": throughput["epoch_seconds"],
             "truncation_rate": throughput["truncation_rate"],
             "illegal_or_crash_rate": arena.get("illegal_or_crash_rate", 0.0),
+            "fallback_prior_use_on_mcts_topk": float(
+                buffer.get(
+                    "fallback_prior_use_on_mcts_topk",
+                    buffer.get("fallback_prior_use_on_mcts_top4", buffer.get("fallback_prior_use", 0.0)),
+                )
+                or 0.0
+            ),
+            "pair_fallback_prior_use_on_mcts_topk": float(
+                buffer.get(
+                    "pair_fallback_prior_use_on_mcts_topk",
+                    buffer.get("pair_fallback_prior_use_on_mcts_top4", buffer.get("pair_fallback_prior_use", 0.0)),
+                )
+                or 0.0
+            ),
             "arena": arena,
             "candidate_recall": candidate,
             "tactical_suite": tactical,
@@ -2555,6 +2573,8 @@ class EvaluationServices:
             - 0.10 * row["truncation_rate"]
             - 0.20 * row["illegal_or_crash_rate"]
             - row["candidate_recall_penalty"]
+            - 0.10 * row["fallback_prior_use_on_mcts_topk"]
+            - 0.10 * row["pair_fallback_prior_use_on_mcts_topk"]
         )
         return row
 

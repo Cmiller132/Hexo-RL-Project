@@ -32,6 +32,23 @@ SCHEDULER_PENALTIES = {
     "epoch_seconds": 0.10,
     "truncation_rate": 0.10,
     "illegal_or_crash_rate": 0.20,
+    "fallback_prior_use_on_mcts_topk": 0.10,
+    "pair_fallback_prior_use_on_mcts_topk": 0.10,
+}
+
+MILESTONE_K_ZERO_SENTINELS = (
+    "illegal_move_rate",
+    "post_terminal_move_attempts",
+    "replay_mismatch_rate",
+    "d6_mismatch_rate",
+    "legal_mask_mismatch_rate",
+    "oracle_threat_mismatch_rate",
+    "missing_legal_action_rows",
+    "pair_mask_violation_rate",
+)
+
+MILESTONE_K_REQUIRED_STATUS = {
+    "target_leakage_check_status": "pass",
 }
 
 
@@ -55,6 +72,7 @@ def compute_phase3_scorecard(
 ) -> ScorecardResult:
     """Compute the documented Phase 3 scorecard from z-normalized metrics."""
 
+    metrics = _with_prior_fallback_aliases(metrics)
     hard_failures = candidate_hard_gate_failures(
         metrics,
         candidate_model=candidate_model,
@@ -105,7 +123,7 @@ def candidate_hard_gate_failures(
     candidate_model: bool,
     fallback_prior_baseline: float | None = None,
 ) -> list[str]:
-    failures: list[str] = []
+    failures: list[str] = milestone_k_hard_gate_failures(metrics)
     if metrics.get("illegal_or_crash_rate", 0.0) > 0.0:
         failures.append("illegal_or_crash_rate")
     if metrics.get("critical_overflow_count", 0.0) != 0.0:
@@ -129,6 +147,19 @@ def candidate_hard_gate_failures(
     return failures
 
 
+def milestone_k_hard_gate_failures(metrics: dict[str, float | str]) -> list[str]:
+    """Return non-negotiable bug-sentinel failures for checkpoint promotion."""
+    failures: list[str] = []
+    for key in MILESTONE_K_ZERO_SENTINELS:
+        if float(metrics.get(key, 0.0) or 0.0) != 0.0:
+            failures.append(key)
+    for key, expected in MILESTONE_K_REQUIRED_STATUS.items():
+        actual = metrics.get(key, expected)
+        if str(actual).lower() != expected:
+            failures.append(key)
+    return failures
+
+
 def final_score_from_league_lcb(rating: Any) -> float:
     """Champion-selection helper: consume LCB, not raw mean."""
 
@@ -139,3 +170,29 @@ def final_score_from_league_lcb(rating: Any) -> float:
 
 def _weighted(metrics: dict[str, float], weights: dict[str, float]) -> float:
     return sum(weights[key] * float(metrics.get(key, 0.0)) for key in weights)
+
+
+def _with_prior_fallback_aliases(metrics: dict[str, float]) -> dict[str, float]:
+    """Normalize top-k fallback telemetry names used by replay and scorecards."""
+    out = dict(metrics)
+    if "fallback_prior_use_on_mcts_topk" not in out:
+        for key in (
+            "fallback_prior_use_on_mcts_top4",
+            "fallback_prior_use_on_mcts_top8",
+            "fallback_prior_use_on_mcts_top1",
+            "fallback_prior_use",
+        ):
+            if key in out:
+                out["fallback_prior_use_on_mcts_topk"] = out[key]
+                break
+    if "pair_fallback_prior_use_on_mcts_topk" not in out:
+        for key in (
+            "pair_fallback_prior_use_on_mcts_top4",
+            "pair_fallback_prior_use_on_mcts_top8",
+            "pair_fallback_prior_use_on_mcts_top1",
+            "pair_fallback_prior_use",
+        ):
+            if key in out:
+                out["pair_fallback_prior_use_on_mcts_topk"] = out[key]
+                break
+    return out

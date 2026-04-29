@@ -39,10 +39,14 @@ from hexorl.dashboard.replay import get_replay_position, position_payload, repla
 from hexorl.graph.batch import (
     GRAPH_FEATURE_DIM,
     GRAPH_SCHEMA_VERSION,
+    GRAPH_CAPACITY_STRATEGY,
     RELATION_SCHEMA_VERSION,
     GraphTokenType,
     RelationType,
     build_graph_batch_from_history,
+    graph_capacity_report,
+    transform_pair_policy_target,
+    transform_policy_target,
 )
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -101,6 +105,8 @@ class ModelLoadRequest(BaseModel):
 class InferRequest(BaseModel):
     history_b64: str
     model_ids: list[str] = Field(default_factory=list)
+    policy_target_v2: list[Any] = Field(default_factory=list)
+    pair_policy_target_v2: list[Any] = Field(default_factory=list)
 
 
 class ArenaStartRequest(BaseModel):
@@ -466,6 +472,7 @@ def create_app(
                 "schema_version": GRAPH_SCHEMA_VERSION,
                 "relation_schema_version": RELATION_SCHEMA_VERSION,
                 "feature_dim": GRAPH_FEATURE_DIM,
+                "capacity_strategy": GRAPH_CAPACITY_STRATEGY,
                 "token_types": {token.name: int(token) for token in GraphTokenType},
                 "relation_types": {relation.name: int(relation) for relation in RelationType},
             },
@@ -474,15 +481,25 @@ def create_app(
     @app.post("/api/debug/graph")
     def debug_graph(req: InferRequest) -> dict[str, Any]:
         history = decode_bytes(req.history_b64)
-        return _graph_debug_payload(history)
+        policy_target = _parse_policy_target_v2(req.policy_target_v2)
+        pair_target = _parse_pair_policy_target_v2(req.pair_policy_target_v2)
+        return _graph_debug_payload(history, policy_target=policy_target, pair_policy_target=pair_target)
 
     @app.post("/api/debug/d6")
     def debug_d6(req: InferRequest) -> dict[str, Any]:
         history = decode_bytes(req.history_b64)
+        base_policy_target = _parse_policy_target_v2(req.policy_target_v2)
+        base_pair_target = _parse_pair_policy_target_v2(req.pair_policy_target_v2)
         transforms = []
         for sym_idx in range(12):
             transformed = _transform_history_bytes(history, sym_idx)
-            graph = _graph_debug_payload(transformed)
+            policy_target = transform_policy_target(base_policy_target, sym_idx)
+            pair_target = transform_pair_policy_target(base_pair_target, sym_idx)
+            graph = _graph_debug_payload(
+                transformed,
+                policy_target=policy_target,
+                pair_policy_target=pair_target,
+            )
             position = position_payload(get_replay_position(transformed, constrain_threats=False))
             model_logits = {}
             for model_id in req.model_ids:
@@ -498,13 +515,20 @@ def create_app(
                     "placements_remaining": position["placements_remaining"],
                     "legal_count": len(position["legal_moves"]),
                     "graph": graph,
-                    "contracts": _d6_contract_payload(transformed, position, graph),
+                    "contracts": _d6_contract_payload(
+                        transformed,
+                        position,
+                        graph,
+                        policy_target=policy_target,
+                        pair_policy_target=pair_target,
+                    ),
                     "model_logits": model_logits,
                 }
             )
         return {
             "symmetry_count": 12,
             "source_history_b64": base64.b64encode(history).decode("ascii"),
+            "target_checks": _d6_target_checks(transforms),
             "transforms": transforms,
         }
 
@@ -1165,8 +1189,104 @@ def _finite_or_none(value: Any) -> float | None:
     return number
 
 
-def _graph_debug_payload(history: bytes) -> dict[str, Any]:
-    graph = build_graph_batch_from_history(history)
+def _parse_policy_target_v2(rows: list[Any]) -> list[tuple[int, int, float]]:
+    parsed: list[tuple[int, int, float]] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            q = row.get("q")
+            r = row.get("r")
+            prob = row.get("prob", row.get("p", row.get("weight", 0.0)))
+        else:
+            if len(row) != 3:
+                raise HTTPException(400, "policy_target_v2 rows must be [q, r, probability]")
+            q, r, prob = row
+        prob_f = float(prob)
+        if prob_f > 0.0:
+            parsed.append((int(q), int(r), prob_f))
+    return parsed
+
+
+def _parse_pair_policy_target_v2(rows: list[Any]) -> list[tuple[tuple[int, int], tuple[int, int], float]]:
+    parsed: list[tuple[tuple[int, int], tuple[int, int], float]] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            first_raw = row.get("first")
+            second_raw = row.get("second")
+            prob = row.get("prob", row.get("p", row.get("weight", 0.0)))
+        else:
+            if len(row) != 3:
+                raise HTTPException(400, "pair_policy_target_v2 rows must be [[q1, r1], [q2, r2], probability]")
+            first_raw, second_raw, prob = row
+        first = (
+            (int(first_raw["q"]), int(first_raw["r"]))
+            if isinstance(first_raw, dict)
+            else (int(first_raw[0]), int(first_raw[1]))
+        )
+        second = (
+            (int(second_raw["q"]), int(second_raw["r"]))
+            if isinstance(second_raw, dict)
+            else (int(second_raw[0]), int(second_raw[1]))
+        )
+        prob_f = float(prob)
+        if prob_f > 0.0:
+            parsed.append((first, second, prob_f))
+    return parsed
+
+
+def _d6_target_checks(transforms: list[dict[str, Any]]) -> dict[str, Any]:
+    policy_masses = [
+        float(item["contracts"]["sparse_candidates"].get("target_mass", 0.0))
+        for item in transforms
+    ]
+    pair_masses = [
+        float(item["contracts"]["pair_rows"].get("target_mass", 0.0))
+        for item in transforms
+    ]
+    graph_policy_masses = [
+        float(item["contracts"]["graph_targets"].get("target_masses", {}).get("policy", 0.0))
+        for item in transforms
+    ]
+    graph_pair_masses = [
+        float(item["contracts"]["graph_targets"].get("target_masses", {}).get("pair", 0.0))
+        for item in transforms
+    ]
+
+    def stable(values: list[float]) -> bool:
+        if not values:
+            return True
+        first = values[0]
+        return all(abs(value - first) <= 1e-5 for value in values)
+
+    return {
+        "policy_target_mass_preserved": stable(policy_masses) and stable(graph_policy_masses),
+        "pair_target_mass_preserved": stable(pair_masses) and stable(graph_pair_masses),
+        "policy_target_masses": policy_masses,
+        "pair_target_masses": pair_masses,
+        "graph_policy_target_masses": graph_policy_masses,
+        "graph_pair_target_masses": graph_pair_masses,
+    }
+
+
+def _last_history_qr(history: bytes) -> tuple[int, int] | None:
+    if len(history) < 12:
+        return None
+    q = int.from_bytes(history[-8:-4], "little", signed=True)
+    r = int.from_bytes(history[-4:], "little", signed=True)
+    return q, r
+
+
+def _graph_debug_payload(
+    history: bytes,
+    *,
+    policy_target: list[tuple[int, int, float]] | None = None,
+    pair_policy_target: list[tuple[tuple[int, int], tuple[int, int], float]] | None = None,
+) -> dict[str, Any]:
+    graph = build_graph_batch_from_history(
+        history,
+        policy_target=policy_target or [],
+        pair_policy_target=pair_policy_target or [],
+    )
+    capacity = graph_capacity_report(graph)
     token_counts = {
         token.name: int((graph.token_type == int(token)).sum())
         for token in GraphTokenType
@@ -1191,6 +1311,14 @@ def _graph_debug_payload(history: bytes) -> dict[str, Any]:
         "schema_version": graph.schema_version,
         "relation_schema_version": graph.relation_schema_version,
         "feature_dim": int(graph.token_features.shape[-1]),
+        "capacity": {
+            "fits_ipc": capacity.fits_ipc,
+            "strategy": capacity.strategy,
+            "failures": list(capacity.failures()),
+            "max_tokens": capacity.max_tokens,
+            "max_actions": capacity.max_actions,
+            "max_pairs": capacity.max_pairs,
+        },
         "token_count": int(graph.token_features.shape[0]),
         "token_counts": token_counts,
         "legal_count": int(graph.legal_qr.shape[0]),
@@ -1205,10 +1333,23 @@ def _graph_debug_payload(history: bytes) -> dict[str, Any]:
         "relation_bias_shape": [int(dim) for dim in graph.relation_bias.shape],
         "placements_remaining": int(graph.placements_remaining),
         "current_player": int(graph.current_player),
+        "target_masses": {
+            "policy": float(graph.policy_target.sum()),
+            "pair": float(graph.pair_policy_target.sum()),
+            "pair_first": float(graph.pair_first_policy_target.sum()),
+            "opp_policy": float(graph.opp_policy_target.sum()),
+        },
     }
 
 
-def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
+def _d6_contract_payload(
+    history: bytes,
+    position: dict[str, Any],
+    graph: dict[str, Any],
+    *,
+    policy_target: list[tuple[int, int, float]] | None = None,
+    pair_policy_target: list[tuple[tuple[int, int], tuple[int, int], float]] | None = None,
+) -> dict[str, Any]:
     legal_moves = [
         (int(row["q"]), int(row["r"]))
         for row in position.get("legal_moves", [])
@@ -1218,7 +1359,7 @@ def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[s
     candidate_budget = min(max(len(legal_moves), 1), 512)
     candidates = build_candidate_batch(
         legal_moves,
-        [],
+        policy_target or [],
         offset_q=offset_q,
         offset_r=offset_r,
         budget=candidate_budget,
@@ -1234,14 +1375,18 @@ def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[s
         if bool(active)
     ][:64]
     pair_rows: list[dict[str, Any]] = []
+    pair_target_mass = 0.0
+    pair_missing_mass = 0.0
     if len(legal_moves) >= 2 and int(position.get("placements_remaining", 1)) >= 2:
         pair = build_pair_candidate_batch(
             candidates.qr,
-            [],
+            pair_policy_target or [],
             budget=min(512, len(legal_moves) * max(len(legal_moves) - 1, 0) // 2),
             candidate_mask=candidates.mask,
             legal_moves=legal_moves,
         )
+        pair_target_mass = float(pair.target.sum())
+        pair_missing_mass = float(pair.missing_mass)
         for row, active in enumerate(pair.mask):
             if not bool(active) or len(pair_rows) >= 64:
                 continue
@@ -1258,6 +1403,45 @@ def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[s
                     },
                 }
             )
+    elif int(position.get("placements_remaining", 1)) == 1 and pair_policy_target:
+        known_first = _last_history_qr(history)
+        if known_first is not None:
+            storage_width = min(max(len(legal_moves) + 1, 1), 512)
+            pair_candidates = build_candidate_batch(
+                [known_first] + legal_moves,
+                [],
+                offset_q=offset_q,
+                offset_r=offset_r,
+                budget=storage_width,
+                storage_width=storage_width,
+                critical_actions=[known_first] + legal_moves,
+            )
+            pair = build_pair_candidate_batch(
+                pair_candidates.qr,
+                pair_policy_target,
+                budget=min(max(len(legal_moves), 1), 512),
+                candidate_mask=pair_candidates.mask,
+                legal_moves=legal_moves,
+                known_first=known_first,
+            )
+            pair_target_mass = float(pair.target.sum())
+            pair_missing_mass = float(pair.missing_mass)
+            for row, active in enumerate(pair.mask):
+                if not bool(active) or len(pair_rows) >= 64:
+                    continue
+                first_idx, second_idx = pair.pair_indices[row]
+                pair_rows.append(
+                    {
+                        "first": {
+                            "q": int(pair_candidates.qr[int(first_idx), 0]),
+                            "r": int(pair_candidates.qr[int(first_idx), 1]),
+                        },
+                        "second": {
+                            "q": int(pair_candidates.qr[int(second_idx), 0]),
+                            "r": int(pair_candidates.qr[int(second_idx), 1]),
+                        },
+                    }
+                )
     axis_input = AxisPolicyInput(
         stones=list(position.get("stones", [])),
         legal_moves=list(position.get("legal_moves", [])),
@@ -1282,10 +1466,14 @@ def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[s
             "feature_version": CANDIDATE_FEATURE_VERSION,
             "feature_names": list(CANDIDATE_FEATURE_NAMES),
             "candidate_count": int(candidates.mask.sum()),
+            "target_mass": float(candidates.target.sum()),
+            "missing_mass": float(candidates.missing_mass),
             "rows": candidate_rows,
         },
         "pair_rows": {
             "available": bool(pair_rows),
+            "target_mass": pair_target_mass,
+            "missing_mass": pair_missing_mass,
             "rows": pair_rows,
         },
         "axis": {
@@ -1297,6 +1485,7 @@ def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[s
             "pair_count": int(graph["pair_count"]),
             "opp_legal_count": int(graph["opp_legal_count"]),
             "token_counts": graph["token_counts"],
+            "target_masses": graph.get("target_masses", {}),
         },
     }
 
