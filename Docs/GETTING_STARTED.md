@@ -4,7 +4,7 @@
 
 - Rust 1.87+ with `cargo`
 - Python 3.10+ with `pip`
-- PyTorch 2.0+ (CUDA recommended for training)
+- PyTorch 2.0+ (CUDA is recommended for training)
 - `maturin` for building the Rust extension
 
 ## Installation
