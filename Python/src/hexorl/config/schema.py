@@ -347,6 +347,7 @@ class RuntimeConfig(BaseModel):
     compile_inference: bool | None = None
     compile_mode: str = "reduce-overhead"
     train_memory_fraction: float = 0.62
+    inference_start_timeout_s: float = 30.0
 
 
 Config.model_rebuild()

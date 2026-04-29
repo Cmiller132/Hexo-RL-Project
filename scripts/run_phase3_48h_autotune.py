@@ -834,6 +834,8 @@ class Phase3Supervisor:
         cfg.train.lr_schedule = "constant"
         cfg.runtime.compile_inference = False
         cfg.runtime.compile_model = False
+        if self._low_memory_cuda_host() and (family.graph or family.sparse_policy or family.architecture == "restnet"):
+            cfg.runtime.inference_start_timeout_s = max(float(cfg.runtime.inference_start_timeout_s), 90.0)
         self._apply_head_bundle_weights(cfg, recipe, dynamic)
         self._apply_dynamic_values(cfg, recipe, dynamic, family)
         autotune_config(cfg, self.host, selfplay_enabled=True)

@@ -311,6 +311,50 @@ def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
     ).train_batch_size == 256
 
 
+def test_low_memory_graph_config_extends_inference_start_timeout(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.base_cfg = module.Config()
+    supervisor.host = SimpleNamespace(
+        logical_cpus=32,
+        physical_cpus=16,
+        system="linux",
+        cuda_available=True,
+        cuda_name="test-gpu",
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+    )
+    supervisor.args = SimpleNamespace(seed=9300, train_batches=100, max_game_moves=384)
+    family = module.FamilySpec(
+        name="graph_hybrid_0",
+        description="graph",
+        architecture="graph_hybrid_0",
+        graph=True,
+        sparse_policy=True,
+        available=True,
+    )
+    recipe = module.StaticRecipe(
+        full_sims=512,
+        pcr_low_sims=128,
+        policy_top_k=96,
+        candidate_budget=256,
+        head_bundle="structural",
+        temperature_family="slow_cool",
+        train_batch_size=128,
+    )
+
+    cfg = module.Phase3Supervisor._make_config(
+        supervisor,
+        family,
+        recipe,
+        module.DynamicParams(),
+        tmp_path,
+        "3A_calibration",
+    )
+
+    assert cfg.runtime.inference_start_timeout_s == 90.0
+
+
 def test_runtime_sweep_prunes_when_all_candidates_fail(tmp_path):
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)

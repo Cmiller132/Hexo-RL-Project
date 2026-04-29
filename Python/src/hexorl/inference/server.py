@@ -141,8 +141,14 @@ class InferenceServer:
             daemon=False,
         )
         self._process.start()
-        if not self._ready_event.wait(timeout=30.0):
-            raise RuntimeError("Inference server failed to start within 30s")
+        timeout_s = max(1.0, float(getattr(self.cfg.runtime, "inference_start_timeout_s", 30.0)))
+        if not self._ready_event.wait(timeout=timeout_s):
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=5.0)
+            self.close()
+            self._process = None
+            raise RuntimeError(f"Inference server failed to start within {timeout_s:g}s")
 
     def stop(self):
         """Signal the server to shut down gracefully."""
