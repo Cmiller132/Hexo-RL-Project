@@ -411,9 +411,9 @@ mod tests {
             "two-placement root search should expose observed joint pair targets"
         );
         assert!(
-            pair_targets.iter().all(|(q1, r1, q2, r2, visits)| {
-                (*q1, *r1) != (*q2, *r2) && *visits > 0
-            }),
+            pair_targets
+                .iter()
+                .all(|(q1, r1, q2, r2, visits)| { (*q1, *r1) != (*q2, *r2) && *visits > 0 }),
             "joint pair targets must contain distinct legal moves with positive visits"
         );
     }

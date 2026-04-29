@@ -62,6 +62,12 @@ class RingBuffer:
         self._pair_policy_v2_r2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
         self._pair_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._policy_v2_exact: List[List[tuple[int, int, float]]] = [[] for _ in range(capacity)]
+        self._opp_policy_v2_exact: List[List[tuple[int, int, float]]] = [[] for _ in range(capacity)]
+        self._opp_policy_legal_v2_exact: List[List[tuple[int, int]]] = [[] for _ in range(capacity)]
+        self._pair_policy_v2_exact: List[List[tuple[tuple[int, int], tuple[int, int], float]]] = [
+            [] for _ in range(capacity)
+        ]
         self._outside_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._missing_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_top1 = np.zeros(capacity, dtype=np.float32)
@@ -320,43 +326,10 @@ class RingBuffer:
                 prob = float(self._opp_policy_probs[idx, j])
                 if prob > 0:
                     opp_policy[action_idx] = prob
-            policy_v2 = []
-            n_v2 = int(self._policy_v2_counts[idx])
-            for j in range(n_v2):
-                prob = float(self._policy_v2_probs[idx, j])
-                if prob > 0:
-                    policy_v2.append((
-                        int(self._policy_v2_q[idx, j]),
-                        int(self._policy_v2_r[idx, j]),
-                        prob,
-                    ))
-            opp_policy_v2 = []
-            n_opp_v2 = int(self._opp_policy_v2_counts[idx])
-            for j in range(n_opp_v2):
-                prob = float(self._opp_policy_v2_probs[idx, j])
-                if prob > 0:
-                    opp_policy_v2.append((
-                        int(self._opp_policy_v2_q[idx, j]),
-                        int(self._opp_policy_v2_r[idx, j]),
-                        prob,
-                    ))
-            opp_policy_legal_v2 = []
-            n_opp_legal_v2 = int(self._opp_policy_legal_v2_counts[idx])
-            for j in range(n_opp_legal_v2):
-                opp_policy_legal_v2.append((
-                    int(self._opp_policy_legal_v2_q[idx, j]),
-                    int(self._opp_policy_legal_v2_r[idx, j]),
-                ))
-            pair_policy_v2 = []
-            n_pair_v2 = int(self._pair_policy_v2_counts[idx])
-            for j in range(n_pair_v2):
-                prob = float(self._pair_policy_v2_probs[idx, j])
-                if prob > 0:
-                    pair_policy_v2.append((
-                        (int(self._pair_policy_v2_q1[idx, j]), int(self._pair_policy_v2_r1[idx, j])),
-                        (int(self._pair_policy_v2_q2[idx, j]), int(self._pair_policy_v2_r2[idx, j])),
-                        prob,
-                    ))
+            policy_v2 = list(self._policy_v2_exact[idx])
+            opp_policy_v2 = list(self._opp_policy_v2_exact[idx])
+            opp_policy_legal_v2 = list(self._opp_policy_legal_v2_exact[idx])
+            pair_policy_v2 = list(self._pair_policy_v2_exact[idx])
 
             return PositionRecord(
                 move_history=self._histories[idx],
@@ -647,6 +620,14 @@ class RingBuffer:
             self._pair_policy_v2_r2.fill(0)
             self._pair_policy_v2_probs.fill(0.0)
             self._pair_policy_v2_counts.fill(0)
+            for store in (
+                self._policy_v2_exact,
+                self._opp_policy_v2_exact,
+                self._opp_policy_legal_v2_exact,
+                self._pair_policy_v2_exact,
+            ):
+                for idx in range(self.capacity):
+                    store[idx].clear()
             self._outside_policy_mass.fill(0.0)
             self._missing_policy_mass.fill(0.0)
             self._candidate_recall_top1.fill(0.0)
@@ -729,12 +710,11 @@ class RingBuffer:
     def _write_v2_targets(self, idx: int, record: PositionRecord):
         """Write action-keyed global policy targets and diagnostics."""
         entries = list(record.policy_target_v2)
-        if len(entries) > self.max_policy_v2_entries:
-            raise ValueError(
-                "policy_target_v2 exceeds RingBuffer capacity: "
-                f"{len(entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
-                "Silent global action target truncation is not allowed."
-            )
+        self._policy_v2_exact[idx] = [
+            (int(q), int(r), float(prob))
+            for q, r, prob in entries
+            if float(prob) > 0.0
+        ]
         n = min(len(entries), self.max_policy_v2_entries)
         self._policy_v2_counts[idx] = n
         self._policy_v2_q[idx].fill(0)
@@ -746,12 +726,11 @@ class RingBuffer:
             self._policy_v2_probs[idx, j] = float(prob)
 
         opp_entries = list(record.opp_policy_target_v2)
-        if len(opp_entries) > self.max_policy_v2_entries:
-            raise ValueError(
-                "opp_policy_target_v2 exceeds RingBuffer capacity: "
-                f"{len(opp_entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
-                "Silent opponent policy target truncation is not allowed."
-            )
+        self._opp_policy_v2_exact[idx] = [
+            (int(q), int(r), float(prob))
+            for q, r, prob in opp_entries
+            if float(prob) > 0.0
+        ]
         n_opp = min(len(opp_entries), self.max_policy_v2_entries)
         self._opp_policy_v2_counts[idx] = n_opp
         self._opp_policy_v2_q[idx].fill(0)
@@ -763,12 +742,10 @@ class RingBuffer:
             self._opp_policy_v2_probs[idx, j] = float(prob)
 
         opp_legal_entries = list(record.opp_policy_legal_v2)
-        if len(opp_legal_entries) > self.max_policy_v2_entries:
-            raise ValueError(
-                "opp_policy_legal_v2 exceeds RingBuffer capacity: "
-                f"{len(opp_legal_entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
-                "Silent opponent legal-table truncation is not allowed."
-            )
+        self._opp_policy_legal_v2_exact[idx] = [
+            (int(q), int(r))
+            for q, r in opp_legal_entries
+        ]
         n_opp_legal = min(len(opp_legal_entries), self.max_policy_v2_entries)
         self._opp_policy_legal_v2_counts[idx] = n_opp_legal
         self._opp_policy_legal_v2_q[idx].fill(0)
@@ -778,12 +755,11 @@ class RingBuffer:
             self._opp_policy_legal_v2_r[idx, j] = int(r)
 
         pair_entries = list(record.pair_policy_target_v2)
-        if len(pair_entries) > self.max_policy_v2_entries:
-            raise ValueError(
-                "pair_policy_target_v2 exceeds RingBuffer capacity: "
-                f"{len(pair_entries)} > max_policy_v2_entries={self.max_policy_v2_entries}. "
-                "Silent pair target truncation is not allowed."
-            )
+        self._pair_policy_v2_exact[idx] = [
+            ((int(first[0]), int(first[1])), (int(second[0]), int(second[1])), float(prob))
+            for first, second, prob in pair_entries
+            if float(prob) > 0.0
+        ]
         n_pair = min(len(pair_entries), self.max_policy_v2_entries)
         self._pair_policy_v2_counts[idx] = n_pair
         self._pair_policy_v2_q1[idx].fill(0)

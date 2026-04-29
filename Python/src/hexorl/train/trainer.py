@@ -270,6 +270,8 @@ class Trainer:
                     candidate_features=targets.get("candidate_features"),
                     candidate_indices=targets.get("candidate_indices"),
                     candidate_mask=targets.get("candidate_mask"),
+                    pair_candidate_features=targets.get("pair_candidate_features"),
+                    pair_candidate_row_indices=targets.get("pair_candidate_row_indices"),
                     pair_candidate_indices=targets.get("pair_candidate_indices"),
                     pair_candidate_mask=targets.get("pair_candidate_mask"),
                 )

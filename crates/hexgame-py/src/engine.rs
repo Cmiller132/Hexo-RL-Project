@@ -895,8 +895,7 @@ impl PyMCTSEngine {
             let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
             legal.push(Hex::new(q, r));
         }
-        let global_actions: Vec<(i32, i32)> =
-            qr.outer_iter().map(|row| (row[0], row[1])).collect();
+        let global_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner
             .expand_root_with_global_priors(&legal, &global_actions, logits, value)
             .map_err(PyValueError::new_err)
@@ -928,6 +927,19 @@ impl PyMCTSEngine {
             .collect();
         self.inner
             .apply_root_pair_priors(&pair_actions, logits, pair_mix)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn apply_root_pair_first_priors<'py>(
+        &mut self,
+        action_logits: PyReadonlyArray1<'py, f32>,
+        pair_mix: f32,
+    ) -> PyResult<()> {
+        let logits = action_logits.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("pair_first logits array must be contiguous")
+        })?;
+        self.inner
+            .apply_root_pair_first_priors(logits, pair_mix)
             .map_err(PyValueError::new_err)
     }
 
@@ -1141,6 +1153,98 @@ impl PyMCTSEngine {
                 &v,
                 &sparse_actions,
                 &sparse_values,
+                stage,
+                sparse_mix,
+            );
+        });
+        self.last_non_terminal_count = 0;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_and_backprop_with_sparse_sources<'py>(
+        &mut self,
+        policies: PyReadonlyArray1<'py, f32>,
+        values: PyReadonlyArray1<'py, f32>,
+        sparse_qr: PyReadonlyArray3<'py, i32>,
+        sparse_logits: PyReadonlyArray2<'py, f32>,
+        sparse_counts: PyReadonlyArray1<'py, u16>,
+        sparse_sources: PyReadonlyArray2<'py, u8>,
+        stage: u8,
+        sparse_mix: f32,
+        py: Python<'py>,
+    ) -> PyResult<()> {
+        let policies_slice = policies
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("policies array must be contiguous"))?;
+        let values_slice = values
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
+        let expected_policies = self.last_non_terminal_count as usize * BOARD_AREA;
+        if policies_slice.len() != expected_policies {
+            return Err(PyValueError::new_err(format!(
+                "policies length {} must equal {}",
+                policies_slice.len(),
+                expected_policies
+            )));
+        }
+        if values_slice.len() != self.last_non_terminal_count as usize {
+            return Err(PyValueError::new_err(format!(
+                "values length {} must equal selected non-terminal leaf count {}",
+                values_slice.len(),
+                self.last_non_terminal_count
+            )));
+        }
+        let qr = sparse_qr.as_array();
+        let logits = sparse_logits.as_array();
+        let sources = sparse_sources.as_array();
+        let counts = sparse_counts
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("sparse_counts array must be contiguous"))?;
+        let n = self.last_non_terminal_count as usize;
+        if qr.shape().len() != 3 || qr.shape()[0] < n || qr.shape()[2] != 2 {
+            return Err(PyValueError::new_err("sparse_qr must have shape (N, K, 2)"));
+        }
+        if logits.shape().len() != 2 || logits.shape()[0] < n {
+            return Err(PyValueError::new_err(
+                "sparse_logits must have shape (N, K)",
+            ));
+        }
+        if sources.shape().len() != 2 || sources.shape()[0] < n {
+            return Err(PyValueError::new_err(
+                "sparse_sources must have shape (N, K)",
+            ));
+        }
+        if counts.len() < n {
+            return Err(PyValueError::new_err("sparse_counts length must be >= N"));
+        }
+        let k = qr.shape()[1].min(logits.shape()[1]).min(sources.shape()[1]);
+        let mut sparse_actions: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+        let mut sparse_values: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut sparse_source_values: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let count = (counts[row] as usize).min(k);
+            let mut actions = Vec::with_capacity(count);
+            let mut vals = Vec::with_capacity(count);
+            let mut srcs = Vec::with_capacity(count);
+            for col in 0..count {
+                actions.push((qr[[row, col, 0]], qr[[row, col, 1]]));
+                vals.push(logits[[row, col]]);
+                srcs.push(sources[[row, col]]);
+            }
+            sparse_actions.push(actions);
+            sparse_values.push(vals);
+            sparse_source_values.push(srcs);
+        }
+        let p = policies_slice.to_vec();
+        let v = values_slice.to_vec();
+        py.allow_threads(|| {
+            self.inner.expand_and_backprop_with_sparse_sources(
+                &p,
+                &v,
+                &sparse_actions,
+                &sparse_values,
+                &sparse_source_values,
                 stage,
                 sparse_mix,
             );

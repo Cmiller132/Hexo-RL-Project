@@ -200,7 +200,7 @@ def test_d6_legal_mask_bijection_random_histories():
 def test_tactical_oracle_default_legal_generation_is_exact_placement_radius():
     legal = set(legal_moves_from_stones({(0, 0): 0}, near_radius=TACTICAL_SCAN_RADIUS))
 
-    assert TACTICAL_SCAN_RADIUS == 3
+    assert TACTICAL_SCAN_RADIUS == PLACEMENT_RADIUS
     assert (TACTICAL_SCAN_RADIUS, 0) in legal
     assert (0, TACTICAL_SCAN_RADIUS) in legal
     assert (TACTICAL_SCAN_RADIUS, -TACTICAL_SCAN_RADIUS) in legal

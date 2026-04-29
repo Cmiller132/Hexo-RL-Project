@@ -137,12 +137,12 @@ def test_global_graph_builder_includes_required_token_families_and_relations():
 def test_global_graph_relation_bias_contract_includes_cover_pair_and_component_edges():
     history = _hist(
         (0, 0, 0),
-        (1, 20, 20),
-        (1, 21, 20),
+        (1, 0, 1),
+        (1, 0, 2),
         (0, 1, 0),
         (0, 2, 0),
-        (1, 22, 20),
-        (1, 23, 20),
+        (1, 0, 3),
+        (1, 0, 4),
         (0, 3, 0),
     )
     graph = build_graph_batch_from_history(

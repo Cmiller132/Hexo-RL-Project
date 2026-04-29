@@ -403,6 +403,18 @@ def compute_losses(
                 targets["legal_mask"],
                 targets.get("policy_weight"),
             )
+        elif head_name == "legal_token_quality":
+            if "legal_mask" not in targets:
+                continue
+            quality_target = targets.get("legal_token_quality_target", targets.get("policy_target"))
+            if quality_target is None:
+                continue
+            loss = sparse_policy_loss(
+                pred,
+                quality_target,
+                targets["legal_mask"],
+                targets.get("policy_weight"),
+            )
         elif head_name == "policy_pair_first":
             first_target = targets.get("pair_first_policy_target", targets.get("policy_target"))
             if first_target is None or "legal_mask" not in targets:

@@ -93,6 +93,35 @@ class GraphBlock(nn.Module):
         return x
 
 
+class LegalContextCrossAttention(nn.Module):
+    """Legal-action queries attending to non-legal context tokens."""
+
+    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError("global graph dim must be divisible by attention heads")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim ** -0.5
+        self.q = nn.Linear(dim, dim)
+        self.kv = nn.Linear(dim, dim * 2)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, legal_vec: torch.Tensor, context: torch.Tensor, context_mask: torch.Tensor) -> torch.Tensor:
+        b, a, d = legal_vec.shape
+        t = context.shape[1]
+        q = self.q(legal_vec).reshape(b, a, self.heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(context).reshape(b, t, 2, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+        score = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        mask = context_mask.to(device=score.device, dtype=torch.bool)
+        score = score.masked_fill(~mask[:, None, None, :], -80.0)
+        attn = self.dropout(torch.softmax(score, dim=-1))
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(b, a, d)
+        return self.proj(out)
+
+
 class GlobalHexGraphNet(nn.Module):
     """Spec-matching graph network over sparse global token/action rows.
 
@@ -124,6 +153,7 @@ class GlobalHexGraphNet(nn.Module):
         n_bins: int = 65,
         architecture: str = "global_graph_option1",
         dropout: float = 0.0,
+        output_heads: Optional[list[str]] = None,
     ):
         super().__init__()
         architecture = architecture.lower()
@@ -132,6 +162,8 @@ class GlobalHexGraphNet(nn.Module):
         self.architecture = architecture
         self.channels = channels
         self.n_bins = n_bins
+        self.head_names = set(output_heads or [])
+        self.lookahead_heads = sorted(name for name in self.head_names if name.startswith("lookahead_"))
         self.input = nn.Linear(GRAPH_FEATURE_DIM, channels)
         self.type_embedding = nn.Embedding(max(int(t) for t in GraphTokenType) + 1, channels)
         self.coord = nn.Sequential(nn.Linear(3, channels), nn.SiLU(), nn.Linear(channels, channels))
@@ -150,10 +182,12 @@ class GlobalHexGraphNet(nn.Module):
         elif architecture == "global_graph768_champion":
             block_count = max(block_count, 6)
         self.blocks = nn.ModuleList([GraphBlock(channels, heads, dropout=dropout) for _ in range(block_count)])
+        self.legal_cross_attention = LegalContextCrossAttention(channels, heads, dropout=dropout)
         self.norm = nn.LayerNorm(channels)
         self.context_to_action = nn.Sequential(nn.Linear(channels * 2, channels), nn.SiLU(), nn.Linear(channels, channels))
         self.line_window_gate = nn.Sequential(nn.Linear(channels * 2, channels), nn.SiLU(), nn.Linear(channels, channels))
         self.hybrid_action_gate = nn.Sequential(nn.Linear(channels + GRAPH_FEATURE_DIM, channels), nn.SiLU(), nn.Linear(channels, channels))
+        self.crop_context = nn.Sequential(nn.Linear(13, channels), nn.SiLU(), nn.Linear(channels, channels))
         self.policy_place = nn.Linear(channels, 1)
         self.policy_pair_first = nn.Linear(channels, 1)
         self.policy_opp = nn.Linear(channels, 1)
@@ -170,8 +204,19 @@ class GlobalHexGraphNet(nn.Module):
         self.value = nn.Sequential(nn.Linear(channels, channels), nn.SiLU(), nn.Linear(channels, n_bins))
         self.regret_rank = nn.Sequential(nn.Linear(channels, channels), nn.SiLU(), nn.Linear(channels, 1))
         self.regret_value = nn.Sequential(nn.Linear(channels, channels), nn.SiLU(), nn.Linear(channels, n_bins))
+        self.lookahead = nn.ModuleDict({
+            name: nn.Sequential(nn.Linear(channels, channels), nn.SiLU(), nn.Linear(channels, n_bins))
+            for name in self.lookahead_heads
+        })
         self.moves_left = nn.Sequential(nn.Linear(channels, channels), nn.SiLU(), nn.Linear(channels, 1), nn.Softplus())
         self.tactical = nn.Linear(channels, 4)
+        self.axis = nn.Linear(channels, 3)
+        self.axis_delta_norm = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, 6 * 33 * 33),
+        )
+        self.legal_token_quality = nn.Linear(channels, 1)
 
     def forward(
         self,
@@ -188,6 +233,7 @@ class GlobalHexGraphNet(nn.Module):
         pair_token_indices: Optional[torch.Tensor] = None,
         relation_type: Optional[torch.Tensor] = None,
         relation_bias: Optional[torch.Tensor] = None,
+        crop_tensor: Optional[torch.Tensor] = None,
         **_unused,
     ) -> Dict[str, torch.Tensor]:
         if self.architecture in self.RELATION_REQUIRED_ARCHITECTURES and (
@@ -216,9 +262,9 @@ class GlobalHexGraphNet(nn.Module):
         legal_idx = legal_idx_raw.clamp(0, max(x.shape[1] - 1, 0))
         legal_vec = x.gather(1, legal_idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
         if self.architecture == "global_xattn_0":
-            legal_vec = legal_vec + self.context_to_action(
-                torch.cat([legal_vec, state.unsqueeze(1).expand_as(legal_vec)], dim=-1)
-            )
+            context_type = token_type.to(device=x.device)
+            context_mask = mask & (context_type != int(GraphTokenType.LEGAL))
+            legal_vec = legal_vec + self.legal_cross_attention(legal_vec, x, context_mask)
         elif self.architecture == "global_line_window_0":
             tactical_types = torch.tensor(
                 [int(GraphTokenType.WINDOW6), int(GraphTokenType.LINE), int(GraphTokenType.COVER_SET)],
@@ -236,6 +282,9 @@ class GlobalHexGraphNet(nn.Module):
                 legal_idx.unsqueeze(-1).expand(-1, -1, token_features.shape[-1]),
             )
             legal_vec = legal_vec + self.hybrid_action_gate(torch.cat([legal_vec, legal_features], dim=-1))
+            if crop_tensor is not None:
+                crop_context = crop_tensor.to(device=x.device, dtype=x.dtype).mean(dim=(-1, -2))
+                legal_vec = legal_vec + self.crop_context(crop_context).unsqueeze(1)
         policy_place = self.policy_place(legal_vec).squeeze(-1).masked_fill(
             ~legal_mask_bool,
             -80.0,
@@ -251,7 +300,15 @@ class GlobalHexGraphNet(nn.Module):
             "regret_value": self.regret_value(state),
             "moves_left": self.moves_left(state),
             "tactical": self.tactical(state),
+            "axis": self.axis(state),
+            "axis_delta_norm": self.axis_delta_norm(state).reshape(state.shape[0], 6, 33, 33),
+            "legal_token_quality": self.legal_token_quality(legal_vec).squeeze(-1).masked_fill(
+                ~legal_mask_bool,
+                -80.0,
+            ),
         }
+        for name, head in self.lookahead.items():
+            out[name] = head(state)
         if opp_legal_qr is not None and opp_legal_mask is not None:
             if opp_legal_qr.ndim != 3 or opp_legal_qr.shape[-1] != 2:
                 raise ValueError("opp_legal_qr must have shape (B, A_opp, 2)")

@@ -352,6 +352,15 @@ def _transform_history_bytes(history_bytes: bytes, sym_idx: int) -> bytes:
     return bytes(out)
 
 
+def _last_move_qr(history_bytes: bytes) -> tuple[int, int] | None:
+    if len(history_bytes) < 12:
+        return None
+    tail = history_bytes[-12:]
+    q = int.from_bytes(tail[4:8], "little", signed=True)
+    r = int.from_bytes(tail[8:12], "little", signed=True)
+    return (q, r)
+
+
 def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
     """Pure Python fallback for apply_d6_symmetry.
 
@@ -551,6 +560,9 @@ class ReplayDataset(_IterableDataset):
             int(self.candidate_budget),
             max((len(getattr(rec, "policy_target_v2", [])) for rec in records), default=0),
             max((len(getattr(rec, "opp_policy_target_v2", [])) for rec in records), default=0),
+            max((len(getattr(rec, "pair_policy_target_v2", [])) + 1 for rec in records), default=0)
+            if self.include_pair_policy
+            else 0,
             1,
         )
         candidate_width = min(candidate_width, 512)
@@ -593,6 +605,16 @@ class ReplayDataset(_IterableDataset):
                 dtype=np.int32,
             )
             if self.include_pair_policy:
+                aux_targets["pair_candidate_row_indices"] = np.full(
+                    (self.batch_size, budget),
+                    -1,
+                    dtype=np.int64,
+                )
+                aux_targets["pair_candidate_features"] = np.zeros(
+                    (self.batch_size, budget, CANDIDATE_FEATURES),
+                    dtype=np.float32,
+                )
+                aux_targets["pair_candidate_row_mask"] = np.zeros((self.batch_size, budget), dtype=np.bool_)
                 aux_targets["pair_candidate_indices"] = np.full(
                     (self.batch_size, budget, 2),
                     -1,
@@ -742,18 +764,95 @@ class ReplayDataset(_IterableDataset):
                     1.0 - represented,
                 )
                 if self.include_pair_policy and not critical_overflow:
-                    pair = build_pair_candidate_batch(
-                        [(int(q), int(r)) for q, r in cand.qr[:width]],
-                        pair_policy_v2,
-                        budget=candidate_width,
-                        candidate_mask=cand.mask[:width],
-                        legal_moves=[(int(q), int(r)) for q, r in legal],
-                    )
-                    pair_width = min(pair.pair_indices.shape[0], aux_targets["pair_candidate_indices"].shape[1])
-                    aux_targets["pair_candidate_indices"][i, :pair_width] = pair.pair_indices[:pair_width]
-                    aux_targets["pair_candidate_mask"][i, :pair_width] = pair.mask[:pair_width]
-                    aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
-                    aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
+                    legal_list = [(int(q), int(r)) for q, r in legal]
+                    legal_set = set(legal_list)
+                    known_first = _last_move_qr(sample_history)
+                    second_targets = [
+                        (second, float(prob))
+                        for first, second, prob in pair_policy_v2
+                        if float(prob) > 0.0
+                        and known_first is not None
+                        and (int(first[0]), int(first[1])) == known_first
+                        and (int(first[0]), int(first[1])) not in legal_set
+                        and (int(second[0]), int(second[1])) in legal_set
+                    ]
+                    if known_first is not None and second_targets:
+                        second_rows = []
+                        seen_second: set[tuple[int, int]] = set()
+                        for second, _prob in second_targets:
+                            qr = (int(second[0]), int(second[1]))
+                            if qr not in seen_second:
+                                seen_second.add(qr)
+                                second_rows.append(qr)
+                        for q, r in cand.qr[:width]:
+                            qr = (int(q), int(r))
+                            if qr in legal_set and qr not in seen_second:
+                                seen_second.add(qr)
+                                second_rows.append(qr)
+                            if len(second_rows) >= max(0, candidate_width - 1):
+                                break
+                        pair_rows = [known_first] + second_rows[: max(0, candidate_width - 1)]
+                        pair_cand = build_candidate_batch(
+                            pair_rows,
+                            [],
+                            offset_q=int(offset_q),
+                            offset_r=int(offset_r),
+                            budget=max(1, len(pair_rows)),
+                            storage_width=candidate_width,
+                            critical_actions=pair_rows,
+                        )
+                        aux_targets["pair_candidate_row_indices"][i, :candidate_width] = pair_cand.indices[:candidate_width]
+                        aux_targets["pair_candidate_features"][i, :candidate_width] = pair_cand.features[:candidate_width]
+                        aux_targets["pair_candidate_row_mask"][i, :candidate_width] = pair_cand.mask[:candidate_width]
+                        target_by_second: dict[tuple[int, int], float] = {}
+                        total_pair_mass = 0.0
+                        for second, prob in second_targets:
+                            qr = (int(second[0]), int(second[1]))
+                            target_by_second[qr] = target_by_second.get(qr, 0.0) + float(prob)
+                            total_pair_mass += float(prob)
+                        pair_indices = np.full((candidate_width, 2), -1, dtype=np.int64)
+                        pair_mask = np.zeros(candidate_width, dtype=np.bool_)
+                        pair_target = np.zeros(candidate_width, dtype=np.float32)
+                        represented_mass = 0.0
+                        row_by_qr = {
+                            (int(q), int(r)): row
+                            for row, (q, r) in enumerate(pair_cand.qr[:candidate_width])
+                            if bool(pair_cand.mask[row])
+                        }
+                        first_row = row_by_qr.get(known_first, -1)
+                        out_row = 0
+                        for second_qr, prob in target_by_second.items():
+                            second_row = row_by_qr.get(second_qr, -1)
+                            if first_row < 0 or second_row < 0 or out_row >= candidate_width:
+                                continue
+                            pair_indices[out_row] = (first_row, second_row)
+                            pair_mask[out_row] = True
+                            pair_target[out_row] = float(prob)
+                            represented_mass += float(prob)
+                            out_row += 1
+                        if represented_mass > 0.0:
+                            pair_target /= represented_mass
+                        pair_width = candidate_width
+                        aux_targets["pair_candidate_indices"][i, :pair_width] = pair_indices[:pair_width]
+                        aux_targets["pair_candidate_mask"][i, :pair_width] = pair_mask[:pair_width]
+                        aux_targets["pair_policy_target"][i, :pair_width] = pair_target[:pair_width]
+                        aux_targets["pair_candidate_missing_mass"][i] = max(0.0, total_pair_mass - represented_mass)
+                    else:
+                        pair = build_pair_candidate_batch(
+                            [(int(q), int(r)) for q, r in cand.qr[:width]],
+                            pair_policy_v2,
+                            budget=candidate_width,
+                            candidate_mask=cand.mask[:width],
+                            legal_moves=legal_list,
+                        )
+                        aux_targets["pair_candidate_row_indices"][i, :candidate_width] = aux_targets["candidate_indices"][i, :candidate_width]
+                        aux_targets["pair_candidate_features"][i, :candidate_width] = aux_targets["candidate_features"][i, :candidate_width]
+                        aux_targets["pair_candidate_row_mask"][i, :candidate_width] = aux_targets["candidate_mask"][i, :candidate_width]
+                        pair_width = min(pair.pair_indices.shape[0], aux_targets["pair_candidate_indices"].shape[1])
+                        aux_targets["pair_candidate_indices"][i, :pair_width] = pair.pair_indices[:pair_width]
+                        aux_targets["pair_candidate_mask"][i, :pair_width] = pair.mask[:pair_width]
+                        aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
+                        aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
                 elif self.include_pair_policy and critical_overflow:
                     aux_targets["pair_candidate_missing_mass"][i] = 1.0
             if self.include_graph_policy:

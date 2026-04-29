@@ -290,11 +290,19 @@ class InferenceServer:
                     self._queue.get_slot(worker_id).req_ready.clear()
 
                 if graph_inputs is not None:
-                    graph_place, values, graph_opp, graph_pair, graph_regret = self._forward_graph(graph_inputs)
+                    (
+                        graph_place,
+                        values,
+                        graph_opp,
+                        graph_pair_first,
+                        graph_pair_joint,
+                        graph_pair_second,
+                        graph_regret,
+                    ) = self._forward_graph(graph_inputs)
                     sparse_logits = pair_logits = policies = None
                 else:
-                    policies, values, sparse_logits, pair_logits = self._forward(batch_tensor, sparse_inputs)
-                    graph_place = graph_opp = graph_pair = None
+                    policies, values, sparse_logits, pair_logits, regret_rank = self._forward(batch_tensor, sparse_inputs)
+                    graph_place = graph_opp = graph_pair_first = graph_pair_joint = graph_pair_second = None
 
                 scatter_t0 = time.monotonic()
                 if graph_inputs is not None:
@@ -303,7 +311,9 @@ class InferenceServer:
                         values,
                         graph_place,
                         graph_opp,
-                        graph_pair,
+                        graph_pair_first,
+                        graph_pair_joint,
+                        graph_pair_second,
                         graph_regret,
                     )
                 else:
@@ -314,6 +324,7 @@ class InferenceServer:
                         values,
                         sparse_logits,
                         pair_logits,
+                        regret_rank,
                     )
                 self.total_scatter_ms += (time.monotonic() - scatter_t0) * 1000.0
 
@@ -636,10 +647,13 @@ class InferenceServer:
         values = v.cpu().numpy()
         sparse = None
         pair = None
+        regret = None
         if sparse_inputs is not None and "sparse_policy" in out:
             sparse = self._sanitize_policy_logits(out["sparse_policy"]).cpu().numpy()
         if sparse_inputs is not None and "pair_policy" in out:
             pair = self._sanitize_policy_logits(out["pair_policy"]).cpu().numpy()
+        if "regret_rank" in out:
+            regret = torch.nan_to_num(out["regret_rank"].detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy()
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -648,7 +662,7 @@ class InferenceServer:
         self.total_postprocess_ms += post_ms
         self.total_download_ms += download_ms
 
-        return policies, values, sparse, pair
+        return policies, values, sparse, pair, regret
 
     def _forward_graph(
         self,
@@ -685,12 +699,13 @@ class InferenceServer:
             neginf=-1.0,
         ).clamp_(-1.0, 1.0)
         opp = self._sanitize_policy_logits(out["opp_policy"]) if "opp_policy" in out else None
-        pair = None
+        pair_first = self._sanitize_policy_logits(out["policy_pair_first"]) if "policy_pair_first" in out else None
+        pair_joint = None
+        pair_second = None
         if "policy_pair_joint" in out:
-            pair_head = out["policy_pair_joint"]
-            if "policy_pair_second" in out and _graph_pair_request_is_second_placement(graph_inputs):
-                pair_head = out["policy_pair_second"]
-            pair = self._sanitize_policy_logits(pair_head)
+            pair_joint = self._sanitize_policy_logits(out["policy_pair_joint"])
+        if "policy_pair_second" in out:
+            pair_second = self._sanitize_policy_logits(out["policy_pair_second"])
         regret = out.get("regret_rank")
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
@@ -698,7 +713,9 @@ class InferenceServer:
         place_np = place.cpu().numpy()
         values_np = values.cpu().numpy()
         opp_np = opp.cpu().numpy() if opp is not None else None
-        pair_np = pair.cpu().numpy() if pair is not None else None
+        pair_first_np = pair_first.cpu().numpy() if pair_first is not None else None
+        pair_joint_np = pair_joint.cpu().numpy() if pair_joint is not None else None
+        pair_second_np = pair_second.cpu().numpy() if pair_second is not None else None
         regret_np = regret.detach().float().cpu().numpy().reshape(-1) if regret is not None else None
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
@@ -707,7 +724,7 @@ class InferenceServer:
         self.total_model_ms += model_ms
         self.total_postprocess_ms += post_ms
         self.total_download_ms += download_ms
-        return place_np, values_np, opp_np, pair_np, regret_np
+        return place_np, values_np, opp_np, pair_first_np, pair_joint_np, pair_second_np, regret_np
 
     @staticmethod
     def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -753,6 +770,7 @@ class InferenceServer:
         values: np.ndarray,
         sparse_logits: Optional[np.ndarray] = None,
         pair_logits: Optional[np.ndarray] = None,
+        regret_rank: Optional[np.ndarray] = None,
     ):
         """Distribute flat policy/value arrays back to per-worker slots."""
         offset = 0
@@ -760,6 +778,10 @@ class InferenceServer:
             slot = self._queue.get_slot(worker_id)
             slot.res_policy[:count] = policies[offset:offset + count]
             slot.res_value[:count] = values[offset:offset + count]
+            if getattr(slot, "res_regret_rank", None) is not None:
+                slot.res_regret_rank[:count] = 0.0
+                if regret_rank is not None:
+                    slot.res_regret_rank[:count] = regret_rank[offset:offset + count]
             if sparse_logits is not None:
                 k = sparse_logits.shape[1]
                 slot.res_sparse_logits[:count, :k] = sparse_logits[offset:offset + count]
@@ -774,7 +796,9 @@ class InferenceServer:
         values: np.ndarray,
         place_logits: np.ndarray,
         opp_logits: Optional[np.ndarray],
-        pair_logits: Optional[np.ndarray],
+        pair_first_logits: Optional[np.ndarray],
+        pair_joint_logits: Optional[np.ndarray],
+        pair_second_logits: Optional[np.ndarray],
         regret_rank: Optional[np.ndarray] = None,
     ):
         """Scatter graph logits using each worker's keyed legal/pair counts."""
@@ -783,8 +807,10 @@ class InferenceServer:
             token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
             if legal_count > place_logits.shape[1]:
                 raise ValueError("graph place logits shorter than legal row table")
-            if pair_count and pair_logits is None:
-                raise ValueError("graph model did not return pair logits for a pair request")
+            if legal_count and pair_first_logits is None:
+                raise ValueError("graph model did not return policy_pair_first for legal rows")
+            if pair_count and (pair_joint_logits is None or pair_second_logits is None):
+                raise ValueError("graph model did not return joint/second pair logits for a pair request")
             slot.res_value[0] = float(values[row])
             slot.res_graph_meta[:] = (
                 GRAPH_SCHEMA_VERSION,
@@ -798,7 +824,9 @@ class InferenceServer:
             )
             slot.res_graph_place_logits.fill(0.0)
             slot.res_graph_opp_logits.fill(0.0)
+            slot.res_graph_pair_first_logits.fill(0.0)
             slot.res_graph_pair_logits.fill(0.0)
+            slot.res_graph_pair_second_logits.fill(0.0)
             if getattr(slot, "res_graph_regret_rank", None) is not None:
                 slot.res_graph_regret_rank[0] = (
                     float(regret_rank[row])
@@ -808,8 +836,12 @@ class InferenceServer:
             slot.res_graph_place_logits[:legal_count] = place_logits[row, :legal_count]
             if opp_count and opp_logits is not None:
                 slot.res_graph_opp_logits[:opp_count] = opp_logits[row, :opp_count]
-            if pair_count and pair_logits is not None:
-                slot.res_graph_pair_logits[:pair_count] = pair_logits[row, :pair_count]
+            if legal_count and pair_first_logits is not None:
+                slot.res_graph_pair_first_logits[:legal_count] = pair_first_logits[row, :legal_count]
+            if pair_count and pair_joint_logits is not None:
+                slot.res_graph_pair_logits[:pair_count] = pair_joint_logits[row, :pair_count]
+            if pair_count and pair_second_logits is not None:
+                slot.res_graph_pair_second_logits[:pair_count] = pair_second_logits[row, :pair_count]
             slot.req_mode[0] = 0
 
     # ── Stats ─────────────────────────────────────────────────────────────

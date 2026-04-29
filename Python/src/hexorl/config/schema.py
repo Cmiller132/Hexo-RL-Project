@@ -180,7 +180,7 @@ class TrainConfig(BaseModel):
     loss_weights: dict[str, float] = Field(default_factory=lambda: {
         "policy": 1.0,
         "value": 1.5,
-        "lookahead_6": 0.15,
+        "lookahead_4": 0.15,
         "lookahead_12": 0.15,
         "lookahead_36": 0.1,
         "regret_rank": 0.1,
@@ -246,6 +246,12 @@ class Config(BaseModel):
             "axis",
             "axis_delta_norm",
             "moves_left",
+            "policy_place",
+            "policy_pair_first",
+            "policy_pair_second",
+            "policy_pair_joint",
+            "legal_token_quality",
+            "tactical",
         }
         global_architectures = {
             "global_graph_option1",
@@ -268,12 +274,21 @@ class Config(BaseModel):
                 "regret_value": self.train.loss_weights.get("regret_value", 0.1),
                 "moves_left": self.train.loss_weights.get("moves_left", 0.05),
                 "tactical": self.train.loss_weights.get("tactical", 0.05),
+                "legal_token_quality": self.train.loss_weights.get("policy", 0.05),
             }
             for name, weight in graph_defaults.items():
                 self.train.loss_weights.setdefault(name, weight)
+            for horizon in self.buffer.lookahead_horizons:
+                name = f"lookahead_{horizon}"
+                self.train.loss_weights.setdefault(name, self.train.loss_weights.get("value", 1.0) * 0.1)
+            graph_auto_heads = set(self.model.heads) | {
+                f"lookahead_{h}" for h in self.buffer.lookahead_horizons
+            }
+        else:
+            graph_auto_heads = set(self.model.heads)
         missing_or_inactive = sorted(
             head
-            for head in self.model.heads
+            for head in graph_auto_heads
             if (head in trainable_heads or head.startswith("lookahead_"))
             and float(self.train.loss_weights.get(head, 0.0)) <= 0.0
         )

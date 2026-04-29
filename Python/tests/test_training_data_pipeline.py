@@ -638,18 +638,27 @@ def test_dense_projection_uses_all_v2_visits_before_topk():
     assert policy[action_to_board_index(1, 0)] == pytest.approx(1 / 3)
 
 
-def test_ring_buffer_rejects_v2_truncation():
+def test_ring_buffer_preserves_v2_targets_beyond_prefix_capacity():
     rec = PositionRecord(
         move_history=b"",
         policy_target={action_to_board_index(0, 0): 1.0},
         policy_target_v2=[(0, 0, 0.5), (1, 0, 0.3), (2, 0, 0.2)],
+        opp_policy_target_v2=[(3, 0, 0.6), (4, 0, 0.4), (5, 0, 0.1)],
+        opp_policy_legal_v2=[(3, 0), (4, 0), (5, 0)],
+        pair_policy_target_v2=[((0, 0), (1, 0), 0.7), ((0, 0), (2, 0), 0.3), ((1, 0), (2, 0), 0.1)],
         root_value=0.0,
         player=0,
         outcome=1.0,
     )
     buffer = RingBuffer(capacity=2, max_policy_v2_entries=2)
-    with pytest.raises(ValueError, match="policy_target_v2 exceeds RingBuffer capacity"):
-        buffer.append(rec)
+    buffer.append(rec)
+
+    out = buffer[0]
+    assert out is not None
+    assert out.policy_target_v2 == rec.policy_target_v2
+    assert out.opp_policy_target_v2 == rec.opp_policy_target_v2
+    assert out.opp_policy_legal_v2 == rec.opp_policy_legal_v2
+    assert out.pair_policy_target_v2 == rec.pair_policy_target_v2
 
 
 def test_sparse_sampler_outputs_candidate_targets():
@@ -885,6 +894,36 @@ def test_replay_dataset_can_emit_pair_policy_target():
     assert aux["pair_candidate_indices"].shape == (1, 8, 2)
     assert aux["pair_candidate_mask"][0].any()
     assert aux["pair_policy_target"][0].sum() == pytest.approx(1.0)
+
+
+def test_replay_dataset_second_placement_pair_target_keeps_known_first_row():
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0) + _move(1, 1, 0),
+        policy_target={action_to_board_index(2, 0): 1.0},
+        policy_target_v2=[(2, 0, 1.0)],
+        pair_policy_target_v2=[((1, 0), (2, 0), 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_sparse_policy=True,
+        include_pair_policy=True,
+        candidate_budget=4,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert tuple(aux["pair_candidate_indices"][0, 0]) == (0, 1)
+    assert aux["pair_candidate_mask"][0, 0]
+    assert aux["pair_policy_target"][0, 0] == pytest.approx(1.0)
+    assert aux["pair_candidate_missing_mass"][0] == pytest.approx(0.0)
+    assert tuple(aux["candidate_qr"][0, 0]) == (2, 0)
 
 
 def test_pair_policy_targets_use_full_policy_v2_by_default():

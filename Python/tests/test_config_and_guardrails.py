@@ -27,7 +27,12 @@ def test_config_rejects_lookahead_head_without_matching_horizon():
 
 def test_config_requires_active_loss_for_matching_lookahead_head():
     with pytest.raises(ValueError, match="active train.loss_weights"):
-        Config.model_validate({"model": {"heads": ["policy", "value", "lookahead_4"]}})
+        Config.model_validate(
+            {
+                "model": {"heads": ["policy", "value", "lookahead_4"]},
+                "train": {"loss_weights": {"policy": 1.0, "value": 1.0}},
+            }
+        )
 
     cfg = Config.model_validate(
         {

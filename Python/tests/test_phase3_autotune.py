@@ -177,12 +177,12 @@ def test_phase3_sparse_candidate_gate_uses_discovery_metrics():
         "avg_candidate_recall_winning_move": 1.0,
         "avg_candidate_recall_forced_block": 1.0,
         "avg_candidate_recall_two_placement_cover": 1.0,
-        "avg_candidate_discovery_top1": 0.2,
-        "avg_candidate_discovery_top4": 0.3,
-        "avg_candidate_discovery_top8": 0.4,
-        "avg_candidate_discovery_winning_move": 0.98,
-        "avg_candidate_discovery_forced_block": 1.0,
-        "avg_candidate_discovery_two_placement_cover": 1.0,
+        "candidate_discovery_top1": 0.2,
+        "candidate_discovery_top4": 0.3,
+        "candidate_discovery_top8": 0.4,
+        "candidate_discovery_winning_move": 0.98,
+        "candidate_discovery_forced_block": 1.0,
+        "candidate_discovery_two_placement_cover": 1.0,
     }
 
     candidate = module.EvaluationServices.candidate_recall(services, trial, buffer)

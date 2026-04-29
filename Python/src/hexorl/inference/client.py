@@ -257,6 +257,14 @@ class InferenceClient:
         self._slot.req_pair_count[:count] = 0
         return policies, values, sparse, pair
 
+    def submit_regret_rank(self, tensor: np.ndarray, count: int) -> np.ndarray:
+        """Submit dense/crop positions and return regret-rank logits."""
+        policies, _values = self.submit(tensor, count)
+        _ = policies
+        if getattr(self._slot, "res_regret_rank", None) is None:
+            raise RuntimeError("inference queue does not expose regret-rank responses")
+        return np.array(self._slot.res_regret_rank[:count], copy=True)
+
     def submit_graph(self, graph_batch) -> dict[str, np.ndarray | dict[str, object]]:
         """Submit one padded global graph request and return keyed logits.
 
@@ -361,7 +369,9 @@ class InferenceClient:
         return {
             "policy_place": np.array(self._slot.res_graph_place_logits[:legal_count], copy=True),
             "opp_policy": np.array(self._slot.res_graph_opp_logits[:opp_count], copy=True),
+            "policy_pair_first": np.array(self._slot.res_graph_pair_first_logits[:legal_count], copy=True),
             "policy_pair_joint": np.array(self._slot.res_graph_pair_logits[:pair_count], copy=True),
+            "policy_pair_second": np.array(self._slot.res_graph_pair_second_logits[:pair_count], copy=True),
             "regret_rank": np.array(
                 getattr(self._slot, "res_graph_regret_rank", np.zeros(1, dtype=np.float32))[:1],
                 copy=True,

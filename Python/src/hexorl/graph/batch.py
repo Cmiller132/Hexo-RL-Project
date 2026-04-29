@@ -349,6 +349,11 @@ def build_graph_batch_from_history(
     legal_index = {qr: i for i, qr in enumerate(legal)}
     windows = _active_windows(stones, legal)
     comp = _component_ids(stones)
+    oracle = scan_tactical_oracle_from_history(
+        history,
+        legal,
+        near_radius=8,
+    )
 
     token_features: list[np.ndarray] = []
     token_type: list[int] = []
@@ -356,7 +361,6 @@ def build_graph_batch_from_history(
     token_axis: list[int] = []
     token_age: list[int] = []
     memberships: dict[int, set[tuple[int, int]]] = {}
-    cover_sets: dict[int, set[tuple[int, int]]] = {}
 
     def add(tt: GraphTokenType, qr: tuple[int, int], **kwargs) -> int:
         idx = len(token_type)
@@ -402,8 +406,6 @@ def build_graph_batch_from_history(
         idx = add(GraphTokenType.WINDOW6, center, axis=axis, count_a=own, count_b=opp)
         window_token_by_key[(axis, start)] = idx
         memberships[idx] = set(_window_cells(start, axis))
-        if own >= 4 or opp >= 4:
-            cover_sets[idx] = set(c for c in empties if c in legal_index)
 
     line_keys = sorted(
         {
@@ -416,7 +418,41 @@ def build_graph_batch_from_history(
         qr = (0, line) if axis == 0 else (line, 0)
         add(GraphTokenType.LINE, qr, axis=axis)
 
-    for cells in cover_sets.values():
+    engine_cover_sets: list[set[tuple[int, int]]] = []
+    for a, b in getattr(oracle, "cover_pairs", ()):
+        cells = {(int(a[0]), int(a[1])), (int(b[0]), int(b[1]))}
+        cells = {cell for cell in cells if cell in legal_index}
+        if cells:
+            engine_cover_sets.append(cells)
+    cover_cells = {
+        (int(q), int(r))
+        for q, r in getattr(oracle, "cover_cells", ())
+        if (int(q), int(r)) in legal_index
+    }
+    forced_cells = {
+        (int(q), int(r))
+        for q, r in getattr(oracle, "forced_block_cells", ())
+        if (int(q), int(r)) in legal_index
+    }
+    winning_cells = {
+        (int(q), int(r))
+        for q, r in getattr(oracle, "win_now_cells", ())
+        if (int(q), int(r)) in legal_index
+    }
+    open_cells = {
+        (int(q), int(r))
+        for rows in (
+            getattr(oracle, "open_four_cells", ()),
+            getattr(oracle, "open_five_cells", ()),
+        )
+        for q, r in rows
+        if (int(q), int(r)) in legal_index
+    }
+    residual_cover = cover_cells | forced_cells | winning_cells | open_cells
+    if residual_cover:
+        engine_cover_sets.append(residual_cover)
+
+    for cells in engine_cover_sets:
         if cells:
             q = round(sum(c[0] for c in cells) / len(cells))
             r = round(sum(c[1] for c in cells) / len(cells))
@@ -532,11 +568,6 @@ def build_graph_batch_from_history(
         legal,
         pair_policy_target,
         placements_remaining=placements_remaining,
-    )
-    oracle = scan_tactical_oracle_from_history(
-        history,
-        legal,
-        near_radius=8,
     )
     tactical_target = _tactical_target_from_oracle(oracle)
 

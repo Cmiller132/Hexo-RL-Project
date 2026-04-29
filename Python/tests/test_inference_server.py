@@ -108,7 +108,7 @@ class TestInferenceServer(unittest.TestCase):
         )
         pair_mask = torch.ones(count, p_rows, dtype=torch.bool)
 
-        policies, values, sparse, pair = server._forward(
+        policies, values, sparse, pair, regret = server._forward(
             tensor,
             {
                 "candidate_indices": candidate_indices,
@@ -123,6 +123,7 @@ class TestInferenceServer(unittest.TestCase):
         self.assertEqual(values.shape, (count,))
         self.assertEqual(sparse.shape, (count, k))
         self.assertEqual(pair.shape, (count, p_rows))
+        self.assertIsNone(regret)
         self.assertTrue(np.isfinite(sparse).all())
         self.assertTrue(np.isfinite(pair).all())
 
@@ -158,14 +159,17 @@ class TestInferenceServer(unittest.TestCase):
             "relation_bias": torch.from_numpy(graph.relation_bias),
         }
 
-        place, values, opp, pair, regret = server._forward_graph(graph_inputs)
+        place, values, opp, pair_first, pair_joint, pair_second, regret = server._forward_graph(graph_inputs)
 
         self.assertEqual(place.shape, graph.legal_mask.shape)
         self.assertEqual(values.shape, (1,))
         self.assertTrue(np.isfinite(place).all())
         self.assertTrue(np.isfinite(values).all())
         self.assertIsNotNone(opp)
-        self.assertIsNotNone(pair)
+        self.assertIsNotNone(pair_first)
+        self.assertEqual(pair_first.shape, graph.legal_mask.shape)
+        self.assertIsNotNone(pair_joint)
+        self.assertIsNotNone(pair_second)
         self.assertIsNotNone(regret)
         self.assertEqual(regret.shape, (1,))
 

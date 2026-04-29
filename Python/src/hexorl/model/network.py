@@ -696,6 +696,8 @@ class HexNet(nn.Module):
         candidate_features: Optional[torch.Tensor] = None,
         candidate_indices: Optional[torch.Tensor] = None,
         candidate_mask: Optional[torch.Tensor] = None,
+        pair_candidate_features: Optional[torch.Tensor] = None,
+        pair_candidate_row_indices: Optional[torch.Tensor] = None,
         pair_candidate_indices: Optional[torch.Tensor] = None,
         pair_candidate_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -733,11 +735,13 @@ class HexNet(nn.Module):
             and candidate_indices is not None
             and pair_candidate_indices is not None
         ):
+            pair_features = pair_candidate_features if pair_candidate_features is not None else candidate_features
+            pair_rows = pair_candidate_row_indices if pair_candidate_row_indices is not None else candidate_indices
             pair = self.pair_policy_head(
                 x,
                 out.get("policy"),
-                candidate_features,
-                candidate_indices,
+                pair_features,
+                pair_rows,
                 pair_candidate_indices,
             )
             if pair_candidate_mask is not None:
@@ -852,12 +856,15 @@ def build_model_from_config(
     arch = getattr(model_cfg, "architecture", "cnn").lower()
     global_architectures = GlobalHexGraphNet.ARCHITECTURES
     if arch in global_architectures:
+        graph_heads = set(getattr(model_cfg, "heads", []))
+        graph_heads.update(f"lookahead_{h}" for h in getattr(getattr(cfg, "buffer", object()), "lookahead_horizons", []))
         model = GlobalHexGraphNet(
             channels=model_cfg.channels,
             layers=getattr(model_cfg, "graph_layers", 3),
             heads=getattr(model_cfg, "attention_heads", 8),
             architecture=arch,
             dropout=getattr(model_cfg, "dropout", 0.0),
+            output_heads=sorted(graph_heads),
         )
         if device is None:
             if torch.cuda.is_available():

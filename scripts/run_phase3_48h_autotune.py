@@ -43,6 +43,7 @@ from hexorl.eval.classical import classical_opponent_fn
 from hexorl.eval.checkpoint_league import CheckpointLeague
 from hexorl.eval.tactical_suite import evaluate_tactical_suite
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
+from hexorl.selfplay.records import BOARD_AREA
 from hexorl.tuning import (
     ASHARungTable,
     BOHBSampler,
@@ -54,6 +55,7 @@ from hexorl.tuning import (
 
 
 LOGGER = logging.getLogger("phase3_autotune")
+FULL_GLOBAL_POLICY_ROWS = BOARD_AREA
 
 
 HEAD_BUNDLES: dict[str, list[str]] = {
@@ -550,7 +552,7 @@ class Phase3Supervisor:
         replay = RingBuffer(
             capacity=cfg.buffer.capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, FULL_GLOBAL_POLICY_ROWS),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -731,7 +733,11 @@ class Phase3Supervisor:
         return RingBuffer(
             capacity=trial.cfg.buffer.capacity,
             max_policy_entries=trial.cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(trial.cfg.selfplay.policy_target_top_k, trial.cfg.model.candidate_budget),
+            max_policy_v2_entries=max(
+                trial.cfg.selfplay.policy_target_top_k,
+                trial.cfg.model.candidate_budget,
+                FULL_GLOBAL_POLICY_ROWS,
+            ),
             recency_decay=trial.cfg.buffer.recency_decay,
             num_lookahead=len(trial.cfg.buffer.lookahead_horizons),
         )
@@ -745,7 +751,7 @@ class Phase3Supervisor:
             trial.replay = RingBuffer(
                 capacity=1,
                 max_policy_entries=max(1, int(trial.cfg.selfplay.policy_target_top_k)),
-                max_policy_v2_entries=max(1, int(trial.cfg.model.candidate_budget)),
+                max_policy_v2_entries=max(1, int(trial.cfg.model.candidate_budget), FULL_GLOBAL_POLICY_ROWS),
                 recency_decay=trial.cfg.buffer.recency_decay,
                 num_lookahead=len(trial.cfg.buffer.lookahead_horizons),
             )
@@ -1076,7 +1082,11 @@ class Phase3Supervisor:
         probe_buffer = RingBuffer(
             capacity=probe_cfg.buffer.capacity,
             max_policy_entries=probe_cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(probe_cfg.selfplay.policy_target_top_k, probe_cfg.model.candidate_budget),
+            max_policy_v2_entries=max(
+                probe_cfg.selfplay.policy_target_top_k,
+                probe_cfg.model.candidate_budget,
+                FULL_GLOBAL_POLICY_ROWS,
+            ),
             recency_decay=probe_cfg.buffer.recency_decay,
             num_lookahead=len(probe_cfg.buffer.lookahead_horizons),
         )
@@ -1808,13 +1818,13 @@ class Phase3Supervisor:
         if float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0) > 1e-6:
             return "policy_target_mass_silently_dropped"
         if trial.family.sparse_policy:
-            discovery = float(buffer.get("avg_candidate_discovery_top8", 1.0) or 0.0)
+            discovery = float(buffer.get("candidate_discovery_top8", 0.0) or 0.0)
             if record.get("buffer", {}).get("size", 0) > 0 and discovery < self.args.candidate_recall_gate:
                 return f"candidate_discovery_below_gate:{discovery:.4f}"
             decisive = min(
-                float(buffer.get("avg_candidate_discovery_winning_move", 1.0) or 0.0),
-                float(buffer.get("avg_candidate_discovery_forced_block", 1.0) or 0.0),
-                float(buffer.get("avg_candidate_discovery_two_placement_cover", 1.0) or 0.0),
+                float(buffer.get("candidate_discovery_winning_move", 0.0) or 0.0),
+                float(buffer.get("candidate_discovery_forced_block", 0.0) or 0.0),
+                float(buffer.get("candidate_discovery_two_placement_cover", 0.0) or 0.0),
             )
             if record.get("buffer", {}).get("size", 0) > 0 and decisive < 0.995:
                 return f"decisive_candidate_discovery_below_gate:{decisive:.4f}"
@@ -2238,12 +2248,12 @@ class EvaluationServices:
     def candidate_recall(self, trial: TrialState, buffer: dict[str, Any]) -> dict[str, Any]:
         if not trial.family.sparse_policy:
             return {"applicable": False, "score": 1.0}
-        top1 = float(buffer.get("avg_candidate_discovery_top1", 0.0) or 0.0)
-        top4 = float(buffer.get("avg_candidate_discovery_top4", 0.0) or 0.0)
-        top8 = float(buffer.get("avg_candidate_discovery_top8", 0.0) or 0.0)
-        winning = float(buffer.get("avg_candidate_discovery_winning_move", 1.0) or 0.0)
-        forced = float(buffer.get("avg_candidate_discovery_forced_block", 1.0) or 0.0)
-        cover = float(buffer.get("avg_candidate_discovery_two_placement_cover", 1.0) or 0.0)
+        top1 = float(buffer.get("candidate_discovery_top1", 0.0) or 0.0)
+        top4 = float(buffer.get("candidate_discovery_top4", 0.0) or 0.0)
+        top8 = float(buffer.get("candidate_discovery_top8", 0.0) or 0.0)
+        winning = float(buffer.get("candidate_discovery_winning_move", 0.0) or 0.0)
+        forced = float(buffer.get("candidate_discovery_forced_block", 0.0) or 0.0)
+        cover = float(buffer.get("candidate_discovery_two_placement_cover", 0.0) or 0.0)
         missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
         decisive = min(winning, forced, cover)
         return {
