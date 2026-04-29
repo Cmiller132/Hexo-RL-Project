@@ -1,9 +1,11 @@
+import base64
 import struct
 
 import numpy as np
 import pytest
 import torch
 
+from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint
@@ -290,6 +292,59 @@ def test_fastapi_dashboard_smoke(tmp_path):
     ).json()
     assert spread["cells"]
     assert spread["debug_terms"]["legal_cells_scored"] > 0
+
+
+def test_dashboard_debug_contract_and_graph_endpoints(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing"))
+    contracts = client.get("/api/debug/contracts").json()
+    assert contracts["candidate"]["feature_version"] == CANDIDATE_FEATURE_VERSION
+    assert contracts["candidate"]["feature_names"] == list(CANDIDATE_FEATURE_NAMES)
+    assert contracts["graph"]["schema_version"] >= 1
+    assert "LEGAL" in contracts["graph"]["token_types"]
+
+    history = _move(0, 0, 0) + _move(1, 1, 0)
+    payload = {"history_b64": base64.b64encode(history).decode("ascii")}
+    graph = client.post("/api/debug/graph", json=payload).json()
+    assert graph["legal_count"] > 0
+    assert graph["token_counts"]["LEGAL"] == graph["legal_count"]
+    assert graph["relation_schema_version"] >= 1
+
+    d6 = client.post("/api/debug/d6", json=payload).json()
+    assert d6["symmetry_count"] == 12
+    assert len(d6["transforms"]) == 12
+    assert all(item["graph"]["legal_count"] == item["legal_count"] for item in d6["transforms"])
+
+
+def test_dashboard_pair_policy_inference_returns_pair_logits(tmp_path):
+    pytest.importorskip("_engine")
+    from hexorl.dashboard.model_cache import CachedModel, ModelCache
+
+    model = HexNet(
+        channels=4,
+        blocks=1,
+        heads=["policy", "value", "pair_policy"],
+    )
+    cache = ModelCache()
+    cache._models["pair-unit"] = CachedModel(
+        "pair-unit",
+        tmp_path / "in-memory.pt",
+        model,
+        torch.device("cpu"),
+    )
+    cache._order.append("pair-unit")
+
+    result = cache.infer_history("pair-unit", _move(0, 0, 0))
+
+    assert result["heads"]["pair_policy"]
+    top = result["heads"]["pair_policy"][0]
+    assert {"first", "second", "logit"} <= set(top)
+    assert top["first"] != top["second"]
 
 
 def test_noisy_model_player_reproducible_without_engine():

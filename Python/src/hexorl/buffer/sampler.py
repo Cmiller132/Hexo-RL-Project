@@ -6,6 +6,7 @@ On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 """
 
 from collections import OrderedDict
+import logging
 import numpy as np
 from typing import Dict, Iterator, Tuple, Optional, List
 
@@ -28,6 +29,12 @@ from hexorl.action_contract.candidates import (
     build_candidate_batch,
     build_pair_candidate_batch,
 )
+from hexorl.action_contract.tactical_oracle import (
+    TACTICAL_SCAN_RADIUS,
+    scan_tactical_oracle_from_history,
+)
+
+logger = logging.getLogger(__name__)
 
 try:
     from hexorl.axis_policy.core import AxisPolicyInput
@@ -537,6 +544,7 @@ class ReplayDataset(_IterableDataset):
             "opp_policy": np.zeros((self.batch_size, BOARD_AREA), dtype=np.float32),
             "regret_rank": np.zeros(self.batch_size, dtype=np.float32),
             "regret_value": np.zeros(self.batch_size, dtype=np.float32),
+            "regret_weight": np.zeros(self.batch_size, dtype=np.float32),
             "axis": np.full(self.batch_size, -1, dtype=np.int64),
             "moves_left": np.zeros(self.batch_size, dtype=np.float32),
             "moves_left_weight": np.ones(self.batch_size, dtype=np.float32),
@@ -555,6 +563,12 @@ class ReplayDataset(_IterableDataset):
             aux_targets["candidate_mask"] = np.zeros((self.batch_size, budget), dtype=np.bool_)
             aux_targets["sparse_policy_target"] = np.zeros((self.batch_size, budget), dtype=np.float32)
             aux_targets["candidate_missing_mass"] = np.zeros(self.batch_size, dtype=np.float32)
+            aux_targets["candidate_critical_count"] = np.zeros(self.batch_size, dtype=np.float32)
+            aux_targets["candidate_critical_overflow_count"] = np.zeros(self.batch_size, dtype=np.float32)
+            aux_targets["candidate_critical_overflow_examples"] = np.zeros(
+                (self.batch_size, 8, 2),
+                dtype=np.int32,
+            )
             if self.include_pair_policy:
                 aux_targets["pair_candidate_indices"] = np.full(
                     (self.batch_size, budget, 2),
@@ -630,6 +644,7 @@ class ReplayDataset(_IterableDataset):
             )
             aux_targets["regret_rank"][i] = rec.regret_rank
             aux_targets["regret_value"][i] = rec.regret_value
+            aux_targets["regret_weight"][i] = rec.regret_weight
             aux_targets["axis"][i] = axis_label
             aux_targets["moves_left"][i] = np.log1p(max(float(rec.moves_left), 0.0)) / np.log1p(self.max_game_turns)
             aux_targets["moves_left_weight"][i] = 0.0 if rec.outcome == 0.0 else 1.0
@@ -647,39 +662,65 @@ class ReplayDataset(_IterableDataset):
                     int(offset_q),
                     int(offset_r),
                 )
+                oracle = scan_tactical_oracle_from_history(
+                    sample_history,
+                    [(int(q), int(r)) for q, r in legal],
+                    offset_q=int(offset_q),
+                    offset_r=int(offset_r),
+                    near_radius=TACTICAL_SCAN_RADIUS,
+                )
                 cand = build_candidate_batch(
                     [(int(q), int(r)) for q, r in legal],
                     policy_v2,
                     offset_q=int(offset_q),
                     offset_r=int(offset_r),
                     budget=candidate_width,
-                    winning_moves=winning_moves,
-                    forced_block_moves=forced_blocks,
-                    cover_cells=cover_cells,
+                    storage_width=candidate_width,
+                    winning_moves=list(winning_moves) + list(oracle.win_now_cells),
+                    forced_block_moves=list(forced_blocks) + list(oracle.forced_block_cells),
+                    cover_cells=list(cover_cells) + list(oracle.cover_cells),
+                    open_four_cells=oracle.open_four_cells,
+                    open_five_cells=oracle.open_five_cells,
                 )
                 width = min(cand.qr.shape[0], aux_targets["candidate_qr"].shape[1])
                 aux_targets["candidate_qr"][i, :width] = cand.qr[:width]
                 aux_targets["candidate_indices"][i, :width] = cand.indices[:width]
                 aux_targets["candidate_features"][i, :width] = cand.features[:width]
                 aux_targets["candidate_mask"][i, :width] = cand.mask[:width]
-                aux_targets["sparse_policy_target"][i, :width] = cand.target[:width]
+                critical_overflow = cand.critical_overflow_count > 0
+                if not critical_overflow:
+                    aux_targets["sparse_policy_target"][i, :width] = cand.target[:width]
+                else:
+                    logger.error(
+                        "Critical candidate overflow: count=%s examples=%s history=%s",
+                        cand.critical_overflow_count,
+                        cand.critical_overflow_examples,
+                        sample_history.hex(),
+                    )
+                    for ex_idx, (q, r) in enumerate(cand.critical_overflow_examples[:8]):
+                        aux_targets["candidate_critical_overflow_examples"][i, ex_idx] = (q, r)
+                aux_targets["candidate_critical_count"][i] = cand.critical_count
+                aux_targets["candidate_critical_overflow_count"][i] = cand.critical_overflow_count
                 represented = float(aux_targets["sparse_policy_target"][i, :width].sum())
                 aux_targets["candidate_missing_mass"][i] = max(
                     float(cand.missing_mass),
                     1.0 - represented,
                 )
-                if self.include_pair_policy:
+                if self.include_pair_policy and not critical_overflow:
                     pair = build_pair_candidate_batch(
                         [(int(q), int(r)) for q, r in cand.qr[:width]],
                         pair_policy_v2,
                         budget=candidate_width,
                         candidate_mask=cand.mask[:width],
+                        legal_moves=[(int(q), int(r)) for q, r in legal],
                     )
                     pair_width = min(pair.pair_indices.shape[0], aux_targets["pair_candidate_indices"].shape[1])
                     aux_targets["pair_candidate_indices"][i, :pair_width] = pair.pair_indices[:pair_width]
                     aux_targets["pair_candidate_mask"][i, :pair_width] = pair.mask[:pair_width]
                     aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
                     aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
+                elif self.include_pair_policy and critical_overflow:
+                    aux_targets["pair_candidate_missing_mass"][i] = 1.0
             if self.include_axis_delta_norm:
                 axis_delta_norm = self._compute_axis_delta_norm(sample_history)
                 aux_targets["axis_delta_norm"][i] = axis_delta_norm

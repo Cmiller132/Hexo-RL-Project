@@ -393,10 +393,7 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
                     move_history=_pack_moves(moves),
                     policy_target=policy,
                     policy_target_v2=policy_v2,
-                    pair_policy_target_v2=pair_policy_v2_from_place_target(
-                        policy_v2,
-                        top_k=min(max(1, cfg.model.candidate_budget), 32),
-                    ),
+                    pair_policy_target_v2=pair_policy_v2_from_place_target(policy_v2),
                     target_policy_mass_outside_window=outside_mass,
                     root_value=value_hint,
                     player=player,
@@ -475,10 +472,7 @@ def _make_fallback_bootstrap_game(
                 move_history=_pack_moves(moves),
                 policy_target=policy,
                 policy_target_v2=policy_v2,
-                pair_policy_target_v2=pair_policy_v2_from_place_target(
-                    policy_v2,
-                    top_k=min(max(1, cfg.model.candidate_budget), 32),
-                ),
+                pair_policy_target_v2=pair_policy_v2_from_place_target(policy_v2),
                 target_policy_mass_outside_window=outside_mass,
                 root_value=float(rng.uniform(-0.25, 0.25)),
                 player=current_player,

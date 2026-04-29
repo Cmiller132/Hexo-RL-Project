@@ -90,6 +90,7 @@ def binned_value_loss(
 def regret_rank_loss(
     scores: torch.Tensor,
     regrets: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact RGSC ranking loss — Equation 7 from arXiv 2602.20809v1.
 
@@ -105,8 +106,16 @@ def regret_rank_loss(
     Returns:
         Scalar loss.
     """
+    values = regrets.to(device=scores.device, dtype=scores.dtype)
+    if weight is not None:
+        row_weight = weight.to(device=scores.device, dtype=scores.dtype)
+        valid = row_weight > 0
+        if not torch.any(valid):
+            return scores.sum() * 0.0
+        scores = scores[valid]
+        values = values[valid]
     log_softmax_scores = F.log_softmax(scores, dim=0)
-    combined = log_softmax_scores + regrets.to(device=scores.device, dtype=scores.dtype)
+    combined = log_softmax_scores + values
     loss = -torch.logsumexp(combined, dim=0)
     return loss
 
@@ -115,6 +124,7 @@ def regret_value_loss(
     pred_logits: torch.Tensor,
     target_regret: torch.Tensor,
     n_bins: int = 65,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Binned regret value loss.
 
@@ -130,7 +140,15 @@ def regret_value_loss(
     regret = target_regret.to(device=logits.device, dtype=logits.dtype)
     target_bins = scalar_to_bins_torch(regret, n_bins=n_bins, min_value=0.0, max_value=4.0)
     log_probs = F.log_softmax(logits, dim=-1)
-    return -(target_bins * log_probs).sum(dim=-1).mean()
+    loss = -(target_bins * log_probs).sum(dim=-1)
+    if weight is not None:
+        row_weight = weight.to(device=loss.device, dtype=loss.dtype)
+        valid = row_weight > 0
+        if not torch.any(valid):
+            return pred_logits.sum() * 0.0
+        row_weight = row_weight * valid.to(dtype=row_weight.dtype)
+        return (loss * row_weight).sum() / row_weight.sum().clamp(min=1e-6)
+    return loss.mean()
 
 
 def policy_loss(
@@ -360,9 +378,18 @@ def compute_losses(
         elif head_name.startswith("lookahead_"):
             loss = binned_value_loss(pred, targets[head_name], n_bins)
         elif head_name == "regret_rank":
-            loss = regret_rank_loss(pred.squeeze(-1), targets["regret_rank"])
+            loss = regret_rank_loss(
+                pred.squeeze(-1),
+                targets["regret_rank"],
+                targets.get("regret_weight"),
+            )
         elif head_name == "regret_value":
-            loss = regret_value_loss(pred, targets["regret_value"], n_bins)
+            loss = regret_value_loss(
+                pred,
+                targets["regret_value"],
+                n_bins,
+                targets.get("regret_weight"),
+            )
         elif head_name == "axis":
             loss = axis_loss(pred, targets.get("axis"))
         elif head_name == "axis_delta_norm":

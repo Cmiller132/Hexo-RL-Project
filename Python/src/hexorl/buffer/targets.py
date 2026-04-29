@@ -34,8 +34,17 @@ def compute_value_targets(
         pos.outcome = outcome
 
 
-def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
-    """Return indices of positions that are turn boundaries.
+def value_from_source_perspective(
+    value: float,
+    source_player: int,
+    target_player: int,
+) -> float:
+    """Convert a two-player zero-sum value to another player's perspective."""
+    return float(value) if source_player == target_player else -float(value)
+
+
+def hexo_turn_start_indices(positions: List[PositionRecord]) -> List[int]:
+    """Return indices of positions that start Hexo turns.
 
     In Hexo, the opening turn has one placement and later turns have two
     placements by the same player. Boundaries are therefore player-run starts,
@@ -46,6 +55,11 @@ def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
         for i, pos in enumerate(positions)
         if i == 0 or pos.player != positions[i - 1].player
     ]
+
+
+def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
+    """Backward-compatible alias for hexo_turn_start_indices."""
+    return hexo_turn_start_indices(positions)
 
 
 def compute_ema_lookahead(
@@ -76,7 +90,7 @@ def compute_ema_lookahead(
     if n == 0:
         return np.array([], dtype=np.float32)
 
-    boundaries = _turn_boundary_indices(positions)
+    boundaries = hexo_turn_start_indices(positions)
     mcts_values = np.array([pos.root_value for pos in positions], dtype=np.float32)
     result = np.copy(mcts_values)
 
@@ -84,9 +98,11 @@ def compute_ema_lookahead(
         target_bi = bisect_right(boundaries, i) + horizon - 1
         if target_bi < len(boundaries):
             j = boundaries[target_bi]
-            future = result[j]
-            if positions[j].player != positions[i].player:
-                future = -future
+            future = value_from_source_perspective(
+                result[j],
+                source_player=positions[j].player,
+                target_player=positions[i].player,
+            )
             result[i] = (1.0 - lambda_) * mcts_values[i] + lambda_ * future
         else:
             result[i] = mcts_values[i]
@@ -171,6 +187,8 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
         return
 
     for i, pos in enumerate(positions):
+        if getattr(record, "truncated", False) or float(record.outcome) == 0.0:
+            pos.value_weight = 0.0
         opp_idx = _next_full_search_opponent_turn_start(positions, i)
         if opp_idx is not None:
             opp = positions[opp_idx]
@@ -183,24 +201,29 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
             pos.opp_policy_weight = 0.0
         if not pos.pair_policy_target_v2 and pos.policy_target_v2:
             pos.pair_policy_target_v2 = pair_policy_v2_from_place_target(pos.policy_target_v2)
-        perspective_outcome = record.outcome if pos.player == 0 else -record.outcome
         tail = positions[i:]
-        regret = sum(
-            (
+        regret_weight = 0.0 if getattr(record, "truncated", False) else 1.0
+        if any(p.selected_action_value is None for p in tail):
+            regret = 0.0
+            regret_weight = 0.0
+        else:
+            regret = sum(
                 (
-                    p.selected_action_value
-                    if p.selected_action_value is not None
-                    else p.root_value
-                )
-                - (record.outcome if p.player == 0 else -record.outcome)
-            ) ** 2
-            for p in tail
-        ) / max(len(tail), 1)
+                    float(p.selected_action_value)
+                    - value_from_source_perspective(
+                        record.outcome,
+                        source_player=0,
+                        target_player=p.player,
+                    )
+                ) ** 2
+                for p in tail
+            ) / max(len(tail), 1)
         pos.regret_rank = float(regret)
         pos.regret_value = float(regret)
+        pos.regret_weight = float(regret_weight)
         pos.moves_left = float(max(total - pos.turn_index, 0))
         if pos.outcome is None:
-            pos.outcome = perspective_outcome if pos.player == 0 else -perspective_outcome
+            pos.outcome = record.outcome
 
     winner = 0 if record.outcome > 0 else 1 if record.outcome < 0 else None
     axis_history = record.final_move_history or positions[-1].move_history

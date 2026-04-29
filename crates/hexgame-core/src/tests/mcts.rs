@@ -237,7 +237,10 @@ mod tests {
         );
         let priors = engine.root_child_priors();
 
-        assert!(priors[0] > priors[1], "outside sparse action should win stage2 prior");
+        assert!(
+            priors[0] > priors[1],
+            "outside sparse action should win stage2 prior"
+        );
     }
 
     #[test]
@@ -245,8 +248,7 @@ mod tests {
         let game = HexGameState::new();
         let mut dense_engine =
             MCTSEngine::with_arena_sim_hint(game.clone(), 1, 50, 1.5, 2, false, 0.0, 0);
-        let mut sparse_engine =
-            MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let mut sparse_engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
         let legal = vec![Hex::new(0, 0), Hex::new(1, 0)];
         let mut dense = vec![-10.0f32; BOARD_AREA];
         dense[16 * 33 + 16] = 3.0;
@@ -264,7 +266,224 @@ mod tests {
             1.0,
         );
 
-        assert_eq!(sparse_engine.root_child_priors(), dense_engine.root_child_priors());
+        assert_eq!(
+            sparse_engine.root_child_priors(),
+            dense_engine.root_child_priors()
+        );
+    }
+
+    #[test]
+    fn mcts_sparse_stage1_only_uses_sparse_at_root() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 4, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        let sparse_actions = vec![(legal[0].q, legal[0].r)];
+        let sparse_logits = vec![10.0f32];
+
+        engine.expand_root_with_sparse_priors(
+            &dense,
+            0.0,
+            oq,
+            or_,
+            &legal,
+            &sparse_actions,
+            &sparse_logits,
+            1,
+            1.0,
+        );
+        let root_sources = engine.root_child_prior_sources();
+        assert_eq!(
+            root_sources[0], 1,
+            "stage1 root should consume sparse prior"
+        );
+
+        let (_, count) = engine.select_leaves(2);
+        assert!(count > 0);
+        let policies = vec![0.0f32; count as usize * BOARD_AREA];
+        let values = vec![0.0f32; count as usize];
+        let leaf_sparse = vec![sparse_actions.clone(); count as usize];
+        let leaf_logits = vec![sparse_logits.clone(); count as usize];
+        engine.expand_and_backprop_with_sparse(
+            &policies,
+            &values,
+            &leaf_sparse,
+            &leaf_logits,
+            1,
+            1.0,
+        );
+        let telemetry = engine.prior_source_telemetry();
+        assert_eq!(
+            telemetry.leaf_sparse_count, 0,
+            "stage1 leaves must stay dense/default"
+        );
+        assert!(telemetry.leaf_dense_count + telemetry.leaf_default_count > 0);
+    }
+
+    #[test]
+    fn mcts_reports_sparse_dense_default_prior_sources() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let legal = vec![Hex::new(50, 50), Hex::new(0, 0), Hex::new(1, 0)];
+        let dense = vec![0.0f32; BOARD_AREA];
+        let sparse_actions = vec![(50, 50)];
+        let sparse_logits = vec![10.0f32];
+
+        engine.expand_root_with_sparse_priors(
+            &dense,
+            0.0,
+            -16,
+            -16,
+            &legal,
+            &sparse_actions,
+            &sparse_logits,
+            2,
+            1.0,
+        );
+
+        let telemetry = engine.prior_source_telemetry();
+        assert_eq!(telemetry.root_total_count, 3);
+        assert_eq!(telemetry.root_sparse_count, 1);
+        assert_eq!(telemetry.root_dense_count, 2);
+        assert_eq!(telemetry.root_default_count, 0);
+
+        let default_legal = vec![Hex::new(80, 80), Hex::new(0, 0)];
+        let mut default_engine =
+            MCTSEngine::with_arena_sim_hint(HexGameState::new(), 1, 50, 1.5, 2, false, 0.0, 0);
+        default_engine.expand_root(&dense, 0.0, -16, -16, &default_legal);
+        let default_telemetry = default_engine.prior_source_telemetry();
+        assert_eq!(default_telemetry.root_default_count, 1);
+        assert_eq!(default_telemetry.root_dense_count, 1);
+    }
+
+    #[test]
+    fn mcts_consumes_pair_policy_on_two_placement_turns() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        assert_eq!(game.placements_remaining(), 2);
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 24, 100, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        assert!(legal.len() >= 3);
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+
+        let pair_a = legal[0];
+        let pair_b = legal[1];
+        engine
+            .apply_root_pair_priors(&[(pair_a.q, pair_a.r, pair_b.q, pair_b.r)], &[10.0], 1.0)
+            .expect("pair priors should apply");
+
+        let priors = engine.root_child_priors();
+        assert!(priors[0] > 0.0);
+        assert!(priors[1] > 0.0);
+        assert_eq!(priors[2], 0.0);
+        let telemetry = engine.prior_source_telemetry();
+        assert_eq!(telemetry.root_pair_candidate_count, 1);
+        assert_eq!(telemetry.root_pair_count, 2);
+
+        while !engine.done() {
+            let (_, count) = engine.select_leaves(4);
+            let policies = vec![0.0f32; count as usize * BOARD_AREA];
+            let values = vec![0.0f32; count as usize];
+            engine.expand_and_backprop(&policies, &values);
+        }
+        let (moves_q, moves_r, visits, _) = engine.get_results();
+        let pair_visits: u32 = moves_q
+            .iter()
+            .zip(moves_r.iter())
+            .zip(visits.iter())
+            .filter_map(|((&q, &r), &v)| {
+                if (q == pair_a.q && r == pair_a.r) || (q == pair_b.q && r == pair_b.r) {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .sum();
+        let non_pair_visits: u32 = visits.iter().sum::<u32>() - pair_visits;
+        assert!(
+            pair_visits > non_pair_visits,
+            "pair-prior actions should dominate visits: pair={pair_visits} non_pair={non_pair_visits}"
+        );
+    }
+
+    #[test]
+    fn mcts_pair_policy_rejects_duplicate_and_illegal_pairs() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        let a = legal[0];
+
+        let duplicate = engine.apply_root_pair_priors(&[(a.q, a.r, a.q, a.r)], &[1.0], 1.0);
+        assert!(duplicate.is_err());
+
+        let illegal = engine.apply_root_pair_priors(&[(a.q, a.r, 999, 999)], &[1.0], 1.0);
+        assert!(illegal.is_err());
+    }
+
+    #[test]
+    fn mcts_consumes_pair_policy_on_second_placement_root() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+
+        let first = legal[0];
+        engine
+            .re_root(first.q as i16, first.r as i16, 1)
+            .expect("reroot at first placement");
+
+        let (_tensor2, oq2, or2, second_legal) = engine.init_root().expect("second root");
+        assert!(second_legal.len() >= 2);
+        engine.expand_root(&dense, 0.0, oq2, or2, &second_legal);
+        let chosen_second = second_legal[1];
+        engine
+            .apply_root_pair_second_priors(
+                &[(first.q, first.r, chosen_second.q, chosen_second.r)],
+                &[8.0],
+                1.0,
+            )
+            .expect("second-placement pair prior should apply");
+
+        let priors = engine.root_child_priors();
+        let chosen_idx = second_legal
+            .iter()
+            .position(|h| h.q == chosen_second.q && h.r == chosen_second.r)
+            .unwrap();
+        assert_eq!(priors[chosen_idx], 1.0);
+        let telemetry = engine.prior_source_telemetry();
+        assert_eq!(telemetry.root_pair_candidate_count, 1);
+        assert_eq!(telemetry.root_pair_count, 1);
+    }
+
+    #[test]
+    fn mcts_second_placement_pair_policy_rejects_wrong_first_or_illegal_second() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        let first = legal[0];
+        engine
+            .re_root(first.q as i16, first.r as i16, 1)
+            .expect("reroot at first placement");
+        let (_tensor2, oq2, or2, second_legal) = engine.init_root().expect("second root");
+        engine.expand_root(&dense, 0.0, oq2, or2, &second_legal);
+        let second = second_legal[0];
+
+        let wrong_first =
+            engine.apply_root_pair_second_priors(&[(999, 999, second.q, second.r)], &[1.0], 1.0);
+        assert!(wrong_first.is_err());
+
+        let illegal_second =
+            engine.apply_root_pair_second_priors(&[(first.q, first.r, 999, 999)], &[1.0], 1.0);
+        assert!(illegal_second.is_err());
     }
 
     #[test]
@@ -279,6 +498,8 @@ mod tests {
         let meta = engine.pending_leaf_metadata();
 
         assert_eq!(meta.len(), count as usize);
-        assert!(meta.iter().all(|(_, _, legal)| !legal.is_empty()));
+        assert!(meta
+            .iter()
+            .all(|(_, _, legal, history)| !legal.is_empty() && !history.is_empty()));
     }
 }

@@ -19,7 +19,7 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 5
+COMPACT_VERSION_V2 = 7
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
@@ -58,7 +58,7 @@ class PositionRecord:
     turn_index: int = 0
 
     # MCTS value of the selected action from the acting player's perspective.
-    # Used by RGSC Eq. 2; older records fall back to root_value.
+    # Used by RGSC Eq. 2; missing values are not valid regret targets.
     selected_action_value: Optional[float] = None
 
     # Lookahead value targets at multiple horizons (KataGo-style).
@@ -76,8 +76,27 @@ class PositionRecord:
     candidate_recall_winning_move: float = 1.0
     candidate_recall_forced_block: float = 1.0
     candidate_recall_two_placement_cover: float = 1.0
+    sparse_prior_stage: int = 0
+    sparse_prior_root_candidate_count: int = 0
+    sparse_prior_leaf_candidate_count: float = 0.0
+    sparse_prior_root_hit_frac: float = 0.0
+    sparse_prior_leaf_hit_frac: float = 0.0
+    fallback_prior_use: float = 0.0
+    fallback_prior_use_on_mcts_top1: float = 0.0
+    fallback_prior_use_on_mcts_top4: float = 0.0
+    fallback_prior_use_on_mcts_top8: float = 0.0
+    sparse_vs_dense_disagreement: float = 0.0
+    sparse_prior_forward_ms: float = 0.0
+    sparse_prior_candidate_build_ms: float = 0.0
+    pair_prior_candidate_count: int = 0
+    pair_prior_hit_frac: float = 0.0
+    pair_fallback_prior_use: float = 0.0
+    pair_fallback_prior_use_on_mcts_top1: float = 0.0
+    pair_fallback_prior_use_on_mcts_top4: float = 0.0
+    pair_fallback_prior_use_on_mcts_top8: float = 0.0
     regret_rank: float = 0.0
     regret_value: float = 0.0
+    regret_weight: float = 0.0
     axis_label: int = -1
     moves_left: float = 0.0
     value_weight: float = 1.0
@@ -137,6 +156,14 @@ class GameRecord:
     # guard fired before either player won.
     truncated: bool = False
     terminal_reason: str = "unknown"
+    rgsc_restart_attempted: bool = False
+    rgsc_restart_used: bool = False
+    rgsc_restart_reason: str = "disabled"
+    rgsc_restart_entry_index: Optional[int] = None
+    rgsc_restart_entry_id: Optional[int] = None
+    rgsc_restart_move_count: int = 0
+    rgsc_prb_inserted: bool = False
+    rgsc_metrics: Dict[str, float] = field(default_factory=dict)
 
     def assign_outcomes(self):
         """Assign the game outcome to all positions."""
@@ -167,9 +194,7 @@ class GameRecord:
             parts.extend(struct.pack("<f", pos.root_value))
             parts.extend(struct.pack(
                 "<f",
-                pos.root_value
-                if pos.selected_action_value is None
-                else float(pos.selected_action_value),
+                float("nan") if pos.selected_action_value is None else float(pos.selected_action_value),
             ))
 
             # Policy target (legacy dense-crop sparse)
@@ -220,6 +245,28 @@ class GameRecord:
             ))
             parts.extend(struct.pack("<f", float(pos.opp_policy_weight)))
             parts.extend(struct.pack("<f", float(pos.value_weight)))
+            parts.extend(struct.pack("<f", float(pos.regret_weight)))
+            parts.extend(struct.pack(
+                "<18f",
+                float(pos.sparse_prior_stage),
+                float(pos.sparse_prior_root_candidate_count),
+                float(pos.sparse_prior_leaf_candidate_count),
+                float(pos.sparse_prior_root_hit_frac),
+                float(pos.sparse_prior_leaf_hit_frac),
+                float(pos.fallback_prior_use),
+                float(pos.fallback_prior_use_on_mcts_top1),
+                float(pos.fallback_prior_use_on_mcts_top4),
+                float(pos.fallback_prior_use_on_mcts_top8),
+                float(pos.sparse_vs_dense_disagreement),
+                float(pos.sparse_prior_forward_ms),
+                float(pos.sparse_prior_candidate_build_ms),
+                float(pos.pair_prior_candidate_count),
+                float(pos.pair_prior_hit_frac),
+                float(pos.pair_fallback_prior_use),
+                float(pos.pair_fallback_prior_use_on_mcts_top1),
+                float(pos.pair_fallback_prior_use_on_mcts_top4),
+                float(pos.pair_fallback_prior_use_on_mcts_top8),
+            ))
 
         return bytes(parts)
 
@@ -262,8 +309,10 @@ class GameRecord:
             offset += 4
             selected_action_value: Optional[float] = None
             if is_v2 and version >= 4:
-                selected_action_value = struct.unpack_from("<f", data, offset)[0]
+                selected_action_value_raw = struct.unpack_from("<f", data, offset)[0]
                 offset += 4
+                if np.isfinite(selected_action_value_raw):
+                    selected_action_value = float(selected_action_value_raw)
 
             # Policy target
             num_entries = struct.unpack_from("<H", data, offset)[0]
@@ -291,8 +340,27 @@ class GameRecord:
             candidate_recall_winning_move = 1.0
             candidate_recall_forced_block = 1.0
             candidate_recall_two_placement_cover = 1.0
+            sparse_prior_stage = 0
+            sparse_prior_root_candidate_count = 0
+            sparse_prior_leaf_candidate_count = 0.0
+            sparse_prior_root_hit_frac = 0.0
+            sparse_prior_leaf_hit_frac = 0.0
+            fallback_prior_use = 0.0
+            fallback_prior_use_on_mcts_top1 = 0.0
+            fallback_prior_use_on_mcts_top4 = 0.0
+            fallback_prior_use_on_mcts_top8 = 0.0
+            sparse_vs_dense_disagreement = 0.0
+            sparse_prior_forward_ms = 0.0
+            sparse_prior_candidate_build_ms = 0.0
+            pair_prior_candidate_count = 0
+            pair_prior_hit_frac = 0.0
+            pair_fallback_prior_use = 0.0
+            pair_fallback_prior_use_on_mcts_top1 = 0.0
+            pair_fallback_prior_use_on_mcts_top4 = 0.0
+            pair_fallback_prior_use_on_mcts_top8 = 0.0
             regret_rank = 0.0
             regret_value = 0.0
+            regret_weight = 0.0
             axis_label = -1
             moves_left = 0.0
             opp_policy_weight = 0.0
@@ -358,6 +426,34 @@ class GameRecord:
                 if is_v2 and version >= 5:
                     value_weight = struct.unpack_from("<f", data, offset)[0]
                     offset += 4
+                if is_v2 and version >= 6:
+                    regret_weight = struct.unpack_from("<f", data, offset)[0]
+                    offset += 4
+                if is_v2 and version >= 7:
+                    (
+                        sparse_prior_stage_f,
+                        sparse_prior_root_candidate_count_f,
+                        sparse_prior_leaf_candidate_count,
+                        sparse_prior_root_hit_frac,
+                        sparse_prior_leaf_hit_frac,
+                        fallback_prior_use,
+                        fallback_prior_use_on_mcts_top1,
+                        fallback_prior_use_on_mcts_top4,
+                        fallback_prior_use_on_mcts_top8,
+                        sparse_vs_dense_disagreement,
+                        sparse_prior_forward_ms,
+                        sparse_prior_candidate_build_ms,
+                        pair_prior_candidate_count_f,
+                        pair_prior_hit_frac,
+                        pair_fallback_prior_use,
+                        pair_fallback_prior_use_on_mcts_top1,
+                        pair_fallback_prior_use_on_mcts_top4,
+                        pair_fallback_prior_use_on_mcts_top8,
+                    ) = struct.unpack_from("<18f", data, offset)
+                    offset += struct.calcsize("<18f")
+                    sparse_prior_stage = int(sparse_prior_stage_f)
+                    sparse_prior_root_candidate_count = int(sparse_prior_root_candidate_count_f)
+                    pair_prior_candidate_count = int(pair_prior_candidate_count_f)
 
             positions.append(PositionRecord(
                 move_history=move_history,
@@ -383,8 +479,27 @@ class GameRecord:
                 candidate_recall_winning_move=candidate_recall_winning_move,
                 candidate_recall_forced_block=candidate_recall_forced_block,
                 candidate_recall_two_placement_cover=candidate_recall_two_placement_cover,
+                sparse_prior_stage=sparse_prior_stage,
+                sparse_prior_root_candidate_count=sparse_prior_root_candidate_count,
+                sparse_prior_leaf_candidate_count=sparse_prior_leaf_candidate_count,
+                sparse_prior_root_hit_frac=sparse_prior_root_hit_frac,
+                sparse_prior_leaf_hit_frac=sparse_prior_leaf_hit_frac,
+                fallback_prior_use=fallback_prior_use,
+                fallback_prior_use_on_mcts_top1=fallback_prior_use_on_mcts_top1,
+                fallback_prior_use_on_mcts_top4=fallback_prior_use_on_mcts_top4,
+                fallback_prior_use_on_mcts_top8=fallback_prior_use_on_mcts_top8,
+                sparse_vs_dense_disagreement=sparse_vs_dense_disagreement,
+                sparse_prior_forward_ms=sparse_prior_forward_ms,
+                sparse_prior_candidate_build_ms=sparse_prior_candidate_build_ms,
+                pair_prior_candidate_count=pair_prior_candidate_count,
+                pair_prior_hit_frac=pair_prior_hit_frac,
+                pair_fallback_prior_use=pair_fallback_prior_use,
+                pair_fallback_prior_use_on_mcts_top1=pair_fallback_prior_use_on_mcts_top1,
+                pair_fallback_prior_use_on_mcts_top4=pair_fallback_prior_use_on_mcts_top4,
+                pair_fallback_prior_use_on_mcts_top8=pair_fallback_prior_use_on_mcts_top8,
                 regret_rank=regret_rank,
                 regret_value=regret_value,
+                regret_weight=regret_weight,
                 axis_label=axis_label,
                 moves_left=moves_left,
             ))
@@ -528,27 +643,33 @@ def policy_v2_from_visits(
 def pair_policy_v2_from_place_target(
     policy_v2: PolicyTargetV2,
     *,
-    top_k: int = 32,
+    top_k: Optional[int] = None,
 ) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
-    """Build an ordered full-turn pair target from place-action probabilities.
+    """Build an unordered full-turn pair target from place-action probabilities.
 
-    MCTS still branches on placements, so this is an auxiliary target: it gives
-    graph models a supervised signal for which two action identities belong
-    together in one turn without forcing pair macro expansion.
+    By default this consumes every global policy_v2 row. ``top_k`` is retained
+    only for explicit tests or debug callers that need a deliberately bounded
+    synthetic target.
     """
-    entries = [(int(q), int(r), float(prob)) for q, r, prob in policy_v2 if prob > 0.0]
+    merged: dict[tuple[int, int], float] = {}
+    for q, r, prob in policy_v2:
+        if prob > 0.0:
+            key = (int(q), int(r))
+            merged[key] = merged.get(key, 0.0) + float(prob)
+    entries = [(q, r, prob) for (q, r), prob in merged.items()]
     entries.sort(key=lambda item: (-item[2], item[0], item[1]))
     if len(entries) < 2:
         return []
     pairs: list[tuple[tuple[int, int], tuple[int, int], float]] = []
-    limit = min(len(entries), max(2, int(top_k)))
+    limit = len(entries) if top_k is None else min(len(entries), max(2, int(top_k)))
     for i in range(limit):
         q1, r1, p1 = entries[i]
         for j in range(i + 1, limit):
             q2, r2, p2 = entries[j]
             pairs.append(((q1, r1), (q2, r2), p1 * p2))
     pairs.sort(key=lambda item: (-item[2], item[0], item[1]))
-    pairs = pairs[: max(1, int(top_k))]
+    if top_k is not None:
+        pairs = pairs[: max(1, int(top_k))]
     total = sum(prob for _a, _b, prob in pairs)
     if total <= 0.0:
         return []

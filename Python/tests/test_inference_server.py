@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
-from hexorl.inference.shm_queue import connect_inference_queue
+from hexorl.inference.shm_queue import CANDIDATE_FEATURES, connect_inference_queue
+from hexorl.model.network import from_config
 
 # Try to import the compiled Rust extension.
 try:
@@ -75,6 +76,54 @@ class TestInferenceServer(unittest.TestCase):
         server.stop()
         server.join(timeout=5.0)
         server_q.close()
+
+    def test_server_forward_returns_sparse_pair_logits(self):
+        """Server forward path returns active pair-policy logits when pair rows are supplied."""
+        cfg = load_config()
+        cfg.model.channels = 8
+        cfg.model.blocks = 2
+        cfg.model.sparse_policy = True
+        cfg.model.heads = ["policy", "value", "sparse_policy", "pair_policy"]
+        cfg.inference.max_batch_size = 16
+        cfg.inference.fp16 = False
+        server = InferenceServer(cfg, num_workers=1)
+        server._device = torch.device("cpu")
+        server._model = from_config(cfg, device=server._device)
+        server._model.eval()
+
+        count = 2
+        k = 4
+        p_rows = 3
+        tensor = torch.randn(count, 13, 33, 33)
+        candidate_indices = torch.from_numpy(np.tile(np.arange(k, dtype=np.int64), (count, 1)))
+        candidate_features = torch.randn(count, k, CANDIDATE_FEATURES)
+        candidate_mask = torch.ones(count, k, dtype=torch.bool)
+        pair_indices = np.array(
+            [
+                [[0, 1], [0, 2], [2, 3]],
+                [[0, 1], [1, 2], [0, 3]],
+            ],
+            dtype=np.int64,
+        )
+        pair_mask = torch.ones(count, p_rows, dtype=torch.bool)
+
+        policies, values, sparse, pair = server._forward(
+            tensor,
+            {
+                "candidate_indices": candidate_indices,
+                "candidate_features": candidate_features,
+                "candidate_mask": candidate_mask,
+                "pair_candidate_indices": torch.from_numpy(pair_indices),
+                "pair_candidate_mask": pair_mask,
+            },
+        )
+
+        self.assertEqual(policies.shape, (count, 1089))
+        self.assertEqual(values.shape, (count,))
+        self.assertEqual(sparse.shape, (count, k))
+        self.assertEqual(pair.shape, (count, p_rows))
+        self.assertTrue(np.isfinite(sparse).all())
+        self.assertTrue(np.isfinite(pair).all())
 
     def test_adaptive_batching_two_clients(self):
         """Two clients submitting simultaneously get correct results."""

@@ -18,12 +18,14 @@ import logging
 from multiprocessing.shared_memory import SharedMemory
 from typing import List, Optional
 
+from hexorl.action_contract.candidates import CANDIDATE_FEATURES
+
 
 NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 MAX_CANDIDATES = 512
-CANDIDATE_FEATURES = 12
+MAX_PAIR_CANDIDATES = 512
 TENSOR_ELEMENTS = NUM_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 13 * 33 * 33 = 14157
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,10 @@ def _shm_name(base: str, worker_id: int) -> str:
         "req_candidate_features": "qcf",
         "req_candidate_mask": "qcm",
         "res_sparse_logits": "rsl",
+        "req_pair_count": "qpc",
+        "req_pair_indices": "qpi",
+        "req_pair_mask": "qpm",
+        "res_pair_logits": "rpl",
         "req_ready": "qr",
         "res_ready": "rr",
     }
@@ -141,6 +147,14 @@ class WorkerSlots:
         self.req_candidate_mask: Optional[np.ndarray] = None
         self.res_sparse_logits_shm: Optional[SharedMemory] = None
         self.res_sparse_logits: Optional[np.ndarray] = None
+        self.req_pair_count_shm: Optional[SharedMemory] = None
+        self.req_pair_count: Optional[np.ndarray] = None
+        self.req_pair_indices_shm: Optional[SharedMemory] = None
+        self.req_pair_indices: Optional[np.ndarray] = None
+        self.req_pair_mask_shm: Optional[SharedMemory] = None
+        self.req_pair_mask: Optional[np.ndarray] = None
+        self.res_pair_logits_shm: Optional[SharedMemory] = None
+        self.res_pair_logits: Optional[np.ndarray] = None
 
         self.req_ready: Optional[SharedEvent] = None
         self.res_ready: Optional[SharedEvent] = None
@@ -230,6 +244,40 @@ class WorkerSlots:
             dtype=np.float32,
             buffer=self.res_sparse_logits_shm.buf,
         )
+        self.req_pair_count_shm = _create_shm(
+            _shm_name("req_pair_count", self.worker_id), self.max_batch * 2
+        )
+        self.req_pair_count = np.ndarray(
+            (self.max_batch,), dtype=np.uint16, buffer=self.req_pair_count_shm.buf
+        )
+        self.req_pair_count.fill(0)
+        self.req_pair_indices_shm = _create_shm(
+            _shm_name("req_pair_indices", self.worker_id),
+            self.max_batch * MAX_PAIR_CANDIDATES * 2 * 8,
+        )
+        self.req_pair_indices = np.ndarray(
+            (self.max_batch, MAX_PAIR_CANDIDATES, 2),
+            dtype=np.int64,
+            buffer=self.req_pair_indices_shm.buf,
+        )
+        self.req_pair_mask_shm = _create_shm(
+            _shm_name("req_pair_mask", self.worker_id),
+            self.max_batch * MAX_PAIR_CANDIDATES,
+        )
+        self.req_pair_mask = np.ndarray(
+            (self.max_batch, MAX_PAIR_CANDIDATES),
+            dtype=np.uint8,
+            buffer=self.req_pair_mask_shm.buf,
+        )
+        self.res_pair_logits_shm = _create_shm(
+            _shm_name("res_pair_logits", self.worker_id),
+            self.max_batch * MAX_PAIR_CANDIDATES * 4,
+        )
+        self.res_pair_logits = np.ndarray(
+            (self.max_batch, MAX_PAIR_CANDIDATES),
+            dtype=np.float32,
+            buffer=self.res_pair_logits_shm.buf,
+        )
 
         self.req_ready = SharedEvent(_shm_name("req_ready", self.worker_id), create=True)
         self.res_ready = SharedEvent(_shm_name("res_ready", self.worker_id), create=True)
@@ -306,6 +354,36 @@ class WorkerSlots:
             dtype=np.float32,
             buffer=self.res_sparse_logits_shm.buf,
         )
+        self.req_pair_count_shm = SharedMemory(
+            name=_shm_name("req_pair_count", self.worker_id), create=False
+        )
+        self.req_pair_count = np.ndarray(
+            (self.max_batch,), dtype=np.uint16, buffer=self.req_pair_count_shm.buf
+        )
+        self.req_pair_indices_shm = SharedMemory(
+            name=_shm_name("req_pair_indices", self.worker_id), create=False
+        )
+        self.req_pair_indices = np.ndarray(
+            (self.max_batch, MAX_PAIR_CANDIDATES, 2),
+            dtype=np.int64,
+            buffer=self.req_pair_indices_shm.buf,
+        )
+        self.req_pair_mask_shm = SharedMemory(
+            name=_shm_name("req_pair_mask", self.worker_id), create=False
+        )
+        self.req_pair_mask = np.ndarray(
+            (self.max_batch, MAX_PAIR_CANDIDATES),
+            dtype=np.uint8,
+            buffer=self.req_pair_mask_shm.buf,
+        )
+        self.res_pair_logits_shm = SharedMemory(
+            name=_shm_name("res_pair_logits", self.worker_id), create=False
+        )
+        self.res_pair_logits = np.ndarray(
+            (self.max_batch, MAX_PAIR_CANDIDATES),
+            dtype=np.float32,
+            buffer=self.res_pair_logits_shm.buf,
+        )
 
         self.req_ready = SharedEvent(_shm_name("req_ready", self.worker_id), create=False)
         self.res_ready = SharedEvent(_shm_name("res_ready", self.worker_id), create=False)
@@ -322,6 +400,10 @@ class WorkerSlots:
             "req_candidate_features_shm",
             "req_candidate_mask_shm",
             "res_sparse_logits_shm",
+            "req_pair_count_shm",
+            "req_pair_indices_shm",
+            "req_pair_mask_shm",
+            "res_pair_logits_shm",
         ):
             shm = getattr(self, attr, None)
             if shm is not None:

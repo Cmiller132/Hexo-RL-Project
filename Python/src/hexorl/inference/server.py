@@ -20,6 +20,7 @@ from hexorl.model.network import from_config, HexNet, load_model_state
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
+    MAX_PAIR_CANDIDATES,
     create_inference_queue,
     connect_inference_queue,
 )
@@ -260,10 +261,17 @@ class InferenceServer:
                 for worker_id in ready_workers:
                     self._queue.get_slot(worker_id).req_ready.clear()
 
-                policies, values, sparse_logits = self._forward(batch_tensor, sparse_inputs)
+                policies, values, sparse_logits, pair_logits = self._forward(batch_tensor, sparse_inputs)
 
                 scatter_t0 = time.monotonic()
-                self._scatter_results(ready_workers, per_worker_counts, policies, values, sparse_logits)
+                self._scatter_results(
+                    ready_workers,
+                    per_worker_counts,
+                    policies,
+                    values,
+                    sparse_logits,
+                    pair_logits,
+                )
                 self.total_scatter_ms += (time.monotonic() - scatter_t0) * 1000.0
 
                 for worker_id in ready_workers:
@@ -373,29 +381,60 @@ class InferenceServer:
             if count > 0:
                 counts = slot.req_candidate_count[:count]
                 max_k = max(max_k, int(counts.max()) if counts.size else 0)
-        if max_k <= 0:
+        max_p = 0
+        for worker_id, count in zip(ready_workers, per_worker_counts):
+            slot = self._queue.get_slot(worker_id)
+            if count > 0 and getattr(slot, "req_pair_count", None) is not None:
+                counts = slot.req_pair_count[:count]
+                max_p = max(max_p, int(counts.max()) if counts.size else 0)
+        if max_k <= 0 and max_p <= 0:
             return None
 
+        max_k = max(max_k, 1)
         indices = np.full((total_count, max_k), -1, dtype=np.int64)
         features = np.zeros((total_count, max_k, CANDIDATE_FEATURES), dtype=np.float32)
         mask = np.zeros((total_count, max_k), dtype=np.bool_)
+        max_p = max(max_p, 0)
+        pair_indices = (
+            np.full((total_count, max_p, 2), -1, dtype=np.int64)
+            if max_p > 0
+            else None
+        )
+        pair_mask = (
+            np.zeros((total_count, max_p), dtype=np.bool_)
+            if max_p > 0
+            else None
+        )
         offset = 0
         for worker_id, count in zip(ready_workers, per_worker_counts):
             slot = self._queue.get_slot(worker_id)
             for row in range(count):
                 k = int(slot.req_candidate_count[row])
-                if k <= 0:
-                    continue
-                kk = min(k, max_k)
-                indices[offset + row, :kk] = slot.req_candidate_indices[row, :kk]
-                features[offset + row, :kk] = slot.req_candidate_features[row, :kk]
-                mask[offset + row, :kk] = slot.req_candidate_mask[row, :kk].astype(bool)
+                if k > 0:
+                    kk = min(k, max_k)
+                    indices[offset + row, :kk] = slot.req_candidate_indices[row, :kk]
+                    features[offset + row, :kk] = slot.req_candidate_features[row, :kk]
+                    mask[offset + row, :kk] = slot.req_candidate_mask[row, :kk].astype(bool)
+                if pair_indices is not None and pair_mask is not None:
+                    p = int(slot.req_pair_count[row])
+                    if p > 0:
+                        pp = min(p, max_p, MAX_PAIR_CANDIDATES)
+                        pair_indices[offset + row, :pp] = slot.req_pair_indices[row, :pp]
+                        pair_mask[offset + row, :pp] = slot.req_pair_mask[row, :pp].astype(bool)
             offset += count
-        return {
+        out = {
             "candidate_indices": torch.from_numpy(indices).to(self._device, non_blocking=True),
             "candidate_features": torch.from_numpy(features).to(self._device, non_blocking=True),
             "candidate_mask": torch.from_numpy(mask).to(self._device, non_blocking=True),
         }
+        if pair_indices is not None and pair_mask is not None:
+            out["pair_candidate_indices"] = torch.from_numpy(pair_indices).to(
+                self._device, non_blocking=True
+            )
+            out["pair_candidate_mask"] = torch.from_numpy(pair_mask).to(
+                self._device, non_blocking=True
+            )
+        return out
 
     # ── Forward pass ──────────────────────────────────────────────────────
 
@@ -403,7 +442,7 @@ class InferenceServer:
         self,
         batch_tensor: torch.Tensor,
         sparse_inputs: Optional[dict[str, torch.Tensor]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """Run the model forward pass on a batch.
 
         Args:
@@ -447,8 +486,11 @@ class InferenceServer:
         policies = p.cpu().numpy()
         values = v.cpu().numpy()
         sparse = None
+        pair = None
         if sparse_inputs is not None and "sparse_policy" in out:
             sparse = self._sanitize_policy_logits(out["sparse_policy"]).cpu().numpy()
+        if sparse_inputs is not None and "pair_policy" in out:
+            pair = self._sanitize_policy_logits(out["pair_policy"]).cpu().numpy()
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -457,7 +499,7 @@ class InferenceServer:
         self.total_postprocess_ms += post_ms
         self.total_download_ms += download_ms
 
-        return policies, values, sparse
+        return policies, values, sparse, pair
 
     @staticmethod
     def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -502,6 +544,7 @@ class InferenceServer:
         policies: np.ndarray,
         values: np.ndarray,
         sparse_logits: Optional[np.ndarray] = None,
+        pair_logits: Optional[np.ndarray] = None,
     ):
         """Distribute flat policy/value arrays back to per-worker slots."""
         offset = 0
@@ -512,6 +555,9 @@ class InferenceServer:
             if sparse_logits is not None:
                 k = sparse_logits.shape[1]
                 slot.res_sparse_logits[:count, :k] = sparse_logits[offset:offset + count]
+            if pair_logits is not None:
+                p = pair_logits.shape[1]
+                slot.res_pair_logits[:count, :p] = pair_logits[offset:offset + count]
             offset += count
 
     # ── Stats ─────────────────────────────────────────────────────────────

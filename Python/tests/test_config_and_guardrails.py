@@ -7,7 +7,7 @@ from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
-from hexorl.model.network import build_model_from_config
+from hexorl.model.network import HexConv2d, GatedResBlock, build_model_from_config, load_model_state
 
 
 def test_config_rejects_lookahead_head_without_matching_horizon():
@@ -23,9 +23,40 @@ def test_config_rejects_lookahead_head_without_matching_horizon():
         )
 
 
-def test_config_adds_default_loss_for_matching_lookahead_head():
-    cfg = Config.model_validate({"model": {"heads": ["policy", "value", "lookahead_4"]}})
+def test_config_requires_active_loss_for_matching_lookahead_head():
+    with pytest.raises(ValueError, match="active train.loss_weights"):
+        Config.model_validate({"model": {"heads": ["policy", "value", "lookahead_4"]}})
+
+    cfg = Config.model_validate(
+        {
+            "model": {"heads": ["policy", "value", "lookahead_4"]},
+            "train": {"loss_weights": {"policy": 1.0, "value": 1.0, "lookahead_4": 0.15}},
+        }
+    )
     assert cfg.train.loss_weights["lookahead_4"] == pytest.approx(0.15)
+
+
+def test_config_forbids_unknown_fields():
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        Config.model_validate({"buffer": {"regret_fracton": 0.1}})
+
+
+def test_regret_fraction_requires_weighted_regret_heads_or_replay_only():
+    with pytest.raises(ValueError, match="regret_fraction"):
+        Config.model_validate(
+            {
+                "buffer": {"regret_fraction": 0.1, "regret_replay_only": False},
+                "model": {"heads": ["policy", "value"]},
+            }
+        )
+
+    cfg = Config.model_validate(
+        {
+            "buffer": {"regret_fraction": 0.1, "regret_replay_only": False},
+            "model": {"heads": ["policy", "value", "regret_rank", "regret_value"]},
+        }
+    )
+    assert cfg.buffer.regret_replay_only is False
 
 
 def test_config_rejects_mismatched_lookahead_horizon_and_lambda_counts():
@@ -185,8 +216,104 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
 
 
 def test_graph_architecture_alias_maps_to_graph_hybrid_0():
-    cfg = Config.model_validate({"model": {"architecture": "graph"}})
+    with pytest.warns(UserWarning, match="deprecated crop-compatible alias"):
+        cfg = Config.model_validate({"model": {"architecture": "graph"}})
     assert cfg.model.architecture == "graph_hybrid_0"
+
+
+def test_hex_conv_invalid_axial_corners_stay_zero_after_optimizer_step():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 8,
+                "blocks": 2,
+                "heads": ["policy", "value"],
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    hex_convs = [m for m in model.modules() if isinstance(m, HexConv2d)]
+    assert hex_convs
+    for conv in hex_convs:
+        assert torch.count_nonzero(conv.weight[:, :, 0, 0]) == 0
+        assert torch.count_nonzero(conv.weight[:, :, 2, 2]) == 0
+
+    opt = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=0.1)
+    out = model(torch.randn(2, 13, 33, 33))
+    loss = out["policy"].sum() + out["value"].sum()
+    loss.backward()
+    opt.step()
+
+    for conv in hex_convs:
+        assert torch.count_nonzero(conv.weight[:, :, 0, 0]) == 0
+        assert torch.count_nonzero(conv.weight[:, :, 2, 2]) == 0
+
+    with torch.no_grad():
+        hex_convs[0].weight[:, :, 0, 0].fill_(1.0)
+        hex_convs[0].weight[:, :, 2, 2].fill_(1.0)
+    model.apply_hex_masks_()
+    assert torch.count_nonzero(hex_convs[0].weight[:, :, 0, 0]) == 0
+    assert torch.count_nonzero(hex_convs[0].weight[:, :, 2, 2]) == 0
+
+
+def test_hex_conv_masks_are_reapplied_after_loading_state_dict():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 8,
+                "blocks": 1,
+                "heads": ["policy", "value"],
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    state = {key: value.clone() for key, value in model.state_dict().items()}
+    for key, value in state.items():
+        if value.ndim == 4 and value.shape[-2:] == (3, 3):
+            value[:, :, 0, 0].fill_(1.0)
+            value[:, :, 2, 2].fill_(1.0)
+
+    load_model_state(model, state)
+
+    for conv in [m for m in model.modules() if isinstance(m, HexConv2d)]:
+        assert torch.count_nonzero(conv.weight[:, :, 0, 0]) == 0
+        assert torch.count_nonzero(conv.weight[:, :, 2, 2]) == 0
+
+
+@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph_hybrid_0"])
+def test_trunks_use_hex_conv_for_architecture_names(architecture):
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 8,
+                "blocks": 3,
+                "architecture": architecture,
+                "attention_heads": 4,
+                "dropout": 0.25,
+                "graph_token_set": "graph256_cells",
+                "graph_token_budget": 64,
+                "graph_layers": 1,
+                "heads": ["policy", "value"],
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+
+    assert isinstance(model.conv_in, HexConv2d)
+    gated_blocks = [m for m in model.res_blocks if isinstance(m, GatedResBlock)]
+    assert gated_blocks
+    for block in gated_blocks:
+        assert isinstance(block.conv1, HexConv2d)
+        assert isinstance(block.conv2, HexConv2d)
+        assert isinstance(block.conv_gate, HexConv2d)
+        assert isinstance(block.dropout, torch.nn.Dropout2d)
+
+    head_convs = [m.conv for m in model.heads.values() if hasattr(m, "conv")]
+    assert head_convs
+    assert all(not isinstance(conv, HexConv2d) and conv.kernel_size == (1, 1) for conv in head_convs)
 
 
 def test_pair_policy_head_forward_and_default_weight():
@@ -197,6 +324,9 @@ def test_pair_policy_head_forward_and_default_weight():
                 "blocks": 2,
                 "heads": ["policy", "value", "pair_policy"],
                 "candidate_budget": 8,
+            },
+            "train": {
+                "loss_weights": {"policy": 1.0, "value": 1.5, "pair_policy": 0.05}
             },
             "inference": {"fp16": False},
         }
@@ -237,13 +367,30 @@ def test_restnet_config_rejects_invalid_attention_position():
         )
 
 
-def test_sparse_policy_config_adds_default_loss_weight():
-    cfg = Config.model_validate({"model": {"sparse_policy": True}})
+def test_sparse_policy_config_requires_active_loss_for_sparse_policy_head():
+    with pytest.raises(ValueError, match="sparse_policy"):
+        Config.model_validate({"model": {"heads": ["policy", "value", "sparse_policy"]}})
+
+    cfg = Config.model_validate(
+        {
+            "model": {"heads": ["policy", "value", "sparse_policy"]},
+            "train": {
+                "loss_weights": {"policy": 1.0, "value": 1.5, "sparse_policy": 0.25}
+            },
+        }
+    )
     assert cfg.train.loss_weights["sparse_policy"] == pytest.approx(0.25)
 
 
 def test_sparse_policy_head_enables_sparse_data_contract():
-    cfg = Config.model_validate({"model": {"heads": ["policy", "value", "sparse_policy"]}})
+    cfg = Config.model_validate(
+        {
+            "model": {"heads": ["policy", "value", "sparse_policy"]},
+            "train": {
+                "loss_weights": {"policy": 1.0, "value": 1.5, "sparse_policy": 0.25}
+            },
+        }
+    )
 
     assert cfg.model.sparse_policy is True
     assert cfg.train.loss_weights["sparse_policy"] == pytest.approx(0.25)
@@ -278,3 +425,26 @@ def test_sparse_policy_effective_candidate_width_capped_by_shm():
 def test_sparse_prior_stage_requires_sparse_policy_contract():
     with pytest.raises(ValueError, match="sparse_prior_stage"):
         Config.model_validate({"model": {"sparse_prior_stage": 1}})
+
+
+def test_rgsc_selfplay_config_bounds():
+    cfg = Config.model_validate(
+        {
+            "selfplay": {
+                "rgsc_beta": 0.75,
+                "rgsc_prb_capacity": 8,
+                "rgsc_prb_temperature": 0.25,
+                "rgsc_prb_ema_alpha": 0.2,
+            }
+        }
+    )
+    assert cfg.selfplay.rgsc_beta == pytest.approx(0.75)
+
+    with pytest.raises(ValueError, match="rgsc_beta"):
+        Config.model_validate({"selfplay": {"rgsc_beta": 1.1}})
+    with pytest.raises(ValueError, match="rgsc_prb_capacity"):
+        Config.model_validate({"selfplay": {"rgsc_prb_capacity": -1}})
+    with pytest.raises(ValueError, match="rgsc_prb_temperature"):
+        Config.model_validate({"selfplay": {"rgsc_prb_temperature": 0.0}})
+    with pytest.raises(ValueError, match="rgsc_prb_ema_alpha"):
+        Config.model_validate({"selfplay": {"rgsc_prb_ema_alpha": -0.1}})

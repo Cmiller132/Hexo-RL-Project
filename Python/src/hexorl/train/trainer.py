@@ -14,6 +14,7 @@ import torch.nn as nn
 from typing import Dict, Optional
 from pathlib import Path
 
+from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.config import Config
 from hexorl.model.network import HexNet, load_model_state
 from hexorl.train.losses import compute_losses
@@ -266,6 +267,13 @@ class Trainer:
         for k, v in per_head.items():
             if isinstance(v, torch.Tensor):
                 result[k] = float(v.detach().cpu())
+        for weight_key in ("value_weight", "policy_weight", "regret_weight", "opp_policy_weight"):
+            weight_tensor = targets.get(weight_key)
+            if weight_tensor is not None:
+                with torch.no_grad():
+                    weight_float = weight_tensor.float()
+                    result[f"{weight_key}_mean"] = float(weight_float.mean().detach().cpu())
+                    result[f"{weight_key}_zero_frac"] = float((weight_float <= 0).float().mean().detach().cpu())
         if "policy" in predictions and "policy" in targets:
             with torch.no_grad():
                 policy_probs = torch.softmax(predictions["policy"], dim=-1)
@@ -373,6 +381,12 @@ class Trainer:
     def save_checkpoint(self, path: Path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_contract = {
+            "candidate_feature_version": CANDIDATE_FEATURE_VERSION,
+            "candidate_feature_names": list(CANDIDATE_FEATURE_NAMES),
+        }
+        model_metadata = self.cfg.model.model_dump(mode="json")
+        model_metadata.update(candidate_contract)
 
         checkpoint = {
             "model_state_dict": _uncompiled_state_dict(self.model),
@@ -384,7 +398,8 @@ class Trainer:
             "global_step": self.global_step,
             "cfg": self.cfg,
             "cfg_json": self.cfg.model_dump(mode="json"),
-            "model_metadata": self.cfg.model.model_dump(mode="json"),
+            "model_metadata": model_metadata,
+            "action_contract_metadata": candidate_contract,
         }
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved to {path}")

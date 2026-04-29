@@ -111,6 +111,12 @@ def _read_checkpoint_metadata(path: Path) -> dict[str, Any]:
         if heads is None:
             heads = _heads_from_state_dict(state)
         metadata["model_heads"] = list(heads or [])
+        if checkpoint.get("action_contract_metadata") is not None:
+            metadata["action_contract_metadata"] = checkpoint["action_contract_metadata"]
+        if checkpoint.get("model_metadata") is not None:
+            model_metadata = checkpoint["model_metadata"]
+            if isinstance(model_metadata, dict) and "candidate_feature_version" in model_metadata:
+                metadata["candidate_feature_version"] = model_metadata["candidate_feature_version"]
         metadata["state_keys"] = len(state) if isinstance(state, dict) else 0
         metadata["is_loadable"] = isinstance(state, dict) and (
             "model_state_dict" in checkpoint or any(k.startswith("conv_in.") for k in state)

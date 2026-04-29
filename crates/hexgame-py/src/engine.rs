@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 
@@ -710,10 +710,7 @@ impl PyMCTSEngine {
             let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
             legal.push(Hex::new(q, r));
         }
-        let sparse_actions: Vec<(i32, i32)> = qr
-            .outer_iter()
-            .map(|row| (row[0], row[1]))
-            .collect();
+        let sparse_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner.expand_root_with_sparse_priors(
             policy_slice,
             value,
@@ -726,6 +723,64 @@ impl PyMCTSEngine {
             sparse_mix,
         );
         Ok(())
+    }
+
+    fn apply_root_pair_priors<'py>(
+        &mut self,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        pair_mix: f32,
+    ) -> PyResult<()> {
+        let qr = pair_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 4 {
+            return Err(PyValueError::new_err("pair_qr must have shape (N, 4)"));
+        }
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        if logits.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "pair_logits length {} is smaller than pair_qr rows {}",
+                logits.len(),
+                qr.shape()[0]
+            )));
+        }
+        let pair_actions: Vec<(i32, i32, i32, i32)> = qr
+            .outer_iter()
+            .map(|row| (row[0], row[1], row[2], row[3]))
+            .collect();
+        self.inner
+            .apply_root_pair_priors(&pair_actions, logits, pair_mix)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn apply_root_pair_second_priors<'py>(
+        &mut self,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        pair_mix: f32,
+    ) -> PyResult<()> {
+        let qr = pair_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 4 {
+            return Err(PyValueError::new_err("pair_qr must have shape (N, 4)"));
+        }
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        if logits.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "pair_logits length {} is smaller than pair_qr rows {}",
+                logits.len(),
+                qr.shape()[0]
+            )));
+        }
+        let pair_actions: Vec<(i32, i32, i32, i32)> = qr
+            .outer_iter()
+            .map(|row| (row[0], row[1], row[2], row[3]))
+            .collect();
+        self.inner
+            .apply_root_pair_second_priors(&pair_actions, logits, pair_mix)
+            .map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (noise, noise_fraction))]
@@ -780,17 +835,22 @@ impl PyMCTSEngine {
     fn pending_leaf_metadata<'py>(
         &self,
         py: Python<'py>,
-    ) -> Vec<(i32, i32, Bound<'py, PyBytes>)> {
+    ) -> Vec<(i32, i32, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         self.inner
             .pending_leaf_metadata()
             .into_iter()
-            .map(|(oq, or_, legal)| {
+            .map(|(oq, or_, legal, history)| {
                 let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
                 for h in &legal {
                     legal_buf.extend_from_slice(&h.q.to_le_bytes());
                     legal_buf.extend_from_slice(&h.r.to_le_bytes());
                 }
-                (oq, or_, PyBytes::new(py, &legal_buf))
+                (
+                    oq,
+                    or_,
+                    PyBytes::new(py, &legal_buf),
+                    PyBytes::new(py, &history),
+                )
             })
             .collect()
     }
@@ -875,7 +935,9 @@ impl PyMCTSEngine {
             return Err(PyValueError::new_err("sparse_qr must have shape (N, K, 2)"));
         }
         if logits.shape().len() != 2 || logits.shape()[0] < n {
-            return Err(PyValueError::new_err("sparse_logits must have shape (N, K)"));
+            return Err(PyValueError::new_err(
+                "sparse_logits must have shape (N, K)",
+            ));
         }
         if counts.len() < n {
             return Err(PyValueError::new_err("sparse_counts length must be >= N"));
@@ -920,6 +982,30 @@ impl PyMCTSEngine {
 
     fn root_child_priors(&self) -> Vec<f32> {
         self.inner.root_child_priors()
+    }
+
+    fn root_child_prior_sources(&self) -> Vec<u8> {
+        self.inner.root_child_prior_sources()
+    }
+
+    fn prior_source_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let t = self.inner.prior_source_telemetry();
+        let dict = PyDict::new(py);
+        dict.set_item("root_total_count", t.root_total_count)?;
+        dict.set_item("root_sparse_count", t.root_sparse_count)?;
+        dict.set_item("root_dense_count", t.root_dense_count)?;
+        dict.set_item("root_default_count", t.root_default_count)?;
+        dict.set_item("leaf_total_count", t.leaf_total_count)?;
+        dict.set_item("leaf_sparse_count", t.leaf_sparse_count)?;
+        dict.set_item("leaf_dense_count", t.leaf_dense_count)?;
+        dict.set_item("leaf_default_count", t.leaf_default_count)?;
+        dict.set_item("root_pair_count", t.root_pair_count)?;
+        dict.set_item("leaf_pair_count", t.leaf_pair_count)?;
+        dict.set_item("root_sparse_candidate_count", t.root_sparse_candidate_count)?;
+        dict.set_item("leaf_sparse_candidate_count", t.leaf_sparse_candidate_count)?;
+        dict.set_item("root_pair_candidate_count", t.root_pair_candidate_count)?;
+        dict.set_item("leaf_expansion_count", t.leaf_expansion_count)?;
+        Ok(dict)
     }
 
     fn root_child_q_values(&self) -> Vec<f32> {

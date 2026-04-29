@@ -67,11 +67,31 @@ class RingBuffer:
         self._candidate_recall_winning = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_forced_block = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_cover = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_stage = np.zeros(capacity, dtype=np.uint8)
+        self._sparse_prior_root_candidate_count = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_leaf_candidate_count = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_root_hit_frac = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_leaf_hit_frac = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use_top1 = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use_top4 = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use_top8 = np.zeros(capacity, dtype=np.float32)
+        self._sparse_vs_dense_disagreement = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_forward_ms = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_candidate_build_ms = np.zeros(capacity, dtype=np.float32)
+        self._pair_prior_candidate_count = np.zeros(capacity, dtype=np.float32)
+        self._pair_prior_hit_frac = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use_top1 = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use_top4 = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use_top8 = np.zeros(capacity, dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
         self._selected_action_values = np.zeros(capacity, dtype=np.float32)
+        self._selected_action_present = np.zeros(capacity, dtype=np.bool_)
         self._value_weights = np.ones(capacity, dtype=np.float32)
         self._regret_rank = np.zeros(capacity, dtype=np.float32)
         self._regret_value = np.zeros(capacity, dtype=np.float32)
+        self._regret_weights = np.zeros(capacity, dtype=np.float32)
         self._axis = np.full(capacity, -1, dtype=np.int16)
         self._moves_left = np.zeros(capacity, dtype=np.float32)
         self._opp_policies = np.zeros((capacity, max_policy_entries), dtype=np.uint16)
@@ -128,10 +148,9 @@ class RingBuffer:
                 self._policy_probs[idx, j] = prob
 
             self._values[idx] = record.to_value_target()
+            self._selected_action_present[idx] = record.selected_action_value is not None
             self._selected_action_values[idx] = (
-                record.root_value
-                if record.selected_action_value is None
-                else float(record.selected_action_value)
+                0.0 if record.selected_action_value is None else float(record.selected_action_value)
             )
             self._value_weights[idx] = record.value_weight
             self._write_aux_targets(idx, record)
@@ -173,10 +192,9 @@ class RingBuffer:
             self._policies[idx, j] = action_idx
             self._policy_probs[idx, j] = prob
         self._values[idx] = record.to_value_target()
+        self._selected_action_present[idx] = record.selected_action_value is not None
         self._selected_action_values[idx] = (
-            record.root_value
-            if record.selected_action_value is None
-            else float(record.selected_action_value)
+            0.0 if record.selected_action_value is None else float(record.selected_action_value)
         )
         self._value_weights[idx] = record.value_weight
         self._write_aux_targets(idx, record)
@@ -243,7 +261,8 @@ class RingBuffer:
             regrets = np.zeros(self._size, dtype=np.float64)
             for i in range(self._size):
                 idx = (self._tail + i) % self.capacity
-                regrets[i] = max(float(self._regret_rank[idx]), 1e-8)
+                if self._regret_weights[idx] > 0.0:
+                    regrets[i] = max(float(self._regret_rank[idx]), 1e-8)
 
         inv_temp = 1.0 / max(temperature, 1e-6)
         weights = regrets ** inv_temp
@@ -322,7 +341,11 @@ class RingBuffer:
                 policy_target=policy,
                 root_value=0.0,
                 player=player,
-                selected_action_value=float(self._selected_action_values[idx]),
+                selected_action_value=(
+                    float(self._selected_action_values[idx])
+                    if self._selected_action_present[idx]
+                    else None
+                ),
                 game_id=int(self._game_ids[idx]),
                 is_full_search=bool(self._is_full[idx]),
                 outcome=outcome,
@@ -340,8 +363,27 @@ class RingBuffer:
                 candidate_recall_winning_move=float(self._candidate_recall_winning[idx]),
                 candidate_recall_forced_block=float(self._candidate_recall_forced_block[idx]),
                 candidate_recall_two_placement_cover=float(self._candidate_recall_cover[idx]),
+                sparse_prior_stage=int(self._sparse_prior_stage[idx]),
+                sparse_prior_root_candidate_count=int(self._sparse_prior_root_candidate_count[idx]),
+                sparse_prior_leaf_candidate_count=float(self._sparse_prior_leaf_candidate_count[idx]),
+                sparse_prior_root_hit_frac=float(self._sparse_prior_root_hit_frac[idx]),
+                sparse_prior_leaf_hit_frac=float(self._sparse_prior_leaf_hit_frac[idx]),
+                fallback_prior_use=float(self._fallback_prior_use[idx]),
+                fallback_prior_use_on_mcts_top1=float(self._fallback_prior_use_top1[idx]),
+                fallback_prior_use_on_mcts_top4=float(self._fallback_prior_use_top4[idx]),
+                fallback_prior_use_on_mcts_top8=float(self._fallback_prior_use_top8[idx]),
+                sparse_vs_dense_disagreement=float(self._sparse_vs_dense_disagreement[idx]),
+                sparse_prior_forward_ms=float(self._sparse_prior_forward_ms[idx]),
+                sparse_prior_candidate_build_ms=float(self._sparse_prior_candidate_build_ms[idx]),
+                pair_prior_candidate_count=int(self._pair_prior_candidate_count[idx]),
+                pair_prior_hit_frac=float(self._pair_prior_hit_frac[idx]),
+                pair_fallback_prior_use=float(self._pair_fallback_prior_use[idx]),
+                pair_fallback_prior_use_on_mcts_top1=float(self._pair_fallback_prior_use_top1[idx]),
+                pair_fallback_prior_use_on_mcts_top4=float(self._pair_fallback_prior_use_top4[idx]),
+                pair_fallback_prior_use_on_mcts_top8=float(self._pair_fallback_prior_use_top8[idx]),
                 regret_rank=float(self._regret_rank[idx]),
                 regret_value=float(self._regret_value[idx]),
+                regret_weight=float(self._regret_weights[idx]),
                 axis_label=int(self._axis[idx]),
                 moves_left=float(self._moves_left[idx]),
                 value_weight=float(self._value_weights[idx]),
@@ -420,6 +462,76 @@ class RingBuffer:
                         [(self._tail + i) % self.capacity for i in range(self._size)]
                     ].mean()
                 ) if self._size > 0 else 0.0,
+                "fallback_prior_use": float(
+                    self._fallback_prior_use[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_top1": float(
+                    self._fallback_prior_use_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_top4": float(
+                    self._fallback_prior_use_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_top8": float(
+                    self._fallback_prior_use_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_topk": float(
+                    self._fallback_prior_use_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "sparse_prior_root_hit_frac": float(
+                    self._sparse_prior_root_hit_frac[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "sparse_prior_leaf_hit_frac": float(
+                    self._sparse_prior_leaf_hit_frac[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "sparse_vs_dense_disagreement": float(
+                    self._sparse_vs_dense_disagreement[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use": float(
+                    self._pair_fallback_prior_use[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_prior_hit_frac": float(
+                    self._pair_prior_hit_frac[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_prior_candidate_count": float(
+                    self._pair_prior_candidate_count[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use_on_mcts_top1": float(
+                    self._pair_fallback_prior_use_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use_on_mcts_top4": float(
+                    self._pair_fallback_prior_use_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use_on_mcts_top8": float(
+                    self._pair_fallback_prior_use_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
             }
 
     def clear(self):
@@ -451,11 +563,31 @@ class RingBuffer:
             self._candidate_recall_winning.fill(0.0)
             self._candidate_recall_forced_block.fill(0.0)
             self._candidate_recall_cover.fill(0.0)
+            self._sparse_prior_stage.fill(0)
+            self._sparse_prior_root_candidate_count.fill(0.0)
+            self._sparse_prior_leaf_candidate_count.fill(0.0)
+            self._sparse_prior_root_hit_frac.fill(0.0)
+            self._sparse_prior_leaf_hit_frac.fill(0.0)
+            self._fallback_prior_use.fill(0.0)
+            self._fallback_prior_use_top1.fill(0.0)
+            self._fallback_prior_use_top4.fill(0.0)
+            self._fallback_prior_use_top8.fill(0.0)
+            self._sparse_vs_dense_disagreement.fill(0.0)
+            self._sparse_prior_forward_ms.fill(0.0)
+            self._sparse_prior_candidate_build_ms.fill(0.0)
+            self._pair_prior_candidate_count.fill(0.0)
+            self._pair_prior_hit_frac.fill(0.0)
+            self._pair_fallback_prior_use.fill(0.0)
+            self._pair_fallback_prior_use_top1.fill(0.0)
+            self._pair_fallback_prior_use_top4.fill(0.0)
+            self._pair_fallback_prior_use_top8.fill(0.0)
             self._values.fill(0.0)
             self._selected_action_values.fill(0.0)
+            self._selected_action_present.fill(False)
             self._value_weights.fill(1.0)
             self._regret_rank.fill(0.0)
             self._regret_value.fill(0.0)
+            self._regret_weights.fill(0.0)
             self._axis.fill(-1)
             self._moves_left.fill(0.0)
             self._opp_policies.fill(0)
@@ -476,6 +608,7 @@ class RingBuffer:
         """Write optional auxiliary targets into struct-of-arrays storage."""
         self._regret_rank[idx] = record.regret_rank
         self._regret_value[idx] = record.regret_value
+        self._regret_weights[idx] = record.regret_weight
         self._axis[idx] = record.axis_label
         self._moves_left[idx] = record.moves_left
         self._opp_policy_weights[idx] = record.opp_policy_weight
@@ -539,3 +672,21 @@ class RingBuffer:
         self._candidate_recall_winning[idx] = float(record.candidate_recall_winning_move)
         self._candidate_recall_forced_block[idx] = float(record.candidate_recall_forced_block)
         self._candidate_recall_cover[idx] = float(record.candidate_recall_two_placement_cover)
+        self._sparse_prior_stage[idx] = int(record.sparse_prior_stage)
+        self._sparse_prior_root_candidate_count[idx] = float(record.sparse_prior_root_candidate_count)
+        self._sparse_prior_leaf_candidate_count[idx] = float(record.sparse_prior_leaf_candidate_count)
+        self._sparse_prior_root_hit_frac[idx] = float(record.sparse_prior_root_hit_frac)
+        self._sparse_prior_leaf_hit_frac[idx] = float(record.sparse_prior_leaf_hit_frac)
+        self._fallback_prior_use[idx] = float(record.fallback_prior_use)
+        self._fallback_prior_use_top1[idx] = float(record.fallback_prior_use_on_mcts_top1)
+        self._fallback_prior_use_top4[idx] = float(record.fallback_prior_use_on_mcts_top4)
+        self._fallback_prior_use_top8[idx] = float(record.fallback_prior_use_on_mcts_top8)
+        self._sparse_vs_dense_disagreement[idx] = float(record.sparse_vs_dense_disagreement)
+        self._sparse_prior_forward_ms[idx] = float(record.sparse_prior_forward_ms)
+        self._sparse_prior_candidate_build_ms[idx] = float(record.sparse_prior_candidate_build_ms)
+        self._pair_prior_candidate_count[idx] = float(record.pair_prior_candidate_count)
+        self._pair_prior_hit_frac[idx] = float(record.pair_prior_hit_frac)
+        self._pair_fallback_prior_use[idx] = float(record.pair_fallback_prior_use)
+        self._pair_fallback_prior_use_top1[idx] = float(record.pair_fallback_prior_use_on_mcts_top1)
+        self._pair_fallback_prior_use_top4[idx] = float(record.pair_fallback_prior_use_on_mcts_top4)
+        self._pair_fallback_prior_use_top8[idx] = float(record.pair_fallback_prior_use_on_mcts_top8)

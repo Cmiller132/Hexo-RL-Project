@@ -16,6 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hexorl.axis_policy.core import AxisPolicyInput
+from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
+from hexorl.buffer.sampler import _transform_history_bytes
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
 from hexorl.dashboard.checkpoints import scan_checkpoints
@@ -29,6 +31,14 @@ from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
 from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
 from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
+from hexorl.graph.batch import (
+    GRAPH_FEATURE_DIM,
+    GRAPH_SCHEMA_VERSION,
+    RELATION_SCHEMA_VERSION,
+    GraphTokenType,
+    RelationType,
+    build_graph_batch_from_history,
+)
 from hexorl.selfplay.records import BOARD_SIZE
 
 
@@ -437,6 +447,52 @@ def create_app(
             return model_cache.infer_history(model_id, decode_bytes(req.history_b64))
         except KeyError as exc:
             raise HTTPException(404, f"Model not loaded: {model_id}") from exc
+
+    @app.get("/api/debug/contracts")
+    def debug_contracts() -> dict[str, Any]:
+        return {
+            "candidate": {
+                "feature_version": CANDIDATE_FEATURE_VERSION,
+                "feature_names": list(CANDIDATE_FEATURE_NAMES),
+                "feature_width": len(CANDIDATE_FEATURE_NAMES),
+            },
+            "graph": {
+                "schema_version": GRAPH_SCHEMA_VERSION,
+                "relation_schema_version": RELATION_SCHEMA_VERSION,
+                "feature_dim": GRAPH_FEATURE_DIM,
+                "token_types": {token.name: int(token) for token in GraphTokenType},
+                "relation_types": {relation.name: int(relation) for relation in RelationType},
+            },
+        }
+
+    @app.post("/api/debug/graph")
+    def debug_graph(req: InferRequest) -> dict[str, Any]:
+        history = decode_bytes(req.history_b64)
+        return _graph_debug_payload(history)
+
+    @app.post("/api/debug/d6")
+    def debug_d6(req: InferRequest) -> dict[str, Any]:
+        history = decode_bytes(req.history_b64)
+        transforms = []
+        for sym_idx in range(12):
+            transformed = _transform_history_bytes(history, sym_idx)
+            graph = _graph_debug_payload(transformed)
+            position = position_payload(get_replay_position(transformed, constrain_threats=False))
+            transforms.append(
+                {
+                    "symmetry_index": sym_idx,
+                    "history_b64": base64.b64encode(transformed).decode("ascii"),
+                    "current_player": position["current_player"],
+                    "placements_remaining": position["placements_remaining"],
+                    "legal_count": len(position["legal_moves"]),
+                    "graph": graph,
+                }
+            )
+        return {
+            "symmetry_count": 12,
+            "source_history_b64": base64.b64encode(history).decode("ascii"),
+            "transforms": transforms,
+        }
 
     @app.post("/api/arena/start")
     def arena_start(req: ArenaStartRequest) -> dict[str, Any]:
@@ -956,6 +1012,7 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
         "global_step": checkpoint.get("global_step"),
         "cfg": cfg,
         "model_metadata": model_metadata,
+        "action_contract_metadata": checkpoint.get("action_contract_metadata", {}),
         "model_parameter_tensors": len(state) if hasattr(state, "__len__") else None,
     }
 
@@ -1040,6 +1097,49 @@ def _finite_or_none(value: Any) -> float | None:
     if number == float("inf") or number == float("-inf") or number != number:
         return None
     return number
+
+
+def _graph_debug_payload(history: bytes) -> dict[str, Any]:
+    graph = build_graph_batch_from_history(history)
+    token_counts = {
+        token.name: int((graph.token_type == int(token)).sum())
+        for token in GraphTokenType
+    }
+    relation_counts = {
+        relation.name: int((graph.relation_type == int(relation)).sum())
+        for relation in RelationType
+        if int((graph.relation_type == int(relation)).sum()) > 0
+    }
+    pair_examples = []
+    token_qr = graph.token_qr
+    for row in range(min(16, int(graph.pair_token_indices.shape[0]))):
+        first = int(graph.pair_first_indices[row])
+        second = int(graph.pair_second_indices[row])
+        pair_examples.append(
+            {
+                "first": {"q": int(token_qr[first, 0]), "r": int(token_qr[first, 1])},
+                "second": {"q": int(token_qr[second, 0]), "r": int(token_qr[second, 1])},
+            }
+        )
+    return {
+        "schema_version": graph.schema_version,
+        "relation_schema_version": graph.relation_schema_version,
+        "feature_dim": int(graph.token_features.shape[-1]),
+        "token_count": int(graph.token_features.shape[0]),
+        "token_counts": token_counts,
+        "legal_count": int(graph.legal_qr.shape[0]),
+        "legal_qr": [
+            {"q": int(q), "r": int(r)}
+            for q, r in graph.legal_qr[: min(64, int(graph.legal_qr.shape[0]))]
+        ],
+        "opp_legal_count": int(graph.opp_legal_qr.shape[0]),
+        "pair_count": int(graph.pair_token_indices.shape[0]),
+        "pair_examples": pair_examples,
+        "relation_counts": relation_counts,
+        "relation_bias_shape": [int(dim) for dim in graph.relation_bias.shape],
+        "placements_remaining": int(graph.placements_remaining),
+        "current_player": int(graph.current_player),
+    }
 
 
 def _axis_input_from_request(store: DashboardStore, req: AxisEvaluateRequest) -> AxisPolicyInput:

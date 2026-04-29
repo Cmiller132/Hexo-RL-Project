@@ -571,7 +571,7 @@ Required implementation:
 
 - Add one shared D6 test harness that:
   - generates random legal histories;
-  - applies all six symmetries;
+  - applies all 12 D6 symmetries;
   - replays transformed histories through Rust;
   - verifies legal masks transform bijectively;
   - verifies dense targets, sparse targets, opponent targets, and pair targets
@@ -1115,7 +1115,7 @@ checkpoint config hash
 
 ### Tactical And D6 Debug
 
-Add a debug panel where one position can be transformed through all six D6
+Add a debug panel where one position can be transformed through all 12 D6
 symmetries and compared:
 
 ```text

@@ -24,8 +24,10 @@ except ImportError:
     HAS_ENGINE = False
 
 from hexorl.config import Config
-from hexorl.action_contract.candidates import build_candidate_batch
+from hexorl.action_contract.candidates import build_candidate_batch, build_pair_candidate_batch
+from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
 from hexorl.inference.client import InferenceClient
+from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
@@ -33,11 +35,15 @@ from hexorl.selfplay.records import (
     dense_policy_from_v2,
     pair_policy_v2_from_place_target,
     policy_v2_from_visits,
-    BOARD_AREA,
 )
 from hexorl.buffer.targets import process_game_record
 
 logger = logging.getLogger(__name__)
+
+PRIOR_SOURCE_SPARSE = 1
+PRIOR_SOURCE_DENSE = 2
+PRIOR_SOURCE_DEFAULT = 3
+PRIOR_SOURCE_PAIR = 4
 
 
 # ── Temperature Schedule ─────────────────────────────────────────────────────
@@ -86,6 +92,85 @@ def _critical_actions_from_root_tensor(
             forced.append((q, r))
             cover.append((q, r))
     return winning, forced, cover
+
+
+def _prior_source_fraction(summary: dict, source_key: str, prefix: str) -> float:
+    total = float(summary.get(f"{prefix}_total_count", 0.0))
+    if total <= 0.0:
+        return 0.0
+    return float(summary.get(f"{prefix}_{source_key}_count", 0.0)) / total
+
+
+def _fallback_use_on_topk(
+    visits: List[int],
+    sources: List[int],
+    k: int,
+) -> float:
+    return _source_fraction_on_topk(visits, sources, k, PRIOR_SOURCE_DEFAULT)
+
+
+def _source_fraction_on_topk(
+    visits: List[int],
+    sources: List[int],
+    k: int,
+    source: int,
+) -> float:
+    if not visits or not sources:
+        return 0.0
+    n = min(len(visits), len(sources))
+    order = sorted(range(n), key=lambda i: (-int(visits[i]), i))
+    top = order[: min(k, n)]
+    if not top:
+        return 0.0
+    hits = sum(1 for i in top if int(sources[i]) == int(source))
+    return hits / float(len(top))
+
+
+def _sparse_dense_disagreement(
+    policy_logits: np.ndarray,
+    sparse_qr: np.ndarray,
+    sparse_logits: np.ndarray,
+    legal: np.ndarray,
+    offset_q: int,
+    offset_r: int,
+) -> float:
+    if legal.size == 0 or sparse_qr.size == 0 or sparse_logits.size == 0:
+        return 0.0
+    legal_set = {(int(q), int(r)) for q, r in legal}
+    dense_best: tuple[int, int] | None = None
+    dense_score = float("-inf")
+    flat_logits = np.asarray(policy_logits, dtype=np.float32).reshape(-1)
+    for q_raw, r_raw in legal:
+        q, r = int(q_raw), int(r_raw)
+        idx = action_to_board_index(q, r, offset_q, offset_r)
+        score = float(flat_logits[idx]) if idx >= 0 else -10.0
+        if score > dense_score:
+            dense_score = score
+            dense_best = (q, r)
+
+    sparse_best: tuple[int, int] | None = None
+    sparse_score = float("-inf")
+    for row, logit in zip(np.asarray(sparse_qr), np.asarray(sparse_logits).reshape(-1)):
+        q, r = int(row[0]), int(row[1])
+        if (q, r) not in legal_set:
+            continue
+        score = float(logit)
+        if score > sparse_score:
+            sparse_score = score
+            sparse_best = (q, r)
+    if dense_best is None or sparse_best is None:
+        return 0.0
+    return 0.0 if dense_best == sparse_best else 1.0
+
+
+def _last_move_qr(move_history: bytes | bytearray) -> tuple[int, int] | None:
+    """Return the most recent placement `(q, r)` from packed move history."""
+    if len(move_history) < 12:
+        return None
+    tail = bytes(move_history[-12:])
+    q = int.from_bytes(tail[4:8], "little", signed=True)
+    r = int.from_bytes(tail[8:12], "little", signed=True)
+    return q, r
 
 
 # ── Mock MCTS Engine ─────────────────────────────────────────────────────────
@@ -175,6 +260,24 @@ class MockMCTSEngine:
         """Mock sparse root expansion by preserving dense mock semantics."""
         self.expand_root(policy, value, offset_q, offset_r, legal_bytes)
 
+    def apply_root_pair_priors(
+        self,
+        pair_qr: np.ndarray,
+        pair_logits: np.ndarray,
+        pair_mix: float,
+    ):
+        """Mock pair-prior hook; records no active pair source."""
+        return None
+
+    def apply_root_pair_second_priors(
+        self,
+        pair_qr: np.ndarray,
+        pair_logits: np.ndarray,
+        pair_mix: float,
+    ):
+        """Mock conditional pair-prior hook; records no active pair source."""
+        return None
+
     def add_dirichlet_noise(self, noise: np.ndarray, fraction: float):
         """Mock Dirichlet noise (no-op in mock)."""
         pass
@@ -260,6 +363,30 @@ class MockMCTSEngine:
             ).astype(np.float32)
         return np.array(self._priors)
 
+    def root_child_prior_sources(self) -> List[int]:
+        """Return mock prior sources; mock policy is dense/default only."""
+        return [PRIOR_SOURCE_DENSE] * max(0, int(self._num_children))
+
+    def prior_source_summary(self) -> dict:
+        """Return mock prior-source counters compatible with the Rust engine."""
+        n = max(0, int(self._num_children))
+        return {
+            "root_total_count": n,
+            "root_sparse_count": 0,
+            "root_dense_count": n,
+            "root_default_count": 0,
+            "root_pair_count": 0,
+            "leaf_pair_count": 0,
+            "leaf_total_count": 0,
+            "leaf_sparse_count": 0,
+            "leaf_dense_count": 0,
+            "leaf_default_count": 0,
+            "root_sparse_candidate_count": 0,
+            "leaf_sparse_candidate_count": 0,
+            "root_pair_candidate_count": 0,
+            "leaf_expansion_count": 0,
+        }
+
     def root_child_q_values(self) -> List[float]:
         """Return mock Q-values."""
         if self._q_values is None:
@@ -272,6 +399,10 @@ class MockMCTSEngine:
         """Return mock packed move history."""
         n_bytes = self._move_count * 12
         return self._rng.bytes(n_bytes)
+
+    def extract_tree_node_histories(self, min_visits: int = 2) -> list[list[tuple[int, int, int]]]:
+        """Mock engine has no real tree-node states."""
+        return []
 
     @property
     def winner(self) -> Optional[int]:
@@ -362,6 +493,22 @@ class RealMCTSEngine:
         else:
             self._engine.expand_root(policy, value, oq, or_, legal_bytes)
 
+    def apply_root_pair_priors(self, pair_qr, pair_logits, pair_mix):
+        if hasattr(self._engine, "apply_root_pair_priors"):
+            self._engine.apply_root_pair_priors(
+                np.asarray(pair_qr, dtype=np.int32),
+                np.asarray(pair_logits, dtype=np.float32),
+                float(pair_mix),
+            )
+
+    def apply_root_pair_second_priors(self, pair_qr, pair_logits, pair_mix):
+        if hasattr(self._engine, "apply_root_pair_second_priors"):
+            self._engine.apply_root_pair_second_priors(
+                np.asarray(pair_qr, dtype=np.int32),
+                np.asarray(pair_logits, dtype=np.float32),
+                float(pair_mix),
+            )
+
     def add_dirichlet_noise(self, noise, fraction):
         self._engine.add_dirichlet_noise(noise, fraction)
 
@@ -430,8 +577,41 @@ class RealMCTSEngine:
     def root_child_priors(self):
         return self._engine.root_child_priors()
 
+    def root_child_prior_sources(self):
+        if hasattr(self._engine, "root_child_prior_sources"):
+            return self._engine.root_child_prior_sources()
+        priors = self.root_child_priors()
+        return [PRIOR_SOURCE_DENSE] * len(priors)
+
+    def prior_source_summary(self):
+        if hasattr(self._engine, "prior_source_summary"):
+            return dict(self._engine.prior_source_summary())
+        n = len(self.root_child_prior_sources())
+        return {
+            "root_total_count": n,
+            "root_sparse_count": 0,
+            "root_dense_count": n,
+            "root_default_count": 0,
+            "root_pair_count": 0,
+            "leaf_pair_count": 0,
+            "leaf_total_count": 0,
+            "leaf_sparse_count": 0,
+            "leaf_dense_count": 0,
+            "leaf_default_count": 0,
+            "root_sparse_candidate_count": 0,
+            "leaf_sparse_candidate_count": 0,
+            "root_pair_candidate_count": 0,
+            "leaf_expansion_count": 0,
+        }
+
     def root_child_q_values(self):
         return self._engine.root_child_q_values()
+
+    def extract_tree_node_histories(self, min_visits: int = 2):
+        if hasattr(self._engine, "extract_tree_node_states"):
+            _tensors, histories, _count = self._engine.extract_tree_node_states(int(min_visits))
+            return histories
+        return []
 
     def move_history_bytes(self):
         return self._game.move_history_bytes()
@@ -483,9 +663,19 @@ class SelfPlayWorker:
         self.sparse_prior_stage = int(getattr(cfg.model, "sparse_prior_stage", 0))
         self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
         self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
+        self.pair_policy_enabled = "pair_policy" in set(getattr(cfg.model, "heads", []))
+        self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
         self.candidate_budget = max(
             int(getattr(cfg.model, "candidate_budget", 256)),
             int(sp.policy_target_top_k),
+        )
+        self.rgsc = RGSCRestartService(
+            beta=float(getattr(sp, "rgsc_beta", 0.0)),
+            capacity=int(getattr(sp, "rgsc_prb_capacity", 100)),
+            ema_alpha=float(getattr(sp, "rgsc_prb_ema_alpha", 0.5)),
+            sampling_temperature=float(getattr(sp, "rgsc_prb_temperature", 0.1)),
+            seed=int(cfg.run.seed + worker_id * 10000),
+            enabled=HAS_ENGINE,
         )
 
         self._engine_factory = MockMCTSEngine if not HAS_ENGINE else RealMCTSEngine
@@ -525,6 +715,33 @@ class SelfPlayWorker:
                             lookahead_horizons=self.cfg.buffer.lookahead_horizons,
                             lookahead_lambdas=self.cfg.buffer.lookahead_lambdas,
                         )
+                        restart_idx = getattr(game_record, "rgsc_restart_entry_index", None)
+                        refreshes_before = self.rgsc.refreshes
+                        inserted = self.rgsc.observe_game(
+                            game_record,
+                            restart_entry_index=restart_idx,
+                        )
+                        game_record.rgsc_prb_inserted = bool(inserted)
+                        game_record.rgsc_metrics = {
+                            "rgsc_prb_size": float(len(self.rgsc.prb)),
+                            "rgsc_restart_attempts": 1.0
+                            if getattr(game_record, "rgsc_restart_attempted", False)
+                            else 0.0,
+                            "rgsc_restart_successes": 1.0
+                            if getattr(game_record, "rgsc_restart_used", False)
+                            else 0.0,
+                            "rgsc_restart_rejections": 1.0
+                            if (
+                                getattr(game_record, "rgsc_restart_attempted", False)
+                                and not getattr(game_record, "rgsc_restart_used", False)
+                            )
+                            else 0.0,
+                            "rgsc_prb_insertions": 1.0 if inserted else 0.0,
+                            "rgsc_prb_refreshes": float(self.rgsc.refreshes - refreshes_before),
+                            "rgsc_tree_node_insertions": float(
+                                getattr(game_record, "rgsc_tree_node_insertions", 0)
+                            ),
+                        }
                         while self.stop_event is None or not self.stop_event.is_set():
                             try:
                                 self.record_queue.put(game_record, timeout=0.5)
@@ -568,8 +785,13 @@ class SelfPlayWorker:
         )
 
         game_id = self._game_id()
+        rgsc_restart = None
         if HAS_ENGINE:
-            game = _engine.HexGame()
+            rgsc_restart = self.rgsc.maybe_restart(
+                _engine.HexGame,
+                max_game_moves=self.max_game_moves,
+            )
+            game = rgsc_restart.game if rgsc_restart.used else _engine.HexGame()
             engine = RealMCTSEngine(
                 game,
                 sims,
@@ -586,8 +808,8 @@ class SelfPlayWorker:
             )
 
         positions: List[PositionRecord] = []
-        move_history = bytearray()
-        move_idx = 0
+        move_history = bytearray(rgsc_restart.move_history if rgsc_restart and rgsc_restart.used else b"")
+        move_idx = int(rgsc_restart.move_count) if rgsc_restart and rgsc_restart.used else 0
         terminal_reason = "unknown"
 
         while True:
@@ -605,6 +827,10 @@ class SelfPlayWorker:
             else:
                 tensor_3d = np.array(tensor)
 
+            sparse_prior_forward_ms = 0.0
+            sparse_prior_candidate_build_ms = 0.0
+            sparse_vs_dense_disagreement = 0.0
+
             if client is not None:
                 try:
                     root_tensor = tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False)
@@ -616,34 +842,181 @@ class SelfPlayWorker:
                             int(offset_q),
                             int(offset_r),
                         )
+                        oracle = scan_tactical_oracle_from_history(
+                            bytes(move_history),
+                            [(int(q), int(r)) for q, r in legal],
+                            offset_q=int(offset_q),
+                            offset_r=int(offset_r),
+                            )
+                        root_placements_remaining = (
+                            int(getattr(engine._game, "placements_remaining", 1))
+                            if HAS_ENGINE and hasattr(engine, "_game")
+                            else (2 if move_idx > 0 and move_idx % 2 == 1 else 1)
+                        )
+                        candidate_budget = self.candidate_budget
+                        if self.pair_policy_enabled and root_placements_remaining == 1:
+                            candidate_budget = max(1, min(candidate_budget, 511))
+                        t_build = time.monotonic()
                         cand = build_candidate_batch(
                             [(int(q), int(r)) for q, r in legal],
                             [],
                             offset_q=int(offset_q),
                             offset_r=int(offset_r),
-                            budget=self.candidate_budget,
-                            winning_moves=winning_moves,
-                            forced_block_moves=forced_blocks,
-                            cover_cells=cover_cells,
+                            budget=candidate_budget,
+                            winning_moves=list(winning_moves) + list(oracle.win_now_cells),
+                            forced_block_moves=list(forced_blocks) + list(oracle.forced_block_cells),
+                            cover_cells=list(cover_cells) + list(oracle.cover_cells),
+                            open_four_cells=oracle.open_four_cells,
+                            open_five_cells=oracle.open_five_cells,
                         )
-                        p, v, sparse = client.submit_sparse(
-                            root_tensor,
-                            1,
-                            cand.indices.reshape(1, -1),
-                            cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1]),
-                            cand.mask.reshape(1, -1),
-                        )
-                        engine.expand_root_with_sparse_priors(
-                            p,
-                            v[0],
-                            offset_q,
-                            offset_r,
-                            legal_bytes,
-                            cand.qr,
-                            sparse[0],
-                            self.sparse_prior_stage,
-                            self.sparse_prior_mix,
-                        )
+                        active_rows = np.flatnonzero(cand.mask)
+                        active_width = int(active_rows.shape[0])
+                        sparse_prior_candidate_build_ms += (time.monotonic() - t_build) * 1000.0
+                        if active_width <= 0:
+                            p, v = client.submit(root_tensor, 1)
+                            engine.expand_root(
+                                p, v[0], offset_q, offset_r, legal_bytes
+                            )
+                        else:
+                            root_candidate_qr = cand.qr[active_rows]
+                            forward_indices = cand.indices[active_rows]
+                            forward_features = cand.features[active_rows]
+                            forward_mask = cand.mask[active_rows]
+                            pair_indices_for_forward = None
+                            pair_mask_for_forward = None
+                            pair_qr = np.zeros((0, 4), dtype=np.int32)
+                            pair_width = 0
+                            sparse_logit_start = 0
+                            use_second_pair_priors = False
+                            if (
+                                self.pair_policy_enabled
+                                and root_placements_remaining >= 2
+                                and active_width >= 2
+                            ):
+                                pair_batch = build_pair_candidate_batch(
+                                    root_candidate_qr.tolist(),
+                                    [],
+                                    budget=min(512, max(1, self.candidate_budget)),
+                                    candidate_mask=np.ones(active_width, dtype=np.bool_),
+                                    legal_moves=legal.tolist(),
+                                )
+                                pair_rows = np.flatnonzero(pair_batch.mask)
+                                pair_width = int(pair_rows.shape[0])
+                                if pair_width > 0:
+                                    pair_indices = pair_batch.pair_indices[pair_rows[:pair_width]]
+                                    pair_qr = np.asarray(
+                                        [
+                                            [
+                                                int(root_candidate_qr[a, 0]),
+                                                int(root_candidate_qr[a, 1]),
+                                                int(root_candidate_qr[b, 0]),
+                                                int(root_candidate_qr[b, 1]),
+                                            ]
+                                            for a, b in pair_indices
+                                        ],
+                                        dtype=np.int32,
+                                    )
+                                    pair_indices_for_forward = pair_indices
+                                    pair_mask_for_forward = pair_batch.mask[pair_rows[:pair_width]]
+                            elif self.pair_policy_enabled and root_placements_remaining == 1 and active_width >= 1:
+                                first_qr = _last_move_qr(move_history)
+                                legal_set = {(int(q), int(r)) for q, r in legal.tolist()}
+                                if first_qr is not None and first_qr not in legal_set:
+                                    first_cand = build_candidate_batch(
+                                        [first_qr],
+                                        [],
+                                        offset_q=int(offset_q),
+                                        offset_r=int(offset_r),
+                                        budget=1,
+                                        critical_actions=[first_qr],
+                                    )
+                                    forward_indices = np.concatenate(
+                                        [first_cand.indices[:1], cand.indices[active_rows]],
+                                        axis=0,
+                                    )
+                                    forward_features = np.concatenate(
+                                        [first_cand.features[:1], cand.features[active_rows]],
+                                        axis=0,
+                                    )
+                                    forward_mask = np.concatenate(
+                                        [first_cand.mask[:1], cand.mask[active_rows]],
+                                        axis=0,
+                                    )
+                                    sparse_logit_start = 1
+                                    pair_width = active_width
+                                    pair_indices_for_forward = np.asarray(
+                                        [[0, i] for i in range(1, active_width + 1)],
+                                        dtype=np.int64,
+                                    )
+                                    pair_mask_for_forward = np.ones(pair_width, dtype=np.bool_)
+                                    first_q, first_r = first_qr
+                                    pair_qr = np.asarray(
+                                        [
+                                            [
+                                                int(first_q),
+                                                int(first_r),
+                                                int(root_candidate_qr[i, 0]),
+                                                int(root_candidate_qr[i, 1]),
+                                            ]
+                                            for i in range(active_width)
+                                        ],
+                                        dtype=np.int32,
+                                    )
+                                    use_second_pair_priors = True
+                            t_forward = time.monotonic()
+                            if pair_indices_for_forward is not None and pair_width > 0:
+                                p, v, sparse, pair_logits = client.submit_sparse_pair(
+                                    root_tensor,
+                                    1,
+                                    forward_indices.reshape(1, -1),
+                                    forward_features.reshape(1, forward_features.shape[0], forward_features.shape[1]),
+                                    forward_mask.reshape(1, -1),
+                                    pair_indices_for_forward.reshape(1, pair_width, 2),
+                                    pair_mask_for_forward.reshape(1, pair_width),
+                                )
+                            else:
+                                p, v, sparse = client.submit_sparse(
+                                    root_tensor,
+                                    1,
+                                    forward_indices.reshape(1, -1),
+                                    forward_features.reshape(1, forward_features.shape[0], forward_features.shape[1]),
+                                    forward_mask.reshape(1, -1),
+                                )
+                                pair_logits = None
+                            sparse_prior_forward_ms += (time.monotonic() - t_forward) * 1000.0
+                            root_sparse_logits = sparse[0, sparse_logit_start:sparse_logit_start + active_width]
+                            sparse_vs_dense_disagreement = _sparse_dense_disagreement(
+                                p,
+                                root_candidate_qr,
+                                root_sparse_logits,
+                                legal,
+                                int(offset_q),
+                                int(offset_r),
+                            )
+                            engine.expand_root_with_sparse_priors(
+                                p,
+                                v[0],
+                                offset_q,
+                                offset_r,
+                                legal_bytes,
+                                root_candidate_qr,
+                                root_sparse_logits,
+                                self.sparse_prior_stage,
+                                self.sparse_prior_mix,
+                            )
+                            if pair_logits is not None and pair_width > 0 and pair_qr.size > 0:
+                                if use_second_pair_priors and hasattr(engine, "apply_root_pair_second_priors"):
+                                    engine.apply_root_pair_second_priors(
+                                        pair_qr,
+                                        pair_logits[0, :pair_width],
+                                        self.pair_prior_mix,
+                                    )
+                                else:
+                                    engine.apply_root_pair_priors(
+                                        pair_qr,
+                                        pair_logits[0, :pair_width],
+                                        self.pair_prior_mix,
+                                    )
                     else:
                         p, v = client.submit(root_tensor, 1)
                         engine.expand_root(
@@ -707,7 +1080,7 @@ class SelfPlayWorker:
                         batch_4d = np.array(batch_tensor)
 
                     if client is not None:
-                        if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
+                        if self.sparse_policy_enabled and self.sparse_prior_stage >= 2:
                             meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
                             if len(meta) == count:
                                 cand_qr = np.zeros((count, self.candidate_budget, 2), dtype=np.int32)
@@ -715,7 +1088,8 @@ class SelfPlayWorker:
                                 cand_features = np.zeros((count, self.candidate_budget, 12), dtype=np.float32)
                                 cand_mask = np.zeros((count, self.candidate_budget), dtype=np.bool_)
                                 cand_counts = np.zeros(count, dtype=np.uint16)
-                                for row, (leaf_oq, leaf_or, leaf_legal_bytes) in enumerate(meta):
+                                t_build = time.monotonic()
+                                for row, (leaf_oq, leaf_or, leaf_legal_bytes, leaf_history_bytes) in enumerate(meta):
                                     legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
                                     leaf_winning, leaf_forced, leaf_cover = _critical_actions_from_root_tensor(
                                         batch_4d[row],
@@ -723,22 +1097,34 @@ class SelfPlayWorker:
                                         int(leaf_oq),
                                         int(leaf_or),
                                     )
+                                    leaf_oracle = scan_tactical_oracle_from_history(
+                                        bytes(leaf_history_bytes),
+                                        [(int(q), int(r)) for q, r in legal],
+                                        offset_q=int(leaf_oq),
+                                        offset_r=int(leaf_or),
+                                    )
                                     cand = build_candidate_batch(
                                         [(int(q), int(r)) for q, r in legal],
                                         [],
                                         offset_q=int(leaf_oq),
                                         offset_r=int(leaf_or),
                                         budget=self.candidate_budget,
-                                        winning_moves=leaf_winning,
-                                        forced_block_moves=leaf_forced,
-                                        cover_cells=leaf_cover,
+                                        winning_moves=list(leaf_winning) + list(leaf_oracle.win_now_cells),
+                                        forced_block_moves=list(leaf_forced) + list(leaf_oracle.forced_block_cells),
+                                        cover_cells=list(leaf_cover) + list(leaf_oracle.cover_cells),
+                                        open_four_cells=leaf_oracle.open_four_cells,
+                                        open_five_cells=leaf_oracle.open_five_cells,
                                     )
-                                    width = min(self.candidate_budget, cand.qr.shape[0])
-                                    cand_qr[row, :width] = cand.qr[:width]
-                                    cand_indices[row, :width] = cand.indices[:width]
-                                    cand_features[row, :width] = cand.features[:width]
-                                    cand_mask[row, :width] = cand.mask[:width]
+                                    active_rows = np.flatnonzero(cand.mask)
+                                    width = min(self.candidate_budget, int(active_rows.shape[0]))
+                                    rows = active_rows[:width]
+                                    cand_qr[row, :width] = cand.qr[rows]
+                                    cand_indices[row, :width] = cand.indices[rows]
+                                    cand_features[row, :width] = cand.features[rows]
+                                    cand_mask[row, :width] = cand.mask[rows]
                                     cand_counts[row] = width
+                                sparse_prior_candidate_build_ms += (time.monotonic() - t_build) * 1000.0
+                                t_forward = time.monotonic()
                                 p, v, sparse = client.submit_sparse(
                                     batch_4d.astype(np.float32, copy=False),
                                     count,
@@ -746,6 +1132,7 @@ class SelfPlayWorker:
                                     cand_features,
                                     cand_mask,
                                 )
+                                sparse_prior_forward_ms += (time.monotonic() - t_forward) * 1000.0
                                 engine.expand_and_backprop_with_sparse(
                                     p,
                                     v,
@@ -785,6 +1172,50 @@ class SelfPlayWorker:
                     break
 
             moves_q, moves_r, visits, root_value = engine.get_results()
+            prior_summary = (
+                engine.prior_source_summary()
+                if hasattr(engine, "prior_source_summary")
+                else {}
+            )
+            root_prior_sources = (
+                list(engine.root_child_prior_sources())
+                if hasattr(engine, "root_child_prior_sources")
+                else []
+            )
+            total_prior_count = float(prior_summary.get("root_total_count", 0.0)) + float(
+                prior_summary.get("leaf_total_count", 0.0)
+            )
+            fallback_prior_use = 0.0
+            if total_prior_count > 0.0:
+                fallback_prior_use = (
+                    float(prior_summary.get("root_default_count", 0.0))
+                    + float(prior_summary.get("leaf_default_count", 0.0))
+                ) / total_prior_count
+            leaf_expansions = float(prior_summary.get("leaf_expansion_count", 0.0))
+            sparse_prior_leaf_candidate_count = (
+                float(prior_summary.get("leaf_sparse_candidate_count", 0.0)) / leaf_expansions
+                if leaf_expansions > 0.0
+                else 0.0
+            )
+            rgsc_tree_node_insertions = 0
+            if self.rgsc.enabled and hasattr(engine, "extract_tree_node_histories"):
+                try:
+                    min_tree_visits = max(2, int(sims) // 16)
+                    histories = engine.extract_tree_node_histories(min_tree_visits)
+                    scored = []
+                    for history in histories:
+                        if not history:
+                            continue
+                        move_bytes = encode_move_history(history)
+                        depth_score = float(len(history))
+                        scored.append((move_bytes, depth_score, depth_score))
+                    rgsc_tree_node_insertions = self.rgsc.observe_tree_node_candidates(
+                        scored,
+                        game_id=game_id,
+                        score_source="mcts_tree_node_depth_heuristic",
+                    )
+                except Exception as exc:
+                    logger.debug("Worker %s: RGSC tree extraction skipped: %s", self.worker_id, exc)
 
             temp = get_temperature(move_idx, self.temperature_schedule)
             q, r = engine.sample_action(temp)
@@ -830,19 +1261,64 @@ class SelfPlayWorker:
                 int(offset_q),
                 int(offset_r),
             )
+            oracle = scan_tactical_oracle_from_history(
+                record_history,
+                [(int(q), int(r)) for q, r in legal_root],
+                offset_q=int(offset_q),
+                offset_r=int(offset_r),
+            )
             candidate_probe = build_candidate_batch(
                 legal_root.tolist(),
                 policy_v2,
                 offset_q=int(offset_q),
                 offset_r=int(offset_r),
                 budget=self.candidate_budget,
-                winning_moves=winning_moves,
-                forced_block_moves=forced_blocks,
-                cover_cells=cover_cells,
+                winning_moves=list(winning_moves) + list(oracle.win_now_cells),
+                forced_block_moves=list(forced_blocks) + list(oracle.forced_block_cells),
+                cover_cells=list(cover_cells) + list(oracle.cover_cells),
+                open_four_cells=oracle.open_four_cells,
+                open_five_cells=oracle.open_five_cells,
             )
-            pair_policy_v2 = pair_policy_v2_from_place_target(
-                policy_v2,
-                top_k=min(max(1, self.candidate_budget), 32),
+            pair_policy_v2 = pair_policy_v2_from_place_target(policy_v2)
+            pair_prior_applicable = move_idx > 0
+            pair_prior_hit_frac = _prior_source_fraction(prior_summary, "pair", "root")
+            pair_fallback_prior_use = (
+                max(0.0, 1.0 - pair_prior_hit_frac)
+                if pair_prior_applicable
+                else 0.0
+            )
+            pair_fallback_prior_use_on_mcts_top1 = (
+                max(
+                    0.0,
+                    1.0
+                    - _source_fraction_on_topk(
+                        visits, root_prior_sources, 1, PRIOR_SOURCE_PAIR
+                    ),
+                )
+                if pair_prior_applicable
+                else 0.0
+            )
+            pair_fallback_prior_use_on_mcts_top4 = (
+                max(
+                    0.0,
+                    1.0
+                    - _source_fraction_on_topk(
+                        visits, root_prior_sources, 4, PRIOR_SOURCE_PAIR
+                    ),
+                )
+                if pair_prior_applicable
+                else 0.0
+            )
+            pair_fallback_prior_use_on_mcts_top8 = (
+                max(
+                    0.0,
+                    1.0
+                    - _source_fraction_on_topk(
+                        visits, root_prior_sources, 8, PRIOR_SOURCE_PAIR
+                    ),
+                )
+                if pair_prior_applicable
+                else 0.0
             )
 
             positions.append(
@@ -859,6 +1335,38 @@ class SelfPlayWorker:
                     candidate_recall_winning_move=candidate_probe.recall_winning_move,
                     candidate_recall_forced_block=candidate_probe.recall_forced_block,
                     candidate_recall_two_placement_cover=candidate_probe.recall_two_placement_cover,
+                    sparse_prior_stage=self.sparse_prior_stage,
+                    sparse_prior_root_candidate_count=int(
+                        prior_summary.get("root_sparse_candidate_count", 0)
+                    ),
+                    sparse_prior_leaf_candidate_count=sparse_prior_leaf_candidate_count,
+                    sparse_prior_root_hit_frac=_prior_source_fraction(
+                        prior_summary, "sparse", "root"
+                    ),
+                    sparse_prior_leaf_hit_frac=_prior_source_fraction(
+                        prior_summary, "sparse", "leaf"
+                    ),
+                    fallback_prior_use=fallback_prior_use,
+                    fallback_prior_use_on_mcts_top1=_fallback_use_on_topk(
+                        visits, root_prior_sources, 1
+                    ),
+                    fallback_prior_use_on_mcts_top4=_fallback_use_on_topk(
+                        visits, root_prior_sources, 4
+                    ),
+                    fallback_prior_use_on_mcts_top8=_fallback_use_on_topk(
+                        visits, root_prior_sources, 8
+                    ),
+                    sparse_vs_dense_disagreement=sparse_vs_dense_disagreement,
+                    sparse_prior_forward_ms=sparse_prior_forward_ms,
+                    sparse_prior_candidate_build_ms=sparse_prior_candidate_build_ms,
+                    pair_prior_candidate_count=int(
+                        prior_summary.get("root_pair_candidate_count", len(pair_policy_v2))
+                    ),
+                    pair_prior_hit_frac=pair_prior_hit_frac,
+                    pair_fallback_prior_use=pair_fallback_prior_use,
+                    pair_fallback_prior_use_on_mcts_top1=pair_fallback_prior_use_on_mcts_top1,
+                    pair_fallback_prior_use_on_mcts_top4=pair_fallback_prior_use_on_mcts_top4,
+                    pair_fallback_prior_use_on_mcts_top8=pair_fallback_prior_use_on_mcts_top8,
                     root_value=root_value,
                     selected_action_value=selected_action_value,
                     player=player,
@@ -905,6 +1413,14 @@ class SelfPlayWorker:
             game_id=game_id,
             game_length=len(positions),
         )
+        if rgsc_restart is not None:
+            record.rgsc_restart_attempted = rgsc_restart.attempted
+            record.rgsc_restart_used = rgsc_restart.used
+            record.rgsc_restart_reason = rgsc_restart.reason
+            record.rgsc_restart_entry_index = rgsc_restart.entry_index
+            record.rgsc_restart_entry_id = rgsc_restart.entry_id
+            record.rgsc_restart_move_count = rgsc_restart.move_count
+        record.rgsc_tree_node_insertions = int(self.rgsc.tree_node_insertions)
         record.final_move_history = full_history
         record.truncated = truncated
         record.terminal_reason = terminal_reason
