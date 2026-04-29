@@ -9,6 +9,10 @@ description = "PyO3 Python bindings for hexgame-core"
 name = "_engine"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+python = []
+
 [dependencies]
 hexgame-core.workspace = true
 pyo3.workspace = true

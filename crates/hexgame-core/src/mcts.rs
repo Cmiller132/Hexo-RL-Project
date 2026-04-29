@@ -310,7 +310,7 @@ fn gather_dense_sources(moves: &[Hex], offset_q: i32, offset_r: i32, sources: &m
     );
 }
 
-fn softmax_in_place(raw: &mut Vec<f32>, priors: &mut Vec<f32>) {
+fn softmax_in_place(raw: &mut [f32], priors: &mut Vec<f32>) {
     let max_val = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for v in raw.iter_mut() {
         *v = (*v - max_val).exp();
@@ -814,6 +814,7 @@ impl MCTSEngine {
             .collect();
 
         let mut valid_pairs: Vec<(usize, usize, f32)> = Vec::with_capacity(pair_actions.len());
+        let mut seen_pairs = std::collections::HashSet::with_capacity(pair_actions.len());
         for (row, &(q1, r1, q2, r2)) in pair_actions.iter().enumerate() {
             if q1 == q2 && r1 == r2 {
                 return Err(format!(
@@ -834,6 +835,16 @@ impl MCTSEngine {
             let logit = pair_logits[row];
             if !logit.is_finite() {
                 return Err(format!("pair policy logit at row {row} is not finite"));
+            }
+            let key = if first_idx <= second_idx {
+                (first_idx, second_idx)
+            } else {
+                (second_idx, first_idx)
+            };
+            if !seen_pairs.insert(key) {
+                return Err(format!(
+                    "duplicate unordered pair policy row at {row}: ({q1}, {r1}) <-> ({q2}, {r2})"
+                ));
             }
             valid_pairs.push((first_idx, second_idx, logit));
         }
@@ -1118,8 +1129,10 @@ impl MCTSEngine {
         // Clamp batch size to the remaining simulation budget.
         let actual_batch = batch_size.min(self.num_simulations - self.sims_done);
 
-        // Clear previous pending state from any prior batch.
-        self.pending.clear();
+        // Clear previous pending state from any prior batch, rolling back
+        // virtual loss if a caller selected a new batch before backpropagating
+        // the old one.
+        self.clear_pending_leaves();
 
         // Reserve batch buffer space for the worst case (all non-terminal).
         let max_floats = actual_batch as usize * TENSOR_SIZE;
@@ -1338,6 +1351,7 @@ impl MCTSEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn expand_and_backprop_with_sparse_sources(
         &mut self,
         policies: &[f32],
@@ -1359,6 +1373,7 @@ impl MCTSEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_and_backprop_with_sparse_impl(
         &mut self,
         policies: &[f32],

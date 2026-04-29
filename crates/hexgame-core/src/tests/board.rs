@@ -5,6 +5,7 @@ use rustc_hash::FxHashSet;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn legal_moves_near_into_matches_bruteforce() {
@@ -30,6 +31,29 @@ mod tests {
         legal.sort();
         brute.sort();
         assert_eq!(legal, brute);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+        #[test]
+        fn legal_moves_match_bruteforce_after_place_and_unplace(
+            ops in prop::collection::vec((-8i32..=8, -8i32..=8, any::<bool>()), 1..48)
+        ) {
+            let mut game = HexGameState::new();
+            assert_legal_matches_bruteforce(&game, 2);
+            assert_legal_matches_bruteforce(&game, PLACEMENT_RADIUS);
+
+            for (q, r, undo) in ops {
+                if undo && game.move_count() > 0 {
+                    game.unplace();
+                } else {
+                    let _ = game.place(q, r);
+                }
+                assert_legal_matches_bruteforce(&game, 2);
+                assert_legal_matches_bruteforce(&game, PLACEMENT_RADIUS);
+            }
+        }
     }
 
     fn populated_game() -> HexGameState {

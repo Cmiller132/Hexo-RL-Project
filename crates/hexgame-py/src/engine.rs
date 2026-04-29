@@ -32,6 +32,66 @@ fn pair_vec_to_py(pairs: Vec<(Hex, Hex)>) -> Vec<((i32, i32), (i32, i32))> {
         .collect()
 }
 
+#[derive(Clone)]
+struct RootSnapshot {
+    offset_q: i32,
+    offset_r: i32,
+    legal: Vec<Hex>,
+}
+
+fn decode_legal_bytes(legal_bytes: &[u8]) -> PyResult<Vec<Hex>> {
+    if !legal_bytes.len().is_multiple_of(8) {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "legal_bytes length {} is not a multiple of 8",
+            legal_bytes.len()
+        )));
+    }
+
+    let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
+    for chunk in legal_bytes.chunks_exact(8) {
+        let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        legal.push(Hex::new(q, r));
+    }
+    Ok(legal)
+}
+
+fn validate_root_snapshot(
+    snapshot: &Option<RootSnapshot>,
+    offset: Option<(i32, i32)>,
+    legal: &[Hex],
+) -> PyResult<()> {
+    let Some(snapshot) = snapshot else {
+        return Err(PyValueError::new_err(
+            "root expansion requires legal_bytes from the most recent init_root() call",
+        ));
+    };
+    if let Some((offset_q, offset_r)) = offset {
+        if offset_q != snapshot.offset_q || offset_r != snapshot.offset_r {
+            return Err(PyValueError::new_err(format!(
+                "root tensor offset mismatch: got ({offset_q}, {offset_r}), expected ({}, {})",
+                snapshot.offset_q, snapshot.offset_r
+            )));
+        }
+    }
+    if legal.len() != snapshot.legal.len() {
+        return Err(PyValueError::new_err(format!(
+            "root legal row count mismatch: got {}, expected {}",
+            legal.len(),
+            snapshot.legal.len()
+        )));
+    }
+    for (idx, (got, expected)) in legal.iter().zip(snapshot.legal.iter()).enumerate() {
+        if got != expected {
+            return Err(PyValueError::new_err(format!(
+                "root legal row mismatch at {idx}: got ({}, {}), expected ({}, {})",
+                got.q, got.r, expected.q, expected.r
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sort_dedup_hex(cells: &mut Vec<Hex>) {
     cells.sort();
     cells.dedup();
@@ -707,6 +767,7 @@ impl PyHexGame {
 pub struct PyMCTSEngine {
     inner: MCTSEngine,
     last_non_terminal_count: u32,
+    root_snapshot: Option<RootSnapshot>,
 }
 
 #[pymethods]
@@ -738,6 +799,7 @@ impl PyMCTSEngine {
         Self {
             inner: engine,
             last_non_terminal_count: 0,
+            root_snapshot: None,
         }
     }
 
@@ -747,6 +809,7 @@ impl PyMCTSEngine {
         py: Python<'py>,
     ) -> PyResult<Option<(Bound<'py, PyArray3<f32>>, i32, i32, Bound<'py, PyBytes>)>> {
         let Some((tensor, oq, or_, legal)) = self.inner.init_root() else {
+            self.root_snapshot = None;
             return Ok(None);
         };
         let arr = ndarray::Array3::from_shape_vec(
@@ -760,6 +823,11 @@ impl PyMCTSEngine {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
+        self.root_snapshot = Some(RootSnapshot {
+            offset_q: oq,
+            offset_r: or_,
+            legal,
+        });
         Ok(Some((arr, oq, or_, PyBytes::new(py, &legal_buf))))
     }
 
@@ -781,20 +849,16 @@ impl PyMCTSEngine {
                 BOARD_AREA
             )));
         }
-        if !legal_bytes.len().is_multiple_of(8) {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "legal_bytes length {} is not a multiple of 8",
-                legal_bytes.len()
-            )));
+        if policy_slice.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err(
+                "policy logits contain non-finite values",
+            ));
         }
-        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
-        for chunk in legal_bytes.chunks_exact(8) {
-            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
-            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            legal.push(Hex::new(q, r));
-        }
+        let legal = decode_legal_bytes(legal_bytes)?;
+        validate_root_snapshot(&self.root_snapshot, Some((offset_q, offset_r)), &legal)?;
         self.inner
             .expand_root(policy_slice, value, offset_q, offset_r, &legal);
+        self.root_snapshot = None;
         Ok(())
     }
 
@@ -821,11 +885,10 @@ impl PyMCTSEngine {
                 BOARD_AREA
             )));
         }
-        if !legal_bytes.len().is_multiple_of(8) {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "legal_bytes length {} is not a multiple of 8",
-                legal_bytes.len()
-            )));
+        if policy_slice.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err(
+                "policy logits contain non-finite values",
+            ));
         }
         let qr = sparse_qr.as_array();
         if qr.ndim() != 2 || qr.shape()[1] != 2 {
@@ -841,12 +904,8 @@ impl PyMCTSEngine {
                 qr.shape()[0]
             )));
         }
-        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
-        for chunk in legal_bytes.chunks_exact(8) {
-            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
-            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            legal.push(Hex::new(q, r));
-        }
+        let legal = decode_legal_bytes(legal_bytes)?;
+        validate_root_snapshot(&self.root_snapshot, Some((offset_q, offset_r)), &legal)?;
         let sparse_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner.expand_root_with_sparse_priors(
             policy_slice,
@@ -859,6 +918,7 @@ impl PyMCTSEngine {
             stage,
             sparse_mix,
         );
+        self.root_snapshot = None;
         Ok(())
     }
 
@@ -869,12 +929,6 @@ impl PyMCTSEngine {
         global_logits: PyReadonlyArray1<'py, f32>,
         value: f32,
     ) -> PyResult<()> {
-        if !legal_bytes.len().is_multiple_of(8) {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "legal_bytes length {} is not a multiple of 8",
-                legal_bytes.len()
-            )));
-        }
         let qr = global_qr.as_array();
         if qr.ndim() != 2 || qr.shape()[1] != 2 {
             return Err(PyValueError::new_err("global_qr must have shape (N, 2)"));
@@ -889,16 +943,14 @@ impl PyMCTSEngine {
                 qr.shape()[0]
             )));
         }
-        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
-        for chunk in legal_bytes.chunks_exact(8) {
-            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
-            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            legal.push(Hex::new(q, r));
-        }
+        let legal = decode_legal_bytes(legal_bytes)?;
+        validate_root_snapshot(&self.root_snapshot, None, &legal)?;
         let global_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner
             .expand_root_with_global_priors(&legal, &global_actions, logits, value)
-            .map_err(PyValueError::new_err)
+            .map_err(PyValueError::new_err)?;
+        self.root_snapshot = None;
+        Ok(())
     }
 
     fn apply_root_pair_priors<'py>(
@@ -1074,6 +1126,9 @@ impl PyMCTSEngine {
         }
         let p = policies_slice.to_vec();
         let v = values_slice.to_vec();
+        if p.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err("policies contain non-finite values"));
+        }
         py.allow_threads(|| {
             self.inner.expand_and_backprop(&p, &v);
         });
@@ -1147,6 +1202,9 @@ impl PyMCTSEngine {
         }
         let p = policies_slice.to_vec();
         let v = values_slice.to_vec();
+        if p.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err("policies contain non-finite values"));
+        }
         py.allow_threads(|| {
             self.inner.expand_and_backprop_with_sparse(
                 &p,
@@ -1238,6 +1296,9 @@ impl PyMCTSEngine {
         }
         let p = policies_slice.to_vec();
         let v = values_slice.to_vec();
+        if p.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err("policies contain non-finite values"));
+        }
         py.allow_threads(|| {
             self.inner.expand_and_backprop_with_sparse_sources(
                 &p,
@@ -1365,7 +1426,10 @@ impl PyMCTSEngine {
             i16::try_from(r).map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
         self.inner
             .re_root(q, r, new_num_simulations)
-            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        self.root_snapshot = None;
+        self.last_non_terminal_count = 0;
+        Ok(())
     }
 }
 
