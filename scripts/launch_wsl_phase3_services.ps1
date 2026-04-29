@@ -81,7 +81,13 @@ memory_guard() {
       ' /proc/meminfo 2>/dev/null || echo "0 0")
     local available_gb="`$(echo "`$line" | awk '{print `$1}')"
     local swap_used_gb="`$(echo "`$line" | awk '{print `$2}')"
-    awk -v avail="`$available_gb" -v swap="`$swap_used_gb" 'BEGIN { exit !((avail > 0 && avail < 3.0) || swap > 2.0) }'
+    awk -v avail="`$available_gb" -v swap="`$swap_used_gb" 'BEGIN {
+      exit !(
+        (avail > 0 && avail < 3.0) ||
+        (avail > 0 && avail < 6.0 && swap > 4.0) ||
+        (swap > 10.5)
+      )
+    }'
     if [[ `$? -eq 0 ]]; then
         local pid=""
         pid=`$(cat "`$RUN/supervisor.pid" 2>/dev/null || true)

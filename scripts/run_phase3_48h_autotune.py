@@ -1239,11 +1239,14 @@ class Phase3Supervisor:
         high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
         if high_search_non_graph:
             # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
-            # heavy. On the 24 GB WSL / 12 GB CUDA host, 5 workers crossed the
-            # keepalive memory guard and 4 was only marginally faster than 3.
+            # heavy. On the 24 GB WSL / 12 GB CUDA host, even 2 workers crossed
+            # the keepalive memory guard for 384-move high-sim probes after
+            # swap had already been exercised, so one stable worker beats a
+            # faster-looking probe that resets the comparison.
             worker_values = sorted(set(worker_values + [2, 3, 4, 5, 6]))
             if self._low_memory_cuda_host():
-                worker_values = [value for value in worker_values if value <= 3]
+                base_workers = 1
+                worker_values = [1]
         worker_budget = max(1, int(self.host.logical_cpus) - max(1, int(cfg.runtime.selfplay_cpu_reserve)))
         max_workers = min(worker_budget, max(worker_values + [base_workers]))
         if high_search_non_graph and self._low_memory_cuda_host() and worker_values:
@@ -1258,6 +1261,8 @@ class Phase3Supervisor:
             batch_per_worker = base_bpw
             if not trial.family.graph and int(trial.static.full_sims) >= 512:
                 batch_per_worker = max(batch_per_worker, 16)
+                if self._low_memory_cuda_host():
+                    batch_per_worker = min(batch_per_worker, 8)
             max_batch = max(64, workers * batch_per_worker + 64)
             if self.host.cuda_available and self.host.cuda_memory_gb < 16.0:
                 max_batch = min(max_batch, 192 if (not trial.family.graph and int(trial.static.full_sims) >= 512) else 128)

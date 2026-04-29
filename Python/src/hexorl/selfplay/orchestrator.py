@@ -61,6 +61,7 @@ class SelfPlayOrchestrator:
         self._record_queue = mp.Queue(maxsize=5000)
         self._stop_event = mp.Event()
         self._collector_thread: Optional[threading.Thread] = None
+        self._stopped = False
 
         # Stats
         self._games_done = 0
@@ -99,6 +100,9 @@ class SelfPlayOrchestrator:
 
     def stop(self, drain_timeout: float = 10.0):
         """Graceful shutdown: drain queues, stop server, join workers."""
+        if self._stopped:
+            return
+        self._stopped = True
         logger.info("Orchestrator shutting down...")
 
         # Signal workers to stop
@@ -106,6 +110,8 @@ class SelfPlayOrchestrator:
 
         # Let workers observe the stop event before forcing termination.
         for p in self._workers:
+            if p is None:
+                continue
             if p.is_alive():
                 p.join(timeout=2.0)
             if p.is_alive():
@@ -121,6 +127,7 @@ class SelfPlayOrchestrator:
         if self._server:
             self._server.stop()
             self._server.join(timeout=5.0)
+            self._server = None
 
         elapsed = time.monotonic() - self._start_time
         logger.info(
@@ -175,7 +182,7 @@ class SelfPlayOrchestrator:
     def _monitor_workers(self):
         """Check worker health and respawn dead ones."""
         for i, p in enumerate(self._workers):
-            if not p.is_alive():
+            if p is None or not p.is_alive():
                 self._workers[i] = self._respawn_worker(i)
 
     # ── Record Collection ────────────────────────────────────────────────
@@ -230,6 +237,7 @@ class SelfPlayOrchestrator:
         """Return current orchestrator statistics."""
         elapsed = max(time.monotonic() - self._start_time, 0.1)
         with self._stats_lock:
+            workers = [p for p in self._workers if p is not None]
             stats = {
                 "games_done": self._games_done,
                 "positions_done": self._positions_done,
@@ -237,8 +245,8 @@ class SelfPlayOrchestrator:
                 "positions_per_min": self._positions_done / elapsed * 60.0,
                 "buffer_size": len(self._buffer),
                 "buffer_capacity": self._buffer.capacity,
-                "workers_alive": sum(1 for p in self._workers if p.is_alive()),
-                "workers_total": len(self._workers),
+                "workers_alive": sum(1 for p in workers if p.is_alive()),
+                "workers_total": len(workers),
                 "elapsed_s": elapsed,
             }
             stats.update(self._rgsc_totals)
@@ -292,7 +300,7 @@ def run_orchestrator(
     # Handle SIGINT/SIGTERM gracefully
     def _shutdown(signum, frame):
         logger.info("Received shutdown signal")
-        orchestrator.stop()
+        orchestrator._stop_event.set()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)

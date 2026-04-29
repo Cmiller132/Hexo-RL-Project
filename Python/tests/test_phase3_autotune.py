@@ -295,6 +295,30 @@ def test_graph_low_memory_runtime_sweep_avoids_two_worker_probe():
     assert [candidate["max_wait_us"] for candidate in candidates] == [500, 800]
 
 
+def test_high_search_low_memory_runtime_sweep_uses_one_worker():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(runtime_sweep_workers="2,3", runtime_sweep_max_candidates=2)
+    supervisor.host = SimpleNamespace(logical_cpus=32, cuda_available=True, cuda_memory_gb=12.0)
+    supervisor._low_memory_cuda_host = lambda: True
+    cfg = SimpleNamespace(
+        selfplay=SimpleNamespace(num_workers=2, batch_size_per_worker=16),
+        inference=SimpleNamespace(max_wait_us=500),
+        runtime=SimpleNamespace(selfplay_cpu_reserve=2),
+    )
+    trial = SimpleNamespace(
+        cfg=cfg,
+        family=SimpleNamespace(graph=False),
+        static=SimpleNamespace(full_sims=800),
+    )
+
+    candidates = module.Phase3Supervisor._runtime_sweep_candidates(supervisor, trial)
+
+    assert [candidate["workers"] for candidate in candidates] == [1, 1]
+    assert [candidate["batch_size_per_worker"] for candidate in candidates] == [8, 8]
+    assert [candidate["max_wait_us"] for candidate in candidates] == [500, 800]
+
+
 def test_runtime_sweep_memory_summary_rejects_marginal_wsl_headroom():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)

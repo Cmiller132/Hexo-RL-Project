@@ -1393,6 +1393,16 @@ def test_selfplay_epoch_completion_requires_games_and_states():
     assert orchestrator.progress == 1.0
 
 
+def test_orchestrator_stop_is_idempotent_with_missing_worker_slot():
+    cfg = Config()
+    orchestrator = SelfPlayOrchestrator(cfg, buffer_capacity=16)
+    orchestrator._workers = [None]
+    orchestrator.stop()
+    orchestrator.stop()
+
+    assert orchestrator.stats["workers_total"] == 0
+
+
 def test_orchestrator_masks_truncated_game_value_targets(tmp_path):
     from hexorl.dashboard.recorder import RunRecorder
     from hexorl.dashboard.db import DashboardStore
