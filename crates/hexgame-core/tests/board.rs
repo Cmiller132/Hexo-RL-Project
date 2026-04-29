@@ -505,6 +505,70 @@ mod tests {
         assert!(matches!(res, Err(GameError::CellOccupied(_))));
     }
 
+    #[test]
+    fn set_position_rejects_post_terminal_extra_stones() {
+        let mut g = HexGameState::new();
+        let res = g.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (5, 0, 0),
+                (6, 0, 1),
+            ],
+            0,
+            2,
+        );
+        assert!(matches!(res, Err(GameError::GameOver)));
+    }
+
+    #[test]
+    fn set_position_is_transactional_on_validation_errors() {
+        let baseline = populated_nonterminal_game();
+        let before = snapshot(&baseline);
+
+        let cases = vec![
+            ("invalid current player", vec![(0, 0, 0)], 2, 1),
+            ("invalid remaining", vec![(0, 0, 0)], 0, 0),
+            (
+                "duplicate cell",
+                vec![(0, 0, 0), (1, 0, 0), (1, 0, 1)],
+                0,
+                2,
+            ),
+            ("invalid stone player", vec![(0, 0, 0), (1, 0, 2)], 0, 2),
+            ("first stone away from origin", vec![(1, 0, 0)], 0, 2),
+            ("out of radius", vec![(0, 0, 0), (99, 0, 1)], 0, 2),
+            (
+                "post-terminal extra stone",
+                vec![
+                    (0, 0, 0),
+                    (1, 0, 0),
+                    (2, 0, 0),
+                    (3, 0, 0),
+                    (4, 0, 0),
+                    (5, 0, 0),
+                    (6, 0, 1),
+                ],
+                0,
+                2,
+            ),
+        ];
+
+        for (label, stones, player, remaining) in cases {
+            let mut game = baseline.clone();
+            let result = game.set_position(&stones, player, remaining);
+            assert!(result.is_err(), "{label} should fail");
+            assert_eq!(
+                snapshot(&game),
+                before,
+                "{label} must not mutate the existing game"
+            );
+        }
+    }
+
     // -- candidates_near2 --------------------------------------------------
 
     #[test]
@@ -618,5 +682,71 @@ mod tests {
         g.place(-2, 1).unwrap();
         g.place(5, 0).unwrap();
         g
+    }
+
+    fn populated_nonterminal_game() -> HexGameState {
+        let mut g = HexGameState::new();
+        g.place(0, 0).unwrap();
+        g.place(1, 0).unwrap();
+        g.place(0, 1).unwrap();
+        g.place(-1, 1).unwrap();
+        g
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct GameSnapshot {
+        stones: Vec<(i32, i32, u8)>,
+        current_player: u8,
+        placements_remaining: u8,
+        winner: Option<u8>,
+        winning_line: Option<Vec<Hex>>,
+        move_count: u32,
+        history: Vec<(i32, i32, u8, u8, u8, Option<u8>, Option<Vec<Hex>>)>,
+        zobrist: u64,
+        legal_radius2: Vec<Hex>,
+        legal_radius8: Vec<Hex>,
+        eval_score: i32,
+        threat_counts: [(u32, u32, u32); 2],
+        hot_lengths: [usize; 2],
+    }
+
+    fn snapshot(game: &HexGameState) -> GameSnapshot {
+        let mut stones: Vec<_> = game.stones().iter().map(|(&h, &p)| (h.q, h.r, p)).collect();
+        stones.sort();
+        let history = game
+            .move_history()
+            .iter()
+            .map(|rec| {
+                (
+                    rec.cell().q,
+                    rec.cell().r,
+                    rec.player(),
+                    rec.current_player_before(),
+                    rec.placements_remaining_before(),
+                    rec.winner_before(),
+                    rec.winning_line_before().map(|line| line.to_vec()),
+                )
+            })
+            .collect();
+        let counts0 = game.eval().counts(0);
+        let counts1 = game.eval().counts(1);
+        GameSnapshot {
+            stones,
+            current_player: game.current_player(),
+            placements_remaining: game.placements_remaining(),
+            winner: game.winner(),
+            winning_line: game.winning_line().map(|line| line.to_vec()),
+            move_count: game.move_count(),
+            history,
+            zobrist: game.zobrist(),
+            legal_radius2: game.legal_moves_near_sorted(2),
+            legal_radius8: game.legal_moves_near_sorted(PLACEMENT_RADIUS),
+            eval_score: game.eval().score(),
+            threat_counts: [
+                (counts0.threes(), counts0.fours(), counts0.fives()),
+                (counts1.threes(), counts1.fours(), counts1.fives()),
+            ],
+            hot_lengths: [game.eval().hot_len(0), game.eval().hot_len(1)],
+        }
     }
 }

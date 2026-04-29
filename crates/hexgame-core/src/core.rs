@@ -202,7 +202,7 @@ pub const HEX_DIRECTIONS: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 /// Number of stones in a row required to win.
 pub const WIN_LENGTH: i32 = 6;
 
-/// Maximum distance from the origin at which a stone may be placed.
+/// Maximum distance from any existing stone at which a non-opening stone may be placed.
 pub const PLACEMENT_RADIUS: i32 = 8;
 
 /// A compact key representing a sliding "window" of cells along one of the

@@ -190,6 +190,29 @@ mod tests {
     }
 
     #[test]
+    fn mcts_repeated_select_rolls_back_previous_virtual_loss() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 10, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
+        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+
+        let root_idx = engine.root_idx as usize;
+        assert_eq!(engine.arena[root_idx].visit_count, 0);
+        let (_, first_count) = engine.select_leaves(1);
+        assert_eq!(first_count, 1);
+        let first_pending_visit_count = engine.arena[root_idx].visit_count;
+        assert_eq!(first_pending_visit_count, 1);
+
+        let (_, second_count) = engine.select_leaves(1);
+        assert_eq!(second_count, 1);
+        assert_eq!(
+            engine.arena[root_idx].visit_count, first_pending_visit_count,
+            "select_leaves must roll back abandoned pending virtual loss before selecting again"
+        );
+    }
+
+    #[test]
     fn mcts_backprop_does_not_flip_between_same_player_placements() {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
@@ -433,6 +456,17 @@ mod tests {
 
         let illegal = engine.apply_root_pair_priors(&[(a.q, a.r, 999, 999)], &[1.0], 1.0);
         assert!(illegal.is_err());
+
+        let b = legal[1];
+        let reversed_duplicate = engine.apply_root_pair_priors(
+            &[(a.q, a.r, b.q, b.r), (b.q, b.r, a.q, a.r)],
+            &[1.0, 2.0],
+            1.0,
+        );
+        assert!(
+            reversed_duplicate.is_err(),
+            "unordered pair policy rows must reject reversed duplicates"
+        );
     }
 
     #[test]

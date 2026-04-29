@@ -53,3 +53,36 @@ def test_mcts_runs_to_completion():
     assert len(visits) > 0
     assert sum(visits) == 20
     assert -1.0 <= root_q <= 1.0
+
+
+def _initialized_mcts_root():
+    g = _engine.PyHexGame()
+    g.place(0, 0)
+    engine = _engine.PyMCTSEngine(g, num_simulations=4, c_puct=1.5,
+                                   near_radius=2, constrain_threats=False,
+                                   c_puct_init=19652.0)
+    tensor, oq, or_, legal_bytes = engine.init_root()
+    policy = np.ones(_engine.BOARD_SIZE ** 2, dtype=np.float32)
+    return engine, policy, oq, or_, legal_bytes
+
+
+def test_mcts_rejects_shifted_root_offset():
+    engine, policy, oq, or_, legal_bytes = _initialized_mcts_root()
+    with pytest.raises(ValueError, match="offset mismatch"):
+        engine.expand_root(policy, 0.0, oq + 1, or_, legal_bytes)
+
+
+def test_mcts_rejects_mutated_root_legal_bytes():
+    engine, policy, oq, or_, legal_bytes = _initialized_mcts_root()
+    rows = np.frombuffer(legal_bytes, dtype=np.int32).copy().reshape(-1, 2)
+    assert len(rows) >= 2
+    rows[[0, 1]] = rows[[1, 0]]
+    with pytest.raises(ValueError, match="root legal row mismatch"):
+        engine.expand_root(policy, 0.0, oq, or_, rows.tobytes())
+
+
+def test_mcts_rejects_non_finite_root_policy():
+    engine, policy, oq, or_, legal_bytes = _initialized_mcts_root()
+    policy[0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        engine.expand_root(policy, 0.0, oq, or_, legal_bytes)

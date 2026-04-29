@@ -412,12 +412,16 @@ impl HexGameState {
         self.winning_line = rec.winning_line_before;
     }
 
-    /// Set the board to a custom position, bypassing normal turn rules.
+    /// Set the board to a custom synthetic fixture position.
     ///
-    /// All pieces in `stones` are placed directly regardless of who is
-    /// "current player".  The resulting `current_player` and
-    /// `placements_remaining` are set explicitly.  Any pre-existing game
-    /// state is discarded (equivalent to [`reset()`](Self::reset) first).
+    /// All pieces in `stones` are placed directly in the supplied order,
+    /// regardless of who is "current player".  The resulting
+    /// `current_player` and `placements_remaining` are set explicitly.
+    /// The generated move history is synthetic fixture history, not proof
+    /// that the position arose from legal chronological play.
+    ///
+    /// The load is transactional: if any validation fails, the pre-existing
+    /// game state is left unchanged.
     ///
     /// # Use cases
     ///
@@ -433,7 +437,9 @@ impl HexGameState {
     /// # Errors
     ///
     /// Returns [`GameError::CellOccupied`] if any two entries in `stones`
-    /// refer to the same hex.
+    /// refer to the same hex. Returns [`GameError::GameOver`] if additional
+    /// stones are supplied after the synthetic load has already produced a
+    /// terminal position.
     pub fn set_position(
         &mut self,
         stones: &[(i32, i32, u8)],
@@ -447,24 +453,26 @@ impl HexGameState {
             return Err(GameError::InvalidRemaining(remaining));
         }
 
-        self.reset();
-
-        let mut sim_player = self.current_player;
-        let mut sim_remaining = self.placements_remaining;
+        let mut next = Self::new();
+        let mut sim_player = next.current_player;
+        let mut sim_remaining = next.placements_remaining;
 
         for &(q, r, stone_player) in stones {
             let cell = Hex::new(q, r);
-            if self.stones.contains_key(&cell) {
+            if next.winner.is_some() {
+                return Err(GameError::GameOver);
+            }
+            if next.stones.contains_key(&cell) {
                 return Err(GameError::CellOccupied(cell));
             }
             if stone_player > 1 {
                 return Err(GameError::InvalidPlayer(stone_player));
             }
-            if self.stones.is_empty() && cell != Hex::ORIGIN {
+            if next.stones.is_empty() && cell != Hex::ORIGIN {
                 return Err(GameError::MustPlaceAtOrigin);
             }
-            if !self.stones.is_empty()
-                && !self
+            if !next.stones.is_empty()
+                && !next
                     .stones
                     .keys()
                     .any(|&e| hex_distance(e, cell) <= PLACEMENT_RADIUS)
@@ -477,25 +485,25 @@ impl HexGameState {
                 player: stone_player,
                 current_player_before: sim_player,
                 placements_remaining_before: sim_remaining,
-                winner_before: self.winner,
-                winning_line_before: self.winning_line,
+                winner_before: next.winner,
+                winning_line_before: next.winning_line,
             };
 
-            self.stones.insert(cell, stone_player);
-            self.zobrist ^= zobrist_piece(stone_player, cell);
-            self.move_count += 1;
-            self.move_history.push(record);
+            next.stones.insert(cell, stone_player);
+            next.zobrist ^= zobrist_piece(stone_player, cell);
+            next.move_count += 1;
+            next.move_history.push(record);
 
-            self.candidates.remove(cell);
-            self.placement_candidates.remove(cell);
-            self.incr_candidate_neighbors(cell);
-            self.incr_placement_candidate_neighbors(cell);
-            self.eval.place(cell, stone_player);
+            next.candidates.remove(cell);
+            next.placement_candidates.remove(cell);
+            next.incr_candidate_neighbors(cell);
+            next.incr_placement_candidate_neighbors(cell);
+            next.eval.place(cell, stone_player);
 
-            if self.winner.is_none() {
-                if let Some(line) = self.find_winning_line(cell, stone_player) {
-                    self.winner = Some(stone_player);
-                    self.winning_line = Some(line);
+            if next.winner.is_none() {
+                if let Some(line) = next.find_winning_line(cell, stone_player) {
+                    next.winner = Some(stone_player);
+                    next.winning_line = Some(line);
                 }
             }
 
@@ -506,8 +514,9 @@ impl HexGameState {
             }
         }
 
-        self.current_player = player;
-        self.placements_remaining = if self.winner.is_some() { 0 } else { remaining };
+        next.current_player = player;
+        next.placements_remaining = if next.winner.is_some() { 0 } else { remaining };
+        *self = next;
         Ok(())
     }
 
