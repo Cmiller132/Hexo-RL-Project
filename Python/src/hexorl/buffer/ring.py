@@ -53,12 +53,21 @@ class RingBuffer:
         self._opp_policy_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._opp_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
         self._opp_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._opp_policy_legal_v2_q = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_legal_v2_r = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
+        self._opp_policy_legal_v2_counts = np.zeros(capacity, dtype=np.uint16)
         self._pair_policy_v2_q1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_r1 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_q2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_r2 = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.int32)
         self._pair_policy_v2_probs = np.zeros((capacity, self.max_policy_v2_entries), dtype=np.float32)
         self._pair_policy_v2_counts = np.zeros(capacity, dtype=np.uint16)
+        self._policy_v2_exact: List[List[tuple[int, int, float]]] = [[] for _ in range(capacity)]
+        self._opp_policy_v2_exact: List[List[tuple[int, int, float]]] = [[] for _ in range(capacity)]
+        self._opp_policy_legal_v2_exact: List[List[tuple[int, int]]] = [[] for _ in range(capacity)]
+        self._pair_policy_v2_exact: List[List[tuple[tuple[int, int], tuple[int, int], float]]] = [
+            [] for _ in range(capacity)
+        ]
         self._outside_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._missing_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_top1 = np.zeros(capacity, dtype=np.float32)
@@ -67,15 +76,49 @@ class RingBuffer:
         self._candidate_recall_winning = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_forced_block = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_cover = np.zeros(capacity, dtype=np.float32)
+        self._candidate_discovery_top1 = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_top4 = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_top8 = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_winning = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_forced_block = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_cover = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_open_four = np.ones(capacity, dtype=np.float32)
+        self._candidate_discovery_open_five = np.ones(capacity, dtype=np.float32)
+        self._candidate_critical_count = np.zeros(capacity, dtype=np.float32)
+        self._candidate_critical_overflow_count = np.zeros(capacity, dtype=np.float32)
+        self._candidate_critical_overflow_examples = np.zeros((capacity, 8, 2), dtype=np.int32)
+        self._candidate_critical_overflow_example_counts = np.zeros(capacity, dtype=np.uint8)
+        self._sparse_prior_stage = np.zeros(capacity, dtype=np.uint8)
+        self._sparse_prior_root_candidate_count = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_leaf_candidate_count = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_root_hit_frac = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_leaf_hit_frac = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use_top1 = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use_top4 = np.zeros(capacity, dtype=np.float32)
+        self._fallback_prior_use_top8 = np.zeros(capacity, dtype=np.float32)
+        self._sparse_vs_dense_disagreement = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_forward_ms = np.zeros(capacity, dtype=np.float32)
+        self._sparse_prior_candidate_build_ms = np.zeros(capacity, dtype=np.float32)
+        self._pair_prior_candidate_count = np.zeros(capacity, dtype=np.float32)
+        self._pair_prior_hit_frac = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use_top1 = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use_top4 = np.zeros(capacity, dtype=np.float32)
+        self._pair_fallback_prior_use_top8 = np.zeros(capacity, dtype=np.float32)
         self._values = np.zeros(capacity, dtype=np.float32)
+        self._selected_action_values = np.zeros(capacity, dtype=np.float32)
+        self._selected_action_present = np.zeros(capacity, dtype=np.bool_)
         self._value_weights = np.ones(capacity, dtype=np.float32)
         self._regret_rank = np.zeros(capacity, dtype=np.float32)
         self._regret_value = np.zeros(capacity, dtype=np.float32)
+        self._regret_weights = np.zeros(capacity, dtype=np.float32)
         self._axis = np.full(capacity, -1, dtype=np.int16)
         self._moves_left = np.zeros(capacity, dtype=np.float32)
         self._opp_policies = np.zeros((capacity, max_policy_entries), dtype=np.uint16)
         self._opp_policy_probs = np.zeros((capacity, max_policy_entries), dtype=np.float32)
         self._opp_policy_counts = np.zeros(capacity, dtype=np.uint16)
+        self._opp_policy_weights = np.zeros(capacity, dtype=np.float32)
         self._game_ids = np.zeros(capacity, dtype=np.uint32)
         self._is_full = np.zeros(capacity, dtype=np.bool_)
         self._players = np.zeros(capacity, dtype=np.uint8)
@@ -126,6 +169,10 @@ class RingBuffer:
                 self._policy_probs[idx, j] = prob
 
             self._values[idx] = record.to_value_target()
+            self._selected_action_present[idx] = record.selected_action_value is not None
+            self._selected_action_values[idx] = (
+                0.0 if record.selected_action_value is None else float(record.selected_action_value)
+            )
             self._value_weights[idx] = record.value_weight
             self._write_aux_targets(idx, record)
             self._write_v2_targets(idx, record)
@@ -166,6 +213,10 @@ class RingBuffer:
             self._policies[idx, j] = action_idx
             self._policy_probs[idx, j] = prob
         self._values[idx] = record.to_value_target()
+        self._selected_action_present[idx] = record.selected_action_value is not None
+        self._selected_action_values[idx] = (
+            0.0 if record.selected_action_value is None else float(record.selected_action_value)
+        )
         self._value_weights[idx] = record.value_weight
         self._write_aux_targets(idx, record)
         self._write_v2_targets(idx, record)
@@ -231,7 +282,8 @@ class RingBuffer:
             regrets = np.zeros(self._size, dtype=np.float64)
             for i in range(self._size):
                 idx = (self._tail + i) % self.capacity
-                regrets[i] = max(float(self._regret_rank[idx]), 1e-8)
+                if self._regret_weights[idx] > 0.0:
+                    regrets[i] = max(float(self._regret_rank[idx]), 1e-8)
 
         inv_temp = 1.0 / max(temperature, 1e-6)
         weights = regrets ** inv_temp
@@ -274,49 +326,30 @@ class RingBuffer:
                 prob = float(self._opp_policy_probs[idx, j])
                 if prob > 0:
                     opp_policy[action_idx] = prob
-            policy_v2 = []
-            n_v2 = int(self._policy_v2_counts[idx])
-            for j in range(n_v2):
-                prob = float(self._policy_v2_probs[idx, j])
-                if prob > 0:
-                    policy_v2.append((
-                        int(self._policy_v2_q[idx, j]),
-                        int(self._policy_v2_r[idx, j]),
-                        prob,
-                    ))
-            opp_policy_v2 = []
-            n_opp_v2 = int(self._opp_policy_v2_counts[idx])
-            for j in range(n_opp_v2):
-                prob = float(self._opp_policy_v2_probs[idx, j])
-                if prob > 0:
-                    opp_policy_v2.append((
-                        int(self._opp_policy_v2_q[idx, j]),
-                        int(self._opp_policy_v2_r[idx, j]),
-                        prob,
-                    ))
-            pair_policy_v2 = []
-            n_pair_v2 = int(self._pair_policy_v2_counts[idx])
-            for j in range(n_pair_v2):
-                prob = float(self._pair_policy_v2_probs[idx, j])
-                if prob > 0:
-                    pair_policy_v2.append((
-                        (int(self._pair_policy_v2_q1[idx, j]), int(self._pair_policy_v2_r1[idx, j])),
-                        (int(self._pair_policy_v2_q2[idx, j]), int(self._pair_policy_v2_r2[idx, j])),
-                        prob,
-                    ))
+            policy_v2 = list(self._policy_v2_exact[idx])
+            opp_policy_v2 = list(self._opp_policy_v2_exact[idx])
+            opp_policy_legal_v2 = list(self._opp_policy_legal_v2_exact[idx])
+            pair_policy_v2 = list(self._pair_policy_v2_exact[idx])
 
             return PositionRecord(
                 move_history=self._histories[idx],
                 policy_target=policy,
                 root_value=0.0,
                 player=player,
+                selected_action_value=(
+                    float(self._selected_action_values[idx])
+                    if self._selected_action_present[idx]
+                    else None
+                ),
                 game_id=int(self._game_ids[idx]),
                 is_full_search=bool(self._is_full[idx]),
                 outcome=outcome,
                 lookahead_values=lv,
                 opp_policy_target=opp_policy,
+                opp_policy_weight=float(self._opp_policy_weights[idx]),
                 policy_target_v2=policy_v2,
                 opp_policy_target_v2=opp_policy_v2,
+                opp_policy_legal_v2=opp_policy_legal_v2,
                 pair_policy_target_v2=pair_policy_v2,
                 target_policy_mass_outside_window=float(self._outside_policy_mass[idx]),
                 missing_target_policy_mass=float(self._missing_policy_mass[idx]),
@@ -326,8 +359,43 @@ class RingBuffer:
                 candidate_recall_winning_move=float(self._candidate_recall_winning[idx]),
                 candidate_recall_forced_block=float(self._candidate_recall_forced_block[idx]),
                 candidate_recall_two_placement_cover=float(self._candidate_recall_cover[idx]),
+                candidate_discovery_top1=float(self._candidate_discovery_top1[idx]),
+                candidate_discovery_top4=float(self._candidate_discovery_top4[idx]),
+                candidate_discovery_top8=float(self._candidate_discovery_top8[idx]),
+                candidate_discovery_winning_move=float(self._candidate_discovery_winning[idx]),
+                candidate_discovery_forced_block=float(self._candidate_discovery_forced_block[idx]),
+                candidate_discovery_two_placement_cover=float(self._candidate_discovery_cover[idx]),
+                candidate_discovery_open_four=float(self._candidate_discovery_open_four[idx]),
+                candidate_discovery_open_five=float(self._candidate_discovery_open_five[idx]),
+                candidate_critical_count=int(self._candidate_critical_count[idx]),
+                candidate_critical_overflow_count=int(self._candidate_critical_overflow_count[idx]),
+                candidate_critical_overflow_examples=tuple(
+                    (int(q), int(r))
+                    for q, r in self._candidate_critical_overflow_examples[
+                        idx, : int(self._candidate_critical_overflow_example_counts[idx])
+                    ]
+                ),
+                sparse_prior_stage=int(self._sparse_prior_stage[idx]),
+                sparse_prior_root_candidate_count=int(self._sparse_prior_root_candidate_count[idx]),
+                sparse_prior_leaf_candidate_count=float(self._sparse_prior_leaf_candidate_count[idx]),
+                sparse_prior_root_hit_frac=float(self._sparse_prior_root_hit_frac[idx]),
+                sparse_prior_leaf_hit_frac=float(self._sparse_prior_leaf_hit_frac[idx]),
+                fallback_prior_use=float(self._fallback_prior_use[idx]),
+                fallback_prior_use_on_mcts_top1=float(self._fallback_prior_use_top1[idx]),
+                fallback_prior_use_on_mcts_top4=float(self._fallback_prior_use_top4[idx]),
+                fallback_prior_use_on_mcts_top8=float(self._fallback_prior_use_top8[idx]),
+                sparse_vs_dense_disagreement=float(self._sparse_vs_dense_disagreement[idx]),
+                sparse_prior_forward_ms=float(self._sparse_prior_forward_ms[idx]),
+                sparse_prior_candidate_build_ms=float(self._sparse_prior_candidate_build_ms[idx]),
+                pair_prior_candidate_count=int(self._pair_prior_candidate_count[idx]),
+                pair_prior_hit_frac=float(self._pair_prior_hit_frac[idx]),
+                pair_fallback_prior_use=float(self._pair_fallback_prior_use[idx]),
+                pair_fallback_prior_use_on_mcts_top1=float(self._pair_fallback_prior_use_top1[idx]),
+                pair_fallback_prior_use_on_mcts_top4=float(self._pair_fallback_prior_use_top4[idx]),
+                pair_fallback_prior_use_on_mcts_top8=float(self._pair_fallback_prior_use_top8[idx]),
                 regret_rank=float(self._regret_rank[idx]),
                 regret_value=float(self._regret_value[idx]),
+                regret_weight=float(self._regret_weights[idx]),
                 axis_label=int(self._axis[idx]),
                 moves_left=float(self._moves_left[idx]),
                 value_weight=float(self._value_weights[idx]),
@@ -406,6 +474,126 @@ class RingBuffer:
                         [(self._tail + i) % self.capacity for i in range(self._size)]
                     ].mean()
                 ) if self._size > 0 else 0.0,
+                "candidate_discovery_top1": float(
+                    self._candidate_discovery_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_top4": float(
+                    self._candidate_discovery_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_top8": float(
+                    self._candidate_discovery_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_winning_move": float(
+                    self._candidate_discovery_winning[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_forced_block": float(
+                    self._candidate_discovery_forced_block[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_two_placement_cover": float(
+                    self._candidate_discovery_cover[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_open_four": float(
+                    self._candidate_discovery_open_four[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "candidate_discovery_open_five": float(
+                    self._candidate_discovery_open_five[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "critical_count": float(
+                    self._candidate_critical_count[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "critical_overflow_count": float(
+                    self._candidate_critical_overflow_count[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].sum()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use": float(
+                    self._fallback_prior_use[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_top1": float(
+                    self._fallback_prior_use_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_top4": float(
+                    self._fallback_prior_use_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_top8": float(
+                    self._fallback_prior_use_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "fallback_prior_use_on_mcts_topk": float(
+                    self._fallback_prior_use_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "sparse_prior_root_hit_frac": float(
+                    self._sparse_prior_root_hit_frac[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "sparse_prior_leaf_hit_frac": float(
+                    self._sparse_prior_leaf_hit_frac[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "sparse_vs_dense_disagreement": float(
+                    self._sparse_vs_dense_disagreement[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use": float(
+                    self._pair_fallback_prior_use[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_prior_hit_frac": float(
+                    self._pair_prior_hit_frac[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_prior_candidate_count": float(
+                    self._pair_prior_candidate_count[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use_on_mcts_top1": float(
+                    self._pair_fallback_prior_use_top1[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use_on_mcts_top4": float(
+                    self._pair_fallback_prior_use_top4[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
+                "pair_fallback_prior_use_on_mcts_top8": float(
+                    self._pair_fallback_prior_use_top8[
+                        [(self._tail + i) % self.capacity for i in range(self._size)]
+                    ].mean()
+                ) if self._size > 0 else 0.0,
             }
 
     def clear(self):
@@ -423,12 +611,23 @@ class RingBuffer:
             self._opp_policy_v2_r.fill(0)
             self._opp_policy_v2_probs.fill(0.0)
             self._opp_policy_v2_counts.fill(0)
+            self._opp_policy_legal_v2_q.fill(0)
+            self._opp_policy_legal_v2_r.fill(0)
+            self._opp_policy_legal_v2_counts.fill(0)
             self._pair_policy_v2_q1.fill(0)
             self._pair_policy_v2_r1.fill(0)
             self._pair_policy_v2_q2.fill(0)
             self._pair_policy_v2_r2.fill(0)
             self._pair_policy_v2_probs.fill(0.0)
             self._pair_policy_v2_counts.fill(0)
+            for store in (
+                self._policy_v2_exact,
+                self._opp_policy_v2_exact,
+                self._opp_policy_legal_v2_exact,
+                self._pair_policy_v2_exact,
+            ):
+                for idx in range(self.capacity):
+                    store[idx].clear()
             self._outside_policy_mass.fill(0.0)
             self._missing_policy_mass.fill(0.0)
             self._candidate_recall_top1.fill(0.0)
@@ -437,15 +636,49 @@ class RingBuffer:
             self._candidate_recall_winning.fill(0.0)
             self._candidate_recall_forced_block.fill(0.0)
             self._candidate_recall_cover.fill(0.0)
+            self._candidate_discovery_top1.fill(1.0)
+            self._candidate_discovery_top4.fill(1.0)
+            self._candidate_discovery_top8.fill(1.0)
+            self._candidate_discovery_winning.fill(1.0)
+            self._candidate_discovery_forced_block.fill(1.0)
+            self._candidate_discovery_cover.fill(1.0)
+            self._candidate_discovery_open_four.fill(1.0)
+            self._candidate_discovery_open_five.fill(1.0)
+            self._candidate_critical_count.fill(0.0)
+            self._candidate_critical_overflow_count.fill(0.0)
+            self._candidate_critical_overflow_examples.fill(0)
+            self._candidate_critical_overflow_example_counts.fill(0)
+            self._sparse_prior_stage.fill(0)
+            self._sparse_prior_root_candidate_count.fill(0.0)
+            self._sparse_prior_leaf_candidate_count.fill(0.0)
+            self._sparse_prior_root_hit_frac.fill(0.0)
+            self._sparse_prior_leaf_hit_frac.fill(0.0)
+            self._fallback_prior_use.fill(0.0)
+            self._fallback_prior_use_top1.fill(0.0)
+            self._fallback_prior_use_top4.fill(0.0)
+            self._fallback_prior_use_top8.fill(0.0)
+            self._sparse_vs_dense_disagreement.fill(0.0)
+            self._sparse_prior_forward_ms.fill(0.0)
+            self._sparse_prior_candidate_build_ms.fill(0.0)
+            self._pair_prior_candidate_count.fill(0.0)
+            self._pair_prior_hit_frac.fill(0.0)
+            self._pair_fallback_prior_use.fill(0.0)
+            self._pair_fallback_prior_use_top1.fill(0.0)
+            self._pair_fallback_prior_use_top4.fill(0.0)
+            self._pair_fallback_prior_use_top8.fill(0.0)
             self._values.fill(0.0)
+            self._selected_action_values.fill(0.0)
+            self._selected_action_present.fill(False)
             self._value_weights.fill(1.0)
             self._regret_rank.fill(0.0)
             self._regret_value.fill(0.0)
+            self._regret_weights.fill(0.0)
             self._axis.fill(-1)
             self._moves_left.fill(0.0)
             self._opp_policies.fill(0)
             self._opp_policy_probs.fill(0.0)
             self._opp_policy_counts.fill(0)
+            self._opp_policy_weights.fill(0.0)
             self._game_ids.fill(0)
             self._is_full.fill(False)
             self._players.fill(0)
@@ -460,8 +693,10 @@ class RingBuffer:
         """Write optional auxiliary targets into struct-of-arrays storage."""
         self._regret_rank[idx] = record.regret_rank
         self._regret_value[idx] = record.regret_value
+        self._regret_weights[idx] = record.regret_weight
         self._axis[idx] = record.axis_label
         self._moves_left[idx] = record.moves_left
+        self._opp_policy_weights[idx] = record.opp_policy_weight
 
         opp_entries = list(record.opp_policy_target.items())
         n_opp = min(len(opp_entries), self.max_policy_entries)
@@ -475,6 +710,11 @@ class RingBuffer:
     def _write_v2_targets(self, idx: int, record: PositionRecord):
         """Write action-keyed global policy targets and diagnostics."""
         entries = list(record.policy_target_v2)
+        self._policy_v2_exact[idx] = [
+            (int(q), int(r), float(prob))
+            for q, r, prob in entries
+            if float(prob) > 0.0
+        ]
         n = min(len(entries), self.max_policy_v2_entries)
         self._policy_v2_counts[idx] = n
         self._policy_v2_q[idx].fill(0)
@@ -486,6 +726,11 @@ class RingBuffer:
             self._policy_v2_probs[idx, j] = float(prob)
 
         opp_entries = list(record.opp_policy_target_v2)
+        self._opp_policy_v2_exact[idx] = [
+            (int(q), int(r), float(prob))
+            for q, r, prob in opp_entries
+            if float(prob) > 0.0
+        ]
         n_opp = min(len(opp_entries), self.max_policy_v2_entries)
         self._opp_policy_v2_counts[idx] = n_opp
         self._opp_policy_v2_q[idx].fill(0)
@@ -496,7 +741,25 @@ class RingBuffer:
             self._opp_policy_v2_r[idx, j] = int(r)
             self._opp_policy_v2_probs[idx, j] = float(prob)
 
+        opp_legal_entries = list(record.opp_policy_legal_v2)
+        self._opp_policy_legal_v2_exact[idx] = [
+            (int(q), int(r))
+            for q, r in opp_legal_entries
+        ]
+        n_opp_legal = min(len(opp_legal_entries), self.max_policy_v2_entries)
+        self._opp_policy_legal_v2_counts[idx] = n_opp_legal
+        self._opp_policy_legal_v2_q[idx].fill(0)
+        self._opp_policy_legal_v2_r[idx].fill(0)
+        for j, (q, r) in enumerate(opp_legal_entries[:n_opp_legal]):
+            self._opp_policy_legal_v2_q[idx, j] = int(q)
+            self._opp_policy_legal_v2_r[idx, j] = int(r)
+
         pair_entries = list(record.pair_policy_target_v2)
+        self._pair_policy_v2_exact[idx] = [
+            ((int(first[0]), int(first[1])), (int(second[0]), int(second[1])), float(prob))
+            for first, second, prob in pair_entries
+            if float(prob) > 0.0
+        ]
         n_pair = min(len(pair_entries), self.max_policy_v2_entries)
         self._pair_policy_v2_counts[idx] = n_pair
         self._pair_policy_v2_q1[idx].fill(0)
@@ -522,3 +785,36 @@ class RingBuffer:
         self._candidate_recall_winning[idx] = float(record.candidate_recall_winning_move)
         self._candidate_recall_forced_block[idx] = float(record.candidate_recall_forced_block)
         self._candidate_recall_cover[idx] = float(record.candidate_recall_two_placement_cover)
+        self._candidate_discovery_top1[idx] = float(record.candidate_discovery_top1)
+        self._candidate_discovery_top4[idx] = float(record.candidate_discovery_top4)
+        self._candidate_discovery_top8[idx] = float(record.candidate_discovery_top8)
+        self._candidate_discovery_winning[idx] = float(record.candidate_discovery_winning_move)
+        self._candidate_discovery_forced_block[idx] = float(record.candidate_discovery_forced_block)
+        self._candidate_discovery_cover[idx] = float(record.candidate_discovery_two_placement_cover)
+        self._candidate_discovery_open_four[idx] = float(record.candidate_discovery_open_four)
+        self._candidate_discovery_open_five[idx] = float(record.candidate_discovery_open_five)
+        self._candidate_critical_count[idx] = float(record.candidate_critical_count)
+        self._candidate_critical_overflow_count[idx] = float(record.candidate_critical_overflow_count)
+        self._candidate_critical_overflow_examples[idx].fill(0)
+        example_count = min(len(record.candidate_critical_overflow_examples), 8)
+        self._candidate_critical_overflow_example_counts[idx] = example_count
+        for row, (q, r) in enumerate(record.candidate_critical_overflow_examples[:example_count]):
+            self._candidate_critical_overflow_examples[idx, row] = (int(q), int(r))
+        self._sparse_prior_stage[idx] = int(record.sparse_prior_stage)
+        self._sparse_prior_root_candidate_count[idx] = float(record.sparse_prior_root_candidate_count)
+        self._sparse_prior_leaf_candidate_count[idx] = float(record.sparse_prior_leaf_candidate_count)
+        self._sparse_prior_root_hit_frac[idx] = float(record.sparse_prior_root_hit_frac)
+        self._sparse_prior_leaf_hit_frac[idx] = float(record.sparse_prior_leaf_hit_frac)
+        self._fallback_prior_use[idx] = float(record.fallback_prior_use)
+        self._fallback_prior_use_top1[idx] = float(record.fallback_prior_use_on_mcts_top1)
+        self._fallback_prior_use_top4[idx] = float(record.fallback_prior_use_on_mcts_top4)
+        self._fallback_prior_use_top8[idx] = float(record.fallback_prior_use_on_mcts_top8)
+        self._sparse_vs_dense_disagreement[idx] = float(record.sparse_vs_dense_disagreement)
+        self._sparse_prior_forward_ms[idx] = float(record.sparse_prior_forward_ms)
+        self._sparse_prior_candidate_build_ms[idx] = float(record.sparse_prior_candidate_build_ms)
+        self._pair_prior_candidate_count[idx] = float(record.pair_prior_candidate_count)
+        self._pair_prior_hit_frac[idx] = float(record.pair_prior_hit_frac)
+        self._pair_fallback_prior_use[idx] = float(record.pair_fallback_prior_use)
+        self._pair_fallback_prior_use_top1[idx] = float(record.pair_fallback_prior_use_on_mcts_top1)
+        self._pair_fallback_prior_use_top4[idx] = float(record.pair_fallback_prior_use_on_mcts_top4)
+        self._pair_fallback_prior_use_top8[idx] = float(record.pair_fallback_prior_use_on_mcts_top8)

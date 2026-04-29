@@ -476,6 +476,29 @@ mod tests {
     }
 
     #[test]
+    fn set_position_terminal_state_has_no_remaining_placements() {
+        let mut g = HexGameState::new();
+        g.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (5, 0, 0),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(g.winner(), Some(0));
+        assert_eq!(g.placements_remaining(), 0);
+        assert!(g.legal_moves().is_empty());
+        assert!(matches!(g.place(0, 1), Err(GameError::GameOver)));
+    }
+
+    #[test]
     fn set_position_rejects_duplicate_cell() {
         let mut g = HexGameState::new();
         let res = g.set_position(&[(0, 0, 0), (1, 0, 0), (1, 0, 1)], 0, 2);

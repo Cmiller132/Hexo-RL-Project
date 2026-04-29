@@ -184,9 +184,76 @@ struct PendingLeaf {
     offset_r: i32,
     /// Legal moves at this leaf position (needed for node expansion).
     legal_moves: Vec<Hex>,
+    /// Packed move history at this leaf as `(player, q, r)` little-endian i32 triples.
+    move_history: Vec<u8>,
+}
+
+fn pack_move_history(game: &HexGameState) -> Vec<u8> {
+    let hist = game.move_history();
+    let mut buf = Vec::with_capacity(hist.len() * 12);
+    for rec in hist {
+        buf.extend_from_slice(&(rec.player() as i32).to_le_bytes());
+        buf.extend_from_slice(&rec.cell().q.to_le_bytes());
+        buf.extend_from_slice(&rec.cell().r.to_le_bytes());
+    }
+    buf
 }
 
 // ── Policy gathering ───────────────────────────────────────────────────
+
+const PRIOR_SOURCE_SPARSE: u8 = 1;
+const PRIOR_SOURCE_DENSE: u8 = 2;
+const PRIOR_SOURCE_DEFAULT: u8 = 3;
+const PRIOR_SOURCE_PAIR: u8 = 4;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PriorSourceTelemetry {
+    pub root_total_count: u32,
+    pub root_sparse_count: u32,
+    pub root_dense_count: u32,
+    pub root_default_count: u32,
+    pub leaf_total_count: u32,
+    pub leaf_sparse_count: u32,
+    pub leaf_dense_count: u32,
+    pub leaf_default_count: u32,
+    pub root_pair_count: u32,
+    pub leaf_pair_count: u32,
+    pub root_sparse_candidate_count: u32,
+    pub leaf_sparse_candidate_count: u32,
+    pub root_pair_candidate_count: u32,
+    pub leaf_expansion_count: u32,
+}
+
+fn dense_source(q: i32, r: i32, offset_q: i32, offset_r: i32) -> u8 {
+    let gi = q - offset_q;
+    let gj = r - offset_r;
+    if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
+        PRIOR_SOURCE_DENSE
+    } else {
+        PRIOR_SOURCE_DEFAULT
+    }
+}
+
+fn summarize_sources(sources: &[u8]) -> (u32, u32, u32, u32, u32) {
+    let mut sparse = 0u32;
+    let mut dense = 0u32;
+    let mut default = 0u32;
+    let mut pair = 0u32;
+    for &source in sources {
+        match source {
+            PRIOR_SOURCE_SPARSE => sparse += 1,
+            PRIOR_SOURCE_DENSE => dense += 1,
+            PRIOR_SOURCE_DEFAULT => default += 1,
+            PRIOR_SOURCE_PAIR => pair += 1,
+            _ => {}
+        }
+    }
+    (sources.len() as u32, sparse, dense, default, pair)
+}
+
+fn count_prior_source(sources: &[u8], wanted: u8) -> u32 {
+    sources.iter().filter(|&&source| source == wanted).count() as u32
+}
 
 /// Gather policy logits for legal moves and normalize them with softmax.
 ///
@@ -234,6 +301,15 @@ fn gather_policy(
     }
 }
 
+fn gather_dense_sources(moves: &[Hex], offset_q: i32, offset_r: i32, sources: &mut Vec<u8>) {
+    sources.clear();
+    sources.extend(
+        moves
+            .iter()
+            .map(|h| dense_source(h.q, h.r, offset_q, offset_r)),
+    );
+}
+
 fn softmax_in_place(raw: &mut Vec<f32>, priors: &mut Vec<f32>) {
     let max_val = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for v in raw.iter_mut() {
@@ -270,26 +346,33 @@ fn gather_policy_with_sparse(
     sparse_logits: &[f32],
     stage: u8,
     sparse_mix: f32,
+    sparse_source: u8,
     raw: &mut Vec<f32>,
     priors: &mut Vec<f32>,
+    sources: &mut Vec<u8>,
 ) {
     if stage == 0 || sparse_actions.is_empty() || sparse_logits.is_empty() {
         gather_policy(moves, policy_logits, offset_q, offset_r, raw, priors);
+        gather_dense_sources(moves, offset_q, offset_r, sources);
         return;
     }
 
     raw.clear();
     raw.resize(moves.len(), -10.0f32);
+    sources.clear();
+    sources.resize(moves.len(), PRIOR_SOURCE_DEFAULT);
     if stage == 2 {
         for (i, h) in moves.iter().enumerate() {
             if let Some(logit) = sparse_logit_for(h.q, h.r, sparse_actions, sparse_logits) {
                 raw[i] = logit;
+                sources[i] = sparse_source;
             } else {
                 let gi = h.q - offset_q;
                 let gj = h.r - offset_r;
                 if (0..BOARD_SIZE).contains(&gi) && (0..BOARD_SIZE).contains(&gj) {
                     let flat = (gi as usize) * (BOARD_SIZE as usize) + gj as usize;
                     raw[i] = policy_logits[flat];
+                    sources[i] = PRIOR_SOURCE_DENSE;
                 }
             }
         }
@@ -298,7 +381,14 @@ fn gather_policy_with_sparse(
     }
 
     let mut dense_priors = Vec::new();
-    gather_policy(moves, policy_logits, offset_q, offset_r, raw, &mut dense_priors);
+    gather_policy(
+        moves,
+        policy_logits,
+        offset_q,
+        offset_r,
+        raw,
+        &mut dense_priors,
+    );
 
     raw.clear();
     raw.resize(moves.len(), f32::NEG_INFINITY);
@@ -329,6 +419,7 @@ fn gather_policy_with_sparse(
     if sparse_total <= 0.0 {
         priors.clear();
         priors.extend(dense_priors);
+        gather_dense_sources(moves, offset_q, offset_r, sources);
         return;
     }
 
@@ -346,6 +437,15 @@ fn gather_policy_with_sparse(
             *p /= total;
         }
     }
+
+    sources.clear();
+    sources.extend(moves.iter().zip(sparse_priors.iter()).map(|(h, &s)| {
+        if s > 0.0 {
+            sparse_source
+        } else {
+            dense_source(h.q, h.r, offset_q, offset_r)
+        }
+    }));
 }
 
 // ── MCTSEngine ─────────────────────────────────────────────────────────
@@ -393,6 +493,19 @@ pub struct MCTSEngine {
     scratch_raw: Vec<f32>,
     /// Reusable scratch buffer for `gather_policy` (normalized priors).
     scratch_priors: Vec<f32>,
+    /// Reusable scratch buffer for prior-source labels aligned with priors.
+    scratch_sources: Vec<u8>,
+    /// Prior-source labels for the current root children.
+    root_prior_sources: Vec<u8>,
+    root_sparse_candidate_count: u32,
+    root_pair_candidate_count: u32,
+    leaf_sparse_candidate_count: u32,
+    leaf_expansion_count: u32,
+    leaf_source_total: u32,
+    leaf_source_sparse: u32,
+    leaf_source_dense: u32,
+    leaf_source_default: u32,
+    leaf_source_pair: u32,
     /// Reusable buffer for `encode_board_into` live-cells channels.
     hot_buf: Vec<Hex>,
     legal_buf: Vec<Hex>,
@@ -466,10 +579,45 @@ impl MCTSEngine {
             pending: Vec::new(),
             scratch_raw: Vec::new(),
             scratch_priors: Vec::new(),
+            scratch_sources: Vec::new(),
+            root_prior_sources: Vec::new(),
+            root_sparse_candidate_count: 0,
+            root_pair_candidate_count: 0,
+            leaf_sparse_candidate_count: 0,
+            leaf_expansion_count: 0,
+            leaf_source_total: 0,
+            leaf_source_sparse: 0,
+            leaf_source_dense: 0,
+            leaf_source_default: 0,
+            leaf_source_pair: 0,
             hot_buf: Vec::new(),
             legal_buf: Vec::new(),
             seed,
         }
+    }
+
+    fn reset_prior_telemetry(&mut self) {
+        self.root_prior_sources.clear();
+        self.root_sparse_candidate_count = 0;
+        self.root_pair_candidate_count = 0;
+        self.leaf_sparse_candidate_count = 0;
+        self.leaf_expansion_count = 0;
+        self.leaf_source_total = 0;
+        self.leaf_source_sparse = 0;
+        self.leaf_source_dense = 0;
+        self.leaf_source_default = 0;
+        self.leaf_source_pair = 0;
+    }
+
+    fn record_leaf_prior_sources(&mut self, sparse_candidate_count: usize) {
+        let (total, sparse, dense, default, pair) = summarize_sources(&self.scratch_sources);
+        self.leaf_source_total += total;
+        self.leaf_source_sparse += sparse;
+        self.leaf_source_dense += dense;
+        self.leaf_source_default += default;
+        self.leaf_source_pair += pair;
+        self.leaf_sparse_candidate_count += sparse_candidate_count as u32;
+        self.leaf_expansion_count += 1;
     }
 
     // ── Root initialization ────────────────────────────────────────────
@@ -515,6 +663,7 @@ impl MCTSEngine {
         offset_r: i32,
         legal: &[Hex],
     ) {
+        self.reset_prior_telemetry();
         let player = self.game.current_player();
         self.expand_node(
             self.root_idx,
@@ -524,6 +673,9 @@ impl MCTSEngine {
             offset_q,
             offset_r,
         );
+        self.root_prior_sources.clear();
+        self.root_prior_sources
+            .extend_from_slice(&self.scratch_sources);
         self.arena[self.root_idx as usize].player = player;
     }
 
@@ -540,10 +692,12 @@ impl MCTSEngine {
         stage: u8,
         sparse_mix: f32,
     ) {
+        self.reset_prior_telemetry();
         if legal.is_empty() {
             return;
         }
         let player = self.game.current_player();
+        self.root_sparse_candidate_count = sparse_actions.len().min(sparse_logits.len()) as u32;
         gather_policy_with_sparse(
             legal,
             policy_logits,
@@ -553,11 +707,367 @@ impl MCTSEngine {
             sparse_logits,
             stage,
             sparse_mix,
+            PRIOR_SOURCE_SPARSE,
             &mut self.scratch_raw,
             &mut self.scratch_priors,
+            &mut self.scratch_sources,
         );
         self.expand_node_with_priors(self.root_idx, legal, player);
+        self.root_prior_sources.clear();
+        self.root_prior_sources
+            .extend_from_slice(&self.scratch_sources);
         self.arena[self.root_idx as usize].player = player;
+    }
+
+    pub fn expand_root_with_global_priors(
+        &mut self,
+        legal: &[Hex],
+        global_actions: &[(i32, i32)],
+        global_logits: &[f32],
+        _value: f32,
+    ) -> Result<(), String> {
+        self.reset_prior_telemetry();
+        if legal.len() != global_actions.len() {
+            return Err(format!(
+                "global prior legal row count mismatch: legal={} global_actions={}",
+                legal.len(),
+                global_actions.len()
+            ));
+        }
+        if global_logits.len() < global_actions.len() {
+            return Err(format!(
+                "global prior logits length {} is smaller than legal rows {}",
+                global_logits.len(),
+                global_actions.len()
+            ));
+        }
+        for (idx, (legal_hex, &(q, r))) in legal.iter().zip(global_actions.iter()).enumerate() {
+            if legal_hex.q != q || legal_hex.r != r {
+                return Err(format!(
+                    "global prior legal row mismatch at {idx}: Rust legal=({}, {}) graph legal=({}, {})",
+                    legal_hex.q, legal_hex.r, q, r
+                ));
+            }
+        }
+        self.scratch_raw.clear();
+        self.scratch_raw
+            .extend(global_logits.iter().take(global_actions.len()).copied());
+        if self.scratch_raw.iter().any(|value| !value.is_finite()) {
+            return Err("global prior logits contain non-finite values".to_string());
+        }
+        softmax_in_place(&mut self.scratch_raw, &mut self.scratch_priors);
+        if self.scratch_priors.len() != legal.len() {
+            return Err("global prior logits could not be normalized".to_string());
+        }
+        self.scratch_sources.clear();
+        self.scratch_sources
+            .extend(std::iter::repeat_n(PRIOR_SOURCE_SPARSE, legal.len()));
+        let player = self.game.current_player();
+        self.expand_node_with_priors(self.root_idx, legal, player);
+        self.root_prior_sources.clear();
+        self.root_prior_sources
+            .extend_from_slice(&self.scratch_sources);
+        self.root_sparse_candidate_count = legal.len() as u32;
+        self.arena[self.root_idx as usize].player = player;
+        Ok(())
+    }
+
+    /// Blend joint pair-action logits into root first-placement priors.
+    ///
+    /// `pair_actions` stores unordered pairs `(q1, r1, q2, r2)` keyed by
+    /// global coordinates.  Each coordinate must be a current root child and
+    /// duplicate cells are illegal.  Pair logits are normalized over pair rows,
+    /// then incident pair mass is summed back onto first-placement children.
+    pub fn apply_root_pair_priors(
+        &mut self,
+        pair_actions: &[(i32, i32, i32, i32)],
+        pair_logits: &[f32],
+        pair_mix: f32,
+    ) -> Result<(), String> {
+        if self.game.placements_remaining() < 2 {
+            self.root_pair_candidate_count = 0;
+            return Ok(());
+        }
+        let root = &self.arena[self.root_idx as usize];
+        let start = root.children_start as usize;
+        let count = root.children_count as usize;
+        if count == 0 {
+            return Err("root must be expanded before applying pair priors".to_string());
+        }
+        if pair_logits.len() < pair_actions.len() {
+            return Err(format!(
+                "pair_logits length {} is smaller than pair_actions rows {}",
+                pair_logits.len(),
+                pair_actions.len()
+            ));
+        }
+        if pair_actions.is_empty() {
+            self.root_pair_candidate_count = 0;
+            return Ok(());
+        }
+
+        let root_actions: Vec<(i32, i32)> = (0..count)
+            .map(|idx| {
+                let child = &self.arena[start + idx];
+                (child.action.0 as i32, child.action.1 as i32)
+            })
+            .collect();
+
+        let mut valid_pairs: Vec<(usize, usize, f32)> = Vec::with_capacity(pair_actions.len());
+        for (row, &(q1, r1, q2, r2)) in pair_actions.iter().enumerate() {
+            if q1 == q2 && r1 == r2 {
+                return Err(format!(
+                    "duplicate coordinates are illegal for pair policy: ({q1}, {r1})"
+                ));
+            }
+            let Some(first_idx) = root_actions.iter().position(|&(q, r)| q == q1 && r == r1) else {
+                return Err(format!(
+                    "pair policy target contains illegal first action: ({q1}, {r1})"
+                ));
+            };
+            let Some(second_idx) = root_actions.iter().position(|&(q, r)| q == q2 && r == r2)
+            else {
+                return Err(format!(
+                    "pair policy target contains illegal second action: ({q2}, {r2})"
+                ));
+            };
+            let logit = pair_logits[row];
+            if !logit.is_finite() {
+                return Err(format!("pair policy logit at row {row} is not finite"));
+            }
+            valid_pairs.push((first_idx, second_idx, logit));
+        }
+
+        let max_logit = valid_pairs
+            .iter()
+            .map(|(_, _, logit)| *logit)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut pair_mass = vec![0.0f32; count];
+        let mut denom = 0.0f32;
+        for &(_first_idx, _second_idx, logit) in &valid_pairs {
+            denom += (logit - max_logit).exp();
+        }
+        if denom <= 0.0 || !denom.is_finite() {
+            return Err("pair policy logits could not be normalized".to_string());
+        }
+        for &(first_idx, second_idx, logit) in &valid_pairs {
+            let p = (logit - max_logit).exp() / denom;
+            pair_mass[first_idx] += p;
+            pair_mass[second_idx] += p;
+        }
+        let mass_total: f32 = pair_mass.iter().sum();
+        if mass_total <= 0.0 {
+            return Err("pair policy produced zero incident action mass".to_string());
+        }
+        for mass in &mut pair_mass {
+            *mass /= mass_total;
+        }
+
+        let mix = pair_mix.clamp(0.0, 1.0);
+        let mut total_prior = 0.0f32;
+        for (idx, pair_prior) in pair_mass.iter().enumerate() {
+            let child = &mut self.arena[start + idx];
+            child.prior = (1.0 - mix) * child.prior + mix * *pair_prior;
+            total_prior += child.prior;
+        }
+        if total_prior > 0.0 {
+            for idx in 0..count {
+                self.arena[start + idx].prior /= total_prior;
+            }
+        }
+        if self.root_prior_sources.len() != count {
+            self.root_prior_sources.resize(count, PRIOR_SOURCE_DEFAULT);
+        }
+        for (idx, pair_prior) in pair_mass.iter().enumerate() {
+            if *pair_prior > 0.0 && mix > 0.0 {
+                self.root_prior_sources[idx] = PRIOR_SOURCE_PAIR;
+            }
+        }
+        self.root_pair_candidate_count = valid_pairs.len() as u32;
+        Ok(())
+    }
+
+    /// Blend first-placement pair-policy logits into root child priors.
+    ///
+    /// The logits are keyed by the current root legal row table. This is the
+    /// direct all-legal `policy_pair_first` head; joint pair logits can still be
+    /// applied afterwards with `apply_root_pair_priors`.
+    pub fn apply_root_pair_first_priors(
+        &mut self,
+        action_logits: &[f32],
+        pair_mix: f32,
+    ) -> Result<(), String> {
+        if self.game.placements_remaining() < 2 {
+            return Ok(());
+        }
+        let root = &self.arena[self.root_idx as usize];
+        let start = root.children_start as usize;
+        let count = root.children_count as usize;
+        if count == 0 {
+            return Err("root must be expanded before applying pair-first priors".to_string());
+        }
+        if action_logits.len() < count {
+            return Err(format!(
+                "pair-first logits length {} is smaller than root legal rows {}",
+                action_logits.len(),
+                count
+            ));
+        }
+        let logits = &action_logits[..count];
+        if logits.iter().any(|value| !value.is_finite()) {
+            return Err("pair-first logits contain non-finite values".to_string());
+        }
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut mass = vec![0.0f32; count];
+        let mut denom = 0.0f32;
+        for (idx, logit) in logits.iter().enumerate() {
+            let p = (*logit - max_logit).exp();
+            mass[idx] = p;
+            denom += p;
+        }
+        if denom <= 0.0 || !denom.is_finite() {
+            return Err("pair-first logits could not be normalized".to_string());
+        }
+        for value in &mut mass {
+            *value /= denom;
+        }
+        let mix = pair_mix.clamp(0.0, 1.0);
+        let mut total_prior = 0.0f32;
+        for (idx, pair_prior) in mass.iter().enumerate() {
+            let child = &mut self.arena[start + idx];
+            child.prior = (1.0 - mix) * child.prior + mix * *pair_prior;
+            total_prior += child.prior;
+        }
+        if total_prior > 0.0 {
+            for idx in 0..count {
+                self.arena[start + idx].prior /= total_prior;
+            }
+        }
+        if self.root_prior_sources.len() != count {
+            self.root_prior_sources.resize(count, PRIOR_SOURCE_DEFAULT);
+        }
+        if mix > 0.0 {
+            for source in &mut self.root_prior_sources {
+                *source = PRIOR_SOURCE_PAIR;
+            }
+        }
+        Ok(())
+    }
+
+    /// Blend conditional pair-action logits into second-placement root priors.
+    ///
+    /// This is used after re-rooting from the first placement of a normal turn.
+    /// `pair_actions` stores ordered `(first_q, first_r, second_q, second_r)`
+    /// rows.  The first coordinate must be the immediately preceding placement
+    /// by the current player; the second coordinate must be a current root child.
+    pub fn apply_root_pair_second_priors(
+        &mut self,
+        pair_actions: &[(i32, i32, i32, i32)],
+        pair_logits: &[f32],
+        pair_mix: f32,
+    ) -> Result<(), String> {
+        if self.game.placements_remaining() != 1 {
+            self.root_pair_candidate_count = 0;
+            return Ok(());
+        }
+        let Some(last_move) = self.game.move_history().last() else {
+            return Err("second-placement pair prior requires a previous placement".to_string());
+        };
+        if last_move.player() != self.game.current_player() {
+            return Err("previous placement does not belong to the current player".to_string());
+        }
+        let first_cell = last_move.cell();
+        let root = &self.arena[self.root_idx as usize];
+        let start = root.children_start as usize;
+        let count = root.children_count as usize;
+        if count == 0 {
+            return Err(
+                "root must be expanded before applying second-placement pair priors".to_string(),
+            );
+        }
+        if pair_logits.len() < pair_actions.len() {
+            return Err(format!(
+                "pair_logits length {} is smaller than pair_actions rows {}",
+                pair_logits.len(),
+                pair_actions.len()
+            ));
+        }
+        if pair_actions.is_empty() {
+            self.root_pair_candidate_count = 0;
+            return Ok(());
+        }
+
+        let root_actions: Vec<(i32, i32)> = (0..count)
+            .map(|idx| {
+                let child = &self.arena[start + idx];
+                (child.action.0 as i32, child.action.1 as i32)
+            })
+            .collect();
+
+        let mut valid_pairs: Vec<(usize, f32)> = Vec::with_capacity(pair_actions.len());
+        for (row, &(q1, r1, q2, r2)) in pair_actions.iter().enumerate() {
+            if q1 == q2 && r1 == r2 {
+                return Err(format!(
+                    "duplicate coordinates are illegal for pair policy: ({q1}, {r1})"
+                ));
+            }
+            if q1 != first_cell.q || r1 != first_cell.r {
+                return Err(format!(
+                    "pair policy first action ({q1}, {r1}) does not match current turn first placement ({}, {})",
+                    first_cell.q, first_cell.r
+                ));
+            }
+            let Some(second_idx) = root_actions.iter().position(|&(q, r)| q == q2 && r == r2)
+            else {
+                return Err(format!(
+                    "pair policy target contains illegal second action: ({q2}, {r2})"
+                ));
+            };
+            let logit = pair_logits[row];
+            if !logit.is_finite() {
+                return Err(format!("pair policy logit at row {row} is not finite"));
+            }
+            valid_pairs.push((second_idx, logit));
+        }
+
+        let max_logit = valid_pairs
+            .iter()
+            .map(|(_, logit)| *logit)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0.0f32;
+        for &(_, logit) in &valid_pairs {
+            denom += (logit - max_logit).exp();
+        }
+        if denom <= 0.0 || !denom.is_finite() {
+            return Err("pair policy logits could not be normalized".to_string());
+        }
+        let mut pair_mass = vec![0.0f32; count];
+        for &(second_idx, logit) in &valid_pairs {
+            pair_mass[second_idx] += (logit - max_logit).exp() / denom;
+        }
+
+        let mix = pair_mix.clamp(0.0, 1.0);
+        let mut total_prior = 0.0f32;
+        for (idx, pair_prior) in pair_mass.iter().enumerate() {
+            let child = &mut self.arena[start + idx];
+            child.prior = (1.0 - mix) * child.prior + mix * *pair_prior;
+            total_prior += child.prior;
+        }
+        if total_prior > 0.0 {
+            for idx in 0..count {
+                self.arena[start + idx].prior /= total_prior;
+            }
+        }
+        if self.root_prior_sources.len() != count {
+            self.root_prior_sources.resize(count, PRIOR_SOURCE_DEFAULT);
+        }
+        for (idx, pair_prior) in pair_mass.iter().enumerate() {
+            if *pair_prior > 0.0 && mix > 0.0 {
+                self.root_prior_sources[idx] = PRIOR_SOURCE_PAIR;
+            }
+        }
+        self.root_pair_candidate_count = valid_pairs.len() as u32;
+        Ok(())
     }
 
     /// Add Dirichlet noise to root priors for exploration.
@@ -667,6 +1177,7 @@ impl MCTSEngine {
                     offset_q: 0,
                     offset_r: 0,
                     legal_moves: Vec::new(),
+                    move_history: pack_move_history(&self.game),
                 });
             } else {
                 let start = non_terminal_count as usize * TENSOR_SIZE;
@@ -695,6 +1206,7 @@ impl MCTSEngine {
                     offset_q: oq,
                     offset_r: or_,
                     legal_moves: self.legal_buf.clone(),
+                    move_history: pack_move_history(&self.game),
                 });
             }
 
@@ -781,6 +1293,7 @@ impl MCTSEngine {
                     leaf.offset_q,
                     leaf.offset_r,
                 );
+                self.record_leaf_prior_sources(0);
                 value = v;
                 eval_idx += 1;
             }
@@ -814,6 +1327,48 @@ impl MCTSEngine {
         stage: u8,
         sparse_mix: f32,
     ) {
+        self.expand_and_backprop_with_sparse_impl(
+            policies,
+            values,
+            sparse_actions,
+            sparse_logits,
+            None,
+            stage,
+            sparse_mix,
+        )
+    }
+
+    pub fn expand_and_backprop_with_sparse_sources(
+        &mut self,
+        policies: &[f32],
+        values: &[f32],
+        sparse_actions: &[Vec<(i32, i32)>],
+        sparse_logits: &[Vec<f32>],
+        sparse_sources: &[Vec<u8>],
+        stage: u8,
+        sparse_mix: f32,
+    ) {
+        self.expand_and_backprop_with_sparse_impl(
+            policies,
+            values,
+            sparse_actions,
+            sparse_logits,
+            Some(sparse_sources),
+            stage,
+            sparse_mix,
+        )
+    }
+
+    fn expand_and_backprop_with_sparse_impl(
+        &mut self,
+        policies: &[f32],
+        values: &[f32],
+        sparse_actions: &[Vec<(i32, i32)>],
+        sparse_logits: &[Vec<f32>],
+        sparse_sources: Option<&[Vec<u8>]>,
+        stage: u8,
+        sparse_mix: f32,
+    ) {
         let non_terminal_count = self.pending.iter().filter(|l| !l.is_terminal).count();
         assert!(
             policies.len() == non_terminal_count * BOARD_AREA,
@@ -831,6 +1386,12 @@ impl MCTSEngine {
             sparse_actions.len() == non_terminal_count && sparse_logits.len() == non_terminal_count,
             "expand_and_backprop_with_sparse: sparse metadata length must equal non-terminal count"
         );
+        if let Some(sources) = sparse_sources {
+            assert!(
+                sources.len() == non_terminal_count,
+                "expand_and_backprop_with_sparse: sparse source metadata length must equal non-terminal count"
+            );
+        }
 
         let mut eval_idx = 0usize;
         let mut leaves = Vec::new();
@@ -856,6 +1417,10 @@ impl MCTSEngine {
                     "expand_and_backprop_with_sparse: NN returned non-finite value at leaf {}",
                     leaf.node_idx,
                 );
+                let sparse_source = sparse_sources
+                    .and_then(|sources| sources.get(eval_idx))
+                    .and_then(|row| row.first().copied())
+                    .unwrap_or(PRIOR_SOURCE_SPARSE);
                 self.expand_node_with_sparse(
                     leaf.node_idx,
                     &leaf.legal_moves,
@@ -867,7 +1432,16 @@ impl MCTSEngine {
                     &sparse_logits[eval_idx],
                     stage,
                     sparse_mix,
+                    sparse_source,
                 );
+                let sparse_count = if stage >= 2 {
+                    sparse_actions[eval_idx]
+                        .len()
+                        .min(sparse_logits[eval_idx].len())
+                } else {
+                    0
+                };
+                self.record_leaf_prior_sources(sparse_count);
                 value = v;
                 eval_idx += 1;
             }
@@ -889,11 +1463,18 @@ impl MCTSEngine {
         std::mem::swap(&mut leaves, &mut self.pending);
     }
 
-    pub fn pending_leaf_metadata(&self) -> Vec<(i32, i32, Vec<Hex>)> {
+    pub fn pending_leaf_metadata(&self) -> Vec<(i32, i32, Vec<Hex>, Vec<u8>)> {
         self.pending
             .iter()
             .filter(|leaf| !leaf.is_terminal)
-            .map(|leaf| (leaf.offset_q, leaf.offset_r, leaf.legal_moves.clone()))
+            .map(|leaf| {
+                (
+                    leaf.offset_q,
+                    leaf.offset_r,
+                    leaf.legal_moves.clone(),
+                    leaf.move_history.clone(),
+                )
+            })
             .collect()
     }
 
@@ -1028,6 +1609,31 @@ impl MCTSEngine {
             .collect()
     }
 
+    pub fn root_child_prior_sources(&self) -> Vec<u8> {
+        self.root_prior_sources.clone()
+    }
+
+    pub fn prior_source_telemetry(&self) -> PriorSourceTelemetry {
+        let (root_total, root_sparse, root_dense, root_default, _root_pair) =
+            summarize_sources(&self.root_prior_sources);
+        PriorSourceTelemetry {
+            root_total_count: root_total,
+            root_sparse_count: root_sparse,
+            root_dense_count: root_dense,
+            root_default_count: root_default,
+            leaf_total_count: self.leaf_source_total,
+            leaf_sparse_count: self.leaf_source_sparse,
+            leaf_dense_count: self.leaf_source_dense,
+            leaf_default_count: self.leaf_source_default,
+            root_pair_count: count_prior_source(&self.root_prior_sources, PRIOR_SOURCE_PAIR),
+            leaf_pair_count: self.leaf_source_pair,
+            root_sparse_candidate_count: self.root_sparse_candidate_count,
+            leaf_sparse_candidate_count: self.leaf_sparse_candidate_count,
+            root_pair_candidate_count: self.root_pair_candidate_count,
+            leaf_expansion_count: self.leaf_expansion_count,
+        }
+    }
+
     /// Get Q-values of root children from the root player's perspective.
     ///
     /// For unvisited children, returns the root's Q-value (before FPU
@@ -1055,6 +1661,44 @@ impl MCTSEngine {
                 }
             })
             .collect()
+    }
+
+    /// Return search-observed joint first/second placement targets at the root.
+    ///
+    /// Rows are `(first_q, first_r, second_q, second_r, visit_count)` and are
+    /// extracted from expanded root-child subtrees. This gives training a real
+    /// MCTS joint-pair signal instead of reconstructing a pair from the single
+    /// first move that happened to be sampled into the played trajectory.
+    pub fn root_pair_visit_targets(&self) -> Vec<(i32, i32, i32, i32, u32)> {
+        if self.game.placements_remaining() < 2 {
+            return Vec::new();
+        }
+        let root = &self.arena[self.root_idx as usize];
+        let start = root.children_start as usize;
+        let count = root.children_count as usize;
+        let mut rows = Vec::new();
+        for first_idx in start..start + count {
+            let first = &self.arena[first_idx];
+            if !first.is_expanded || first.children_count == 0 {
+                continue;
+            }
+            let second_start = first.children_start as usize;
+            let second_count = first.children_count as usize;
+            for second_idx in second_start..second_start + second_count {
+                let second = &self.arena[second_idx];
+                if second.visit_count == 0 {
+                    continue;
+                }
+                rows.push((
+                    first.action.0 as i32,
+                    first.action.1 as i32,
+                    second.action.0 as i32,
+                    second.action.1 as i32,
+                    second.visit_count,
+                ));
+            }
+        }
+        rows
     }
 
     // ── Training data extraction ───────────────────────────────────────
@@ -1308,6 +1952,7 @@ impl MCTSEngine {
             &mut self.scratch_raw,
             &mut self.scratch_priors,
         );
+        gather_dense_sources(legal_moves, offset_q, offset_r, &mut self.scratch_sources);
         self.expand_node_with_priors(node_idx, legal_moves, player);
     }
 
@@ -1324,10 +1969,12 @@ impl MCTSEngine {
         sparse_logits: &[f32],
         stage: u8,
         sparse_mix: f32,
+        sparse_source: u8,
     ) {
         if legal_moves.is_empty() {
             return;
         }
+        let effective_stage = if stage >= 2 { 2 } else { 0 };
         gather_policy_with_sparse(
             legal_moves,
             policy_logits,
@@ -1335,10 +1982,12 @@ impl MCTSEngine {
             offset_r,
             sparse_actions,
             sparse_logits,
-            stage,
+            effective_stage,
             sparse_mix,
+            sparse_source,
             &mut self.scratch_raw,
             &mut self.scratch_priors,
+            &mut self.scratch_sources,
         );
         self.expand_node_with_priors(node_idx, legal_moves, player);
     }

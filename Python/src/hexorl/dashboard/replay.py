@@ -9,6 +9,12 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from hexorl.action_contract.candidates import (
+    CANDIDATE_FEATURE_NAMES,
+    CANDIDATE_FEATURE_VERSION,
+    build_candidate_batch,
+)
+from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
 from hexorl.dashboard.db import DashboardStore
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -67,17 +73,7 @@ def replay_game(store: DashboardStore, game_id: int) -> dict[str, Any]:
     return {
         "game": _public_game(game),
         "moves": [_move_dict(m) for m in moves],
-        "positions": [
-            {
-                "position_id": row["position_id"],
-                "turn_index": row["turn_index"],
-                "player": row["player"],
-                "root_value": row["root_value"],
-                "policy": row.get("policy_json", {}),
-                "debug": row.get("debug_json", {}),
-            }
-            for row in position_rows
-        ],
+        "positions": [_public_position(row) for row in position_rows],
     }
 
 
@@ -356,6 +352,153 @@ def _public_game(row: dict[str, Any]) -> dict[str, Any]:
         "move_count": row["move_count"],
         "payload": row.get("payload_json", {}),
     }
+
+
+def _public_position(row: dict[str, Any]) -> dict[str, Any]:
+    debug = dict(row.get("debug_json", {}) or {})
+    if "policy_weight" not in debug:
+        debug["policy_weight"] = 1.0 if debug.get("is_full_search", True) else 0.0
+    debug.setdefault("opp_policy_weight", 0.0)
+    debug.setdefault("value_weight", 1.0)
+    debug.setdefault("regret_weight", 0.0)
+    debug.setdefault("final_outcome", debug.get("outcome"))
+    selected_action_value = debug.get("selected_action_value")
+    if selected_action_value is not None and debug.get("final_outcome") is not None:
+        perspective_outcome = float(debug["final_outcome"])
+        if int(row["player"]) == 1:
+            perspective_outcome = -perspective_outcome
+        debug.setdefault(
+            "per_step_error",
+            (float(selected_action_value) - perspective_outcome) ** 2,
+        )
+    debug["candidate_rows"] = _candidate_rows_debug(row, debug)
+    prior_sources = {
+        key: debug.get(key, 0.0)
+        for key in (
+            "sparse_prior_stage",
+            "sparse_prior_root_candidate_count",
+            "sparse_prior_leaf_candidate_count",
+            "sparse_prior_root_hit_frac",
+            "sparse_prior_leaf_hit_frac",
+            "fallback_prior_use",
+            "fallback_prior_use_on_mcts_top1",
+            "fallback_prior_use_on_mcts_top4",
+            "fallback_prior_use_on_mcts_top8",
+            "pair_prior_candidate_count",
+            "pair_prior_hit_frac",
+            "pair_fallback_prior_use",
+            "pair_fallback_prior_use_on_mcts_top1",
+            "pair_fallback_prior_use_on_mcts_top4",
+            "pair_fallback_prior_use_on_mcts_top8",
+        )
+        if key in debug
+    }
+    return {
+        "position_id": row["position_id"],
+        "turn_index": row["turn_index"],
+        "player": row["player"],
+        "root_value": row["root_value"],
+        "selected_action_value": debug.get("selected_action_value"),
+        "final_outcome": debug.get("final_outcome"),
+        "per_step_error": debug.get("per_step_error"),
+        "regret_rank": debug.get("regret_rank", 0.0),
+        "regret_value": debug.get("regret_value", 0.0),
+        "value_weight": debug["value_weight"],
+        "policy_weight": debug["policy_weight"],
+        "opp_policy_weight": debug["opp_policy_weight"],
+        "regret_weight": debug["regret_weight"],
+        "policy": row.get("policy_json", {}),
+        "policy_target_v2": debug.get("policy_target_v2", []),
+        "opp_policy_target_v2": debug.get("opp_policy_target_v2", []),
+        "pair_policy_target_v2": debug.get("pair_policy_target_v2", []),
+        "prior_sources": prior_sources,
+        "debug": debug,
+    }
+
+
+def _candidate_rows_debug(row: dict[str, Any], debug: dict[str, Any], limit: int = 64) -> dict[str, Any]:
+    history = row.get("move_history_b64") or b""
+    policy_v2 = _policy_v2_from_debug(debug.get("policy_target_v2", []))
+    try:
+        position = get_replay_position(history, constrain_threats=False)
+        legal = [(int(move["q"]), int(move["r"])) for move in position.legal_moves]
+        offset_q = int(position.encoding.get("offset_q", -BOARD_SIZE // 2))
+        offset_r = int(position.encoding.get("offset_r", -BOARD_SIZE // 2))
+        oracle = scan_tactical_oracle_from_history(
+            history,
+            legal,
+            offset_q=offset_q,
+            offset_r=offset_r,
+        )
+        candidates = build_candidate_batch(
+            legal,
+            policy_v2,
+            offset_q=offset_q,
+            offset_r=offset_r,
+            budget=min(max(len(legal), 1), 512),
+            winning_moves=oracle.win_now_cells,
+            forced_block_moves=oracle.forced_block_cells,
+            cover_cells=oracle.cover_cells,
+            open_four_cells=oracle.open_four_cells,
+            open_five_cells=oracle.open_five_cells,
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": str(exc),
+            "feature_version": CANDIDATE_FEATURE_VERSION,
+            "feature_names": list(CANDIDATE_FEATURE_NAMES),
+            "rows": [],
+        }
+
+    rows = []
+    active = np.flatnonzero(candidates.mask)
+    feature_names = list(CANDIDATE_FEATURE_NAMES)
+    for row_idx in active[:limit]:
+        row_i = int(row_idx)
+        rows.append(
+            {
+                "row": row_i,
+                "q": int(candidates.qr[row_i, 0]),
+                "r": int(candidates.qr[row_i, 1]),
+                "dense_index": int(candidates.indices[row_i]),
+                "target_prob": float(candidates.target[row_i]),
+                "features": {
+                    name: float(candidates.features[row_i, col])
+                    for col, name in enumerate(feature_names)
+                },
+            }
+        )
+    return {
+        "available": True,
+        "feature_version": CANDIDATE_FEATURE_VERSION,
+        "feature_names": feature_names,
+        "candidate_count": int(active.shape[0]),
+        "shown": len(rows),
+        "missing_mass": float(candidates.missing_mass),
+        "recall_top1": float(candidates.recall_top1),
+        "recall_top4": float(candidates.recall_top4),
+        "recall_top8": float(candidates.recall_top8),
+        "recall_winning_move": float(candidates.recall_winning_move),
+        "recall_forced_block": float(candidates.recall_forced_block),
+        "recall_two_placement_cover": float(candidates.recall_two_placement_cover),
+        "rows": rows,
+    }
+
+
+def _policy_v2_from_debug(value: Any) -> list[tuple[int, int, float]]:
+    out: list[tuple[int, int, float]] = []
+    if not isinstance(value, list):
+        return out
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            continue
+        q, r, prob = item
+        try:
+            out.append((int(q), int(r), float(prob)))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def policy_debug(policy_logits: np.ndarray, legal_mask: list[int], top_k: int = 12) -> dict[str, Any]:

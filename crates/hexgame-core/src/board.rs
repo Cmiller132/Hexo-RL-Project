@@ -507,7 +507,7 @@ impl HexGameState {
         }
 
         self.current_player = player;
-        self.placements_remaining = remaining;
+        self.placements_remaining = if self.winner.is_some() { 0 } else { remaining };
         Ok(())
     }
 

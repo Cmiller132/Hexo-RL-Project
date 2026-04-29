@@ -38,7 +38,7 @@ The final Phase 2 comparison is intentionally narrow:
 |---|---|---|---|---|
 | A. `best_current_33` | Phase 1 | `33x33` crop | flat `0..1088` logits | crop baseline |
 | B. `best_restnet_33` | Phase 1 | `33x33` crop + attention | flat `0..1088` logits | attention-inside-crop control |
-| C. `best_graph_option1` | Phase 2 | sparse global tokens | legal `(q,r)` logits | true window replacement |
+| C. `global_graph_option1` | Phase 2 target | sparse global tokens | legal `(q,r)` logits | true window replacement |
 
 This answers the question cleanly:
 
@@ -646,7 +646,7 @@ Finalists:
 ```text
 best_current_33
 best_restnet_33
-best_graph_option1
+global_graph_option1
 ```
 
 Run three views:

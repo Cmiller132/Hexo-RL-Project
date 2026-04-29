@@ -11,11 +11,18 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hexorl.axis_policy.core import AxisPolicyInput
+from hexorl.action_contract.candidates import (
+    CANDIDATE_FEATURE_NAMES,
+    CANDIDATE_FEATURE_VERSION,
+    build_candidate_batch,
+    build_pair_candidate_batch,
+)
+from hexorl.buffer.sampler import _transform_history_bytes
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
 from hexorl.dashboard.checkpoints import scan_checkpoints
@@ -27,7 +34,16 @@ from hexorl.dashboard.fixtures import (
 )
 from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
+from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
 from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
+from hexorl.graph.batch import (
+    GRAPH_FEATURE_DIM,
+    GRAPH_SCHEMA_VERSION,
+    RELATION_SCHEMA_VERSION,
+    GraphTokenType,
+    RelationType,
+    build_graph_batch_from_history,
+)
 from hexorl.selfplay.records import BOARD_SIZE
 
 
@@ -84,6 +100,7 @@ class ModelLoadRequest(BaseModel):
 
 class InferRequest(BaseModel):
     history_b64: str
+    model_ids: list[str] = Field(default_factory=list)
 
 
 class ArenaStartRequest(BaseModel):
@@ -242,6 +259,58 @@ def create_app(
         pos = get_replay_position(rows[0]["final_history_b64"], turn_index=turn_index)
         return position_payload(pos)
 
+    @app.get("/api/games/{game_id}/snapshot.png")
+    def game_snapshot(
+        game_id: int,
+        run_id: str | None = None,
+        turn_index: int = -1,
+        width: int = 1280,
+        height: int = 960,
+        context_rings: int = 2,
+        show_numbers: bool = True,
+        show_legal: bool = False,
+        fit: str = "played",
+        near_radius: int = 8,
+    ) -> Response:
+        row = _game_row_for_request(store, suite_root, game_id, run_id)
+        if row is None:
+            raise HTTPException(404, f"Game not found: {game_id}")
+        history = row["final_history_b64"]
+        turn = None if turn_index < 0 else turn_index
+        legal_moves = None
+        if show_legal:
+            try:
+                legal_moves = get_replay_position(
+                    history,
+                    turn_index=turn,
+                    near_radius=max(1, min(near_radius, 64)),
+                    constrain_threats=False,
+                ).legal_moves
+            except Exception:
+                legal_moves = None
+        title = f"{row.get('source') or 'match'} epoch {row.get('epoch') if row.get('epoch') is not None else '-'}"
+        png = render_match_snapshot_png(
+            history,
+            options=MatchSnapshotOptions(
+                width=width,
+                height=height,
+                turn_index=turn,
+                context_rings=context_rings,
+                show_numbers=show_numbers,
+                show_legal=show_legal,
+                fit=fit,
+                title=title,
+            ),
+            legal_moves=legal_moves,
+            metadata=row,
+        )
+        filename = snapshot_filename(row, turn_index=turn)
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+
     @app.get("/api/suite/status")
     def suite_status() -> dict[str, Any]:
         if suite_root is None:
@@ -385,6 +454,60 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(404, f"Model not loaded: {model_id}") from exc
 
+    @app.get("/api/debug/contracts")
+    def debug_contracts() -> dict[str, Any]:
+        return {
+            "candidate": {
+                "feature_version": CANDIDATE_FEATURE_VERSION,
+                "feature_names": list(CANDIDATE_FEATURE_NAMES),
+                "feature_width": len(CANDIDATE_FEATURE_NAMES),
+            },
+            "graph": {
+                "schema_version": GRAPH_SCHEMA_VERSION,
+                "relation_schema_version": RELATION_SCHEMA_VERSION,
+                "feature_dim": GRAPH_FEATURE_DIM,
+                "token_types": {token.name: int(token) for token in GraphTokenType},
+                "relation_types": {relation.name: int(relation) for relation in RelationType},
+            },
+        }
+
+    @app.post("/api/debug/graph")
+    def debug_graph(req: InferRequest) -> dict[str, Any]:
+        history = decode_bytes(req.history_b64)
+        return _graph_debug_payload(history)
+
+    @app.post("/api/debug/d6")
+    def debug_d6(req: InferRequest) -> dict[str, Any]:
+        history = decode_bytes(req.history_b64)
+        transforms = []
+        for sym_idx in range(12):
+            transformed = _transform_history_bytes(history, sym_idx)
+            graph = _graph_debug_payload(transformed)
+            position = position_payload(get_replay_position(transformed, constrain_threats=False))
+            model_logits = {}
+            for model_id in req.model_ids:
+                try:
+                    model_logits[model_id] = model_cache.infer_history(model_id, transformed)
+                except KeyError as exc:
+                    raise HTTPException(404, f"Model not loaded: {model_id}") from exc
+            transforms.append(
+                {
+                    "symmetry_index": sym_idx,
+                    "history_b64": base64.b64encode(transformed).decode("ascii"),
+                    "current_player": position["current_player"],
+                    "placements_remaining": position["placements_remaining"],
+                    "legal_count": len(position["legal_moves"]),
+                    "graph": graph,
+                    "contracts": _d6_contract_payload(transformed, position, graph),
+                    "model_logits": model_logits,
+                }
+            )
+        return {
+            "symmetry_count": 12,
+            "source_history_b64": base64.b64encode(history).decode("ascii"),
+            "transforms": transforms,
+        }
+
     @app.post("/api/arena/start")
     def arena_start(req: ArenaStartRequest) -> dict[str, Any]:
         match_id = arena_manager.start(
@@ -451,6 +574,40 @@ def _suite_trial_dirs(run_root: Path) -> list[Path]:
     if not trials.exists():
         return []
     return sorted([path for path in trials.iterdir() if (path / "dashboard.sqlite3").exists()])
+
+
+def _game_row_for_request(
+    store: DashboardStore,
+    run_root: Path | None,
+    game_id: int,
+    run_id: str | None,
+) -> dict[str, Any] | None:
+    if run_id:
+        trial_store = _suite_store_for_run(run_root, run_id)
+        if trial_store is not None:
+            rows = trial_store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+            if rows:
+                rows[0]["source_db"] = str(trial_store.path)
+                return rows[0]
+        rows = store.rows("SELECT * FROM games WHERE game_id=? AND run_id=?", (game_id, run_id))
+        return rows[0] if rows else None
+    rows = store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+    if rows:
+        return rows[0]
+    if run_root is None:
+        return None
+    for trial_dir in _suite_trial_dirs(run_root):
+        db = trial_dir / "dashboard.sqlite3"
+        try:
+            trial_store = DashboardStore(db)
+            rows = trial_store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+        except Exception:
+            continue
+        if rows:
+            rows[0]["trial_id"] = trial_dir.name
+            rows[0]["source_db"] = str(db)
+            return rows[0]
+    return None
 
 
 def _suite_store_for_run(run_root: Path | None, run_id: str | None) -> DashboardStore | None:
@@ -908,6 +1065,7 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
         "global_step": checkpoint.get("global_step"),
         "cfg": cfg,
         "model_metadata": model_metadata,
+        "action_contract_metadata": checkpoint.get("action_contract_metadata", {}),
         "model_parameter_tensors": len(state) if hasattr(state, "__len__") else None,
     }
 
@@ -918,9 +1076,9 @@ def _architecture_summary(model: dict[str, Any], family: dict[str, Any] | None =
     channels = model.get("channels") or family.get("channels")
     blocks = model.get("blocks") or family.get("blocks")
     heads = model.get("heads") or []
-    if arch == "graph":
+    if arch in {"graph", "graph_hybrid_0"}:
         return (
-            f"Graph transformer, {channels} channels, {blocks} residual blocks, "
+            f"Graph hybrid 0, {channels} channels, {blocks} residual blocks, "
             f"{model.get('graph_token_budget', '?')} {model.get('graph_token_set', 'tokens')}, "
             f"{model.get('graph_layers', '?')} graph layers, heads: {len(heads)}."
         )
@@ -934,8 +1092,8 @@ def _architecture_summary(model: dict[str, Any], family: dict[str, Any] | None =
 
 def _model_summary_from_trial(family: dict[str, Any], static: dict[str, Any]) -> str:
     arch = str(family.get("architecture") or "")
-    if arch == "graph":
-        return f"graph {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
+    if arch in {"graph", "graph_hybrid_0"}:
+        return f"graph_hybrid_0 {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
     return f"{arch or 'model'} {family.get('channels', '?')}x{family.get('blocks', '?')}"
 
 
@@ -1005,6 +1163,142 @@ def _finite_or_none(value: Any) -> float | None:
     if number == float("inf") or number == float("-inf") or number != number:
         return None
     return number
+
+
+def _graph_debug_payload(history: bytes) -> dict[str, Any]:
+    graph = build_graph_batch_from_history(history)
+    token_counts = {
+        token.name: int((graph.token_type == int(token)).sum())
+        for token in GraphTokenType
+    }
+    relation_counts = {
+        relation.name: int((graph.relation_type == int(relation)).sum())
+        for relation in RelationType
+        if int((graph.relation_type == int(relation)).sum()) > 0
+    }
+    pair_examples = []
+    token_qr = graph.token_qr
+    for row in range(min(16, int(graph.pair_token_indices.shape[0]))):
+        first = int(graph.pair_first_indices[row])
+        second = int(graph.pair_second_indices[row])
+        pair_examples.append(
+            {
+                "first": {"q": int(token_qr[first, 0]), "r": int(token_qr[first, 1])},
+                "second": {"q": int(token_qr[second, 0]), "r": int(token_qr[second, 1])},
+            }
+        )
+    return {
+        "schema_version": graph.schema_version,
+        "relation_schema_version": graph.relation_schema_version,
+        "feature_dim": int(graph.token_features.shape[-1]),
+        "token_count": int(graph.token_features.shape[0]),
+        "token_counts": token_counts,
+        "legal_count": int(graph.legal_qr.shape[0]),
+        "legal_qr": [
+            {"q": int(q), "r": int(r)}
+            for q, r in graph.legal_qr[: min(64, int(graph.legal_qr.shape[0]))]
+        ],
+        "opp_legal_count": int(graph.opp_legal_qr.shape[0]),
+        "pair_count": int(graph.pair_token_indices.shape[0]),
+        "pair_examples": pair_examples,
+        "relation_counts": relation_counts,
+        "relation_bias_shape": [int(dim) for dim in graph.relation_bias.shape],
+        "placements_remaining": int(graph.placements_remaining),
+        "current_player": int(graph.current_player),
+    }
+
+
+def _d6_contract_payload(history: bytes, position: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
+    legal_moves = [
+        (int(row["q"]), int(row["r"]))
+        for row in position.get("legal_moves", [])
+    ]
+    offset_q = int(position.get("encoding", {}).get("offset_q", -16))
+    offset_r = int(position.get("encoding", {}).get("offset_r", -16))
+    candidate_budget = min(max(len(legal_moves), 1), 512)
+    candidates = build_candidate_batch(
+        legal_moves,
+        [],
+        offset_q=offset_q,
+        offset_r=offset_r,
+        budget=candidate_budget,
+        storage_width=candidate_budget,
+    )
+    candidate_rows = [
+        {
+            "q": int(candidates.qr[row, 0]),
+            "r": int(candidates.qr[row, 1]),
+            "dense_index": int(candidates.indices[row]),
+        }
+        for row, active in enumerate(candidates.mask)
+        if bool(active)
+    ][:64]
+    pair_rows: list[dict[str, Any]] = []
+    if len(legal_moves) >= 2 and int(position.get("placements_remaining", 1)) >= 2:
+        pair = build_pair_candidate_batch(
+            candidates.qr,
+            [],
+            budget=min(512, len(legal_moves) * max(len(legal_moves) - 1, 0) // 2),
+            candidate_mask=candidates.mask,
+            legal_moves=legal_moves,
+        )
+        for row, active in enumerate(pair.mask):
+            if not bool(active) or len(pair_rows) >= 64:
+                continue
+            first_idx, second_idx = pair.pair_indices[row]
+            pair_rows.append(
+                {
+                    "first": {
+                        "q": int(candidates.qr[int(first_idx), 0]),
+                        "r": int(candidates.qr[int(first_idx), 1]),
+                    },
+                    "second": {
+                        "q": int(candidates.qr[int(second_idx), 0]),
+                        "r": int(candidates.qr[int(second_idx), 1]),
+                    },
+                }
+            )
+    axis_input = AxisPolicyInput(
+        stones=list(position.get("stones", [])),
+        legal_moves=list(position.get("legal_moves", [])),
+        current_player=int(position.get("current_player", 0)),
+        offset_q=offset_q,
+        offset_r=offset_r,
+        metadata={
+            "source": "dashboard_d6_debug",
+            "placements_remaining": int(position.get("placements_remaining", 1)),
+            "history_b64": base64.b64encode(history).decode("ascii"),
+        },
+    )
+    axis_results = evaluate_all(axis_input, {})
+    return {
+        "dense_legal_mask": {
+            "offset_q": offset_q,
+            "offset_r": offset_r,
+            "legal_indices": list(position.get("encoding", {}).get("legal_mask", []))[:128],
+            "legal_count": len(legal_moves),
+        },
+        "sparse_candidates": {
+            "feature_version": CANDIDATE_FEATURE_VERSION,
+            "feature_names": list(CANDIDATE_FEATURE_NAMES),
+            "candidate_count": int(candidates.mask.sum()),
+            "rows": candidate_rows,
+        },
+        "pair_rows": {
+            "available": bool(pair_rows),
+            "rows": pair_rows,
+        },
+        "axis": {
+            "prototype_count": len(axis_results),
+            "results": axis_results[:8],
+        },
+        "graph_targets": {
+            "legal_count": int(graph["legal_count"]),
+            "pair_count": int(graph["pair_count"]),
+            "opp_legal_count": int(graph["opp_legal_count"]),
+            "token_counts": graph["token_counts"],
+        },
+    }
 
 
 def _axis_input_from_request(store: DashboardStore, req: AxisEvaluateRequest) -> AxisPolicyInput:

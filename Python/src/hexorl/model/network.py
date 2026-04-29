@@ -14,28 +14,62 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
 
+from hexorl.action_contract.candidates import CANDIDATE_FEATURES
+from hexorl.model.global_graph import GlobalHexGraphNet
+
 
 BOARD_SIZE = 33
 BOARD_AREA = BOARD_SIZE * BOARD_SIZE
-DEFAULT_CANDIDATE_FEATURES = 12
+DEFAULT_CANDIDATE_FEATURES = CANDIDATE_FEATURES
+
+
+class HexConv2d(nn.Conv2d):
+    """3x3 convolution constrained to the valid axial hex neighborhood."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.kernel_size != (3, 3):
+            raise ValueError("HexConv2d is only defined for 3x3 kernels")
+        mask = torch.ones_like(self.weight)
+        mask[:, :, 0, 0] = 0.0
+        mask[:, :, 2, 2] = 0.0
+        self.register_buffer("hex_mask", mask, persistent=False)
+        self.apply_hex_mask_()
+
+    @torch.no_grad()
+    def apply_hex_mask_(self) -> None:
+        self.weight.mul_(self.hex_mask)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(
+            x,
+            self.weight * self.hex_mask,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
 
 
 class GatedResBlock(nn.Module):
     """Gated residual block with BatchNorm2d for training stability."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, dropout: float = 0.0):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.conv1 = HexConv2d(channels, channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.conv2 = HexConv2d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
-        self.conv_gate = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
+        self.conv_gate = HexConv2d(channels, channels, 3, padding=1, bias=False)
         self.bn_gate = nn.BatchNorm2d(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = torch.relu(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
+        x = self.dropout(x)
         gate = torch.sigmoid(self.bn_gate(self.conv_gate(residual)))
         x = x * gate
         return x + residual
@@ -102,14 +136,15 @@ class SpatialTransformerBlock(nn.Module):
         return tokens.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
 
-class SparseHexGraphEncoder(nn.Module):
-    """Sparse token Transformer trunk for Phase 2 graph finalists.
+class SparseHexGraphHybrid0Encoder(nn.Module):
+    """Sparse token Transformer trunk for the graph_hybrid_0 scout.
 
     The public model contract remains `(B,13,33,33) -> dense heads`, but this
-    module replaces part of the crop trunk with deterministic sparse graph
-    attention over tactically relevant cells. The action identity path is the
+    module replaces part of the crop trunk with deterministic sparse attention
+    over tactically relevant crop cells. The action identity path is the
     candidate/action-keyed sparse policy head, which keeps global `(q,r)` priors
-    out of the dense crop projection.
+    out of the dense crop projection. This is not the true global sparse graph
+    model from the architecture spec.
     """
 
     TOKEN_SETS = {
@@ -234,7 +269,7 @@ class SparseHexGraphEncoder(nn.Module):
     def forward(self, features: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
         b, c, h, w = features.shape
         if h != BOARD_SIZE or w != BOARD_SIZE:
-            raise ValueError(f"SparseHexGraphEncoder expects {BOARD_SIZE}x{BOARD_SIZE}, got {h}x{w}")
+            raise ValueError(f"SparseHexGraphHybrid0Encoder expects {BOARD_SIZE}x{BOARD_SIZE}, got {h}x{w}")
         k = min(self.cell_budget, h * w)
         flat = features.flatten(2).transpose(1, 2).contiguous()
         score = self._selection_score(raw)
@@ -541,16 +576,18 @@ class HexNet(nn.Module):
             heads = ["policy", "value"]
         self.head_names = list(heads)
 
-        self.conv_in = nn.Conv2d(13, channels, kernel_size=3, padding=1)
+        self.conv_in = HexConv2d(13, channels, kernel_size=3, padding=1)
 
         self.res_blocks = nn.ModuleList()
-        self.graph_encoder: Optional[SparseHexGraphEncoder] = None
+        self.graph_encoder: Optional[SparseHexGraphHybrid0Encoder] = None
         attention_set = set(self.attention_positions)
         if self.architecture == "graph":
+            self.architecture = "graph_hybrid_0"
+        if self.architecture == "graph_hybrid_0":
             local_blocks = max(1, min(blocks, max(2, blocks // 4)))
             for _ in range(local_blocks):
-                self.res_blocks.append(GatedResBlock(channels))
-            self.graph_encoder = SparseHexGraphEncoder(
+                self.res_blocks.append(GatedResBlock(channels, dropout=dropout))
+            self.graph_encoder = SparseHexGraphHybrid0Encoder(
                 channels,
                 token_budget=graph_token_budget,
                 token_set=graph_token_set,
@@ -574,7 +611,7 @@ class HexNet(nn.Module):
                         )
                     )
                 else:
-                    self.res_blocks.append(GatedResBlock(channels))
+                    self.res_blocks.append(GatedResBlock(channels, dropout=dropout))
 
         head_modules: Dict[str, nn.Module] = {}
         for name in self.head_names:
@@ -621,6 +658,7 @@ class HexNet(nn.Module):
         )
 
         self._init_weights()
+        self.apply_hex_masks_()
 
     def _init_weights(self):
         """Kaiming normal initialization for Conv2d and Linear layers."""
@@ -637,6 +675,12 @@ class HexNet(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
+    @torch.no_grad()
+    def apply_hex_masks_(self) -> None:
+        for m in self.modules():
+            if isinstance(m, HexConv2d):
+                m.apply_hex_mask_()
+
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         raw = x
         x = torch.relu(self.conv_in(x))
@@ -652,6 +696,8 @@ class HexNet(nn.Module):
         candidate_features: Optional[torch.Tensor] = None,
         candidate_indices: Optional[torch.Tensor] = None,
         candidate_mask: Optional[torch.Tensor] = None,
+        pair_candidate_features: Optional[torch.Tensor] = None,
+        pair_candidate_row_indices: Optional[torch.Tensor] = None,
         pair_candidate_indices: Optional[torch.Tensor] = None,
         pair_candidate_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -689,11 +735,13 @@ class HexNet(nn.Module):
             and candidate_indices is not None
             and pair_candidate_indices is not None
         ):
+            pair_features = pair_candidate_features if pair_candidate_features is not None else candidate_features
+            pair_rows = pair_candidate_row_indices if pair_candidate_row_indices is not None else candidate_indices
             pair = self.pair_policy_head(
                 x,
                 out.get("policy"),
-                candidate_features,
-                candidate_indices,
+                pair_features,
+                pair_rows,
                 pair_candidate_indices,
             )
             if pair_candidate_mask is not None:
@@ -782,7 +830,7 @@ class HexNet(nn.Module):
         return out
 
 
-def from_config(cfg, device: Optional[torch.device] = None) -> HexNet:
+def from_config(cfg, device: Optional[torch.device] = None) -> nn.Module:
     """Create a HexNet from a Config object.
 
     Args:
@@ -801,10 +849,37 @@ def build_model_from_config(
     cfg,
     device: Optional[torch.device] = None,
     inference: bool = False,
-) -> HexNet:
+) -> nn.Module:
     """Create a HexNet from config while preserving default CNN compatibility."""
     model_cfg = cfg.model
     inference_cfg = cfg.inference
+    arch = getattr(model_cfg, "architecture", "cnn").lower()
+    global_architectures = GlobalHexGraphNet.ARCHITECTURES
+    if arch in global_architectures:
+        graph_heads = set(getattr(model_cfg, "heads", []))
+        graph_heads.update(f"lookahead_{h}" for h in getattr(getattr(cfg, "buffer", object()), "lookahead_horizons", []))
+        model = GlobalHexGraphNet(
+            channels=model_cfg.channels,
+            layers=getattr(model_cfg, "graph_layers", 3),
+            heads=getattr(model_cfg, "attention_heads", 8),
+            architecture=arch,
+            dropout=getattr(model_cfg, "dropout", 0.0),
+            output_heads=sorted(graph_heads),
+        )
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+        model = model.to(device)
+        if inference and inference_cfg.fp16 and device.type == "cuda":
+            model = model.half()
+        if inference:
+            model.eval()
+        return model
+
     heads = list(model_cfg.heads)
     if getattr(model_cfg, "sparse_policy", False) and "sparse_policy" not in heads:
         heads.append("sparse_policy")
@@ -855,6 +930,12 @@ def load_model_state(model: nn.Module, state_dict: dict, *, allow_partial: bool 
     target = getattr(model, "_orig_mod", None)
     if target is not None:
         state_dict = strip_compiled_prefix(state_dict)
-        return target.load_state_dict(state_dict, strict=not allow_partial)
+        result = target.load_state_dict(state_dict, strict=not allow_partial)
+        if hasattr(target, "apply_hex_masks_"):
+            target.apply_hex_masks_()
+        return result
     state_dict = strip_compiled_prefix(state_dict)
-    return model.load_state_dict(state_dict, strict=not allow_partial)
+    result = model.load_state_dict(state_dict, strict=not allow_partial)
+    if hasattr(model, "apply_hex_masks_"):
+        model.apply_hex_masks_()
+    return result

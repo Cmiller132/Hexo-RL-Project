@@ -15,7 +15,24 @@ import numpy as np
 from hexorl.selfplay.records import BOARD_AREA, BOARD_SIZE, PolicyTargetV2, action_to_board_index
 
 
-CANDIDATE_FEATURES = 12
+CANDIDATE_FEATURE_VERSION = 2
+CANDIDATE_FEATURE_NAMES = (
+    "q_norm",
+    "r_norm",
+    "s_norm",
+    "hex_distance_norm",
+    "inside_crop",
+    "crop_q_norm",
+    "crop_r_norm",
+    "legal_rank_norm",
+    "winning_cell",
+    "forced_block",
+    "outside_crop",
+    "critical_cell",
+)
+CANDIDATE_FEATURES = len(CANDIDATE_FEATURE_NAMES)
+
+CandidateMode = str
 
 
 @dataclass(frozen=True)
@@ -32,6 +49,19 @@ class CandidateBatch:
     recall_winning_move: float
     recall_forced_block: float
     recall_two_placement_cover: float
+    discovery_top1: float = 1.0
+    discovery_top4: float = 1.0
+    discovery_top8: float = 1.0
+    discovery_winning_move: float = 1.0
+    discovery_forced_block: float = 1.0
+    discovery_two_placement_cover: float = 1.0
+    discovery_open_four: float = 1.0
+    discovery_open_five: float = 1.0
+    recall_open_four: float = 1.0
+    recall_open_five: float = 1.0
+    critical_count: int = 0
+    critical_overflow_count: int = 0
+    critical_overflow_examples: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +83,10 @@ def _unique_qr(items: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     return out
 
 
+def _as_qr(item: tuple[int, int] | Sequence[int]) -> tuple[int, int]:
+    return (int(item[0]), int(item[1]))
+
+
 def build_candidate_set(
     legal_moves: Sequence[tuple[int, int]],
     policy_target_v2: PolicyTargetV2,
@@ -61,7 +95,10 @@ def build_candidate_set(
     winning_moves: Sequence[tuple[int, int]] = (),
     forced_block_moves: Sequence[tuple[int, int]] = (),
     cover_cells: Sequence[tuple[int, int]] = (),
+    open_four_cells: Sequence[tuple[int, int]] = (),
+    open_five_cells: Sequence[tuple[int, int]] = (),
     critical_actions: Sequence[tuple[int, int]] = (),
+    mode: CandidateMode = "protected",
 ) -> list[tuple[int, int]]:
     """Build a deterministic candidate set.
 
@@ -69,10 +106,21 @@ def build_candidate_set(
     the budget controls only the non-critical fill.
     """
     budget = max(1, int(budget))
-    target_actions = _unique_qr((q, r) for q, r, prob in policy_target_v2 if prob > 0.0)
+    if mode not in {"protected", "discovery"}:
+        raise ValueError(f"Unsupported candidate mode: {mode!r}")
+    target_actions = (
+        _unique_qr((q, r) for q, r, prob in policy_target_v2 if prob > 0.0)
+        if mode == "protected"
+        else []
+    )
     legal_set = set(_unique_qr((int(move[0]), int(move[1])) for move in legal_moves))
     tactical_actions = _unique_qr(
-        list(winning_moves) + list(forced_block_moves) + list(cover_cells) + list(critical_actions)
+        list(winning_moves)
+        + list(forced_block_moves)
+        + list(cover_cells)
+        + list(open_four_cells)
+        + list(open_five_cells)
+        + list(critical_actions)
     )
     tactical_actions = [qr for qr in tactical_actions if qr in legal_set]
     protected = _unique_qr(target_actions + tactical_actions)
@@ -94,12 +142,30 @@ def build_candidate_batch(
     winning_moves: Sequence[tuple[int, int]] = (),
     forced_block_moves: Sequence[tuple[int, int]] = (),
     cover_cells: Sequence[tuple[int, int]] = (),
+    open_four_cells: Sequence[tuple[int, int]] = (),
+    open_five_cells: Sequence[tuple[int, int]] = (),
     critical_actions: Sequence[tuple[int, int]] = (),
+    mode: CandidateMode = "protected",
+    storage_width: int | None = None,
 ) -> CandidateBatch:
     winning_set = set(_unique_qr(winning_moves))
     forced_set = set(_unique_qr(forced_block_moves))
     cover_set = set(_unique_qr(cover_cells))
-    critical_set = set(_unique_qr(critical_actions)) | winning_set | forced_set | cover_set
+    open_four_set = set(_unique_qr(open_four_cells))
+    open_five_set = set(_unique_qr(open_five_cells))
+    legal_set = set(_unique_qr((int(move[0]), int(move[1])) for move in legal_moves))
+    target_map: dict[tuple[int, int], float] = {
+        (int(q), int(r)): float(prob) for q, r, prob in policy_target_v2 if prob > 0.0
+    }
+    tactical_critical_set = (
+        set(_unique_qr(critical_actions))
+        | winning_set
+        | forced_set
+        | cover_set
+        | open_four_set
+        | open_five_set
+    )
+    diagnostic_critical_set = set(target_map) | tactical_critical_set
     candidates = build_candidate_set(
         legal_moves,
         policy_target_v2,
@@ -107,12 +173,31 @@ def build_candidate_batch(
         winning_moves=winning_moves,
         forced_block_moves=forced_block_moves,
         cover_cells=cover_cells,
+        open_four_cells=open_four_cells,
+        open_five_cells=open_five_cells,
         critical_actions=critical_actions,
+        mode=mode,
     )
-    target_map: dict[tuple[int, int], float] = {
-        (int(q), int(r)): float(prob) for q, r, prob in policy_target_v2 if prob > 0.0
-    }
-    k = max(len(candidates), int(budget))
+    discovery_candidates = build_candidate_set(
+        legal_moves,
+        policy_target_v2,
+        budget,
+        winning_moves=winning_moves,
+        forced_block_moves=forced_block_moves,
+        cover_cells=cover_cells,
+        open_four_cells=open_four_cells,
+        open_five_cells=open_five_cells,
+        critical_actions=critical_actions,
+        mode="discovery",
+    )
+    critical_count = len(diagnostic_critical_set & legal_set)
+    if storage_width is None:
+        k = max(len(candidates), int(budget))
+    else:
+        k = max(1, int(storage_width))
+    overflowed_critical = [qr for qr in candidates[k:] if qr in diagnostic_critical_set]
+    overflow = len(overflowed_critical)
+    overflow_examples = tuple(overflowed_critical[:8])
     qr_arr = np.zeros((k, 2), dtype=np.int32)
     indices = np.full(k, -1, dtype=np.int64)
     features = np.zeros((k, CANDIDATE_FEATURES), dtype=np.float32)
@@ -125,13 +210,14 @@ def build_candidate_batch(
     target_top1 = {(int(q), int(r)) for q, r, _ in target_sorted[:1]}
     target_top4 = {(int(q), int(r)) for q, r, _ in target_sorted[:4]}
     target_top8 = {(int(q), int(r)) for q, r, _ in target_sorted[:8]}
-    candidate_set = set(candidates)
+    candidate_set = set(candidates[:k])
+    discovery_candidate_set = set(discovery_candidates)
 
     represented_mass = 0.0
     half = BOARD_SIZE // 2
     max_coord = float(max(half, 1))
     max_legal_rank = float(max(len(legal_rank) - 1, 1))
-    for i, (q, r) in enumerate(candidates):
+    for i, (q, r) in enumerate(candidates[:k]):
         if i >= k:
             break
         idx = action_to_board_index(q, r, offset_q, offset_r)
@@ -154,11 +240,11 @@ def build_candidate_batch(
                 in_crop,
                 ((gi - half) / max_coord) if idx >= 0 else 0.0,
                 ((gj - half) / max_coord) if idx >= 0 else 0.0,
-                prob,
-                1.0 if prob > 0.0 else 0.0,
                 legal_rank.get((q, r), 0) / max_legal_rank,
+                1.0 if (q, r) in winning_set else 0.0,
+                1.0 if (q, r) in forced_set else 0.0,
                 1.0 - in_crop,
-                1.0 if (q, r) in critical_set else 0.0,
+                1.0 if (q, r) in tactical_critical_set else 0.0,
             ],
             dtype=np.float32,
         )
@@ -170,6 +256,11 @@ def build_candidate_batch(
         if not top:
             return 1.0
         return len(top & candidate_set) / float(len(top))
+
+    def discovery_recall(top: set[tuple[int, int]]) -> float:
+        if not top:
+            return 1.0
+        return len(top & discovery_candidate_set) / float(len(top))
 
     return CandidateBatch(
         qr=qr_arr,
@@ -184,6 +275,19 @@ def build_candidate_batch(
         recall_winning_move=recall(winning_set),
         recall_forced_block=recall(forced_set),
         recall_two_placement_cover=recall(cover_set),
+        discovery_top1=discovery_recall(target_top1),
+        discovery_top4=discovery_recall(target_top4),
+        discovery_top8=discovery_recall(target_top8),
+        discovery_winning_move=discovery_recall(winning_set),
+        discovery_forced_block=discovery_recall(forced_set),
+        discovery_two_placement_cover=discovery_recall(cover_set),
+        discovery_open_four=discovery_recall(open_four_set),
+        discovery_open_five=discovery_recall(open_five_set),
+        recall_open_four=recall(open_four_set),
+        recall_open_five=recall(open_five_set),
+        critical_count=critical_count,
+        critical_overflow_count=overflow,
+        critical_overflow_examples=overflow_examples,
     )
 
 
@@ -193,6 +297,8 @@ def _canonical_pair(
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     a = (int(a[0]), int(a[1]))
     b = (int(b[0]), int(b[1]))
+    if a == b:
+        raise ValueError(f"duplicate coordinates are illegal for pair policy: {a}")
     return (a, b) if a <= b else (b, a)
 
 
@@ -201,19 +307,59 @@ def build_pair_candidate_batch(
     pair_policy_target_v2: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
     *,
     budget: int,
+    candidate_mask: Sequence[bool] | None = None,
+    legal_moves: Sequence[tuple[int, int]] | None = None,
 ) -> PairCandidateBatch:
-    """Build a bounded pair-action target over candidate row indices."""
-    budget = max(1, int(budget))
-    candidate_list = _unique_qr((int(q), int(r)) for q, r in candidate_qr)
-    candidate_index = {qr: i for i, qr in enumerate(candidate_list)}
+    """Build a bounded unordered pair-action target over candidate row indices.
 
+    Target pairs may be missing from the candidate table; that is represented
+    as missing mass. Duplicated cells and pairs outside the supplied legal set
+    are contract violations and fail early.
+    """
+    budget = max(1, int(budget))
+    if candidate_mask is None:
+        mask_iter = [True] * len(candidate_qr)
+    else:
+        mask_iter = [bool(x) for x in candidate_mask]
+        if len(mask_iter) != len(candidate_qr):
+            raise ValueError(
+                f"candidate_mask length {len(mask_iter)} does not match candidate_qr length {len(candidate_qr)}"
+            )
+    candidate_list: list[tuple[int, int]] = []
+    candidate_index: dict[tuple[int, int], int] = {}
+    for row, (qr_raw, keep) in enumerate(zip(candidate_qr, mask_iter)):
+        if not keep:
+            continue
+        qr = _as_qr(qr_raw)
+        if qr in candidate_index:
+            raise ValueError(f"duplicate active candidate row for pair policy: {qr}")
+        candidate_index[qr] = row
+        candidate_list.append(qr)
+
+    legal_set = (
+        set(_unique_qr(_as_qr(move) for move in legal_moves))
+        if legal_moves is not None
+        else None
+    )
     target_map: dict[tuple[tuple[int, int], tuple[int, int]], float] = {}
     protected: list[tuple[tuple[int, int], tuple[int, int]]] = []
     total_target_mass = 0.0
     for a, b, prob in pair_policy_target_v2:
         if prob <= 0.0:
             continue
-        key = _canonical_pair(a, b)
+        first = _as_qr(a)
+        second = _as_qr(b)
+        key = _canonical_pair(first, second)
+        if legal_set is not None:
+            first_legal = first in legal_set
+            second_legal = second in legal_set
+            if not (first_legal and second_legal):
+                # Second-placement targets are ordered as
+                # `(known_first, legal_second)`. The known first stone is not a
+                # current legal move, so legacy candidate-pair scouts count it
+                # as missing mass instead of rejecting the record.
+                if first_legal == second_legal:
+                    raise ValueError(f"pair policy target contains illegal action pair: {key}")
         total_target_mass += float(prob)
         target_map[key] = target_map.get(key, 0.0) + float(prob)
         if key[0] in candidate_index and key[1] in candidate_index and key[0] != key[1]:

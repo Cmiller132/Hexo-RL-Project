@@ -51,7 +51,7 @@ class SelfPlayOrchestrator:
         self._buffer = RingBuffer(
             capacity=buffer_capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -67,6 +67,7 @@ class SelfPlayOrchestrator:
         self._positions_done = 0
         self._start_time = 0.0
         self._stats_lock = threading.Lock()
+        self._rgsc_totals: dict[str, float] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -210,6 +211,14 @@ class SelfPlayOrchestrator:
             with self._stats_lock:
                 self._games_done += 1
                 self._positions_done += len(valid_positions)
+                for key, value in getattr(game_record, "rgsc_metrics", {}).items():
+                    if key == "rgsc_prb_size":
+                        self._rgsc_totals[key] = max(
+                            self._rgsc_totals.get(key, 0.0),
+                            float(value),
+                        )
+                    else:
+                        self._rgsc_totals[key] = self._rgsc_totals.get(key, 0.0) + float(value)
 
         except Exception as e:
             logger.error(f"Failed to ingest game: {e}")
@@ -221,7 +230,7 @@ class SelfPlayOrchestrator:
         """Return current orchestrator statistics."""
         elapsed = max(time.monotonic() - self._start_time, 0.1)
         with self._stats_lock:
-            return {
+            stats = {
                 "games_done": self._games_done,
                 "positions_done": self._positions_done,
                 "games_per_min": self._games_done / elapsed * 60.0,
@@ -232,6 +241,8 @@ class SelfPlayOrchestrator:
                 "workers_total": len(self._workers),
                 "elapsed_s": elapsed,
             }
+            stats.update(self._rgsc_totals)
+            return stats
 
     @property
     def buffer(self) -> RingBuffer:

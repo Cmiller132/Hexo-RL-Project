@@ -1,10 +1,13 @@
 """Pydantic configuration schema."""
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List
+import warnings
 
 
 class RunConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     seed: int = 42
     output_dir: str = "./runs/{name}"
     log_level: str = "INFO"
@@ -12,6 +15,8 @@ class RunConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     channels: int = 128
     blocks: int = 16
     heads: List[str] = Field(default_factory=lambda: ["policy", "value"])
@@ -29,12 +34,33 @@ class ModelConfig(BaseModel):
     candidate_budget: int = 256
     sparse_prior_stage: int = 0
     sparse_prior_mix: float = 0.25
+    pair_prior_mix: float = 0.35
 
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
         arch = self.architecture.lower()
-        if arch not in {"cnn", "restnet", "graph"}:
-            raise ValueError("model.architecture must be 'cnn', 'restnet', or 'graph'")
+        global_architectures = {
+            "global_graph_option1",
+            "global_xattn_0",
+            "global_line_window_0",
+            "global_pair_twostage_0",
+            "global_graph_full_0",
+            "global_hybrid_action_0",
+            "global_graph768_champion",
+        }
+        if arch == "graph":
+            warnings.warn(
+                "model.architecture='graph' is a deprecated crop-compatible alias; "
+                "normalizing to 'graph_hybrid_0'. Use a global_graph_* architecture "
+                "for the first-class global graph contract.",
+                stacklevel=2,
+            )
+            arch = "graph_hybrid_0"
+        if arch not in {"cnn", "restnet", "graph_hybrid_0", *global_architectures}:
+            raise ValueError(
+                "model.architecture must be cnn, restnet, graph_hybrid_0, "
+                "or a global_graph_option1 family architecture"
+            )
         self.architecture = arch
         if self.blocks <= 0:
             raise ValueError("model.blocks must be positive")
@@ -42,7 +68,7 @@ class ModelConfig(BaseModel):
             raise ValueError("model.channels must be positive")
         if self.attention_heads <= 0:
             raise ValueError("model.attention_heads must be positive")
-        if (arch in {"restnet", "graph"} or self.attention_positions) and self.channels % self.attention_heads != 0:
+        if (arch in {"restnet", "graph_hybrid_0", *global_architectures} or self.attention_positions) and self.channels % self.attention_heads != 0:
             raise ValueError("model.channels must be divisible by model.attention_heads")
         if self.attention_mlp_ratio <= 0.0:
             raise ValueError("model.attention_mlp_ratio must be positive")
@@ -75,6 +101,8 @@ class ModelConfig(BaseModel):
             raise ValueError("model.sparse_prior_stage must be 0, 1, or 2")
         if not 0.0 <= self.sparse_prior_mix <= 1.0:
             raise ValueError("model.sparse_prior_mix must be in [0, 1]")
+        if not 0.0 <= self.pair_prior_mix <= 1.0:
+            raise ValueError("model.pair_prior_mix must be in [0, 1]")
         invalid_positions = [
             pos for pos in self.attention_positions if pos < 1 or pos > self.blocks
         ]
@@ -85,12 +113,14 @@ class ModelConfig(BaseModel):
             )
         if arch == "cnn" and self.attention_positions:
             raise ValueError("model.attention_positions require architecture='restnet'")
-        if arch == "graph" and self.attention_positions:
+        if arch in {"graph_hybrid_0", *global_architectures} and self.attention_positions:
             raise ValueError("model.attention_positions are only used by architecture='restnet'")
         return self
 
 
 class SelfPlayConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     num_workers: int = 24
     games_per_epoch: int = 4096
     states_per_epoch: int = 400_000
@@ -110,9 +140,15 @@ class SelfPlayConfig(BaseModel):
     constrain_threats: bool = True
     subtree_reuse: bool = False
     train_on_truncated_games: bool = False
+    rgsc_beta: float = 0.0
+    rgsc_prb_capacity: int = 100
+    rgsc_prb_temperature: float = 0.1
+    rgsc_prb_ema_alpha: float = 0.5
 
 
 class InferenceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     max_batch_size: int = 128
     max_wait_us: int = 200
     fp16: bool = True
@@ -120,15 +156,20 @@ class InferenceConfig(BaseModel):
 
 
 class BufferConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     capacity: int = 2_000_000
     recency_decay: float = 0.99
     pcr_weight: float = 0.25
     regret_fraction: float = 0.08
+    regret_replay_only: bool = True
     lookahead_horizons: List[int] = Field(default_factory=lambda: [4, 12, 36])
     lookahead_lambdas: List[float] = Field(default_factory=lambda: [0.75, 0.90, 0.97])
 
 
 class TrainConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     batch_size: int = 256
     batches_per_epoch: int = 2000
     prefetch_batches: int = 2
@@ -136,10 +177,10 @@ class TrainConfig(BaseModel):
     lr_schedule: str = "cosine"
     peak_lr: float = 3e-3
     weight_decay: float = 1e-4
-    loss_weights: dict = Field(default_factory=lambda: {
+    loss_weights: dict[str, float] = Field(default_factory=lambda: {
         "policy": 1.0,
         "value": 1.5,
-        "lookahead_6": 0.15,
+        "lookahead_4": 0.15,
         "lookahead_12": 0.15,
         "lookahead_36": 0.1,
         "regret_rank": 0.1,
@@ -152,6 +193,8 @@ class TrainConfig(BaseModel):
 
 
 class Config(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     run: RunConfig = Field(default_factory=RunConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     selfplay: SelfPlayConfig = Field(default_factory=SelfPlayConfig)
@@ -177,8 +220,13 @@ class Config(BaseModel):
                 "model lookahead heads must match buffer.lookahead_horizons; "
                 f"missing horizons for heads: {missing_horizons}"
             )
-        if "pair_policy" in self.model.heads and not self.model.sparse_policy:
-            self.model.sparse_policy = True
+        if ("sparse_policy" in self.model.heads or "pair_policy" in self.model.heads) and not self.model.sparse_policy:
+            raise ValueError(
+                "model heads sparse_policy/pair_policy require explicit model.sparse_policy = true; "
+                "the config is not auto-mutated"
+            )
+        if "pair_policy" in self.model.heads and self.model.pair_prior_mix <= 0.0:
+            raise ValueError("pair_policy head requires model.pair_prior_mix > 0 so MCTS consumes pair priors")
         if self.model.sparse_policy and max(
             self.model.candidate_budget,
             self.selfplay.policy_target_top_k,
@@ -187,16 +235,98 @@ class Config(BaseModel):
                 "sparse policy effective candidate width must be <= 512 "
                 "(max(model.candidate_budget, selfplay.policy_target_top_k))"
             )
-        if self.model.sparse_policy and "sparse_policy" not in self.train.loss_weights:
-            self.train.loss_weights["sparse_policy"] = 0.25
-        if "pair_policy" in self.model.heads:
-            if "pair_policy" not in self.train.loss_weights:
-                self.train.loss_weights["pair_policy"] = 0.05
+        trainable_heads = {
+            "policy",
+            "sparse_policy",
+            "pair_policy",
+            "opp_policy",
+            "value",
+            "regret_rank",
+            "regret_value",
+            "axis",
+            "axis_delta_norm",
+            "moves_left",
+            "policy_place",
+            "policy_pair_first",
+            "policy_pair_second",
+            "policy_pair_joint",
+            "legal_token_quality",
+            "tactical",
+        }
+        global_architectures = {
+            "global_graph_option1",
+            "global_xattn_0",
+            "global_line_window_0",
+            "global_pair_twostage_0",
+            "global_graph_full_0",
+            "global_hybrid_action_0",
+            "global_graph768_champion",
+        }
+        if self.model.architecture in global_architectures:
+            graph_defaults = {
+                "policy_place": self.train.loss_weights.get("policy", 1.0),
+                "policy_pair_first": self.train.loss_weights.get("pair_policy", 0.05),
+                "policy_pair_second": self.train.loss_weights.get("pair_policy", 0.05),
+                "policy_pair_joint": self.train.loss_weights.get("pair_policy", 0.05),
+                "opp_policy": self.train.loss_weights.get("opp_policy", 0.15),
+                "value": self.train.loss_weights.get("value", 1.0),
+                "regret_rank": self.train.loss_weights.get("regret_rank", 0.1),
+                "regret_value": self.train.loss_weights.get("regret_value", 0.1),
+                "moves_left": self.train.loss_weights.get("moves_left", 0.05),
+                "tactical": self.train.loss_weights.get("tactical", 0.05),
+                "legal_token_quality": self.train.loss_weights.get("policy", 0.05),
+            }
+            for name, weight in graph_defaults.items():
+                self.train.loss_weights.setdefault(name, weight)
+            for horizon in self.buffer.lookahead_horizons:
+                name = f"lookahead_{horizon}"
+                self.train.loss_weights.setdefault(name, self.train.loss_weights.get("value", 1.0) * 0.1)
+            graph_auto_heads = set(self.model.heads) | {
+                f"lookahead_{h}" for h in self.buffer.lookahead_horizons
+            }
+        else:
+            graph_auto_heads = set(self.model.heads)
+        missing_or_inactive = sorted(
+            head
+            for head in graph_auto_heads
+            if (head in trainable_heads or head.startswith("lookahead_"))
+            and float(self.train.loss_weights.get(head, 0.0)) <= 0.0
+        )
+        if missing_or_inactive:
+            raise ValueError(
+                "enabled model heads require active train.loss_weights entries; "
+                f"missing or inactive: {missing_or_inactive}"
+            )
+        regret_heads_active = all(
+            head in self.model.heads and float(self.train.loss_weights.get(head, 0.0)) > 0.0
+            for head in ("regret_rank", "regret_value")
+        )
+        if (
+            self.buffer.regret_fraction > 0.0
+            and not self.buffer.regret_replay_only
+            and not regret_heads_active
+        ):
+            raise ValueError(
+                "buffer.regret_fraction > 0 requires enabled and weighted regret heads "
+                "or buffer.regret_replay_only = true"
+            )
+        if self.model.sparse_prior_stage > 0 and not self.model.sparse_policy:
+            raise ValueError("model.sparse_prior_stage > 0 requires model.sparse_policy = true")
+        if not 0.0 <= self.selfplay.rgsc_beta <= 1.0:
+            raise ValueError("selfplay.rgsc_beta must be in [0, 1]")
+        if self.selfplay.rgsc_prb_capacity < 0:
+            raise ValueError("selfplay.rgsc_prb_capacity must be non-negative")
+        if self.selfplay.rgsc_prb_temperature <= 0.0:
+            raise ValueError("selfplay.rgsc_prb_temperature must be positive")
+        if not 0.0 <= self.selfplay.rgsc_prb_ema_alpha <= 1.0:
+            raise ValueError("selfplay.rgsc_prb_ema_alpha must be in [0, 1]")
 
         return self
 
 
 class RuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     """Host-aware performance knobs.
 
     Values left as ``None`` are filled in by the runtime autotuner. This keeps

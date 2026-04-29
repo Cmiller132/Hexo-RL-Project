@@ -11,6 +11,12 @@ import numpy as np
 import torch
 
 from hexorl.config import Config
+from hexorl.action_contract.candidates import (
+    CANDIDATE_FEATURE_NAMES,
+    CANDIDATE_FEATURE_VERSION,
+    build_candidate_batch,
+    build_pair_candidate_batch,
+)
 from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
@@ -77,18 +83,98 @@ class ModelCache:
             .unsqueeze(0)
             .to(device=cached.device, dtype=model_input_dtype(cached.model))
         )
+        model_sparse = bool(getattr(cached.model, "sparse_policy_enabled", False))
+        model_pair = getattr(cached.model, "pair_policy_head", None) is not None
+        candidate_payload: dict[str, Any] | None = None
+        forward_kwargs: dict[str, torch.Tensor] = {}
+        if (model_sparse or model_pair) and len(arr) > 0:
+            cand = build_candidate_batch(
+                [(int(q), int(r)) for q, r in arr],
+                [],
+                offset_q=int(offset_q),
+                offset_r=int(offset_r),
+                budget=min(max(len(arr), 1), 512),
+            )
+            candidate_payload = {
+                "qr": cand.qr,
+                "mask": cand.mask,
+            }
+            forward_kwargs = {
+                "candidate_indices": torch.from_numpy(cand.indices.reshape(1, -1)).to(cached.device),
+                "candidate_features": torch.from_numpy(cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1])).to(cached.device),
+                "candidate_mask": torch.from_numpy(cand.mask.reshape(1, -1)).to(cached.device),
+            }
+            if model_pair:
+                pair_budget = min(max((int(cand.mask.sum()) * max(int(cand.mask.sum()) - 1, 0)) // 2, 1), 512)
+                pair = build_pair_candidate_batch(
+                    cand.qr,
+                    [],
+                    budget=pair_budget,
+                    candidate_mask=cand.mask,
+                    legal_moves=[(int(q), int(r)) for q, r in arr],
+                )
+                candidate_payload["pair_indices"] = pair.pair_indices
+                candidate_payload["pair_mask"] = pair.mask
+                forward_kwargs["pair_candidate_indices"] = torch.from_numpy(
+                    pair.pair_indices.reshape(1, pair.pair_indices.shape[0], 2)
+                ).to(cached.device)
+                forward_kwargs["pair_candidate_mask"] = torch.from_numpy(
+                    pair.mask.reshape(1, -1)
+                ).to(cached.device)
         with torch.no_grad():
-            out = cached.model(x)
+            out = cached.model(x, **forward_kwargs) if forward_kwargs else cached.model(x)
         result: dict[str, Any] = {
             "model_id": model_id,
             "legal_moves": [{"q": int(q), "r": int(r)} for q, r in arr],
             "outside_window_legal_count": len(outside_legal),
             "outside_window_legal_moves": outside_legal[:32],
+            "candidate_contract": {
+                "feature_version": CANDIDATE_FEATURE_VERSION,
+                "feature_names": list(CANDIDATE_FEATURE_NAMES),
+            },
             "heads": {},
         }
         if "policy" in out:
             logits = out["policy"][0].detach().cpu().numpy()
             result["heads"]["policy"] = policy_debug(logits, legal_mask)
+        if "sparse_policy" in out and candidate_payload is not None:
+            sparse_logits = out["sparse_policy"][0].detach().float().cpu().numpy()
+            mask = candidate_payload["mask"]
+            qr = candidate_payload["qr"]
+            valid_rows = np.where(mask)[0]
+            if valid_rows.size:
+                top_rows = valid_rows[np.argsort(-sparse_logits[valid_rows])[:16]]
+                result["heads"]["sparse_policy"] = [
+                    {
+                        "q": int(qr[row, 0]),
+                        "r": int(qr[row, 1]),
+                        "logit": float(sparse_logits[row]),
+                    }
+                    for row in top_rows
+                ]
+        if "pair_policy" in out and candidate_payload is not None:
+            pair_logits = out["pair_policy"][0].detach().float().cpu().numpy()
+            pair_mask = candidate_payload.get("pair_mask")
+            pair_indices = candidate_payload.get("pair_indices")
+            qr = candidate_payload["qr"]
+            if pair_mask is not None and pair_indices is not None:
+                valid_rows = np.where(pair_mask)[0]
+                if valid_rows.size:
+                    top_rows = valid_rows[np.argsort(-pair_logits[valid_rows])[:16]]
+                    result["heads"]["pair_policy"] = [
+                        {
+                            "first": {
+                                "q": int(qr[int(pair_indices[row, 0]), 0]),
+                                "r": int(qr[int(pair_indices[row, 0]), 1]),
+                            },
+                            "second": {
+                                "q": int(qr[int(pair_indices[row, 1]), 0]),
+                                "r": int(qr[int(pair_indices[row, 1]), 1]),
+                            },
+                            "logit": float(pair_logits[row]),
+                        }
+                        for row in top_rows
+                    ]
         if "value" in out:
             value_logits = out["value"].detach().cpu()
             result["heads"]["value"] = float(cached.model.bins_to_value(value_logits)[0])

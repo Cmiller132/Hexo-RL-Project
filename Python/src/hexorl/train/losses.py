@@ -36,6 +36,27 @@ def value_to_bins_torch(t: torch.Tensor, n_bins: int = 65) -> torch.Tensor:
     return target
 
 
+def scalar_to_bins_torch(
+    t: torch.Tensor,
+    *,
+    n_bins: int = 65,
+    min_value: float,
+    max_value: float,
+) -> torch.Tensor:
+    """Convert continuous scalar targets to soft bins over a fixed range."""
+    values = t.clamp(min_value, max_value)
+    bin_width = (max_value - min_value) / (n_bins - 1)
+    idx = (values - min_value) / bin_width
+    lo = idx.floor().long().clamp(0, n_bins - 1)
+    hi = (lo + 1).clamp(0, n_bins - 1)
+    w_hi = (idx - lo.float()).clamp(0.0, 1.0)
+    w_lo = 1.0 - w_hi
+    target = torch.zeros(t.shape[0], n_bins, device=t.device, dtype=torch.float32)
+    target.scatter_add_(1, lo.unsqueeze(1), w_lo.unsqueeze(1))
+    target.scatter_add_(1, hi.unsqueeze(1), w_hi.unsqueeze(1))
+    return target
+
+
 def binned_value_loss(
     pred_logits: torch.Tensor,
     target_values: torch.Tensor,
@@ -69,6 +90,7 @@ def binned_value_loss(
 def regret_rank_loss(
     scores: torch.Tensor,
     regrets: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact RGSC ranking loss — Equation 7 from arXiv 2602.20809v1.
 
@@ -84,14 +106,16 @@ def regret_rank_loss(
     Returns:
         Scalar loss.
     """
-    # Normalize regrets to [0, 1] so they are comparable to log-probabilities.
-    r_min = regrets.min()
-    r_max = regrets.max()
-    r_range = (r_max - r_min).clamp(min=1e-6)
-    regrets_norm = (regrets - r_min) / r_range
-
+    values = regrets.to(device=scores.device, dtype=scores.dtype)
+    if weight is not None:
+        row_weight = weight.to(device=scores.device, dtype=scores.dtype)
+        valid = row_weight > 0
+        if not torch.any(valid):
+            return scores.sum() * 0.0
+        scores = scores[valid]
+        values = values[valid]
     log_softmax_scores = F.log_softmax(scores, dim=0)
-    combined = log_softmax_scores + regrets_norm
+    combined = log_softmax_scores + values
     loss = -torch.logsumexp(combined, dim=0)
     return loss
 
@@ -100,6 +124,7 @@ def regret_value_loss(
     pred_logits: torch.Tensor,
     target_regret: torch.Tensor,
     n_bins: int = 65,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Binned regret value loss.
 
@@ -111,7 +136,19 @@ def regret_value_loss(
     Returns:
         Scalar loss.
     """
-    return binned_value_loss(pred_logits, target_regret, n_bins)
+    logits = pred_logits.float()
+    regret = target_regret.to(device=logits.device, dtype=logits.dtype)
+    target_bins = scalar_to_bins_torch(regret, n_bins=n_bins, min_value=0.0, max_value=4.0)
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(target_bins * log_probs).sum(dim=-1)
+    if weight is not None:
+        row_weight = weight.to(device=loss.device, dtype=loss.dtype)
+        valid = row_weight > 0
+        if not torch.any(valid):
+            return pred_logits.sum() * 0.0
+        row_weight = row_weight * valid.to(dtype=row_weight.dtype)
+        return (loss * row_weight).sum() / row_weight.sum().clamp(min=1e-6)
+    return loss.mean()
 
 
 def policy_loss(
@@ -180,9 +217,20 @@ def pair_policy_loss(
     return sparse_policy_loss(pred_logits, target_probs, pair_candidate_mask, weight)
 
 
+def graph_policy_loss(
+    pred_logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    row_mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masked cross-entropy for all-legal graph action rows."""
+    return sparse_policy_loss(pred_logits, target_probs, row_mask, weight)
+
+
 def opp_policy_loss(
     pred_logits: torch.Tensor,
     target_probs: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy for opponent policy head (same as policy_loss).
 
@@ -193,7 +241,15 @@ def opp_policy_loss(
     Returns:
         Scalar loss.
     """
-    return policy_loss(pred_logits, target_probs)
+    target = target_probs.to(device=pred_logits.device, dtype=torch.float32)
+    valid = target.sum(dim=-1) > 0
+    if weight is None:
+        row_weight = valid.to(dtype=torch.float32, device=pred_logits.device)
+    else:
+        row_weight = weight.to(device=pred_logits.device, dtype=torch.float32) * valid.to(dtype=torch.float32)
+    if not torch.any(row_weight > 0):
+        return pred_logits.sum() * 0.0
+    return policy_loss(pred_logits, target, row_weight)
 
 
 def axis_loss(
@@ -245,6 +301,22 @@ def moves_left_loss(
         w = weight.to(device=loss.device, dtype=loss.dtype)
         if not torch.any(w > 0):
             return pred.sum() * 0.0
+        return (loss * w).sum() / w.sum().clamp(min=1e-6)
+    return loss.mean()
+
+
+def tactical_loss(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Multi-label tactical state loss for win/block/cover/quiet labels."""
+    labels = target.to(device=pred_logits.device, dtype=pred_logits.dtype)
+    loss = F.binary_cross_entropy_with_logits(pred_logits.float(), labels.float(), reduction="none").mean(dim=-1)
+    if weight is not None:
+        w = weight.to(device=loss.device, dtype=loss.dtype)
+        if not torch.any(w > 0):
+            return pred_logits.sum() * 0.0
         return (loss * w).sum() / w.sum().clamp(min=1e-6)
     return loss.mean()
 
@@ -311,7 +383,7 @@ def compute_losses(
                 pred,
                 targets["sparse_policy_target"],
                 targets["candidate_mask"],
-                targets.get("policy_weight"),
+                targets.get("sparse_policy_weight", targets.get("policy_weight")),
             )
         elif head_name == "pair_policy":
             if "pair_policy_target" not in targets or "pair_candidate_mask" not in targets:
@@ -320,21 +392,79 @@ def compute_losses(
                 pred,
                 targets["pair_policy_target"],
                 targets["pair_candidate_mask"],
+                targets.get("pair_policy_weight", targets.get("policy_weight")),
+            )
+        elif head_name == "policy_place":
+            if "policy_target" not in targets or "legal_mask" not in targets:
+                continue
+            loss = graph_policy_loss(
+                pred,
+                targets["policy_target"],
+                targets["legal_mask"],
                 targets.get("policy_weight"),
             )
+        elif head_name == "legal_token_quality":
+            if "legal_mask" not in targets:
+                continue
+            quality_target = targets.get("legal_token_quality_target", targets.get("policy_target"))
+            if quality_target is None:
+                continue
+            loss = sparse_policy_loss(
+                pred,
+                quality_target,
+                targets["legal_mask"],
+                targets.get("policy_weight"),
+            )
+        elif head_name == "policy_pair_first":
+            first_target = targets.get("pair_first_policy_target", targets.get("policy_target"))
+            if first_target is None or "legal_mask" not in targets:
+                continue
+            loss = graph_policy_loss(
+                pred,
+                first_target,
+                targets["legal_mask"],
+                targets.get("pair_policy_weight", targets.get("policy_weight")),
+            )
+        elif head_name in {"policy_pair_second", "policy_pair_joint"}:
+            if "pair_policy_target" not in targets or "pair_token_indices" not in targets:
+                continue
+            pair_mask = targets["pair_token_indices"] >= 0
+            loss = graph_policy_loss(
+                pred,
+                targets["pair_policy_target"],
+                pair_mask,
+                targets.get("pair_policy_weight", targets.get("policy_weight")),
+            )
         elif head_name == "opp_policy":
-            target = targets.get("opp_policy", targets.get("policy"))
+            target = targets.get("opp_policy_target", targets.get("opp_policy", targets.get("policy")))
             if target is None:
                 continue
-            loss = opp_policy_loss(pred, target)
+            if "opp_legal_mask" in targets and pred.shape == targets["opp_legal_mask"].shape:
+                loss = graph_policy_loss(
+                    pred,
+                    target,
+                    targets["opp_legal_mask"],
+                    targets.get("opp_policy_weight"),
+                )
+            else:
+                loss = opp_policy_loss(pred, target, targets.get("opp_policy_weight"))
         elif head_name == "value":
             loss = binned_value_loss(pred, targets["value"], n_bins, targets.get("value_weight"))
         elif head_name.startswith("lookahead_"):
             loss = binned_value_loss(pred, targets[head_name], n_bins)
         elif head_name == "regret_rank":
-            loss = regret_rank_loss(pred.squeeze(-1), targets["regret_rank"])
+            loss = regret_rank_loss(
+                pred.squeeze(-1),
+                targets["regret_rank"],
+                targets.get("regret_weight"),
+            )
         elif head_name == "regret_value":
-            loss = regret_value_loss(pred, targets["regret_value"], n_bins)
+            loss = regret_value_loss(
+                pred,
+                targets["regret_value"],
+                n_bins,
+                targets.get("regret_weight"),
+            )
         elif head_name == "axis":
             loss = axis_loss(pred, targets.get("axis"))
         elif head_name == "axis_delta_norm":
@@ -344,13 +474,19 @@ def compute_losses(
             loss = axis_map_loss(pred, target)
         elif head_name == "moves_left":
             loss = moves_left_loss(pred, targets["moves_left"], targets.get("moves_left_weight"))
+        elif head_name == "tactical":
+            target = targets.get("tactical_target")
+            if target is None:
+                continue
+            loss = tactical_loss(pred, target, targets.get("policy_weight"))
         else:
             continue
 
         per_head[head_name] = weight * loss
 
-    if "policy" in predictions and "entropy" in loss_weights:
-        ent = entropy_loss(predictions["policy"])
+    entropy_head = "policy" if "policy" in predictions else "policy_place" if "policy_place" in predictions else None
+    if entropy_head is not None and "entropy" in loss_weights:
+        ent = entropy_loss(predictions[entropy_head])
         per_head["entropy"] = loss_weights["entropy"] * ent
 
     if not per_head:

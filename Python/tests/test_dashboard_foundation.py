@@ -1,3 +1,4 @@
+import base64
 import json
 import struct
 
@@ -5,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint
@@ -12,6 +14,7 @@ from hexorl.dashboard.db import DashboardStore
 from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical_fixtures
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
 from hexorl.dashboard.recorder import RunRecorder
+from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png
 from hexorl.eval.players import NoisyModelPlayer, NoisyPolicyConfig
 from hexorl.eval.arena import ArenaStats, MatchResult
 from hexorl.model.network import HexNet
@@ -45,6 +48,26 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     assert len(positions) == 2
     assert positions[0]["policy_json"]
     assert (tmp_path / "events.jsonl").exists()
+
+
+def test_match_snapshot_renderer_outputs_png_bytes():
+    history = (
+        _move(0, 0, 0)
+        + _move(1, 1, 0)
+        + _move(1, 1, -1)
+        + _move(0, -1, 0)
+        + _move(0, -1, 1)
+    )
+
+    png = render_match_snapshot_png(
+        history,
+        options=MatchSnapshotOptions(width=420, height=320, title="unit snapshot"),
+        metadata={"run_id": "unit-run", "game_id": 3, "source": "unit"},
+    )
+
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert b"IHDR" in png[:32]
+    assert len(png) > 1000
 
 
 def test_checkpoint_indexing_extracts_current_hexorl_metadata(tmp_path):
@@ -236,6 +259,10 @@ def test_fastapi_dashboard_smoke(tmp_path):
     assert games[0]["move_count"] == 1
     assert games[0]["payload"] == {"fixture": True}
     assert "final_history_b64" not in games[0]
+    snapshot = client.get(f"/api/games/{games[0]['game_id']}/snapshot.png?width=360&height=280")
+    assert snapshot.status_code == 200
+    assert snapshot.headers["content-type"] == "image/png"
+    assert snapshot.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert client.get("/api/axis/prototypes").json()
     created = client.post("/api/session/create", json={}).json()
     assert created["session_id"]
@@ -269,6 +296,8 @@ def test_fastapi_dashboard_smoke(tmp_path):
 
 
 def test_suite_dashboard_scores_and_stage_fallback(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
 
     from hexorl.dashboard.app import create_app
@@ -332,6 +361,64 @@ def test_suite_dashboard_scores_and_stage_fallback(tmp_path):
     status = client.get("/api/suite/status").json()
     assert status["latest_stage"] == "3B_static_asha"
     assert status["best_score"] == pytest.approx(0.4242)
+
+
+def test_dashboard_debug_contract_and_graph_endpoints(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing"))
+    contracts = client.get("/api/debug/contracts").json()
+    assert contracts["candidate"]["feature_version"] == CANDIDATE_FEATURE_VERSION
+    assert contracts["candidate"]["feature_names"] == list(CANDIDATE_FEATURE_NAMES)
+    assert contracts["graph"]["schema_version"] >= 1
+    assert "LEGAL" in contracts["graph"]["token_types"]
+
+    history = _move(0, 0, 0) + _move(1, 1, 0)
+    payload = {"history_b64": base64.b64encode(history).decode("ascii")}
+    graph = client.post("/api/debug/graph", json=payload).json()
+    assert graph["legal_count"] > 0
+    assert graph["token_counts"]["LEGAL"] == graph["legal_count"]
+    assert graph["relation_schema_version"] >= 1
+
+    d6 = client.post("/api/debug/d6", json=payload).json()
+    assert d6["symmetry_count"] == 12
+    assert len(d6["transforms"]) == 12
+    assert all(item["graph"]["legal_count"] == item["legal_count"] for item in d6["transforms"])
+    first = d6["transforms"][0]["contracts"]
+    assert first["dense_legal_mask"]["legal_count"] == d6["transforms"][0]["legal_count"]
+    assert first["sparse_candidates"]["feature_version"] == CANDIDATE_FEATURE_VERSION
+    assert first["axis"]["prototype_count"] > 0
+    assert "graph_targets" in first
+
+
+def test_dashboard_pair_policy_inference_returns_pair_logits(tmp_path):
+    pytest.importorskip("_engine")
+    from hexorl.dashboard.model_cache import CachedModel, ModelCache
+
+    model = HexNet(
+        channels=4,
+        blocks=1,
+        heads=["policy", "value", "pair_policy"],
+    )
+    cache = ModelCache()
+    cache._models["pair-unit"] = CachedModel(
+        "pair-unit",
+        tmp_path / "in-memory.pt",
+        model,
+        torch.device("cpu"),
+    )
+    cache._order.append("pair-unit")
+
+    result = cache.infer_history("pair-unit", _move(0, 0, 0))
+
+    assert result["heads"]["pair_policy"]
+    top = result["heads"]["pair_policy"][0]
+    assert {"first", "second", "logit"} <= set(top)
+    assert top["first"] != top["second"]
 
 
 def test_noisy_model_player_reproducible_without_engine():

@@ -8,9 +8,11 @@ Runs CPU-side on completed game records. Computes:
     opponent policy, regret rank/value, dominant axis, and moves-left.
 """
 
+from bisect import bisect_right
 import numpy as np
 from typing import List, Tuple, Optional
-from hexorl.selfplay.records import GameRecord, PositionRecord, pair_policy_v2_from_place_target
+from hexorl.graph.batch import legal_moves_for_stones, parse_history
+from hexorl.selfplay.records import GameRecord, PositionRecord
 
 
 def compute_value_targets(
@@ -33,18 +35,32 @@ def compute_value_targets(
         pos.outcome = outcome
 
 
-def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
-    """Return indices of positions that are turn boundaries.
+def value_from_source_perspective(
+    value: float,
+    source_player: int,
+    target_player: int,
+) -> float:
+    """Convert a two-player zero-sum value to another player's perspective."""
+    return float(value) if source_player == target_player else -float(value)
 
-    In Hexo, a turn boundary is a position where a new full turn starts.
-    Since players alternate every placement, boundaries occur every 2
-    placements: indices 0, 2, 4, ...
+
+def hexo_turn_start_indices(positions: List[PositionRecord]) -> List[int]:
+    """Return indices of positions that start Hexo turns.
+
+    In Hexo, the opening turn has one placement and later turns have two
+    placements by the same player. Boundaries are therefore player-run starts,
+    e.g. players [0, 1, 1, 0, 0] -> indices [0, 1, 3].
     """
-    boundaries = []
-    for i, pos in enumerate(positions):
-        if pos.turn_index % 2 == 0:
-            boundaries.append(i)
-    return boundaries
+    return [
+        i
+        for i, pos in enumerate(positions)
+        if i == 0 or pos.player != positions[i - 1].player
+    ]
+
+
+def _turn_boundary_indices(positions: List[PositionRecord]) -> List[int]:
+    """Backward-compatible alias for hexo_turn_start_indices."""
+    return hexo_turn_start_indices(positions)
 
 
 def compute_ema_lookahead(
@@ -75,26 +91,20 @@ def compute_ema_lookahead(
     if n == 0:
         return np.array([], dtype=np.float32)
 
-    boundaries = _turn_boundary_indices(positions)
+    boundaries = hexo_turn_start_indices(positions)
     mcts_values = np.array([pos.root_value for pos in positions], dtype=np.float32)
     result = np.copy(mcts_values)
 
     for i in range(n - 1, -1, -1):
-        try:
-            bi = boundaries.index(i)
-        except ValueError:
-            bi = 0
-            for b in boundaries:
-                if b >= i:
-                    bi = boundaries.index(b)
-                    break
-            else:
-                bi = len(boundaries) - 1
-
-        target_bi = bi + horizon
+        target_bi = bisect_right(boundaries, i) + horizon - 1
         if target_bi < len(boundaries):
             j = boundaries[target_bi]
-            result[i] = (1.0 - lambda_) * mcts_values[i] + lambda_ * result[j]
+            future = value_from_source_perspective(
+                result[j],
+                source_player=positions[j].player,
+                target_player=positions[i].player,
+            )
+            result[i] = (1.0 - lambda_) * mcts_values[i] + lambda_ * future
         else:
             result[i] = mcts_values[i]
 
@@ -178,34 +188,115 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
         return
 
     for i, pos in enumerate(positions):
-        if i + 1 < total:
-            pos.opp_policy_target = dict(positions[i + 1].policy_target)
-            pos.opp_policy_target_v2 = list(getattr(positions[i + 1], "policy_target_v2", []))
+        if getattr(record, "truncated", False) or float(record.outcome) == 0.0:
+            pos.value_weight = 0.0
+        opp_idx = _next_full_search_opponent_turn_start(positions, i)
+        if opp_idx is not None:
+            opp = positions[opp_idx]
+            pos.opp_policy_target = dict(opp.policy_target)
+            pos.opp_policy_target_v2 = list(getattr(opp, "policy_target_v2", []))
+            pos.opp_policy_legal_v2 = _legal_qr_from_history(opp.move_history)
+            pos.opp_policy_weight = float(
+                getattr(opp, "policy_weight", 1.0 if getattr(opp, "is_full_search", False) else 0.0)
+            )
         else:
             pos.opp_policy_target = {}
             pos.opp_policy_target_v2 = []
-        if not pos.pair_policy_target_v2 and pos.policy_target_v2:
-            pos.pair_policy_target_v2 = pair_policy_v2_from_place_target(pos.policy_target_v2)
-        perspective_outcome = record.outcome if pos.player == 0 else -record.outcome
+            pos.opp_policy_legal_v2 = []
+            pos.opp_policy_weight = 0.0
+        if not pos.pair_policy_target_v2:
+            pos.pair_policy_target_v2 = _real_pair_policy_target(positions, i)
         tail = positions[i:]
-        regret = sum(
-            (
-                p.root_value
-                - (record.outcome if p.player == 0 else -record.outcome)
-            ) ** 2
-            for p in tail
-        ) / max(len(tail), 1)
+        regret_weight = 0.0 if getattr(record, "truncated", False) else 1.0
+        if any(p.selected_action_value is None for p in tail):
+            regret = 0.0
+            regret_weight = 0.0
+        else:
+            regret = sum(
+                (
+                    float(p.selected_action_value)
+                    - value_from_source_perspective(
+                        record.outcome,
+                        source_player=0,
+                        target_player=p.player,
+                    )
+                ) ** 2
+                for p in tail
+            ) / max(len(tail), 1)
         pos.regret_rank = float(regret)
-        pos.regret_value = float(max(-1.0, min(1.0, 2.0 * regret - 1.0)))
+        pos.regret_value = float(regret)
+        pos.regret_weight = float(regret_weight)
         pos.moves_left = float(max(total - pos.turn_index, 0))
         if pos.outcome is None:
-            pos.outcome = perspective_outcome if pos.player == 0 else -perspective_outcome
+            pos.outcome = record.outcome
 
     winner = 0 if record.outcome > 0 else 1 if record.outcome < 0 else None
     axis_history = record.final_move_history or positions[-1].move_history
     axis = _dominant_axis_label(axis_history, winner)
     for pos in positions:
         pos.axis_label = axis
+
+
+def _legal_qr_from_history(history: bytes) -> List[Tuple[int, int]]:
+    stones = {(q, r): player for player, q, r in parse_history(history)}
+    return legal_moves_for_stones(stones, radius=8)
+
+
+def _last_move_qr(history: bytes) -> Tuple[int, int] | None:
+    if len(history) < 12:
+        return None
+    moves = parse_history(history)
+    if not moves:
+        return None
+    _player, q, r = moves[-1]
+    return (int(q), int(r))
+
+
+def _history_len(history: bytes) -> int:
+    return len(history) // 12
+
+
+def _real_pair_policy_target(
+    positions: List[PositionRecord],
+    index: int,
+) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
+    pos = positions[index]
+    if not pos.policy_target_v2:
+        return []
+    legal = set(_legal_qr_from_history(pos.move_history))
+    if len(legal) <= 1:
+        return []
+    # Second placement: the known first move is the final move in this history.
+    if index > 0 and positions[index - 1].player == pos.player:
+        first = _last_move_qr(pos.move_history)
+        if first is None:
+            return []
+        return [
+            (first, (int(q), int(r)), float(prob))
+            for q, r, prob in pos.policy_target_v2
+            if float(prob) > 0.0 and (int(q), int(r)) in legal and (int(q), int(r)) != first
+        ]
+    # First-placement joint pair targets must come from the root MCTS joint
+    # table recorded during self-play.  Reconstructing them from the sampled
+    # next state only labels one observed first move and is not an all-legal
+    # joint prior.
+    return []
+
+
+def _next_full_search_opponent_turn_start(
+    positions: List[PositionRecord],
+    i: int,
+) -> int | None:
+    """Return the next opponent turn-start index with a full-search target."""
+    player = positions[i].player
+    for j in range(i + 1, len(positions)):
+        if positions[j].player == player:
+            continue
+        if j > 0 and positions[j - 1].player == positions[j].player:
+            continue
+        if positions[j].is_full_search:
+            return j
+    return None
 
 
 def _dominant_axis_label(history_bytes: bytes, winner: int | None) -> int:

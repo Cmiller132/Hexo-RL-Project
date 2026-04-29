@@ -32,7 +32,6 @@ from hexorl.selfplay.records import (
     PositionRecord,
     action_to_board_index,
     dense_policy_from_v2,
-    pair_policy_v2_from_place_target,
 )
 from hexorl.train.trainer import Trainer
 from hexorl.dashboard.recorder import RunRecorder
@@ -98,7 +97,7 @@ def run_epoch(
         else RingBuffer(
             capacity=cfg.buffer.capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -157,12 +156,17 @@ def run_epoch(
             batch_size=cfg.train.batch_size,
             recency_decay=cfg.buffer.recency_decay,
             pcr_weight=cfg.buffer.pcr_weight,
-            use_symmetry=not bool(getattr(cfg.model, "sparse_policy", False)),
+            use_symmetry=True,
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             regret_fraction=cfg.buffer.regret_fraction,
             include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
-            include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False) or "pair_policy" in cfg.model.heads),
+            include_sparse_policy=bool(
+                getattr(cfg.model, "sparse_policy", False)
+                or "sparse_policy" in cfg.model.heads
+                or "pair_policy" in cfg.model.heads
+            ),
             include_pair_policy="pair_policy" in cfg.model.heads,
+            include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
             candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
             max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
         )
@@ -275,7 +279,7 @@ def run_tiny_training_smoke(
         capacity=cfg.buffer.capacity,
         recency_decay=cfg.buffer.recency_decay,
         num_lookahead=1,
-        max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+        max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
     )
     replay.extend(_make_bootstrap_positions(cfg, 16))
 
@@ -284,11 +288,16 @@ def run_tiny_training_smoke(
         batch_size=cfg.train.batch_size,
         recency_decay=cfg.buffer.recency_decay,
         pcr_weight=cfg.buffer.pcr_weight,
-        use_symmetry=not bool(getattr(cfg.model, "sparse_policy", False)),
+        use_symmetry=True,
         lookahead_horizons=cfg.buffer.lookahead_horizons,
         regret_fraction=cfg.buffer.regret_fraction,
-        include_sparse_policy=bool(getattr(cfg.model, "sparse_policy", False) or "pair_policy" in cfg.model.heads),
+        include_sparse_policy=bool(
+            getattr(cfg.model, "sparse_policy", False)
+            or "sparse_policy" in cfg.model.heads
+            or "pair_policy" in cfg.model.heads
+        ),
         include_pair_policy="pair_policy" in cfg.model.heads,
+        include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
         candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
     )
     num_workers = dataloader_worker_count(cfg)
@@ -385,10 +394,6 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
                     move_history=_pack_moves(moves),
                     policy_target=policy,
                     policy_target_v2=policy_v2,
-                    pair_policy_target_v2=pair_policy_v2_from_place_target(
-                        policy_v2,
-                        top_k=min(max(1, cfg.model.candidate_budget), 32),
-                    ),
                     target_policy_mass_outside_window=outside_mass,
                     root_value=value_hint,
                     player=player,
@@ -434,7 +439,7 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
         truncated=(terminal_reason != "win"),
         terminal_reason=terminal_reason,
     )
-    game.assign_outcomes()
+    process_game_record(game)
     return game
 
 
@@ -467,10 +472,6 @@ def _make_fallback_bootstrap_game(
                 move_history=_pack_moves(moves),
                 policy_target=policy,
                 policy_target_v2=policy_v2,
-                pair_policy_target_v2=pair_policy_v2_from_place_target(
-                    policy_v2,
-                    top_k=min(max(1, cfg.model.candidate_budget), 32),
-                ),
                 target_policy_mass_outside_window=outside_mass,
                 root_value=float(rng.uniform(-0.25, 0.25)),
                 player=current_player,

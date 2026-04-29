@@ -23,8 +23,6 @@ dirichlet_fraction = 0.25
 pcr_low_sim_prob = 0.5
 pcr_low_sims = 64
 train_on_truncated_games = true
-resign_threshold = -0.95
-resign_disable_prob = 0.1
 
 [inference]
 max_batch_size = 0

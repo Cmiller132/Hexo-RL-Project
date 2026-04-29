@@ -77,6 +77,111 @@ failure_map:
 These outputs are consumed directly by Phase 2. Phase 3 should not tune the
 transformer until these baselines and diagnostics exist.
 
+## 2026-04-28 Implementation Completeness Audit
+
+Current status:
+
+```text
+ResTNet crop architecture: partial scout implementation
+candidate/action-keyed policy path: partial scout implementation
+Phase 1 diagnostics and gates: partial implementation
+```
+
+This is not a failure of the plan; it is a naming and completion boundary. The
+current code has enough ResTNet-like machinery to run a useful crop scout, but
+it must not be treated as a finished, paper-faithful, Hexo-optimized ResTNet
+adaptation until the requirements below are satisfied.
+
+### ResTNet Completeness Requirements
+
+The current `architecture = "restnet"` path interleaves `SpatialTransformerBlock`
+modules into the existing 33x33 crop trunk. That gives attention inside the
+crop, but the implementation is still compromised in these ways:
+
+- convolution blocks use ordinary square `3x3` convolutions, so the two
+  hex-distance-2 corner kernel entries are still active unless a hex-masked
+  convolution is added;
+- coordinate encoding is a square `(q,r)` mesh over crop indices, not a
+  complete axial/hex geometry encoding with `(q,r,s)`, hex distance, and
+  symmetry-aware relative geometry;
+- `relative_bias = true` is rejected by config validation, so the documented
+  `rest_128_3_rel` control is not actually implemented;
+- the attention MLP is a plain SiLU MLP, not a true SwiGLU/GEGLU-style gated
+  feed-forward block;
+- attention is full-crop attention over a centroid window, so it cannot solve
+  outside-window or separated-cluster failures by construction;
+- there is no ResTNet-specific D6/equivariance check showing that attention,
+  coordinate features, and axis targets transform consistently.
+
+No-compromise finished ResTNet contract:
+
+```text
+hex-masked local trunk
+axial/cube coordinate features
+tested D6-consistent coordinate and axis transforms
+implemented relative-position bias ablation
+gated feed-forward block as specified
+documented attention placement grid
+throughput/strength scorecard against matched CNN baseline
+outside-window failure buckets proving what the crop can and cannot solve
+```
+
+Acceptance tests:
+
+```text
+test_restnet_uses_hex_masked_convolutions
+test_restnet_relative_bias_forward_shapes
+test_restnet_coordinate_encoding_is_d6_consistent
+test_restnet_d6_forward_aug_is_finite
+test_restnet_d6_forward_aug_uses_real_attention_positions
+test_restnet_attention_positions_match_config
+test_restnet_hex_corner_weights_remain_zero_after_optimizer_step
+```
+
+Until those pass, call the implementation `restnet_crop_scout` or describe it
+as "ResTNet-inspired attention inside the existing crop." It can still be a
+valid Phase 1 baseline, but not a completed ResTNet adaptation.
+
+The documented `rest_128_3_rel` row is planned work until
+`relative_bias = true` can pass config validation and a forward/loss smoke test.
+Do not include it in runnable grids or reports as if it already exists.
+
+### Candidate/Action Contract Completeness Requirements
+
+The current sparse/action-keyed path proves that `(q,r)` targets and sparse
+logits can flow through training and MCTS. It is still incomplete as a final
+action-contract scout unless it satisfies the hard rules already stated later
+in this document:
+
+- candidate recall must be reported in both protected-training mode and live
+  discovery mode;
+- full-board tactical oracle outputs must be used, not only crop-visible hot
+  planes;
+- critical actions must override normal candidate budgets and overflow must be
+  a failing diagnostic, not a silent truncation;
+- sparse prior source telemetry must prove whether MCTS used sparse, dense, or
+  fallback priors at root and leaf expansion;
+- pair-turn policy must become an active two-placement search signal when
+  enabled, not only a diagnostic target.
+
+Acceptance tests:
+
+```text
+test_candidate_discovery_recall_does_not_include_target_only_actions
+test_full_board_oracle_finds_outside_crop_wins_and_blocks
+test_critical_candidate_overflow_is_a_hard_gate
+test_sparse_prior_source_counters_are_nonzero_when_stage_enabled
+test_pair_policy_shapes_two_placement_mcts_when_enabled
+```
+
+Promotion rule:
+
+```text
+Do not mark Phase 1 complete because the code can train.
+Mark it complete only when the ResTNet crop scout, action-keyed policy scout,
+and diagnostics all satisfy their acceptance gates.
+```
+
 ## System A: Best Current `33x33` Baseline
 
 The current model remains the first control. Do not let Phase 2 compare a new
@@ -155,7 +260,7 @@ Default settings:
 |---|---|---:|---|---|
 | `rest_128_2` | `128x16` | `2` | `5,10` | low-risk attention scout |
 | `rest_128_3` | `128x16` | `3` | `5,10,14` | main ResTNet candidate |
-| `rest_128_3_rel` | `128x16` | `3` | `5,10,14` | relative-bias control |
+| `rest_128_3_rel` | `128x16` | `3` | `5,10,14` | planned relative-bias control once implemented |
 | `rest_160_3` | `160x20` | `3` | `6,12,18` | capacity-matched candidate |
 
 Decision rules:
@@ -391,7 +496,9 @@ a fair control.
 
 1. Add the window/action instrumentation to the existing baseline.
 2. Run `base_128x16` and `base_160x20` enough to choose `best_current_33`.
-3. Run `rest_128_2`, `rest_128_3`, `rest_128_3_rel`, and `rest_160_3`.
+3. Run `rest_128_2`, `rest_128_3`, and `rest_160_3`. Add
+   `rest_128_3_rel` only after the relative-bias implementation and tests
+   exist.
 4. Add `policy_target_v2` and candidate recall reporting.
 5. Train `candidate_policy_33` offline from the same replay pool.
 6. If recall gates pass, test sparse-prior mixing in MCTS.

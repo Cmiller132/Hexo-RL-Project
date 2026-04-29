@@ -3,8 +3,8 @@
 This implements the plan in Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md:
 
 * Phase 3A finalist import/calibration.
-* Phase 3B ASHA-style static narrowing.
-* Phase 3C PBT schedule search.
+* Phase 3B ASHA/BOHB static narrowing.
+* Phase 3C PB2 schedule search, with explicit PBT fallback when requested.
 * Phase 3D protected champion training.
 * Phase 3E final arena/checkpoint selection.
 
@@ -41,10 +41,22 @@ from hexorl.dashboard.recorder import RunRecorder
 from hexorl.epoch import run_epoch
 from hexorl.eval.arena import load_checkpoint_model, model_move_fn, run_arena
 from hexorl.eval.classical import classical_opponent_fn
+from hexorl.eval.checkpoint_league import CheckpointLeague
+from hexorl.eval.tactical_suite import evaluate_tactical_suite
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
+from hexorl.selfplay.records import BOARD_AREA
+from hexorl.tuning import (
+    ASHARungTable,
+    BOHBSampler,
+    PB2Observation,
+    PB2Scheduler,
+    SearchSpace,
+    TrialObservation,
+)
 
 
 LOGGER = logging.getLogger("phase3_autotune")
+FULL_GLOBAL_POLICY_ROWS = BOARD_AREA
 
 
 HEAD_BUNDLES: dict[str, list[str]] = {
@@ -149,7 +161,7 @@ DYNAMIC_CENTER = {
 PHASE_FRACTIONS = {
     "3A_calibration": 4.0 / 48.0,
     "3B_static_asha": 12.0 / 48.0,
-    "3C_pbt": 16.0 / 48.0,
+    "3C_schedule_search": 16.0 / 48.0,
     "3D_champion": 12.0 / 48.0,
     "3E_final": 4.0 / 48.0,
 }
@@ -207,6 +219,7 @@ class StaticRecipe:
     graph_token_budget: int = 256
     graph_layers: int = 1
     sparse_prior_stage: int = 0
+    train_batch_size: int = 256
 
 
 @dataclass
@@ -298,6 +311,29 @@ class Phase3Supervisor:
                 raise ValueError(f"Unknown --family-filter finalist(s): {', '.join(missing)}")
         self.blocked_families: dict[str, str] = {}
         self._apply_host_runtime_family_guards()
+        asha_resources = tuple(self._asha_resources())
+        self.asha_table = ASHARungTable(
+            resources=asha_resources,
+            promotion_fraction=float(args.asha_promote_fraction),
+        )
+        self.bohb_sampler = BOHBSampler(
+            self._bohb_search_space(),
+            min_resource=min(asha_resources),
+            max_resource=max(asha_resources),
+            eta=2,
+            warmup_points=max(3, min(6, int(args.max_active_trials))),
+            random_fraction=float(args.bohb_random_fraction),
+        )
+        self.pb2_scheduler = PB2Scheduler(
+            {name: tuple(bounds) for name, bounds in DYNAMIC_RANGES.items()},
+            uncertainty_weight=float(args.pb2_uncertainty_weight),
+            parameter_conditions={
+                "sparse_policy_loss": {"key": "sparse_policy", "values": [True]},
+                "pair_policy_loss": {"key": "pair_policy", "values": [True]},
+                "graph_aux_multiplier": {"key": "graph", "values": [True]},
+                "regret_fraction": {"key": "regret_heads", "values": [True]},
+            },
+        )
         self.trials: list[TrialState] = []
         self.baseline_loss_p75 = {True: 128.0, False: 128.0}
         self.reference_checkpoints = self._reference_checkpoints()
@@ -314,7 +350,7 @@ class Phase3Supervisor:
         try:
             self.phase_3a_calibration()
             self.phase_3b_static_asha()
-            self.phase_3c_pbt()
+            self.phase_3c_schedule_search()
             self.phase_3d_champion()
             self.phase_3e_final()
             self._write_report(final=True)
@@ -418,28 +454,44 @@ class Phase3Supervisor:
                     self._train_trial_epoch(trial, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
                 if not trial.pruned:
                     self._evaluate_trial(trial, stage=stage, force=True)
-            current = self._promote_top_fraction(current, stage=stage)
+            self._score_population(current, stage=stage)
+            self._record_asha_rung(current, resource)
+            decision = self.asha_table.decision_for(resource)
+            self.asha_table.save(self.output_root / "asha_rungs.json")
+            current = self._apply_asha_decision(current, decision, stage=stage)
         self._save_state()
 
-    def phase_3c_pbt(self) -> None:
-        stage = "3C_pbt"
-        self.log.write("stage_start", {"stage": stage})
+    def phase_3c_schedule_search(self) -> None:
+        deadline_stage = "3C_schedule_search"
+        stage = "3C_pb2" if self.args.schedule_method == "pb2" else "3C_pbt_fallback"
+        self.log.write("stage_start", {"stage": stage, "schedule_method": self.args.schedule_method})
         population = self._seed_pbt_population()
         generation = 0
-        while self._within_stage(stage) and generation < self.args.pbt_generations and population:
+        while self._within_stage(deadline_stage) and generation < self.args.pbt_generations and population:
             generation += 1
-            self.log.write("pbt_generation_start", {"generation": generation, "population": [t.trial_id for t in population]})
+            self.log.write(
+                "schedule_generation_start",
+                {
+                    "generation": generation,
+                    "source_method": self.args.schedule_method,
+                    "population": [t.trial_id for t in population],
+                },
+            )
             for trial in population:
                 if trial.pruned:
                     continue
                 for _ in range(self.args.perturb_interval):
-                    if trial.pruned or not self._within_stage(stage):
+                    if trial.pruned or not self._within_stage(deadline_stage):
                         break
                     self._train_trial_epoch(trial, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
                 if not trial.pruned:
                     self._evaluate_trial(trial, stage=stage, force=True)
             self._score_population(population, stage=stage)
-            self._pbt_exploit_explore(population, generation)
+            if self.args.schedule_method == "pb2":
+                self._pb2_exploit_explore(population, generation)
+                self.pb2_scheduler.save(self.output_root / "pb2_scheduler.json")
+            else:
+                self._pbt_exploit_explore(population, generation)
             self._save_state()
 
     def phase_3d_champion(self) -> None:
@@ -505,7 +557,7 @@ class Phase3Supervisor:
         replay = RingBuffer(
             capacity=cfg.buffer.capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, FULL_GLOBAL_POLICY_ROWS),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
         )
@@ -619,8 +671,18 @@ class Phase3Supervisor:
 
     def _clone_compatible_trial(self, src: TrialState, dst: TrialState, generation: int) -> bool:
         if src.compatible_key != dst.compatible_key or src.checkpoint_path is None:
+            self.log.write(
+                "scheduler_clone_rejected",
+                {
+                    "generation": generation,
+                    "source_method": self.args.schedule_method,
+                    "from": src.trial_id,
+                    "to": dst.trial_id,
+                    "reason": "incompatible_or_missing_checkpoint",
+                },
+            )
             return False
-        dst.replay = src.replay
+        dst.replay = self._fresh_replay_for_trial(dst)
         dst.checkpoint_path = src.checkpoint_path
         if dst.trainer is not None:
             dst.trainer.load_checkpoint(src.checkpoint_path)
@@ -628,16 +690,21 @@ class Phase3Supervisor:
         event = {
             "generation": generation,
             "event": "exploit",
+            "source_method": self.args.schedule_method,
             "from": src.trial_id,
             "to": dst.trial_id,
             "checkpoint_path": str(src.checkpoint_path),
+            "compatible_key": str(src.compatible_key),
+            "shared_mutable_replay": False,
+            "replay_transfer": "fresh_empty_after_checkpoint_exploit",
         }
         dst.mutation_history.append(event)
-        self.log.write("pbt_exploit", event)
+        self.log.write("scheduler_exploit", event)
         return True
 
     def _mutate_trial(self, trial: TrialState, generation: int) -> None:
         old = asdict(trial.dynamic)
+        clamped: dict[str, bool] = {}
         for field_name, value in old.items():
             if field_name == "dirichlet_alpha_mode":
                 if self.rng.random() < 0.20:
@@ -648,21 +715,39 @@ class Phase3Supervisor:
             lo, hi = DYNAMIC_RANGES[field_name]
             if self.rng.random() < 0.20:
                 new_value = self.rng.uniform(lo, hi)
+                clamped[field_name] = False
             else:
                 new_value = float(value) * self.rng.choice([0.8, 1.2])
+                unclamped = new_value
                 new_value = max(lo, min(hi, new_value))
+                clamped[field_name] = new_value != unclamped
             setattr(trial.dynamic, field_name, new_value)
         self._apply_dynamic_to_config(trial)
         self._apply_dynamic_to_trainer(trial)
         event = {
             "generation": generation,
             "event": "explore",
+            "source_method": "pbt_baseline",
             "trial_id": trial.trial_id,
             "old": old,
             "new": asdict(trial.dynamic),
+            "clamped": clamped,
         }
         trial.mutation_history.append(event)
-        self.log.write("pbt_explore", event)
+        self.log.write("pbt_baseline_explore", event)
+
+    def _fresh_replay_for_trial(self, trial: TrialState) -> RingBuffer:
+        return RingBuffer(
+            capacity=trial.cfg.buffer.capacity,
+            max_policy_entries=trial.cfg.selfplay.policy_target_top_k,
+            max_policy_v2_entries=max(
+                trial.cfg.selfplay.policy_target_top_k,
+                trial.cfg.model.candidate_budget,
+                FULL_GLOBAL_POLICY_ROWS,
+            ),
+            recency_decay=trial.cfg.buffer.recency_decay,
+            num_lookahead=len(trial.cfg.buffer.lookahead_horizons),
+        )
 
     def _release_trial_runtime(self, trial: TrialState, *, reason: str) -> None:
         replay_capacity = int(getattr(trial.replay, "capacity", 0) or 0)
@@ -673,7 +758,7 @@ class Phase3Supervisor:
             trial.replay = RingBuffer(
                 capacity=1,
                 max_policy_entries=max(1, int(trial.cfg.selfplay.policy_target_top_k)),
-                max_policy_v2_entries=max(1, int(trial.cfg.model.candidate_budget)),
+                max_policy_v2_entries=max(1, int(trial.cfg.model.candidate_budget), FULL_GLOBAL_POLICY_ROWS),
                 recency_decay=trial.cfg.buffer.recency_decay,
                 num_lookahead=len(trial.cfg.buffer.lookahead_horizons),
             )
@@ -698,7 +783,7 @@ class Phase3Supervisor:
     def _initial_dynamic(self, family: FamilySpec) -> DynamicParams:
         dynamic = copy.deepcopy(DynamicParams())
         # Graph and action-keyed sparse heads are new research paths. The doc
-        # LR range is still explored by PBT mutations, but bootstrapping these
+        # LR range is still explored by PB2/PBT schedule mutations, but bootstrapping these
         # families at the CNN center rate can corrupt weights before the first
         # scorecard exists. Start them at the known-stable safety rail and let
         # the population exploit/explore upward only after finite metrics land.
@@ -744,7 +829,7 @@ class Phase3Supervisor:
         cfg.selfplay.num_workers = 0
         cfg.selfplay.batch_size_per_worker = 0
         cfg.inference.max_batch_size = 0
-        cfg.train.batch_size = 0
+        cfg.train.batch_size = int(recipe.train_batch_size)
         cfg.train.batches_per_epoch = self.args.train_batches
         cfg.train.lr_schedule = "constant"
         cfg.runtime.compile_inference = False
@@ -798,7 +883,11 @@ class Phase3Supervisor:
         return Config.model_validate(cfg.model_dump())
 
     def _apply_head_bundle_weights(self, cfg: Config, recipe: StaticRecipe, dynamic: DynamicParams) -> None:
-        aux = dynamic.graph_aux_multiplier if getattr(cfg.model, "architecture", "cnn") == "graph" else dynamic.aux_multiplier
+        aux = (
+            dynamic.graph_aux_multiplier
+            if getattr(cfg.model, "architecture", "cnn") in {"graph", "graph_hybrid_0"}
+            else dynamic.aux_multiplier
+        )
         weights = {
             "policy": 1.0,
             "value": dynamic.value_loss_weight,
@@ -1045,7 +1134,11 @@ class Phase3Supervisor:
         probe_buffer = RingBuffer(
             capacity=probe_cfg.buffer.capacity,
             max_policy_entries=probe_cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(probe_cfg.selfplay.policy_target_top_k, probe_cfg.model.candidate_budget),
+            max_policy_v2_entries=max(
+                probe_cfg.selfplay.policy_target_top_k,
+                probe_cfg.model.candidate_budget,
+                FULL_GLOBAL_POLICY_ROWS,
+            ),
             recency_decay=probe_cfg.buffer.recency_decay,
             num_lookahead=len(probe_cfg.buffer.lookahead_horizons),
         )
@@ -1306,69 +1399,120 @@ class Phase3Supervisor:
 
     def _generate_static_candidates(self, max_trials: int) -> list[tuple[FamilySpec, StaticRecipe]]:
         available = self._eligible_families()
-        by_family: dict[str, list[tuple[FamilySpec, StaticRecipe]]] = {}
-        for family in available:
-            bundles = ["structural", "full_aux_light"]
-            if family.graph:
-                bundles = ["graph_tactical", "full_aux_light"]
-            if family.sparse_policy:
-                bundles.append("prediction")
-            graph_ladder = self._graph_static_ladder() if family.graph else [("graph256_cells", 256, 1, 0)]
-            full_sim_options = [512, 800, 1200, 1600]
-            family_combos: list[tuple[FamilySpec, StaticRecipe]] = [(family, self._recommended_recipe(family))]
-            for full_sims in full_sim_options:
-                for token_set, token_budget, graph_layers, sparse_stage in graph_ladder:
-                    recipe = StaticRecipe(
-                        full_sims=full_sims,
-                        pcr_low_sims=self._pcr_low_sims_for_full_sims(full_sims),
-                        policy_top_k=96,
-                        candidate_budget=token_budget
-                        if family.graph
-                        else (self.rng.choice(STATIC_SPACE["candidate_budget"]) if family.sparse_policy else 256),
-                        head_bundle=self.rng.choice(bundles),
-                        temperature_family=self.rng.choice(STATIC_SPACE["temperature_family"]),
-                        subtree_reuse=True,
-                        graph_token_set=token_set,
-                        graph_token_budget=token_budget,
-                        graph_layers=graph_layers,
-                        sparse_prior_stage=sparse_stage,
-                    )
-                    family_combos.append((family, recipe))
-            # Deduplicate recommended recipes that also appear in the ladder,
-            # then shuffle within the family. The outer scheduler below keeps
-            # the active pool family-balanced.
-            deduped: dict[tuple[Any, ...], tuple[FamilySpec, StaticRecipe]] = {}
-            for item_family, item_recipe in family_combos:
-                deduped[
-                    (
-                        item_recipe.full_sims,
-                        item_recipe.pcr_low_sims,
-                        item_recipe.policy_top_k,
-                        item_recipe.candidate_budget,
-                        item_recipe.head_bundle,
-                        item_recipe.temperature_family,
-                        item_recipe.graph_token_set,
-                        item_recipe.graph_token_budget,
-                        item_recipe.graph_layers,
-                        item_recipe.sparse_prior_stage,
-                    )
-                ] = (item_family, item_recipe)
-            family_items = list(deduped.values())
-            self.rng.shuffle(family_items)
-            by_family[family.name] = family_items
+        by_name = {family.name: family for family in available}
         combos: list[tuple[FamilySpec, StaticRecipe]] = []
-        family_names = [family.name for family in available]
-        cursor = 0
-        while len(combos) < max_trials and any(by_family.get(name) for name in family_names):
-            name = family_names[cursor % max(1, len(family_names))]
-            bucket = by_family.get(name) or []
-            if bucket:
-                combos.append(bucket.pop(0))
-            cursor += 1
-        # Ensure every documented discrete value is represented in the manifest,
-        # while ASHA keeps the active pool small as required by the plan.
-        _write_json(self.output_root / "static_search_space.json", STATIC_SPACE)
+        seen: set[str] = set()
+        for family in available:
+            recipe = self._recommended_recipe(family)
+            key = json.dumps({"family": family.name, "recipe": asdict(recipe)}, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            combos.append((family, recipe))
+            if len(combos) >= max_trials:
+                break
+        attempts = 0
+        while len(combos) < max_trials and attempts < max_trials * 8 and by_name:
+            attempts += 1
+            record = self.bohb_sampler.sample(seed=self.args.seed + attempts)
+            config = record["config"]
+            family = by_name.get(config.get("model_family"))
+            if family is None:
+                continue
+            recipe = self._static_recipe_from_bohb_config(family, config)
+            key = json.dumps({"family": family.name, "recipe": asdict(recipe)}, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            combos.append((family, recipe))
+        if len(combos) < min(max_trials, len(available)):
+            for family in available:
+                recipe = self._recommended_recipe(family)
+                key = json.dumps({"family": family.name, "recipe": asdict(recipe)}, sort_keys=True)
+                if key not in seen:
+                    combos.append((family, recipe))
+                    seen.add(key)
+                if len(combos) >= max_trials:
+                    break
+        self.bohb_sampler.save(self.output_root / "bohb_sampler.json")
+        _write_json(
+            self.output_root / "static_search_space.json",
+            {
+                "planned": STATIC_SPACE,
+                "actual_bohb_space": self.bohb_sampler.search_space.parameters,
+                "blocked_families": self.blocked_families,
+            },
+        )
         return combos[:max_trials]
+
+    def _bohb_search_space(self) -> SearchSpace:
+        family_names = [family.name for family in self._eligible_families()]
+        if not family_names:
+            family_names = [family.name for family in self.families]
+        return SearchSpace(
+            {
+                "model_family": {"type": "categorical", "choices": family_names},
+                "full_sims": {"type": "categorical", "choices": STATIC_SPACE["full_sims"]},
+                "candidate_budget": {"type": "categorical", "choices": [128, 256, 384]},
+                "policy_top_k": {"type": "categorical", "choices": [64, 96, 128]},
+                "head_bundle": {"type": "categorical", "choices": list(HEAD_BUNDLES)},
+                "temperature_family": {"type": "categorical", "choices": STATIC_SPACE["temperature_family"]},
+                "train_batch_size": {"type": "categorical", "choices": [128, 256, 384]},
+                "graph_token_budget": {
+                    "type": "categorical",
+                    "choices": [256, 384, 512],
+                    "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
+                },
+                "graph_layers": {
+                    "type": "categorical",
+                    "choices": [1, 2, 3],
+                    "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
+                },
+                "sparse_prior_stage": {
+                    "type": "categorical",
+                    "choices": [0, 1],
+                    "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
+                },
+            }
+        )
+
+    def _static_recipe_from_bohb_config(self, family: FamilySpec, config: dict[str, Any]) -> StaticRecipe:
+        full_sims = int(config.get("full_sims", 256 if family.graph else 800))
+        graph_budget = int(config.get("graph_token_budget", 256))
+        graph_layers = int(config.get("graph_layers", 1))
+        sparse_stage = int(config.get("sparse_prior_stage", 0 if not family.graph else 0))
+        if not family.graph:
+            sparse_stage = 0
+        if family.graph:
+            token_set = {
+                256: "graph256_cells",
+                384: "graph384_windows",
+                512: "graph512_cover",
+            }.get(graph_budget, "graph256_cells")
+        else:
+            token_set = "graph256_cells"
+            graph_budget = 256
+            graph_layers = 1
+        head_bundle = str(config.get("head_bundle", "structural"))
+        if family.graph and head_bundle not in {"graph_tactical", "full_aux_light", "structural"}:
+            head_bundle = "graph_tactical"
+        if not family.graph and head_bundle == "graph_tactical":
+            head_bundle = "full_aux_light"
+        candidate_budget = graph_budget if family.graph else int(config.get("candidate_budget", 256))
+        return StaticRecipe(
+            full_sims=full_sims,
+            pcr_low_sims=self._pcr_low_sims_for_full_sims(full_sims),
+            policy_top_k=int(config.get("policy_top_k", 96)),
+            candidate_budget=candidate_budget,
+            head_bundle=head_bundle,
+            temperature_family=str(config.get("temperature_family", "slow_cool")),
+            subtree_reuse=True,
+            graph_token_set=token_set,
+            graph_token_budget=graph_budget,
+            graph_layers=graph_layers,
+            sparse_prior_stage=sparse_stage,
+            train_batch_size=int(config.get("train_batch_size", 256)),
+        )
 
     def _graph_static_ladder(self) -> list[tuple[str, int, int, int]]:
         """Keep graph ASHA broad, but scale action-keyed priors to the host.
@@ -1524,7 +1668,8 @@ class Phase3Supervisor:
         hard_reasons = (
             "selfplay_generated_no_positions",
             "policy_target_mass_silently_dropped",
-            "candidate_recall_below_gate",
+            "candidate_discovery_below_gate",
+            "decisive_candidate_discovery_below_gate",
             "non_finite_train_metric",
             "train_exception",
             "illegal_or_crash_rate",
@@ -1543,6 +1688,58 @@ class Phase3Supervisor:
             },
         )
         self._prune_trials_for_family(family, reason, stage=stage)
+
+    def _record_asha_rung(self, trials: list[TrialState], resource: int) -> None:
+        for trial in trials:
+            hard_failure = bool(trial.pruned and trial.prune_reason)
+            score = trial.last_score if math.isfinite(trial.last_score) else float("-inf")
+            latest = trial.metrics_history[-1] if trial.metrics_history else {}
+            self.asha_table.record(
+                TrialObservation(
+                    trial_id=trial.trial_id,
+                    resource=int(resource),
+                    score=float(score),
+                    completed_epochs=int(trial.epoch),
+                    wall_time_seconds=float(trial.wall_time_s),
+                    selfplay_positions=int(
+                        (latest.get("selfplay") or {}).get("positions_done")
+                        or (latest.get("buffer") or {}).get("size")
+                        or 0
+                    ),
+                    hard_failure=hard_failure,
+                    failure_reason=trial.prune_reason or None,
+                    metrics={
+                        "scheduler_score": float(score) if math.isfinite(score) else -1e9,
+                        "epoch_seconds": float(latest.get("epoch_elapsed_s", 0.0) or 0.0),
+                    },
+                )
+            )
+
+    def _apply_asha_decision(
+        self,
+        trials: list[TrialState],
+        decision: dict[str, Any],
+        *,
+        stage: str,
+    ) -> list[TrialState]:
+        promoted = set(decision["promoted"])
+        quarantined = set(decision["quarantined"])
+        for trial in trials:
+            if trial.trial_id in promoted:
+                continue
+            if trial.trial_id in quarantined:
+                trial.pruned = True
+                trial.prune_reason = trial.prune_reason or f"asha_quarantined_resource_{decision['resource']}"
+            else:
+                trial.pruned = True
+                trial.prune_reason = f"asha_not_promoted_resource_{decision['resource']}"
+            self.log.write(
+                "trial_pruned",
+                {"trial_id": trial.trial_id, "stage": stage, "reason": trial.prune_reason},
+            )
+            self._release_trial_runtime(trial, reason=trial.prune_reason)
+        self.log.write("asha_promoted", {"stage": stage, **decision})
+        return [trial for trial in trials if trial.trial_id in promoted and not trial.pruned]
 
     def _promote_top_fraction(self, trials: list[TrialState], *, stage: str) -> list[TrialState]:
         live = [t for t in trials if not t.pruned]
@@ -1599,7 +1796,14 @@ class Phase3Supervisor:
         while not asha_survivors and len(population) < min(self.args.pbt_population, len(eligible)):
             family = eligible[len(population)]
             recipe = self._recommended_recipe(family)
-            trial = self._create_trial(f"pbt_seed_{len(population):02d}_{family.name}", family, recipe, self._initial_dynamic(family), "3C_pbt")
+            stage = "3C_pb2" if self.args.schedule_method == "pb2" else "3C_pbt_fallback"
+            trial = self._create_trial(
+                f"{self.args.schedule_method}_seed_{len(population):02d}_{family.name}",
+                family,
+                recipe,
+                self._initial_dynamic(family),
+                stage,
+            )
             self.trials.append(trial)
             population.append(trial)
         return population
@@ -1618,12 +1822,97 @@ class Phase3Supervisor:
                 self._clone_compatible_trial(donor, loser, generation)
             self._mutate_trial(loser, generation)
 
+    def _pb2_exploit_explore(self, population: list[TrialState], generation: int) -> None:
+        live = [t for t in population if not t.pruned and t.score_history]
+        if len(live) < 2:
+            return
+        for trial in live:
+            self.pb2_scheduler.observe(
+                PB2Observation(
+                    trial_id=trial.trial_id,
+                    epoch=int(trial.epoch),
+                    params=self._dynamic_params_for_pb2(trial),
+                    score=float(trial.last_score),
+                    compatible_group=self._pb2_group(trial),
+                )
+            )
+        live.sort(key=lambda t: t.last_score, reverse=True)
+        quartile = max(1, len(live) // 4)
+        top = live[:quartile]
+        bottom = live[-quartile:]
+        for loser in bottom:
+            donor = self._compatible_donor(loser, top)
+            if donor is None:
+                self.log.write(
+                    "pb2_clone_rejected",
+                    {
+                        "generation": generation,
+                        "trial_id": loser.trial_id,
+                        "reason": "no_compatible_donor",
+                    },
+                )
+                continue
+            if not self._clone_compatible_trial(donor, loser, generation):
+                continue
+            try:
+                event = self.pb2_scheduler.propose(
+                    self._dynamic_params_for_pb2(loser),
+                    seed=self.args.seed + generation * 1009 + len(loser.mutation_history),
+                    compatible_group=self._pb2_group(loser),
+                    candidates=int(self.args.pb2_candidates),
+                    context=self._pb2_context(loser),
+                    epoch=int(loser.epoch + self.args.perturb_interval),
+                )
+            except Exception as exc:
+                self.log.write(
+                    "pb2_mutation_rejected",
+                    {
+                        "generation": generation,
+                        "trial_id": loser.trial_id,
+                        "reason": f"{type(exc).__name__}:{exc}",
+                    },
+                )
+                continue
+            self._apply_pb2_values(loser, event["final_values"])
+            mutation_event = {
+                "generation": generation,
+                "event": "pb2_explore",
+                "trial_id": loser.trial_id,
+                **event,
+            }
+            loser.mutation_history.append(mutation_event)
+            self.log.write("pb2_explore", mutation_event)
+
     def _compatible_donor(self, loser: TrialState, top: list[TrialState]) -> TrialState | None:
         compatible = [t for t in top if t.compatible_key == loser.compatible_key and t is not loser]
         if compatible:
             return compatible[0]
         same_family = [t for t in top if t.family.compatible_key == loser.family.compatible_key and t is not loser]
         return same_family[0] if same_family else None
+
+    def _dynamic_params_for_pb2(self, trial: TrialState) -> dict[str, float]:
+        values = asdict(trial.dynamic)
+        return {name: float(values[name]) for name in DYNAMIC_RANGES if name in values}
+
+    def _apply_pb2_values(self, trial: TrialState, values: dict[str, float]) -> None:
+        for name, value in values.items():
+            if name not in DYNAMIC_RANGES:
+                continue
+            lo, hi = DYNAMIC_RANGES[name]
+            setattr(trial.dynamic, name, max(float(lo), min(float(hi), float(value))))
+        self._apply_dynamic_to_config(trial)
+        self._apply_dynamic_to_trainer(trial)
+
+    def _pb2_group(self, trial: TrialState) -> str:
+        return "|".join(str(item) for item in trial.compatible_key)
+
+    def _pb2_context(self, trial: TrialState) -> dict[str, Any]:
+        return {
+            "sparse_policy": bool(trial.family.sparse_policy),
+            "pair_policy": "pair_policy" in trial.cfg.model.heads,
+            "graph": bool(trial.family.graph),
+            "regret_heads": any(head.startswith("regret_") for head in trial.cfg.model.heads),
+        }
 
     # ── Scoring/Pruning ────────────────────────────────────────────────
 
@@ -1647,14 +1936,32 @@ class Phase3Supervisor:
             if not trial.score_history or trial.pruned:
                 continue
             row = trial.score_history[-1]
-            strength = (
-                0.40 * z["league_lcb"].get(id(row), 0.0)
-                + 0.20 * z["outside_window_robustness"].get(id(row), 0.0)
-                + 0.15 * z["tactical_suite_score"].get(id(row), 0.0)
-                + 0.10 * z["classical_survival_score"].get(id(row), 0.0)
-                + 0.10 * z["value_calibration_score"].get(id(row), 0.0)
-                + 0.05 * z["policy_target_quality"].get(id(row), 0.0)
-            )
+            epoch = int(row.get("epoch", 0) or 0)
+            if epoch < int(self.args.strategy_score_min_epochs):
+                strength = (
+                    0.45 * z["policy_target_quality"].get(id(row), 0.0)
+                    + 0.35 * z["value_calibration_score"].get(id(row), 0.0)
+                    + 0.20 * z["outside_window_robustness"].get(id(row), 0.0)
+                )
+                score_mode = "health_warmup"
+            elif epoch < int(self.args.classical_score_min_epochs):
+                strength = (
+                    0.30 * z["tactical_suite_score"].get(id(row), 0.0)
+                    + 0.25 * z["outside_window_robustness"].get(id(row), 0.0)
+                    + 0.25 * z["policy_target_quality"].get(id(row), 0.0)
+                    + 0.20 * z["value_calibration_score"].get(id(row), 0.0)
+                )
+                score_mode = "pre_classical_strategy"
+            else:
+                strength = (
+                    0.40 * z["league_lcb"].get(id(row), 0.0)
+                    + 0.20 * z["outside_window_robustness"].get(id(row), 0.0)
+                    + 0.15 * z["tactical_suite_score"].get(id(row), 0.0)
+                    + 0.10 * z["classical_survival_score"].get(id(row), 0.0)
+                    + 0.10 * z["value_calibration_score"].get(id(row), 0.0)
+                    + 0.05 * z["policy_target_quality"].get(id(row), 0.0)
+                )
+                score_mode = "classical_strategy"
             scheduler = (
                 strength
                 - 0.10 * z["epoch_seconds"].get(id(row), 0.0)
@@ -1664,7 +1971,39 @@ class Phase3Supervisor:
             row["strength_score"] = strength
             row["scheduler_score"] = scheduler
             row["score_stage"] = stage
+            row["score_mode"] = score_mode
             self.log.write("score_updated", {"trial_id": trial.trial_id, **row})
+            if stage == "3B_static_asha":
+                self.bohb_sampler.observe(
+                    self._bohb_config_from_trial(trial),
+                    scheduler,
+                    valid=not trial.pruned,
+                    budget=max(1, int(trial.epoch)),
+                    status="completed" if not trial.pruned else "pruned",
+                    reason=trial.prune_reason or None,
+                )
+        if stage == "3B_static_asha":
+            self.bohb_sampler.save(self.output_root / "bohb_sampler.json")
+
+    def _bohb_config_from_trial(self, trial: TrialState) -> dict[str, Any]:
+        payload = {
+            "model_family": trial.family.name,
+            "full_sims": int(trial.static.full_sims),
+            "candidate_budget": int(trial.static.candidate_budget),
+            "policy_top_k": int(trial.static.policy_top_k),
+            "head_bundle": trial.static.head_bundle,
+            "temperature_family": trial.static.temperature_family,
+            "train_batch_size": int(trial.static.train_batch_size),
+        }
+        if trial.family.graph:
+            payload.update(
+                {
+                    "graph_token_budget": int(trial.static.graph_token_budget),
+                    "graph_layers": int(trial.static.graph_layers),
+                    "sparse_prior_stage": int(trial.static.sparse_prior_stage),
+                }
+            )
+        return payload
 
     def _hard_prune_reason(self, trial: TrialState, record: dict[str, Any]) -> str:
         train = record.get("train", {})
@@ -1678,16 +2017,16 @@ class Phase3Supervisor:
         if float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0) > 1e-6:
             return "policy_target_mass_silently_dropped"
         if trial.family.sparse_policy:
-            recall = float(buffer.get("avg_candidate_recall_mcts_top8", 1.0) or 0.0)
-            if record.get("buffer", {}).get("size", 0) > 0 and recall < self.args.candidate_recall_gate:
-                return f"candidate_recall_below_gate:{recall:.4f}"
+            discovery = float(buffer.get("candidate_discovery_top8", 0.0) or 0.0)
+            if record.get("buffer", {}).get("size", 0) > 0 and discovery < self.args.candidate_recall_gate:
+                return f"candidate_discovery_below_gate:{discovery:.4f}"
             decisive = min(
-                float(buffer.get("avg_candidate_recall_winning_move", 1.0) or 0.0),
-                float(buffer.get("avg_candidate_recall_forced_block", 1.0) or 0.0),
-                float(buffer.get("avg_candidate_recall_two_placement_cover", 1.0) or 0.0),
+                float(buffer.get("candidate_discovery_winning_move", 0.0) or 0.0),
+                float(buffer.get("candidate_discovery_forced_block", 0.0) or 0.0),
+                float(buffer.get("candidate_discovery_two_placement_cover", 0.0) or 0.0),
             )
             if record.get("buffer", {}).get("size", 0) > 0 and decisive < 0.995:
-                return f"decisive_candidate_recall_below_gate:{decisive:.4f}"
+                return f"decisive_candidate_discovery_below_gate:{decisive:.4f}"
         elapsed = float(record.get("epoch_elapsed_s", 0.0) or 0.0)
         ref = max(float(self.args.target_epoch_seconds), 1.0)
         last_score = trial.last_score
@@ -1723,22 +2062,34 @@ class Phase3Supervisor:
         arena = self._arena_checkpoint_vs_classical(ckpt, cfg, games=self.args.final_eval_games, temperature=0.05)
         illegal = float(arena.get("illegal_or_crash_rate", 0.0))
         classical_winrate = float(arena.get("model_win_rate", 0.0))
+        league = CheckpointLeague()
+        for color, record in (arena.get("by_color") or {}).items():
+            games = int(record.get("wins", 0)) + int(record.get("losses", 0)) + int(record.get("draws", 0))
+            if games > 0:
+                league.record_match(
+                    label,
+                    color=color,
+                    wins=int(record.get("wins", 0)),
+                    losses=int(record.get("losses", 0)),
+                    draws=int(record.get("draws", 0)),
+                )
+        league_rating = league.ratings.get(label)
         outside = 0.0
         tactical = classical_winrate
-        league_lcb = classical_winrate - float(arena.get("winrate_std", 0.0))
+        league_lcb = float(league_rating.lcb) if league_rating is not None else classical_winrate - float(arena.get("winrate_std", 0.0))
         final_score = (
-            0.55 * league_lcb
-            + 0.20 * outside
-            + 0.15 * tactical
-            + 0.05 * float(arena.get("classical_survival_score", 0.0))
-            + 0.05 * classical_winrate
-            - 0.10 * illegal
+            league_lcb
+            + 20.0 * outside
+            + 15.0 * tactical
+            + 5.0 * float(arena.get("classical_survival_score", 0.0))
+            - 100.0 * illegal
         )
         return {
             "label": label,
             "checkpoint": str(ckpt),
             "final_score": final_score,
             "final_league_lcb": league_lcb,
+            "final_league_rating": asdict(league_rating) if league_rating is not None else None,
             "final_classical_winrate": classical_winrate,
             "final_classical_survival_score": arena.get("classical_survival_score", 0.0),
             "illegal_or_crash_rate": illegal,
@@ -1803,7 +2154,12 @@ class Phase3Supervisor:
         survival_scores = []
         illegal_or_crash = 0
         loss_moves_by_color: dict[bool, list[int]] = {True: [], False: []}
+        by_color = {
+            "black": {"wins": 0, "losses": 0, "draws": 0},
+            "white": {"wins": 0, "losses": 0, "draws": 0},
+        }
         for result in stats.results:
+            color_key = "black" if result.opening_is_black else "white"
             bad = result.reason.startswith("illegal") or result.reason.startswith("crash") or result.reason == "no_move"
             if bad:
                 illegal_or_crash += 1
@@ -1811,13 +2167,17 @@ class Phase3Supervisor:
             survival_ratio = max(0.0, min(result.moves / max(baseline, 1.0), 1.25))
             if result.winner == 0:
                 score = 1.00 + 0.05 * min(survival_ratio, 1.25)
+                by_color[color_key]["wins"] += 1
             elif result.winner == 1:
                 score = 0.15 + 0.55 * min(survival_ratio, 1.00)
                 loss_moves_by_color[result.opening_is_black].append(result.moves)
+                by_color[color_key]["losses"] += 1
             elif result.reason == "max_moves":
                 score = 0.25 + 0.20 * min(survival_ratio, 1.00)
+                by_color[color_key]["draws"] += 1
             else:
                 score = -0.50
+                by_color[color_key]["losses"] += 1
             survival_scores.append(score)
         for color, moves in loss_moves_by_color.items():
             if moves:
@@ -1832,6 +2192,7 @@ class Phase3Supervisor:
             "avg_moves": stats.avg_moves,
             "games_per_min": stats.games_per_min,
             "reason_counts": stats.reason_counts,
+            "by_color": by_color,
             "classical_survival_score": float(sum(survival_scores) / max(len(survival_scores), 1)),
             "illegal_or_crash_rate": illegal_or_crash / max(stats.total_games, 1),
             "baseline_loss_p75": dict(self.baseline_loss_p75),
@@ -1857,9 +2218,9 @@ class Phase3Supervisor:
                 attention_positions=(5, 10, 14),
             ),
             FamilySpec(
-                "best_graph_option1",
-                "Phase 2 sparse Hex graph Transformer with action-keyed priors.",
-                "graph",
+                "graph_hybrid_0",
+                "Crop-compatible sparse token Transformer hybrid with action-keyed priors.",
+                "graph_hybrid_0",
                 graph=True,
                 sparse_policy=True,
                 available=True,
@@ -1898,8 +2259,10 @@ class Phase3Supervisor:
             "duration_hours": self.args.duration_hours,
             "phase_fractions": PHASE_FRACTIONS,
             "static_space": STATIC_SPACE,
+            "bohb_space": self.bohb_sampler.search_space.parameters,
             "dynamic_ranges": DYNAMIC_RANGES,
             "dynamic_center": DYNAMIC_CENTER,
+            "schedule_method": self.args.schedule_method,
             "families": [asdict(f) for f in self.families],
             "blocked_families": self.blocked_families,
             "fallback_branch": (
@@ -1919,6 +2282,9 @@ class Phase3Supervisor:
             "blocked_families": self.blocked_families,
             "baseline_loss_p75": self.baseline_loss_p75,
             "runtime_sweep_cache_size": len(self.runtime_sweep_cache),
+            "asha_decisions": self.asha_table.replay_decisions(),
+            "bohb_samples": self.bohb_sampler.samples[-10:],
+            "pb2_events": self.pb2_scheduler.events[-10:],
             "trials": [self._trial_public_state(t) for t in self.trials],
         }
         _write_json(self.output_root / "state.json", state)
@@ -1953,7 +2319,8 @@ class Phase3Supervisor:
             f"- final: `{final}`",
             f"- elapsed_s: `{self.elapsed_s():.1f}`",
             f"- doc: `Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md`",
-            f"- fallback branch: graph unavailable, so tuned crop/ResTNet/candidate-policy finalists.",
+            f"- schedule_method: `{self.args.schedule_method}`",
+            f"- fallback branch: `{self._manifest_payload()['fallback_branch']}`",
             "",
             "## Top Trials",
             "",
@@ -1973,7 +2340,10 @@ class Phase3Supervisor:
                 f"- baseline_loss_p75_by_color: `{self.baseline_loss_p75}`",
                 f"- candidate recall gate: `{self.args.candidate_recall_gate}`",
                 f"- graph beat crop/ResTNet: `tracked when graph trials pass hard gates; quarantines={self.blocked_families}`",
-                "- 1200 vs 800 per wall-clock: recorded in ASHA scorecards when both recipes complete",
+                "- BOHB static samples: persisted in `bohb_sampler.json`",
+                "- ASHA rung decisions: persisted in `asha_rungs.json`",
+                "- PB2/PBT schedule events: persisted in `pb2_scheduler.json` for PB2 or trial mutation history for PBT fallback",
+                "- 1200 vs 800 per wall-clock: recorded in ASHA/BOHB scorecards when both recipes complete",
                 "- candidate-policy priors: evaluated through candidate recall, missing mass, sparse loss, and sparse top-1",
                 "- pair policy: `evaluated when graph_tactical head bundles survive hard gates`",
                 "- regret replay: evaluated only for head bundles that include regret heads",
@@ -1981,7 +2351,7 @@ class Phase3Supervisor:
                 "## Remaining Failure Modes",
                 "",
                 "- Final strength remains noisy until Phase 3E completes enough league/classical games.",
-                "- Tactical suite currently uses available replay/arena diagnostics plus named component scorecard; add hand-authored fixtures when present.",
+                "- Tactical suite uses authored replayable fixtures; failed fixture rows are included in trial scorecards.",
             ]
         )
         (self.output_root / "PHASE3_AUTOTUNE_REPORT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2009,6 +2379,7 @@ class EvaluationServices:
 
     def __init__(self, supervisor: Phase3Supervisor):
         self.s = supervisor
+        self.args = supervisor.args
 
     def evaluate_trial(self, trial: TrialState, *, stage: str) -> dict[str, Any]:
         latest = trial.metrics_history[-1] if trial.metrics_history else {}
@@ -2028,15 +2399,22 @@ class EvaluationServices:
         policy_quality = float(train.get("policy_full_search_frac", 0.0) or 0.0) * (
             1.0 - float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
         )
-        league_lcb = float(arena.get("model_win_rate", 0.0)) - float(arena.get("winrate_std", 0.0))
+        raw_league_lcb = float(arena.get("model_win_rate", 0.0)) - float(arena.get("winrate_std", 0.0))
+        raw_classical_survival = float(arena.get("classical_survival_score", 0.0) or 0.0)
+        classical_score_active = int(trial.epoch) >= int(self.args.classical_score_min_epochs)
+        league_lcb = raw_league_lcb if classical_score_active else 0.0
+        classical_survival = raw_classical_survival if classical_score_active else 0.0
         row = {
             "stage": stage,
             "trial_id": trial.trial_id,
             "epoch": trial.epoch,
             "league_lcb": league_lcb,
+            "raw_league_lcb": raw_league_lcb,
             "outside_window_robustness": outside["outside_window_robustness"],
             "tactical_suite_score": tactical["tactical_suite_score"],
-            "classical_survival_score": arena.get("classical_survival_score", 0.0),
+            "classical_survival_score": classical_survival,
+            "raw_classical_survival_score": raw_classical_survival,
+            "classical_score_active": classical_score_active,
             "value_calibration_score": value_calibration,
             "policy_target_quality": policy_quality,
             "epoch_seconds": throughput["epoch_seconds"],
@@ -2058,7 +2436,7 @@ class EvaluationServices:
         )
         row["scheduler_score"] = (
             row["strength_score"]
-            - 0.10 * row["epoch_seconds"] / max(self.s.args.target_epoch_seconds, 1.0)
+            - 0.10 * row["epoch_seconds"] / max(self.args.target_epoch_seconds, 1.0)
             - 0.10 * row["truncation_rate"]
             - 0.20 * row["illegal_or_crash_rate"]
         )
@@ -2067,24 +2445,24 @@ class EvaluationServices:
     def candidate_recall(self, trial: TrialState, buffer: dict[str, Any]) -> dict[str, Any]:
         if not trial.family.sparse_policy:
             return {"applicable": False, "score": 1.0}
-        top1 = float(buffer.get("avg_candidate_recall_mcts_top1", 0.0) or 0.0)
-        top4 = float(buffer.get("avg_candidate_recall_mcts_top4", 0.0) or 0.0)
-        top8 = float(buffer.get("avg_candidate_recall_mcts_top8", 0.0) or 0.0)
-        winning = float(buffer.get("avg_candidate_recall_winning_move", 1.0) or 0.0)
-        forced = float(buffer.get("avg_candidate_recall_forced_block", 1.0) or 0.0)
-        cover = float(buffer.get("avg_candidate_recall_two_placement_cover", 1.0) or 0.0)
+        top1 = float(buffer.get("candidate_discovery_top1", 0.0) or 0.0)
+        top4 = float(buffer.get("candidate_discovery_top4", 0.0) or 0.0)
+        top8 = float(buffer.get("candidate_discovery_top8", 0.0) or 0.0)
+        winning = float(buffer.get("candidate_discovery_winning_move", 0.0) or 0.0)
+        forced = float(buffer.get("candidate_discovery_forced_block", 0.0) or 0.0)
+        cover = float(buffer.get("candidate_discovery_two_placement_cover", 0.0) or 0.0)
         missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
         decisive = min(winning, forced, cover)
         return {
             "applicable": True,
-            "candidate_recall_mcts_top1": top1,
-            "candidate_recall_mcts_top4": top4,
-            "candidate_recall_mcts_top8": top8,
-            "candidate_recall_winning_move": winning,
-            "candidate_recall_forced_block": forced,
-            "candidate_recall_two_placement_cover": cover,
+            "candidate_discovery_top1": top1,
+            "candidate_discovery_top4": top4,
+            "candidate_discovery_top8": top8,
+            "candidate_discovery_winning_move": winning,
+            "candidate_discovery_forced_block": forced,
+            "candidate_discovery_two_placement_cover": cover,
             "missing_target_policy_mass": missing,
-            "gate_pass": top8 >= self.s.args.candidate_recall_gate and decisive >= 0.995 and missing <= 0.01,
+            "gate_pass": top8 >= self.args.candidate_recall_gate and decisive >= 0.995 and missing <= 0.01,
             "score": max(0.0, min(1.0, min(top8, decisive) - missing)),
         }
 
@@ -2095,21 +2473,43 @@ class EvaluationServices:
         arena: dict[str, Any],
         candidate: dict[str, Any],
     ) -> dict[str, Any]:
-        # The fixed component names are reported every time. Where no authored
-        # fixture file exists yet, the score uses the closest live diagnostic:
-        # legal/crash-free arena play, candidate recall, and no missing target
-        # mass. This keeps the Phase 3 gate active instead of silently skipping
-        # it.
-        missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
-        legal = 1.0 - float(arena.get("illegal_or_crash_rate", 0.0) or 0.0)
-        recall = float(candidate.get("score", 1.0))
-        outside = 1.0 - min(float(buffer.get("avg_target_policy_mass_outside_window", 0.0) or 0.0), 1.0) * 0.0
-        base = max(0.0, min(1.0, legal * recall * (1.0 - missing) * outside))
-        return {
-            "components": {name: base for name in TACTICAL_COMPONENTS},
-            "tactical_suite_score": base,
-            "fixture_mode": "live_diagnostics_proxy",
-        }
+        try:
+            model = load_checkpoint_model(Path(trial.checkpoint_path), trial.cfg)
+            player = model_move_fn(
+                model,
+                temperature=0.05,
+                top_p=1.0,
+                seed=self.s.args.seed + int(trial.epoch),
+                near_radius=8,
+                constrain_threats=True,
+            )
+            suite = evaluate_tactical_suite(
+                player,
+                time_ms=self.s.args.eval_time_ms,
+            )
+            component_scores = {
+                str(row["suite"]): 1.0 if row["passed"] else 0.0
+                for row in suite.positions
+            }
+            return {
+                "components": component_scores,
+                "tactical_suite_score": suite.score,
+                "fixture_mode": "authored_replayable_positions",
+                "passed": suite.passed,
+                "total": suite.total,
+                "positions": suite.positions,
+            }
+        except Exception as exc:
+            missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
+            legal = 1.0 - float(arena.get("illegal_or_crash_rate", 0.0) or 0.0)
+            recall = float(candidate.get("score", 1.0))
+            base = max(0.0, min(1.0, legal * recall * (1.0 - missing)))
+            return {
+                "components": {name: base for name in TACTICAL_COMPONENTS},
+                "tactical_suite_score": base,
+                "fixture_mode": "diagnostic_fallback_after_fixture_error",
+                "error": repr(exc),
+            }
 
     def outside_window(self, buffer: dict[str, Any]) -> dict[str, Any]:
         missing = float(buffer.get("avg_missing_target_policy_mass", 0.0) or 0.0)
@@ -2171,13 +2571,19 @@ def parse_args() -> argparse.Namespace:
         help="Maximum worker/batch/wait candidates per uncached runtime sweep.",
     )
     parser.add_argument("--train-batches", type=int, default=100)
-    parser.add_argument("--max-active-trials", type=int, default=8)
-    parser.add_argument("--asha-resources", default="2,5,10")
+    parser.add_argument("--max-active-trials", type=int, default=6)
+    parser.add_argument("--asha-resources", default="8,12,14")
     parser.add_argument("--asha-promote-fraction", type=float, default=0.5)
+    parser.add_argument("--bohb-random-fraction", type=float, default=0.25)
+    parser.add_argument("--schedule-method", choices=["pb2", "pbt"], default="pb2")
+    parser.add_argument("--pb2-candidates", type=int, default=64)
+    parser.add_argument("--pb2-uncertainty-weight", type=float, default=0.25)
     parser.add_argument("--pbt-population", type=int, default=8)
     parser.add_argument("--perturb-interval", type=int, default=5)
     parser.add_argument("--pbt-generations", type=int, default=6)
     parser.add_argument("--champion-min-epochs", type=int, default=20)
+    parser.add_argument("--strategy-score-min-epochs", type=int, default=8)
+    parser.add_argument("--classical-score-min-epochs", type=int, default=12)
     parser.add_argument("--eval-every-epochs", type=int, default=2)
     parser.add_argument("--eval-games", type=int, default=4)
     parser.add_argument("--final-eval-games", type=int, default=12)

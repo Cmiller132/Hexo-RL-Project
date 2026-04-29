@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 
@@ -16,6 +16,73 @@ use hexgame_core::WIN_LENGTH;
 use std::time::Duration;
 
 use hexgame_core::encoder::{BOARD_AREA, BOARD_SIZE, NUM_CHANNELS};
+
+fn hex_to_tuple(h: Hex) -> (i32, i32) {
+    (h.q, h.r)
+}
+
+fn hex_vec_to_py(cells: Vec<Hex>) -> Vec<(i32, i32)> {
+    cells.into_iter().map(hex_to_tuple).collect()
+}
+
+fn pair_vec_to_py(pairs: Vec<(Hex, Hex)>) -> Vec<((i32, i32), (i32, i32))> {
+    pairs
+        .into_iter()
+        .map(|(a, b)| (hex_to_tuple(a), hex_to_tuple(b)))
+        .collect()
+}
+
+fn sort_dedup_hex(cells: &mut Vec<Hex>) {
+    cells.sort();
+    cells.dedup();
+}
+
+fn sort_dedup_pairs(pairs: &mut Vec<(Hex, Hex)>) {
+    for (a, b) in pairs.iter_mut() {
+        if *b < *a {
+            std::mem::swap(a, b);
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+}
+
+fn collect_hot_window_empties(
+    game: &HexGameState,
+    player: u8,
+    legal: &std::collections::HashSet<Hex>,
+    open_four: &mut Vec<Hex>,
+    open_five: &mut Vec<Hex>,
+) {
+    for key in game.eval().hot_windows(player) {
+        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
+        let mut empties = Vec::<Hex>::with_capacity(2);
+        for k in 0..WIN_LENGTH {
+            let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
+            if !game.stones().contains_key(&h) && legal.contains(&h) {
+                empties.push(h);
+            }
+        }
+        match empties.len() {
+            1 => open_five.extend(empties),
+            2 => open_four.extend(empties),
+            _ => {}
+        }
+    }
+}
+
+fn collect_all_hot_empties(
+    game: &HexGameState,
+    player: u8,
+    legal: &std::collections::HashSet<Hex>,
+    out: &mut Vec<Hex>,
+) {
+    let mut fours = Vec::new();
+    let mut fives = Vec::new();
+    collect_hot_window_empties(game, player, legal, &mut fours, &mut fives);
+    out.extend(fours);
+    out.extend(fives);
+}
 
 // -------------------------------------------------------------------------
 // Python-facing wrapper for HexGameState
@@ -198,6 +265,76 @@ impl PyHexGame {
             result.push(cells);
         }
         result
+    }
+
+    /// Engine-backed tactical oracle using the incremental hot-window index.
+    ///
+    /// This is intentionally bounded to hot-window empties and exact
+    /// `ThreatStatus` constraints instead of rescanning every legal cell.
+    #[pyo3(signature = (radius=8))]
+    fn tactical_oracle<'py>(&self, py: Python<'py>, radius: i32) -> PyResult<Bound<'py, PyDict>> {
+        let legal: std::collections::HashSet<Hex> = self
+            .inner
+            .legal_moves_near_sorted(radius)
+            .into_iter()
+            .collect();
+        let current = self.inner.current_player();
+        let opponent = 1 - current;
+
+        let mut win_now = Vec::<Hex>::new();
+        let mut forced = Vec::<Hex>::new();
+        let mut cover = Vec::<Hex>::new();
+        let mut cover_pairs = Vec::<(Hex, Hex)>::new();
+        let mut open_four = Vec::<Hex>::new();
+        let mut open_five = Vec::<Hex>::new();
+
+        collect_hot_window_empties(&self.inner, current, &legal, &mut open_four, &mut open_five);
+        let status_text = match threat_status(&self.inner) {
+            ThreatStatus::Quiet => "quiet",
+            ThreatStatus::Unblockable => {
+                collect_all_hot_empties(&self.inner, opponent, &legal, &mut forced);
+                cover.extend_from_slice(&forced);
+                "unblockable"
+            }
+            ThreatStatus::WinningTurn(t) => {
+                win_now.push(t.first());
+                if let Some(second) = t.second() {
+                    win_now.push(second);
+                }
+                "winning_turn"
+            }
+            ThreatStatus::MustBlock(blocks) => {
+                forced.extend_from_slice(blocks.cells());
+                cover.extend_from_slice(blocks.cells());
+                for &(a, b) in blocks.pairs() {
+                    forced.push(a);
+                    forced.push(b);
+                    cover.push(a);
+                    cover.push(b);
+                    cover_pairs.push((a, b));
+                }
+                "must_block"
+            }
+        };
+
+        sort_dedup_hex(&mut win_now);
+        sort_dedup_hex(&mut forced);
+        sort_dedup_hex(&mut cover);
+        sort_dedup_hex(&mut open_four);
+        sort_dedup_hex(&mut open_five);
+        sort_dedup_pairs(&mut cover_pairs);
+
+        let out = PyDict::new(py);
+        out.set_item("status", status_text)?;
+        out.set_item("current_player", current)?;
+        out.set_item("placements_remaining", self.inner.placements_remaining())?;
+        out.set_item("win_now_cells", hex_vec_to_py(win_now))?;
+        out.set_item("forced_block_cells", hex_vec_to_py(forced))?;
+        out.set_item("cover_cells", hex_vec_to_py(cover))?;
+        out.set_item("cover_pairs", pair_vec_to_py(cover_pairs))?;
+        out.set_item("open_four_cells", hex_vec_to_py(open_four))?;
+        out.set_item("open_five_cells", hex_vec_to_py(open_five))?;
+        Ok(out)
     }
 
     /// Dict-like list of all occupied cells: `[(q, r, player), ...]`.
@@ -710,10 +847,7 @@ impl PyMCTSEngine {
             let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
             legal.push(Hex::new(q, r));
         }
-        let sparse_actions: Vec<(i32, i32)> = qr
-            .outer_iter()
-            .map(|row| (row[0], row[1]))
-            .collect();
+        let sparse_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner.expand_root_with_sparse_priors(
             policy_slice,
             value,
@@ -726,6 +860,116 @@ impl PyMCTSEngine {
             sparse_mix,
         );
         Ok(())
+    }
+
+    fn expand_root_with_global_priors<'py>(
+        &mut self,
+        legal_bytes: &[u8],
+        global_qr: PyReadonlyArray2<'py, i32>,
+        global_logits: PyReadonlyArray1<'py, f32>,
+        value: f32,
+    ) -> PyResult<()> {
+        if !legal_bytes.len().is_multiple_of(8) {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "legal_bytes length {} is not a multiple of 8",
+                legal_bytes.len()
+            )));
+        }
+        let qr = global_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 2 {
+            return Err(PyValueError::new_err("global_qr must have shape (N, 2)"));
+        }
+        let logits = global_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("global_logits array must be contiguous"))?;
+        if logits.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "global_logits length {} is smaller than global_qr rows {}",
+                logits.len(),
+                qr.shape()[0]
+            )));
+        }
+        let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
+        for chunk in legal_bytes.chunks_exact(8) {
+            let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            legal.push(Hex::new(q, r));
+        }
+        let global_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
+        self.inner
+            .expand_root_with_global_priors(&legal, &global_actions, logits, value)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn apply_root_pair_priors<'py>(
+        &mut self,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        pair_mix: f32,
+    ) -> PyResult<()> {
+        let qr = pair_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 4 {
+            return Err(PyValueError::new_err("pair_qr must have shape (N, 4)"));
+        }
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        if logits.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "pair_logits length {} is smaller than pair_qr rows {}",
+                logits.len(),
+                qr.shape()[0]
+            )));
+        }
+        let pair_actions: Vec<(i32, i32, i32, i32)> = qr
+            .outer_iter()
+            .map(|row| (row[0], row[1], row[2], row[3]))
+            .collect();
+        self.inner
+            .apply_root_pair_priors(&pair_actions, logits, pair_mix)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn apply_root_pair_first_priors<'py>(
+        &mut self,
+        action_logits: PyReadonlyArray1<'py, f32>,
+        pair_mix: f32,
+    ) -> PyResult<()> {
+        let logits = action_logits.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("pair_first logits array must be contiguous")
+        })?;
+        self.inner
+            .apply_root_pair_first_priors(logits, pair_mix)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn apply_root_pair_second_priors<'py>(
+        &mut self,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        pair_mix: f32,
+    ) -> PyResult<()> {
+        let qr = pair_qr.as_array();
+        if qr.ndim() != 2 || qr.shape()[1] != 4 {
+            return Err(PyValueError::new_err("pair_qr must have shape (N, 4)"));
+        }
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        if logits.len() < qr.shape()[0] {
+            return Err(PyValueError::new_err(format!(
+                "pair_logits length {} is smaller than pair_qr rows {}",
+                logits.len(),
+                qr.shape()[0]
+            )));
+        }
+        let pair_actions: Vec<(i32, i32, i32, i32)> = qr
+            .outer_iter()
+            .map(|row| (row[0], row[1], row[2], row[3]))
+            .collect();
+        self.inner
+            .apply_root_pair_second_priors(&pair_actions, logits, pair_mix)
+            .map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (noise, noise_fraction))]
@@ -780,17 +1024,22 @@ impl PyMCTSEngine {
     fn pending_leaf_metadata<'py>(
         &self,
         py: Python<'py>,
-    ) -> Vec<(i32, i32, Bound<'py, PyBytes>)> {
+    ) -> Vec<(i32, i32, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         self.inner
             .pending_leaf_metadata()
             .into_iter()
-            .map(|(oq, or_, legal)| {
+            .map(|(oq, or_, legal, history)| {
                 let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
                 for h in &legal {
                     legal_buf.extend_from_slice(&h.q.to_le_bytes());
                     legal_buf.extend_from_slice(&h.r.to_le_bytes());
                 }
-                (oq, or_, PyBytes::new(py, &legal_buf))
+                (
+                    oq,
+                    or_,
+                    PyBytes::new(py, &legal_buf),
+                    PyBytes::new(py, &history),
+                )
             })
             .collect()
     }
@@ -875,7 +1124,9 @@ impl PyMCTSEngine {
             return Err(PyValueError::new_err("sparse_qr must have shape (N, K, 2)"));
         }
         if logits.shape().len() != 2 || logits.shape()[0] < n {
-            return Err(PyValueError::new_err("sparse_logits must have shape (N, K)"));
+            return Err(PyValueError::new_err(
+                "sparse_logits must have shape (N, K)",
+            ));
         }
         if counts.len() < n {
             return Err(PyValueError::new_err("sparse_counts length must be >= N"));
@@ -910,6 +1161,98 @@ impl PyMCTSEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn expand_and_backprop_with_sparse_sources<'py>(
+        &mut self,
+        policies: PyReadonlyArray1<'py, f32>,
+        values: PyReadonlyArray1<'py, f32>,
+        sparse_qr: PyReadonlyArray3<'py, i32>,
+        sparse_logits: PyReadonlyArray2<'py, f32>,
+        sparse_counts: PyReadonlyArray1<'py, u16>,
+        sparse_sources: PyReadonlyArray2<'py, u8>,
+        stage: u8,
+        sparse_mix: f32,
+        py: Python<'py>,
+    ) -> PyResult<()> {
+        let policies_slice = policies
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("policies array must be contiguous"))?;
+        let values_slice = values
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("values array must be contiguous"))?;
+        let expected_policies = self.last_non_terminal_count as usize * BOARD_AREA;
+        if policies_slice.len() != expected_policies {
+            return Err(PyValueError::new_err(format!(
+                "policies length {} must equal {}",
+                policies_slice.len(),
+                expected_policies
+            )));
+        }
+        if values_slice.len() != self.last_non_terminal_count as usize {
+            return Err(PyValueError::new_err(format!(
+                "values length {} must equal selected non-terminal leaf count {}",
+                values_slice.len(),
+                self.last_non_terminal_count
+            )));
+        }
+        let qr = sparse_qr.as_array();
+        let logits = sparse_logits.as_array();
+        let sources = sparse_sources.as_array();
+        let counts = sparse_counts
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("sparse_counts array must be contiguous"))?;
+        let n = self.last_non_terminal_count as usize;
+        if qr.shape().len() != 3 || qr.shape()[0] < n || qr.shape()[2] != 2 {
+            return Err(PyValueError::new_err("sparse_qr must have shape (N, K, 2)"));
+        }
+        if logits.shape().len() != 2 || logits.shape()[0] < n {
+            return Err(PyValueError::new_err(
+                "sparse_logits must have shape (N, K)",
+            ));
+        }
+        if sources.shape().len() != 2 || sources.shape()[0] < n {
+            return Err(PyValueError::new_err(
+                "sparse_sources must have shape (N, K)",
+            ));
+        }
+        if counts.len() < n {
+            return Err(PyValueError::new_err("sparse_counts length must be >= N"));
+        }
+        let k = qr.shape()[1].min(logits.shape()[1]).min(sources.shape()[1]);
+        let mut sparse_actions: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+        let mut sparse_values: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut sparse_source_values: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let count = (counts[row] as usize).min(k);
+            let mut actions = Vec::with_capacity(count);
+            let mut vals = Vec::with_capacity(count);
+            let mut srcs = Vec::with_capacity(count);
+            for col in 0..count {
+                actions.push((qr[[row, col, 0]], qr[[row, col, 1]]));
+                vals.push(logits[[row, col]]);
+                srcs.push(sources[[row, col]]);
+            }
+            sparse_actions.push(actions);
+            sparse_values.push(vals);
+            sparse_source_values.push(srcs);
+        }
+        let p = policies_slice.to_vec();
+        let v = values_slice.to_vec();
+        py.allow_threads(|| {
+            self.inner.expand_and_backprop_with_sparse_sources(
+                &p,
+                &v,
+                &sparse_actions,
+                &sparse_values,
+                &sparse_source_values,
+                stage,
+                sparse_mix,
+            );
+        });
+        self.last_non_terminal_count = 0;
+        Ok(())
+    }
+
     fn get_results(&self) -> (Vec<i32>, Vec<i32>, Vec<u32>, f32) {
         self.inner.get_results()
     }
@@ -922,8 +1265,36 @@ impl PyMCTSEngine {
         self.inner.root_child_priors()
     }
 
+    fn root_child_prior_sources(&self) -> Vec<u8> {
+        self.inner.root_child_prior_sources()
+    }
+
+    fn prior_source_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let t = self.inner.prior_source_telemetry();
+        let dict = PyDict::new(py);
+        dict.set_item("root_total_count", t.root_total_count)?;
+        dict.set_item("root_sparse_count", t.root_sparse_count)?;
+        dict.set_item("root_dense_count", t.root_dense_count)?;
+        dict.set_item("root_default_count", t.root_default_count)?;
+        dict.set_item("leaf_total_count", t.leaf_total_count)?;
+        dict.set_item("leaf_sparse_count", t.leaf_sparse_count)?;
+        dict.set_item("leaf_dense_count", t.leaf_dense_count)?;
+        dict.set_item("leaf_default_count", t.leaf_default_count)?;
+        dict.set_item("root_pair_count", t.root_pair_count)?;
+        dict.set_item("leaf_pair_count", t.leaf_pair_count)?;
+        dict.set_item("root_sparse_candidate_count", t.root_sparse_candidate_count)?;
+        dict.set_item("leaf_sparse_candidate_count", t.leaf_sparse_candidate_count)?;
+        dict.set_item("root_pair_candidate_count", t.root_pair_candidate_count)?;
+        dict.set_item("leaf_expansion_count", t.leaf_expansion_count)?;
+        Ok(dict)
+    }
+
     fn root_child_q_values(&self) -> Vec<f32> {
         self.inner.root_child_q_values()
+    }
+
+    fn root_pair_visit_targets(&self) -> Vec<(i32, i32, i32, i32, u32)> {
+        self.inner.root_pair_visit_targets()
     }
 
     #[pyo3(signature = (min_visits=1))]

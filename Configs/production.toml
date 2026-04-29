@@ -21,8 +21,6 @@ dirichlet_alpha = 0.3
 dirichlet_fraction = 0.25
 pcr_low_sim_prob = 0.75
 pcr_low_sims = 192
-resign_threshold = -0.95
-resign_disable_prob = 0.1
 
 [inference]
 max_batch_size = 0
@@ -45,7 +43,7 @@ prefetch_batches = 2
 optimizer = "adamw"
 lr_schedule = "cosine"
 peak_lr = 0.003
-loss_weights = { policy = 1.0, value = 1.5, lookahead_4 = 0.2, lookahead_12 = 0.2, lookahead_36 = 0.1 }
+loss_weights = { policy = 1.0, value = 1.5, lookahead_4 = 0.2, lookahead_12 = 0.2, lookahead_36 = 0.1, axis = 0.05 }
 
 [runtime]
 autotune = true
