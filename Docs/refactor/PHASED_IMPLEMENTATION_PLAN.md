@@ -1,41 +1,118 @@
-# Modular Refactor — Master Implementation Plan
+# Modular Refactor - Master Implementation Plan
 
 Date: 2026-04-29
 
-## Purpose
-Translate the redesign proposal into a strict, test-gated, parallelized execution program.
+Source of truth: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_V2_20260429.md`
 
-## Sequencing
+## Purpose
+
+Translate the V2 redesign into a strict, test-gated, breaking-refactor execution program.
+
+This program is not a compatibility migration. It is a controlled cutover to a cohesive architecture. A phase is not complete because a new path exists; it is complete only when the old runtime path it replaces is deleted, quarantined outside runtime, or proven unreachable by import/code-search gates.
+
+## Phase Sequence
 
 The program executes in strict order:
 
-0. `phases/PHASE_00.md` — Program Setup and Baseline Freeze
-1. `phases/PHASE_01.md` — Contracts Foundation
-2. `phases/PHASE_02.md` — Engine Boundary and Rust/Python Parity
-3. `phases/PHASE_03.md` — Model Registry and Family Adapters
-4. `phases/PHASE_04.md` — Inference Protocol and Adapterization
-5. `phases/PHASE_05.md` — Search and Pair Strategy Isolation
-6. `phases/PHASE_06.md` — Self-Play Decomposition
-7. `phases/PHASE_07.md` — Replay/Training/Eval Convergence
-8. `phases/PHASE_08.md` — Dashboard and Debug Convergence
-9. `phases/PHASE_09.md` — Deletion Sweep and CI Hardening
+0. `phases/PHASE_00.md` - Baseline Freeze, Guardrails, And Evidence
+1. `phases/PHASE_01.md` - Engine + Contracts Foundation
+2. `phases/PHASE_02.md` - Candidate/Pair/Graph Builder Convergence
+3. `phases/PHASE_03.md` - Model Registry, TrainAdapter, And CheckpointManager
+4. `phases/PHASE_04.md` - Inference Protocol And Adapters
+5. `phases/PHASE_05.md` - PolicyProvider, PairStrategy, EngineAdapter
+6. `phases/PHASE_06.md` - GameRunner And SelfPlayWorker Cleanup
+7. `phases/PHASE_07.md` - Replay Cutover
+8. `phases/PHASE_08.md` - Evaluation, Dashboard, And Autotune
+9. `phases/PHASE_09.md` - Final Deletion And CI Enforcement
 
-## Parallel Delivery Model
+No phase may defer its own core requirements to a later phase. Later phases can build on earlier phases, but they cannot be used as a hiding place for partial implementation, legacy runtime paths, or missing tests.
 
-Execution is parallelized through five subagents with one orchestrator that owns gate approval.
+## Execution Model
 
-See: `orchestration/PARALLEL_SUBAGENT_EXECUTION_MODEL.md`.
+Execution may use five subagents plus one orchestrator, but parallelism is subordinate to interface discipline.
+
+Each phase must run through these mini-gates:
+
+```text
+1. Interface freeze
+2. Fixture/artifact freeze
+3. Implementation work on non-overlapping ownership slices
+4. Integration branch
+5. Deletion/import-audit sweep
+6. Test/CI/telemetry evidence capture
+7. Orchestrator conformance review
+```
+
+Shared contracts and public interfaces must be frozen before parallel implementation begins. A subagent may not invent a second shape for data that already has a contract owner.
 
 ## Promotion Rule
 
 A phase may advance only when all are true:
 
-- mandatory unit/integration/parity/performance checks pass,
-- telemetry + contract source/version assertions are present,
-- no partial migrations or hidden legacy fallbacks remain in phase scope,
-- rollback tag is created and validated,
-- orchestrator signs off with evidence.
+- mandatory unit, integration, parity, policy, deletion, telemetry, and performance checks pass
+- V2 requirement matrix rows owned by the phase are complete
+- no implementation remains "present but unused"
+- no runtime compatibility shim remains without an explicit non-runtime quarantine and expiry
+- all phase-owned legacy imports are removed or test-only
+- structured logs/traces required by the phase have sample artifacts
+- CI commands and local command transcripts are attached
+- rollback point is tagged and recovery smoke is documented
+- orchestrator signs off with evidence
 
 ## Strictness Policy
 
-The orchestrator must reject signoff if any implementation is feature-incomplete, partially wired, or spec-divergent, even if tests pass superficially.
+The orchestrator must reject signoff if any implementation is feature-incomplete, partially wired, spec-divergent, or only unit-tested when V2 requires runtime consumption.
+
+The following are phase blockers:
+
+- a new module exists but no runtime consumer uses it
+- a replacement path exists but the old path remains reachable
+- a compatibility shim remains in `Python/src/hexorl/` after its owner phase
+- pair scoring can happen without `PairStrategy`
+- dashboard/training/eval reconstruct data that should come from contracts
+- inference protocol mismatch can hang instead of fail fast
+- autotune can mutate raw config fields instead of typed recipes
+- logs cannot explain where a self-play/autotune stall occurred
+
+## Required Program Artifacts
+
+Each phase writes artifacts under:
+
+```text
+Docs/refactor/artifacts/phase_XX/
+```
+
+Each phase must include:
+
+```text
+MANIFEST.md
+commands/
+test_output/
+import_audits/
+deletion_manifest/
+telemetry_samples/
+fixtures_or_references/
+exit_gate_report.md
+```
+
+`MANIFEST.md` must identify the git SHA, command lines, relevant config hashes, generated files, owners, and any intentional non-runtime migration tooling.
+
+## V2 Requirement Matrix
+
+`Docs/refactor/V2_REQUIREMENTS_MATRIX.md` is the orchestrator's master gate. Every V2 invariant must map to:
+
+```text
+requirement id
+source V2 section
+owner phase
+owner module/package
+implementation proof
+test proof
+CI proof
+deletion/import proof
+telemetry/debug proof
+signoff owner
+status
+```
+
+No phase can close with an owned matrix row marked partial, deferred, or implemented-but-unconsumed.
