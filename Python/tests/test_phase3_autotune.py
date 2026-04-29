@@ -247,6 +247,70 @@ def test_graph_low_memory_runtime_sweep_includes_one_worker():
     assert [candidate["workers"] for candidate in candidates] == [1, 2]
 
 
+def test_low_memory_restnet_recommended_recipe_caps_train_batch():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.host = SimpleNamespace(
+        cuda_available=True,
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+        physical_cpus=16,
+    )
+    family = module.FamilySpec(
+        name="best_restnet_33",
+        description="restnet",
+        architecture="restnet",
+        attention_positions=(5, 10, 14),
+        available=True,
+    )
+
+    recipe = module.Phase3Supervisor._recommended_recipe(supervisor, family)
+
+    assert recipe.train_batch_size == 128
+
+
+def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.host = SimpleNamespace(
+        cuda_available=True,
+        cuda_memory_gb=12.0,
+        system_memory_gb=23.5,
+        physical_cpus=16,
+    )
+    restnet = module.FamilySpec(
+        name="best_restnet_33",
+        description="restnet",
+        architecture="restnet",
+        attention_positions=(5, 10, 14),
+        available=True,
+    )
+    graph = module.FamilySpec(
+        name="graph_hybrid_0",
+        description="graph",
+        architecture="graph_hybrid_0",
+        graph=True,
+        sparse_policy=True,
+        available=True,
+    )
+    dense = module.FamilySpec(
+        name="best_current_33",
+        description="cnn",
+        architecture="cnn",
+        available=True,
+    )
+
+    assert module.Phase3Supervisor._static_recipe_from_bohb_config(
+        supervisor, restnet, {"full_sims": 800, "train_batch_size": 384}
+    ).train_batch_size == 128
+    assert module.Phase3Supervisor._static_recipe_from_bohb_config(
+        supervisor, graph, {"full_sims": 512, "train_batch_size": 384}
+    ).train_batch_size == 128
+    assert module.Phase3Supervisor._static_recipe_from_bohb_config(
+        supervisor, dense, {"full_sims": 800, "train_batch_size": 384}
+    ).train_batch_size == 256
+
+
 def test_runtime_sweep_prunes_when_all_candidates_fail(tmp_path):
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)

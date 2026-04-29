@@ -1525,7 +1525,7 @@ class Phase3Supervisor:
             graph_token_budget=graph_budget,
             graph_layers=graph_layers,
             sparse_prior_stage=sparse_stage,
-            train_batch_size=int(config.get("train_batch_size", 256)),
+            train_batch_size=self._host_safe_train_batch_size(family, int(config.get("train_batch_size", 256))),
         )
 
     def _graph_static_ladder(self) -> list[tuple[str, int, int, int]]:
@@ -1563,6 +1563,7 @@ class Phase3Supervisor:
                 graph_token_budget=256,
                 graph_layers=1,
                 sparse_prior_stage=0,
+                train_batch_size=self._host_safe_train_batch_size(family, 256),
             )
         if family.sparse_policy:
             return StaticRecipe(
@@ -1573,6 +1574,7 @@ class Phase3Supervisor:
                 head_bundle="structural",
                 temperature_family="slow_cool",
                 subtree_reuse=True,
+                train_batch_size=self._host_safe_train_batch_size(family, 256),
             )
         return StaticRecipe(
             full_sims=800,
@@ -1582,7 +1584,17 @@ class Phase3Supervisor:
             head_bundle="structural",
             temperature_family="slow_cool",
             subtree_reuse=True,
+            train_batch_size=self._host_safe_train_batch_size(family, 256),
         )
+
+    def _host_safe_train_batch_size(self, family: FamilySpec, requested: int) -> int:
+        batch_size = max(1, int(requested))
+        if not self._low_memory_cuda_host():
+            return batch_size
+        memory_hungry = bool(family.graph or family.sparse_policy or family.architecture == "restnet")
+        if memory_hungry:
+            return min(batch_size, 128)
+        return min(batch_size, 256)
 
     @staticmethod
     def _pcr_low_sims_for_full_sims(full_sims: int) -> int:
