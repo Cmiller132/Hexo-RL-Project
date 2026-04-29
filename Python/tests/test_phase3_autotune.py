@@ -220,6 +220,69 @@ def test_phase3_sparse_calibration_top8_candidate_gate_is_score_only():
     assert reason == ""
 
 
+def test_phase3_sparse_candidate_gate_failure_penalizes_scheduler_score(monkeypatch):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(
+        candidate_recall_gate=0.95,
+        classical_score_min_epochs=12,
+        eval_games=4,
+        eval_time_ms=25,
+        seed=9300,
+        target_epoch_seconds=100.0,
+    )
+    services = module.EvaluationServices.__new__(module.EvaluationServices)
+    services.s = supervisor
+    services.args = supervisor.args
+    trial = SimpleNamespace(
+        checkpoint_path="checkpoint.pt",
+        cfg=SimpleNamespace(),
+        epoch=1,
+        family=SimpleNamespace(sparse_policy=True),
+        metrics_history=[
+            {
+                "epoch_elapsed_s": 10.0,
+                "train": {
+                    "loss_value": 1.0,
+                    "policy_full_search_frac": 1.0,
+                },
+                "buffer": {
+                    "size": 10,
+                    "candidate_discovery_top8": 0.40,
+                    "candidate_discovery_winning_move": 1.0,
+                    "candidate_discovery_forced_block": 1.0,
+                    "candidate_discovery_two_placement_cover": 1.0,
+                    "avg_missing_target_policy_mass": 0.0,
+                },
+                "selfplay": {"positions_per_min": 1.0},
+            }
+        ],
+        trial_id="graph_low_recall",
+    )
+
+    monkeypatch.setattr(
+        supervisor,
+        "_arena_checkpoint_vs_classical",
+        lambda *args, **kwargs: {
+            "model_win_rate": 0.0,
+            "winrate_std": 0.0,
+            "classical_survival_score": 0.0,
+            "illegal_or_crash_rate": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        module.EvaluationServices,
+        "tactical_suite",
+        lambda *args, **kwargs: {"tactical_suite_score": 1.0},
+    )
+
+    row = module.EvaluationServices.evaluate_trial(services, trial, stage="3A_calibration")
+
+    assert row["candidate_recall"]["gate_pass"] is False
+    assert row["candidate_recall_penalty"] == 0.09
+    assert row["scheduler_score"] == row["strength_score"] - 0.01 - 0.09
+
+
 def test_transient_train_exception_does_not_quarantine_family():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)

@@ -2542,11 +2542,18 @@ class EvaluationServices:
             + 0.10 * row["value_calibration_score"]
             + 0.05 * row["policy_target_quality"]
         )
+        candidate_score = float(candidate.get("score", 1.0))
+        row["candidate_recall_penalty"] = (
+            0.15 * max(0.0, 1.0 - candidate_score)
+            if bool(candidate.get("applicable")) and not bool(candidate.get("gate_pass"))
+            else 0.0
+        )
         row["scheduler_score"] = (
             row["strength_score"]
             - 0.10 * row["epoch_seconds"] / max(self.args.target_epoch_seconds, 1.0)
             - 0.10 * row["truncation_rate"]
             - 0.20 * row["illegal_or_crash_rate"]
+            - row["candidate_recall_penalty"]
         )
         return row
 
