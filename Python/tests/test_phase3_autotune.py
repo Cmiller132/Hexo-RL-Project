@@ -198,6 +198,98 @@ def test_phase3_sparse_candidate_gate_uses_discovery_metrics():
     assert reason == "candidate_discovery_below_gate:0.4000"
 
 
+def test_transient_train_exception_does_not_quarantine_family():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.blocked_families = {}
+    supervisor.trials = []
+    supervisor.log = _CaptureLog()
+    family = module.FamilySpec(
+        name="graph_hybrid_0",
+        description="graph",
+        architecture="graph_hybrid_0",
+        graph=True,
+        sparse_policy=True,
+        available=True,
+    )
+
+    module.Phase3Supervisor._quarantine_family(
+        supervisor,
+        family,
+        "train_exception:RuntimeError:Inference server failed to start within 30s",
+        stage="3A_calibration",
+    )
+
+    assert family.available is True
+    assert "graph_hybrid_0" not in supervisor.blocked_families
+    assert supervisor.log.events[-1][0] == "family_quarantine_skipped"
+
+
+def test_graph_low_memory_runtime_sweep_includes_one_worker():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(runtime_sweep_workers="2,3", runtime_sweep_max_candidates=2)
+    supervisor.host = SimpleNamespace(logical_cpus=32, cuda_available=True, cuda_memory_gb=12.0)
+    supervisor._low_memory_cuda_host = lambda: True
+    cfg = SimpleNamespace(
+        selfplay=SimpleNamespace(num_workers=2, batch_size_per_worker=8),
+        inference=SimpleNamespace(max_wait_us=500),
+        runtime=SimpleNamespace(selfplay_cpu_reserve=2),
+    )
+    trial = SimpleNamespace(
+        cfg=cfg,
+        family=SimpleNamespace(graph=True),
+        static=SimpleNamespace(full_sims=512),
+    )
+
+    candidates = module.Phase3Supervisor._runtime_sweep_candidates(supervisor, trial)
+
+    assert [candidate["workers"] for candidate in candidates] == [1, 2]
+
+
+def test_runtime_sweep_prunes_when_all_candidates_fail(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(runtime_sweep_states=16)
+    supervisor.output_root = tmp_path
+    supervisor.runtime_sweep_cache = {}
+    supervisor.log = _CaptureLog()
+    supervisor._runtime_sweep_key = lambda trial: "key"
+    supervisor._runtime_sweep_candidates = lambda trial: [{"workers": 1}]
+    supervisor._within_stage = lambda stage: True
+    supervisor._run_runtime_sweep_candidate = lambda *args, **kwargs: {
+        "candidate": {"workers": 1},
+        "ok": False,
+        "positions": 0,
+        "positions_per_min": 0.0,
+        "memory": {"unsafe": True},
+    }
+    released = []
+    supervisor._release_trial_runtime = lambda trial, reason: released.append((trial.trial_id, reason))
+    trial = SimpleNamespace(
+        trial_id="cal_graph_hybrid_0",
+        run_dir=tmp_path / "cal_graph_hybrid_0",
+        runtime_sweep={},
+        pruned=False,
+        prune_reason="",
+    )
+
+    module.Phase3Supervisor._ensure_runtime_sweep(supervisor, trial, stage="3A_calibration")
+
+    assert trial.pruned is True
+    assert trial.prune_reason == "runtime_sweep_failed:all_probe_candidates_failed_or_memory_unsafe"
+    assert supervisor.log.events[-2][0] == "runtime_sweep_failed"
+    assert released == [("cal_graph_hybrid_0", trial.prune_reason)]
+
+
+class _CaptureLog:
+    def __init__(self):
+        self.events = []
+
+    def write(self, event, payload):
+        self.events.append((event, payload))
+
+
 def _obs(trial_id, resource, score, hard_failure=False):
     return TrialObservation(
         trial_id=trial_id,

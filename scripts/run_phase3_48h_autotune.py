@@ -1077,16 +1077,23 @@ class Phase3Supervisor:
             and not self._runtime_sweep_memory_unsafe(row)
         ]
         if not valid:
-            selected = dict(min(candidates, key=lambda row: int(row.get("workers", 9999))))
-            selected_record = {
-                "candidate": selected,
-                "positions_per_min": 0.0,
-                "fallback": True,
-                "reason": "all_probe_candidates_failed_or_memory_unsafe",
+            reason = "runtime_sweep_failed:all_probe_candidates_failed_or_memory_unsafe"
+            trial.pruned = True
+            trial.prune_reason = reason
+            trial.runtime_sweep = {
+                "applied": False,
+                "key": key,
+                "candidate_count": len(candidates),
+                "results": results,
+                "reason": reason,
             }
-        else:
-            selected_record = max(valid, key=lambda row: float(row.get("score", row.get("positions_per_min", 0.0)) or 0.0))
-            selected = dict(selected_record["candidate"])
+            self.log.write("runtime_sweep_failed", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
+            self.log.write("trial_pruned", {"trial_id": trial.trial_id, "stage": stage, "reason": reason})
+            self._release_trial_runtime(trial, reason=reason)
+            return
+
+        selected_record = max(valid, key=lambda row: float(row.get("score", row.get("positions_per_min", 0.0)) or 0.0))
+        selected = dict(selected_record["candidate"])
 
         self._apply_runtime_candidate(trial.cfg, selected)
         trial.runtime_sweep = {
@@ -1217,6 +1224,9 @@ class Phase3Supervisor:
         worker_values = _parse_int_list(getattr(self.args, "runtime_sweep_workers", ""))
         if not worker_values:
             worker_values = [max(1, base_workers - 1), base_workers, base_workers + 1]
+        graph_low_memory = bool(trial.family.graph and self._low_memory_cuda_host())
+        if graph_low_memory:
+            worker_values = sorted(set([1, 2] + [value for value in worker_values if value <= 2]))
         high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
         if high_search_non_graph:
             # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
@@ -1249,7 +1259,7 @@ class Phase3Supervisor:
             if candidate not in candidates:
                 candidates.append(candidate)
 
-        if not high_search_non_graph:
+        if not high_search_non_graph and not graph_low_memory:
             add(base_workers, base_wait)
         for workers in sorted(set(worker_values)):
             add(workers, base_wait)
@@ -1675,10 +1685,18 @@ class Phase3Supervisor:
             "candidate_discovery_below_gate",
             "decisive_candidate_discovery_below_gate",
             "non_finite_train_metric",
-            "train_exception",
             "illegal_or_crash_rate",
         )
         if not any(reason.startswith(prefix) for prefix in hard_reasons):
+            self.log.write(
+                "family_quarantine_skipped",
+                {
+                    "stage": stage,
+                    "family": family.name,
+                    "reason": reason,
+                    "effect": "trial_pruned_but_family_kept_for_fair_comparison",
+                },
+            )
             return
         self.blocked_families[family.name] = reason
         object.__setattr__(family, "available", False)
