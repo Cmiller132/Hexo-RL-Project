@@ -137,6 +137,14 @@ The adapter must:
 - Produce finite, masked loss tensors.
 - Return typed training outputs rather than generic model-core dictionaries.
 
+Training verification rule:
+- Do not assume existing training batches or targets are correct.
+- Every adapter must support a debug/probe path that shows replay record -> contracts -> model input tensors -> targets -> masks -> model outputs -> loss inputs.
+- Target validation must check semantic row identity, not just tensor shape.
+- Tensors produced from contracts must either own their memory or be guarded against mutation of the source contract after validation.
+- D6-augmented batches must prove target mass, legal-row identity, pair-row identity, and known-first semantics are preserved.
+- Negative tests must corrupt legal rows, target rows, pair targets, masks, graph links, tensor shapes, schema versions, and non-finite values, and each failure must identify whether the owner is replay projection, train adapter, model output validation, or loss planning.
+
 ## Inference Adapter Manifest And Declaration
 Every family must declare its inference protocol through `inference_manifest(spec)`.
 
@@ -261,6 +269,11 @@ test_pair_target_validation_rejects_opening_pair_loss
 test_pair_target_validation_rejects_missing_known_first
 test_pair_target_validation_rejects_stale_post_first_legal_table
 test_pair_target_mass_preserved_under_d6
+test_train_adapter_debug_bundle_reconstructs_replay_to_loss_inputs
+test_train_adapter_rejects_mutated_contract_after_projection
+test_train_adapter_rejects_stale_legal_row_identity
+test_train_adapter_rejects_corrupt_masks_or_nonfinite_targets
+test_model_output_validation_rejects_wrong_rows_shapes_and_nonfinite_values
 test_checkpoint_manifest_round_trips
 test_checkpoint_inspect_does_not_load_weights
 test_checkpoint_load_rejects_missing_manifest
@@ -296,6 +309,8 @@ one-batch trainer smoke output for every family
 checkpoint manifest round-trip output
 checkpoint inspect-without-weights proof
 pair target validation proof for opening, first-placement, second-placement, and D6 cases
+single-position training debug bundle showing replay record, contracts, tensors, targets, masks, outputs, losses, hashes, and trace ids
+mutation/corruption test output for target and tensor projection boundaries
 import/deletion audit output
 ```
 
@@ -311,6 +326,8 @@ checkpoint manifest save/load/inspect round-trips
 checkpoint inspect works without loading weights
 strict checkpoint load rejects malformed, stale, incompatible, or prefix-cleanup-dependent checkpoints
 pair target validation is phase-aware, turn-aware, legal-row-aware, D6-aware, masked, and finite
+training debug bundle localizes failures to replay projection, train adapter, model output validation, or loss planning
+target/tensor projection paths are mutation-safe and corruption-tested
 runtime contains no `hexorl/model` compatibility shim
 runtime imports do not reference `hexorl/model`
 old model switches, checkpoint cleanup, and deprecated aliases are absent from runtime

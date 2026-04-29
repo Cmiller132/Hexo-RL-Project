@@ -60,6 +60,7 @@ Rules:
 - Dense, sparse, graph, and pair model batches are projections from the same record contracts.
 - Projection failures are hard errors unless the record is explicitly marked as a frozen negative/corruption fixture.
 - Corruption handling must identify the record, field, schema version, and failed invariant.
+- Replay records must not store mutable views into self-play/game-runner payloads. Stored records must be immutable or copied at the boundary so later game-state mutation cannot change written data.
 
 ## Projection Requirements
 - `replay/projector.py` is the single runtime path from replay sample to trainable batch payload.
@@ -68,6 +69,20 @@ Rules:
 - Legal rows, candidates, pair rows, targets, masks, graph inputs, and loss inputs are derived from canonical contract builders and adapters.
 - D6 replay augmentation, if active in this phase, must transform canonical contracts rather than mutate already-projected tensors privately.
 - Sample-to-loss smoke coverage proves that a sampled record becomes a finite loss through the projector path.
+
+## Detailed Replay Verification
+
+Replay is a correctness boundary, not only a storage format. This phase must prove records preserve the semantics that training later consumes.
+
+Required verification:
+
+- self-play traced position -> replay record -> decoded record -> projected contracts must preserve history hash, legal row ids, source, schema version, target identity, D6 identity, candidate/pair/graph identities, and record hash
+- record writing must reject stale legal hashes, stale schema versions, mismatched policy targets, mismatched value targets, bad pair known-first references, illegal masks, and non-finite target values
+- storage round-trips must prove byte serialization does not reorder rows, drop source/version fields, alter target mass, or mutate nested payloads
+- D6 replay augmentation must prove inverse/composition, target mass preservation, row identity preservation, and no in-place mutation of source records
+- projector outputs must be reproducible from the record and canonical builders only
+- corruption tests must identify whether the failure belongs to codec, storage, sampler, projector, contract builder, or train adapter
+- the single-position behavior debug bundle must include replay record content, decoded content, projector output identities, and sample-to-loss identity checks
 
 ## Migration Boundary
 Old replay data may be converted, but not consumed by runtime code.
@@ -102,8 +117,11 @@ Any migration script must be explicit about input schema, output schema, validat
 - New replay codec roundtrip tests for golden records.
 - Storage write/read roundtrip tests with schema-version validation.
 - Corruption tests for malformed headers, truncated payloads, invalid schema versions, invalid legal hashes, invalid targets, and bad contract metadata.
+- Corruption tests for stale row ids, stale hashes, bad masks, non-finite target values, bad known-first pair targets, reordered rows, and mutated nested payloads.
 - Projector tests proving sampled records produce canonical train batches for supported model families.
 - Sample-to-loss smoke tests proving projected batches produce finite losses through `train/adapters.py`.
+- Tests proving self-play trace -> replay write -> replay read -> projector -> train adapter preserves semantic identities.
+- Tests proving D6 replay augmentation does not mutate source records and preserves target mass and row identity.
 - Import audit tests proving no runtime import of `buffer/` or old replay paths.
 - Tests proving old replay/buffer decode exists only in `tools/migration/` or frozen fixtures.
 - Tests proving sampler reads only new records and fails hard on old replay payloads.
@@ -112,6 +130,8 @@ Any migration script must be explicit about input schema, output schema, validat
 - New replay schema/version documentation.
 - Golden new replay fixture set with generator command and fixed seed.
 - Corruption fixture set or synthetic corruption test helper.
+- Replay verification report proving trace-to-record-to-projector identity preservation.
+- Single-position behavior debug bundle replay section sample.
 - Migration tool notes for any retained old replay conversion path.
 - Import audit output or CI check covering forbidden runtime imports.
 - Sample-to-loss smoke output for each supported training adapter in scope.
@@ -121,6 +141,8 @@ Any migration script must be explicit about input schema, output schema, validat
 - Sampler reads only new replay records.
 - Training batches are produced only through `replay/projector.py`.
 - Projector consumes canonical contracts rather than sampler-private reconstruction logic.
+- Replay records, decoded records, and projector outputs preserve semantic identity across trace, storage, D6, and training boundaries.
+- Replay mutation/corruption tests fail loudly with codec/storage/sampler/projector/train-adapter ownership.
 - Old replay/buffer decode is absent from runtime imports.
 - Old replay/buffer decode exists only in `tools/migration/` or frozen fixtures.
 - Roundtrip, corruption, projection, and sample-to-loss tests pass.

@@ -70,6 +70,13 @@ Boundary rules:
 - Production code may not silently fall back from Rust legal rows to Python legal rows.
 - Any fixture-only fallback must be explicit, local to tests or fixture builders, and marked with `source="fixture"`.
 
+Engine verification rule:
+- Do not treat the current Rust/Python boundary as automatically correct.
+- Every Rust-exposed payload must be validated for semantic correctness, not only shape or row count.
+- Legal rows must be checked for duplicate cells, occupied cells, current-player correctness, phase correctness, terminal-state consistency, row ordering, dense-index mapping, and stable source/hash identity.
+- History replay must cross-check final board state, side to move, terminal result, placement counts, and rejected illegal transitions.
+- Engine output used by contracts must be copied, frozen, or guarded so later mutation cannot invalidate hashes, cached views, targets, or traces silently.
+
 ### 3. History Ownership
 Centralize compact-history handling.
 
@@ -157,7 +164,23 @@ Required behavior:
 - Validation can distinguish full debug validation from hot-path boundary validation.
 - Cached views must not permit mutation that invalidates hashes or equality semantics.
 
-### 8. Production Fallback Removal
+### 8. Detailed Verification And Mutation Safety
+
+This phase must establish the verification style used by all later phases. The existing runtime is not a trusted oracle.
+
+Required verification patterns:
+- golden histories with hand-audited board state, side to move, terminal status, legal rows, and D6 variants
+- negative histories covering malformed bytes, duplicate placements, occupied-cell moves, illegal turn order, stale known-first placement, invalid radius, and impossible terminal states
+- round-trip checks for Rust history replay -> Python `MoveHistory` -> Rust replay
+- legal table checks that compare row ids, row order, dense indices, source, schema version, hash, and coordinate semantics
+- D6 checks that validate inverse, composition, target mass, legal-row identity, and row ordering after canonicalization
+- mutation tests for every ndarray/Torch/cached/zero-copy view exposed by contracts
+- hash invalidation tests proving any payload mutation is either impossible or produces a different validated identity
+- source enforcement tests proving fixture and fallback data cannot enter production paths accidentally
+
+The phase artifact must include at least one single-position debug payload showing history, board state, legal rows, source/hash/version, D6 transforms, and validation outcome. Later phases extend this payload rather than inventing separate debug formats.
+
+### 9. Production Fallback Removal
 Remove or isolate production private implementations replaced by this phase.
 
 Delete or make fixture-only:
@@ -199,6 +222,8 @@ Required legal tests:
 - Rust legal table parity passes for golden positions
 - legal row ordering is stable
 - legal table hash is stable
+- legal rows reject occupied cells, duplicate rows, stale side-to-move state, terminal-state inconsistencies, and phase mismatches
+- legal row identity includes source, schema/version, dense index mapping, and canonical coordinate semantics
 - production fallback source fails hard
 - fixture source is accepted only in fixture/test mode
 - dashboard/sampler/graph callers consume shared legal contracts
@@ -213,6 +238,13 @@ Required D6 tests:
 - policy target mass preservation
 - pair target mass preservation
 - legal-table transformed hash consistency
+- no D6 transform mutates the source history, legal table, target, tensor, or cached view in place unless explicitly documented and validated as an owned mutable buffer
+
+Required mutation-safety tests:
+- cached legal/history/D6 views cannot mutate canonical contract payloads
+- zero-copy arrays are read-only or guarded by validation identity checks
+- copying, tensor conversion, batching, and debug serialization preserve contract hashes
+- corrupted hashes, stale schema versions, and changed source labels fail at decode/boundary validation
 
 Required boundary/import tests:
 - `contracts/` imports no forbidden runtime subsystem packages
@@ -243,6 +275,7 @@ Produce or update the following as part of this phase:
 - `Python/src/hexorl/engine/` package
 - contract schema/version/hash/source definitions
 - Rust/Python parity fixtures or golden fixture references
+- single-position debug payload for engine/history/legal/D6 verification
 - focused tests under `Python/tests/contracts/`
 - focused tests under `Python/tests/engine/`
 - import-boundary tests for contract purity
@@ -276,6 +309,8 @@ All gates are required.
 - Dashboard, sampler, graph, self-play, tactical, replay, RGSC, and bootstrap paths use shared history/legal/D6 contracts or engine providers.
 - Contract schema/version/hash/source rules are implemented and tested.
 - Hot-path zero-copy/cached view rules are implemented or explicitly documented for each hot contract.
+- Detailed verification fixtures cover positive, negative, D6, mutation, source, and semantic-identity cases.
+- Single-position debug payload exists and can identify whether a failure belongs to engine replay, legal table construction, D6 transformation, or contract validation.
 - Rust/Python D6 parity passes.
 - Rust legal parity passes.
 - History encode/decode parity passes for golden histories.

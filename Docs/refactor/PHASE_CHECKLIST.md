@@ -8,9 +8,14 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] Entry criteria from the previous phase are satisfied.
 - [ ] Public contracts/interfaces for this phase are frozen before implementation work.
 - [ ] Golden fixtures or baseline artifacts needed by this phase are identified.
+- [ ] Golden fixtures include negative/corrupt cases, D6 variants, and expected semantic identities, not just shapes.
 - [ ] Unit tests for new behavior are added.
 - [ ] Integration tests prove runtime consumers use the new path.
 - [ ] Parity tests use frozen fixtures or migration tools only; old runtime code is not kept as an oracle.
+- [ ] Cross-validation tests prove row identity, ordering, source, schema version, and hash stability across subsystem boundaries.
+- [ ] Mutation-safety tests prove cached views, tensors, replay payloads, and target projections cannot silently change after validation.
+- [ ] Corruption tests prove bad histories, illegal rows, stale hashes, bad masks, wrong D6 transforms, malformed targets, and protocol mismatches fail loudly.
+- [ ] A single-position debug bundle or equivalent trace can localize failures to the owning subsystem.
 - [ ] Performance smoke is compared to Phase 00 baseline where relevant.
 - [ ] Structured telemetry/logging samples are attached where relevant.
 - [ ] Import/code-search audits prove old phase-owned paths are removed or test-only.
@@ -42,6 +47,8 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] Rust is the production legal/history source.
 - [ ] Python legal fallback is fixture-only.
 - [ ] Rust/Python parity passes for legal rows, compact history, D6 coordinates/history/legal/dense tensors.
+- [ ] Engine/legal verification checks semantic legality, row ordering, duplicate detection, terminal state, current player, and source/hash identity.
+- [ ] Contract mutation tests prove zero-copy/cached views cannot invalidate validated hashes silently.
 - [ ] Private production legal/history/D6 helpers removed or quarantined outside runtime.
 
 ### Phase 02
@@ -50,6 +57,8 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] `PairCandidateBatch` is deleted or demoted to a semantics-free projection from `PairActionTable`.
 - [ ] Graph semantic construction and tensorization are separate.
 - [ ] Golden parity proves candidate/pair/graph equality across consumers.
+- [ ] Candidate, pair, and graph tensor projections are proven to be pure, immutable projections from canonical contracts.
+- [ ] D6 round-trip and inverse tests cover candidate rows, pair rows, graph tokens, graph relations, masks, and target mass.
 
 ### Phase 03
 - [ ] `models/` registry/spec/capability system is authoritative.
@@ -57,6 +66,8 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] Every family exposes model, train adapter, inference manifest/declaration, policy provider, loss plan, default recipe, and tune space.
 - [ ] Trainer runs one batch for every registered family through `TrainAdapter`.
 - [ ] Checkpoint manifest strict round-trip and inspect-without-weights tests pass.
+- [ ] Model target verification covers legal-row alignment, pair known-first semantics, opening no-pair targets, masks, finite losses, and D6 target mass.
+- [ ] Training debug bundle proves replay record -> contracts -> tensors -> targets -> loss inputs without private reconstruction.
 
 ### Phase 04
 - [ ] `InferenceProtocolManifest` is negotiated before request submission.
@@ -71,12 +82,16 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] `PairStrategySpec` validates root/leaf/full caps independently.
 - [ ] Default pair strategy is `none`; `global_xattn` emits zero pair rows by default.
 - [ ] Global graph pair heads have turn-aware, row-mapped, telemetry-visible contracts.
+- [ ] Policy and MCTS verification proves raw model outputs map to exactly the intended legal rows before search consumes them.
+- [ ] EngineAdapter rejects stale legal-row identity, stale pair-row identity, non-finite priors, and all-zero priors without explicit fallback reason.
 
 ### Phase 06
 - [ ] `GameRunner` depends on providers/adapters/builders, not architecture/config strings.
 - [ ] `SelfPlayWorker` is lifecycle/IPC only.
 - [ ] Worker-owned game-loop, replay assembly, graph/candidate/pair chunking, and MCTS prior wiring are removed.
 - [ ] Self-play heartbeat, no-progress, game summary, policy timing, pair summary, and `ContractTrace` events are asserted.
+- [ ] Single-game debug trace can replay one game position-by-position and identify engine, contract, inference, MCTS, or replay-writer failures.
+- [ ] Self-play verification catches legal-row disagreement, changed hashes, mutated model inputs, stale targets, and replay record mismatch.
 
 ### Phase 07
 - [ ] New self-play writes only new replay records.
@@ -89,6 +104,7 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] Arena/eval uses `PolicyProvider` for every registered family.
 - [ ] Dashboard routes use `ContractInspector` and read-only services only.
 - [ ] Dashboard shows contract hash/source/version, trace IDs, and mismatch location.
+- [ ] Dashboard can inspect a single-position debug bundle across engine, contracts, D6, targets, model outputs, policy priors, MCTS, and replay.
 - [ ] Autotune uses typed `ModelRecipe` and family spaces, not raw config mutation.
 - [ ] Recipe dry-run, scheduler decision logging, and no-progress watchdog tests pass.
 

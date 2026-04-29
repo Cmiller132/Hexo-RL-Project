@@ -91,6 +91,8 @@ all-zero prior mass without an explicit fallback reason
 model output rows that cannot be traced to legal rows
 ```
 
+Verification rule: `SearchEvaluation` must prove that model behavior is being interpreted correctly. It must preserve enough raw-output metadata, row ids, masks, prior source labels, and trace ids to determine whether a bad move came from the model, adapter decode, policy mapping, legal table, pair strategy, or MCTS.
+
 ### PairEvaluation
 
 `PairEvaluation` is the only pair-prior object accepted by `EngineAdapter`.
@@ -269,6 +271,18 @@ Hard rules:
 - MCTS telemetry reports whether `pair_first`, `pair_second`, `pair_joint`, tactical pairs, or no pairs influenced the decision.
 - Pair-prior application is a no-op for empty `PairEvaluation`, and the trace must show that no pair influence occurred.
 
+## Detailed Policy And MCTS Verification
+This phase must verify the model-to-search boundary as if subtle mapping bugs already exist.
+
+Required verification:
+- For each model family, compare raw model outputs, decoded adapter outputs, `SearchEvaluation` priors, and `EngineAdapter` inputs for the same golden positions.
+- Verify that every prior accepted by MCTS maps to exactly one `LegalActionTable` row with matching row id, dense index, coordinate, phase, schema version, source hash, and trace id.
+- Verify that masked rows cannot receive prior mass and legal rows cannot disappear silently.
+- Verify that non-finite logits, non-finite values, all-zero prior mass, stale legal hashes, stale pair hashes, duplicate rows, and wrong protocol versions fail before MCTS.
+- Verify that MCTS cannot mutate the `SearchEvaluation`, `PairEvaluation`, legal table, pair table, or policy-provider response.
+- Verify that search traces report raw prior source, normalized prior, MCTS visit count, selected move, value estimate, pair influence, and fallback reason when a fallback is explicitly allowed.
+- Add a single-position policy/search debug bundle containing contracts, raw model outputs, decoded outputs, priors, pair evaluation, MCTS input, MCTS output, selected move, hashes, and timings.
+
 ## Parallel Subagent Work
 
 - S1: Implement `SearchContext`, `SearchEvaluation`, and row-mapped prior validation in `search/context.py` and `search/priors.py`.
@@ -332,6 +346,9 @@ test_engine_adapter_rejects_raw_logits
 test_engine_adapter_validates_legal_row_identity
 test_engine_adapter_validates_pair_row_identity
 test_engine_adapter_empty_pair_eval_is_noop
+test_engine_adapter_rejects_mutated_search_evaluation
+test_engine_adapter_rejects_stale_hashes_duplicate_rows_and_nonfinite_priors
+test_policy_search_debug_bundle_localizes_mapping_or_mcts_failure
 test_mcts_integration_consumes_policy_provider_outputs
 test_mcts_integration_consumes_pair_strategy_outputs_when_enabled
 ```
@@ -372,6 +389,8 @@ Produce these artifacts before marking the phase complete:
 - `PairStrategySpec` schema and validation tests for root/leaf/full caps.
 - Default recipe/config evidence showing `none` for global graph families, including `global_xattn`.
 - MCTS trace sample showing policy provider, pair strategy, legal row count, pair rows possible, selected pair rows, scored pair rows, and pair influence.
+- Single-position policy/search debug bundle showing raw outputs, decoded outputs, row-mapped priors, pair evaluation, MCTS inputs/outputs, hashes, trace ids, and selected move.
+- Mutation/corruption verification proof for policy outputs, legal rows, pair rows, priors, and MCTS inputs.
 - Import audit output summary proving `EngineAdapter` is the only Rust MCTS caller.
 - Import audit output summary proving no worker architecture string checks remain.
 - Import audit output summary proving no pair enablement from heads/config/architecture remains.
@@ -411,6 +430,8 @@ Full pair scoring is diagnostic-only, root-only, capped, and cannot run at leave
 Global graph pair heads satisfy legal-row, PairActionTable, and known-first contracts.
 Opening positions have no pair prior and no pair loss.
 MCTS telemetry reports policy provider, pair strategy, pair rows possible, pair rows scored, and pair influence.
+Policy/search debug bundle can identify whether a bad decision came from raw model output, inference decode, policy mapping, pair strategy, legal rows, or MCTS.
+MCTS cannot mutate policy, pair, legal, or contract payloads after validation.
 Import audits show no direct Rust MCTS calls outside EngineAdapter.
 Import audits show no worker-owned pair chunk/scoring path.
 Import audits show no runtime architecture string gates outside registry/spec validation.

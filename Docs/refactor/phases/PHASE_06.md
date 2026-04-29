@@ -109,6 +109,8 @@ Self-play logs must make these failure classes distinguishable:
 - record writing slow or failing
 - legal rows disagree between engine and contract
 - priors missing, masked out, non-finite, or mapped to wrong rows
+- contract, tensor, policy, search, or replay payload mutated after validation
+- replay record content disagrees with the traced position contracts
 
 Required event types:
 
@@ -120,6 +122,8 @@ Required event types:
 - `pair_strategy_summary`
 - `contract_validation_failure`
 - `inference_protocol_mismatch`
+- `selfplay_position_debug_bundle`
+- `selfplay_mutation_guard_failure`
 
 Required heartbeat fields:
 
@@ -210,6 +214,61 @@ Required spans:
 - `pair_chunk_count`
 - `pair_chunk_forward_ms`
 
+## Behavior Debug Bundle Requirements
+
+Self-play must support a debug/probe mode for a single game or selected positions. This is not a replacement for hot-path logging; it is the detailed artifact used when a model is not learning or a game result looks suspicious.
+
+The bundle must show, for each traced position:
+
+- run id, game id, move index, seed, current player, phase, and compact history
+- board state from Rust replay and contract identity from Python
+- legal rows, dense indices, row ids, source, schema version, and hash
+- D6 transform identity when augmentation is involved
+- candidate rows, pair rows, graph tokens, graph relations, masks, and hashes
+- model family, recipe id, checkpoint manifest, inference protocol, and provider name
+- model input tensor shapes, row mappings, and immutable/projection ownership
+- raw model outputs, decoded outputs, value estimate, masks, warnings, and non-finite counts
+- row-mapped priors with prior source, masked rows, normalized mass, and fallback reason if any
+- pair strategy decision, pair rows possible, selected rows, scored rows, and pair influence
+- MCTS input, visit distribution, final selected move, engine apply result, and terminal status
+- replay record payload, replay schema version, record hash, and record-writer result
+- validation failures, mutation-guard failures, and suggested owner subsystem
+
+The bundle must localize failures to one of:
+
+```text
+engine replay/legal
+contract validation
+D6 transform
+candidate builder
+pair table builder
+graph semantic builder
+graph tensorizer
+inference protocol/transport
+model forward/output validation
+policy provider row mapping
+pair strategy
+EngineAdapter/MCTS
+move application
+record writer/replay encoding
+```
+
+Debug bundles should be sampled or explicitly requested so normal self-play remains fast.
+
+## Detailed Self-Play Verification
+
+This phase must verify full-game behavior without assuming the old worker path is correct.
+
+Required verification:
+
+- deterministic fake providers/adapters/builders must drive a full game and produce reproducible traces
+- golden-position game runner tests must compare engine replay, contract rows, policy priors, MCTS result, move application, and replay record content
+- mutation guards must detect changes to legal tables, candidates, pair tables, graph tensors, policy outputs, search evaluations, and replay records after validation
+- legal-row disagreement between Rust replay, contract tables, policy rows, MCTS input, selected move, and replay output must fail with the owner subsystem named
+- D6-augmented positions must prove history, legal rows, targets, model inputs, priors, and replay records stay semantically aligned
+- corrupt or stale hashes, schema versions, row ids, masks, model outputs, pair rows, and replay payloads must fail before record writing
+- no-progress diagnostics must include enough state to decide whether to inspect engine, contracts, inference, model forward, MCTS, or replay writing first
+
 ## Concrete Work
 
 1. Add `GameRunRequest`, `GameRunResult`, and any narrow per-game state objects needed by `GameRunner`.
@@ -237,10 +296,19 @@ Required spans:
   - heartbeat, no-progress, game summary, policy timing, and pair summary events contain required fields
   - `ContractTrace` fields and required spans are present for a traced position
   - stall diagnosis identifies IPC wait, engine wait, record writer wait, and pair-budget issues separately
+  - position debug bundles contain engine, contract, D6, model input, raw output, policy, pair, MCTS, and replay sections
+  - mutation guard failures identify the mutated payload and owning subsystem
 
 - `Python/tests/selfplay/test_record_writer.py`
   - replay records are assembled and validated outside `SelfPlayWorker`
   - record writer failures are surfaced through `GameRunResult` and telemetry
+  - replay record hashes and schema versions match the traced position contracts
+  - corrupt or stale record payloads fail before write success is reported
+
+- `Python/tests/selfplay/test_game_runner_verification.py`
+  - golden positions verify engine rows, contract rows, policy priors, MCTS selected move, move application, and replay payload identity
+  - D6-augmented positions preserve legal rows, targets, priors, and replay identity
+  - stale hashes, mutated tensors, bad masks, stale legal rows, and non-finite outputs fail before MCTS or record writing
 
 - `Python/tests/selfplay/test_no_worker_architecture_logic.py`
   - no architecture string checks in `worker.py`
@@ -283,6 +351,8 @@ This phase must leave behind:
 - `SelfPlayContractBuilders` dependency bundle
 - `SelfPlayRecordWriter` implementation or interface in `record_writer.py`
 - structured self-play telemetry event definitions
+- single-position and single-game behavior debug bundle definitions
+- mutation guard definitions for self-play payloads and projections
 - import-audit output captured in the phase PR or implementation notes
 - tests listed above, with deterministic fixtures or fakes
 
@@ -298,6 +368,9 @@ This phase must leave behind:
 - Default pair strategy reports zero pair rows scored.
 - Dense, graph hybrid, and global graph self-play run through the same `GameRunner` interface.
 - Heartbeat, no-progress, game summary, policy timing, pair summary, and `ContractTrace` telemetry are emitted and tested.
+- Behavior debug bundles can localize model-behavior failures across engine, contracts, D6, targets, model outputs, policy mapping, MCTS, and replay.
+- Mutation guards catch post-validation changes to contract, tensor, policy, search, and replay payloads.
+- Golden self-play verification proves selected moves and replay records are semantically aligned with engine/legal/contract state.
 - Import audits pass.
 - Relevant test suites pass:
 

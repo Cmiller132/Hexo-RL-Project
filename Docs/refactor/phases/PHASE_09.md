@@ -70,6 +70,9 @@ no dashboard route imports sampler-private builders
 no trainer model-class checks
 no eval dense-only player assumptions
 no autotune raw config mutation for model-family behavior
+single-position behavior debug bundle covers engine/contracts/D6/targets/model/policy/MCTS/replay
+mutation guards reject post-validation payload changes
+corruption tests reject stale hashes, bad schema versions, wrong row identity, illegal masks, and non-finite model outputs
 ```
 
 Use AST/import-graph checks where regex would be too brittle.
@@ -94,6 +97,8 @@ eval through PolicyProvider
 dashboard ContractInspector route/view smoke
 tuning recipe dry-run and rejected-recipe explanation
 structured logs/traces for self-play and autotune
+single-position behavior debug bundle generation
+mutation/corruption verification for one golden position
 ```
 
 ## V2 Requirement Matrix Closure
@@ -124,6 +129,8 @@ manual verification only
 - Full CI matrix green.
 - Import graph and banned-path checks green.
 - Final end-to-end smoke archived.
+- Behavior debug bundle test proves one position can be traced across engine, contracts, D6, targets, model outputs, policy mapping, MCTS, replay, dashboard, and autotune report references.
+- Mutation/corruption test suite proves stale hashes, bad schemas, wrong legal rows, mutated tensors, bad masks, bad pair rows, non-finite outputs, and replay mismatches fail loudly.
 - Dashboard build and route smoke pass.
 - Tuning dry-run and rejection-reason tests pass.
 - Rollback drill from final cut tag documented.
@@ -137,6 +144,7 @@ Docs/refactor/artifacts/phase_09/import_audits/
 Docs/refactor/artifacts/phase_09/deletion_manifest/
 Docs/refactor/artifacts/phase_09/final_smoke/
 Docs/refactor/artifacts/phase_09/telemetry_samples/
+Docs/refactor/artifacts/phase_09/verification/
 Docs/refactor/artifacts/phase_09/final_conformance_report.md
 ```
 
@@ -146,5 +154,6 @@ Docs/refactor/artifacts/phase_09/final_conformance_report.md
 - No compatibility shims remain in the main runtime path.
 - No banned imports or behavior gates remain.
 - Final smoke proves the cohesive runtime flow works end to end.
+- Final verification proves the runtime can localize subtle correctness failures without trusting the old implementation as the oracle.
 - V2 requirement matrix is fully closed.
 - Final conformance report confirms complete, spec-compliant delivery.

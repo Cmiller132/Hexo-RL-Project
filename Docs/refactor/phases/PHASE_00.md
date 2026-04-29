@@ -17,6 +17,7 @@ V2 rules that Phase 00 must enforce immediately:
 - Self-play logs must make stalls, slow phases, pair scoring, inference waits, and contract mismatches diagnosable.
 - Every runtime sweep must have a no-progress watchdog.
 - Deprecated aliases and stale compatibility shims must be deleted by the owning phase, not preserved indefinitely.
+- The current runtime must not be treated as a trusted oracle; later phases require independent or cross-validated verification, corruption tests, and mutation guards.
 
 ## In-Scope Repository Context
 Baseline and inventory must cover at least:
@@ -70,7 +71,8 @@ No later phase may treat an undocumented local run, checkpoint, replay file, tra
 9. No-progress watchdog smoke showing a stalled self-play or runtime sweep emits a diagnosable event and exits or aborts predictably.
 10. Architecture-string dependency inventory.
 11. Deletion and legacy inventory with owning phase for every fallback, duplicate helper, deprecated alias, and stale runtime path found.
-12. Hard exit gate report signed by the orchestrator before Phase 01 starts.
+12. Verification inventory listing golden positions, negative/corrupt cases, D6 variants, mutation-risk payloads, and independent oracle options for each boundary.
+13. Hard exit gate report signed by the orchestrator before Phase 01 starts.
 
 ## Baseline Freeze
 Freeze the baseline before any breaking refactor edits.
@@ -210,6 +212,26 @@ Docs/refactor/artifacts/phase_00/traces/
 
 Samples may be small, but they must be real outputs from commands recorded in `COMMAND_INDEX.md`.
 
+## Verification Inventory
+Create the verification plan before Phase 01 starts. This inventory exists because the current runtime is not trusted enough to be the sole oracle for the refactor.
+
+Required inventory:
+
+- golden positions with hand-audited compact histories, board state, side to move, legal moves, terminal status, and expected failure class
+- D6 variants for each golden position, including inverse and composition expectations
+- negative/corrupt cases for malformed history, illegal move order, duplicate occupancy, stale known-first placement, bad legal rows, bad masks, bad hashes, bad schema versions, non-finite model outputs, and replay corruption
+- mutation-risk payloads, including NumPy arrays, Torch tensors, cached views, graph batches, replay records, inference transport buffers, search evaluations, and MCTS inputs
+- independent or cross-validated oracle options for each boundary, such as Rust replay, contract validation, hand-audited fixtures, inverse D6 checks, replay round-trips, schema/hash checks, and owner-specific corruption tests
+- planned single-position debug bundle sections for engine, contracts, D6, candidates, pairs, graph, targets, model inputs, model outputs, policy priors, MCTS, replay, dashboard, and autotune reports
+
+Required file:
+
+```text
+Docs/refactor/artifacts/phase_00/checks/verification_inventory.md
+```
+
+The inventory must explicitly say where old-runtime comparison is allowed only as a weak signal and where it is forbidden as the sole proof.
+
 ## No-Progress Watchdog Smoke
 Prove that a no-progress condition is observable and actionable.
 
@@ -284,6 +306,8 @@ autotune or runtime sweep dry-run
 dashboard build if dashboard dependencies are present
 ```
 
+Also create the verification inventory and transcript any lightweight checks used to build it. If a golden position or corruption case cannot be created in Phase 00, the inventory must assign it to the exact owner phase and explain why.
+
 The command index must mark every check as one of:
 
 ```text
@@ -301,7 +325,7 @@ No failed or skipped mandatory check may be waved through without an explicit ha
 - S2 Engine/Runtime: map Rust/Python ownership boundaries, legal fallback paths, and no-progress watchdog behavior.
 - S3 Models/Search: inventory model family checks, `global_xattn` defaults, pair-policy coupling points, and accidental pair scoring tests.
 - S4 Data/Train/Eval: baseline replay-to-sampler-to-trainer path, training smoke, evaluation assumptions, and deletion owners.
-- S5 Quality/Obs/Docs: command transcripts, structured logs, trace samples, artifact manifest, and exit gate report.
+- S5 Quality/Obs/Docs: command transcripts, structured logs, trace samples, verification inventory, artifact manifest, and exit gate report.
 
 ## Hard Exit Gates
 Phase 00 is complete only when every gate below is satisfied or explicitly marked blocking.
@@ -321,6 +345,8 @@ Hard gates:
 - Structured log samples exist for self-play progress, pair summary, policy timing, autotune lifecycle, scheduler decision, and no-progress.
 - Trace sample includes pair row counts, graph counts, timings, and warnings.
 - No-progress watchdog smoke emits an actionable event and exits, aborts, or marks failure predictably.
+- Verification inventory exists and treats old-runtime comparison as insufficient by itself.
+- Golden positions, negative/corrupt cases, D6 variants, mutation-risk payloads, and independent oracle options are mapped to owner phases.
 - Architecture-string inventory exists.
 - Deletion and legacy inventory exists with owning phases.
 - Rust/Python rule boundary inventory exists.

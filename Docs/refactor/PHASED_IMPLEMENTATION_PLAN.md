@@ -50,6 +50,8 @@ Shared contracts and public interfaces must be frozen before parallel implementa
 A phase may advance only when all are true:
 
 - mandatory unit, integration, parity, policy, deletion, telemetry, and performance checks pass
+- correctness checks do not assume the existing runtime is trusted; every phase-owned boundary has an independent or cross-validated oracle
+- mutation-safety checks prove contracts, views, tensor projections, D6 transforms, replay records, and model targets cannot be silently changed after hashing/validation
 - V2 requirement matrix rows owned by the phase are complete
 - no implementation remains "present but unused"
 - no runtime compatibility shim remains without an explicit non-runtime quarantine and expiry
@@ -73,6 +75,24 @@ The following are phase blockers:
 - inference protocol mismatch can hang instead of fail fast
 - autotune can mutate raw config fields instead of typed recipes
 - logs cannot explain where a self-play/autotune stall occurred
+- verification relies on the old implementation as the only oracle
+- a contract or tensor can be mutated after validation without changing its hash, version, or trace identity
+- a Rust/Python parity test checks only shape/count and not row identity, ordering, legality, and semantic meaning
+
+## Verification Philosophy
+
+The current project structure is not a trusted baseline. The refactor must verify behavior as if subtle bugs already exist in the engine boundary, encoders, D6 transforms, target builders, tensor projections, inference mapping, MCTS integration, and replay storage.
+
+Every phase that introduces or cuts over a data boundary must include:
+
+- golden position fixtures with known histories, legal rows, terminal status, D6 variants, targets, and expected failure cases
+- independent or cross-implementation checks, such as Rust replay against Python contract validation, inverse D6 transforms, replay round-trips, and model-output-to-legal-row reconstruction
+- identity checks for row ordering, row ids, hashes, schema versions, source labels, and trace ids
+- immutability or mutation-detection tests for cached views, NumPy/Torch tensors, replay records, model targets, graph tensors, and transport buffers
+- negative tests that deliberately corrupt histories, rows, masks, hashes, targets, tensor shapes, protocol versions, and pair semantics
+- single-position debug bundles that can localize whether a failure belongs to engine, contracts, D6, candidates, pairs, graph tensorization, training targets, inference, policy mapping, MCTS, self-play, replay, dashboard, or autotune
+
+Shape-only tests, smoke-only tests, and tests that merely compare old output to new output are not enough.
 
 ## Required Program Artifacts
 

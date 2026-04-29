@@ -148,6 +148,15 @@ Fail-fast behavior:
 - Mismatches are logged through `inference_protocol_mismatch` telemetry with the client manifest, server manifest, selected checkpoint manifest, and mismatch field.
 - There is no fallback to architecture-prefix dispatch, legacy submit methods, dense tensor reconstruction, or Python legal/candidate/pair rebuilding.
 
+Detailed verification:
+
+- Inference tests must assume request packing, shared-memory transport, tensor collation, model forward, scatter, and decode can each corrupt, reorder, or stale-read data.
+- Request packing must preserve trace id, history hash, legal row ids, candidate row ids, pair row ids, graph token ids, graph relation ids, schema versions, caps, and masks.
+- Transport buffers must not allow stale request data, stale response data, stale ready flags, or post-validation mutation to appear as a valid response.
+- Response decoding must validate output shape, row identity, protocol version, model family, output contract, non-finite values, masks, and count fields before returning to `PolicyProvider`.
+- Negative tests must corrupt protocol versions, request kind, row counts, masks, token counts, pair counts, output shapes, stale ready flags, stale trace ids, and non-finite outputs.
+- A single-position inference debug payload must show packed request metadata, transport lifecycle timings, raw model output metadata, decoded output metadata, response hashes, and validation failures.
+
 ## Transport Lifecycle Ownership
 
 `inference/shm_transport.py` owns IPC setup, shared-memory allocation, queue wiring, heartbeat, backpressure, deadlines, teardown, and orphan cleanup.
@@ -209,6 +218,8 @@ Response telemetry assertions:
 - Required spans include `ipc_pack_ms`, `ipc_wait_ms`, `queue_wait_ms`, `collate_ms`, `model_forward_ms`, `scatter_ms`, and `decode_ms`.
 - Pair responses also include `pair_chunk_count`, `pair_chunk_forward_ms`, `pair_rows_requested`, `pair_rows_scored`, and the active pair strategy name supplied by the caller.
 - Response assertions reject missing heads, unexpected heads, non-finite logits/values, shape mismatches, legal-row count mismatches, pair-row count mismatches, graph count mismatches, stale manifest hashes, and mismatched request ids.
+- Response telemetry can identify pack, transport, collate, model-forward, scatter, decode, validation, timeout, and cleanup failures separately.
+- Corrupt or stale transport/request/response payloads fail before policy/search consumes them.
 
 ## Required Deletions
 
@@ -273,6 +284,8 @@ Required cases:
 - Saturated queue produces retryable or failed status, not a hang.
 - Shutdown drains or fails accepted requests.
 - Shared-memory segments are closed/unlinked by transport ownership.
+- Stale ready flags, stale trace ids, stale response buffers, and reused shared-memory contents fail validation.
+- Post-validation mutation of request/response metadata is detected before policy/search consumption.
 
 Adapters and responses:
 
@@ -293,6 +306,8 @@ Required cases:
 - Pair adapter does not generate pair rows by itself.
 - Response telemetry contains protocol, schema, manifest, count, timing, and head metadata.
 - Non-finite, wrong-shape, wrong-row-count, and stale-manifest responses fail assertions.
+- Corrupt masks, row ids, token ids, relation ids, pair row ids, request ids, trace ids, and schema versions fail assertions.
+- Single-position inference debug payload localizes pack, transport, collate, forward, scatter, decode, and validation failures.
 
 Dispatch and import audits:
 
@@ -323,6 +338,8 @@ Docs/refactor/artifacts/phase_04_handshake_matrix.md
 Docs/refactor/artifacts/phase_04_timeout_audit.md
 Docs/refactor/artifacts/phase_04_import_audit.md
 Docs/refactor/artifacts/phase_04_response_telemetry_snapshot.md
+Docs/refactor/artifacts/phase_04_inference_debug_bundle.md
+Docs/refactor/artifacts/phase_04_mutation_corruption_report.md
 ```
 
 Artifact contents:
@@ -332,6 +349,8 @@ Artifact contents:
 - Timeout audit listing every inference wait site and its finite deadline behavior.
 - Import audit proving worker/dashboard/training do not call private inference tensor rebuild paths.
 - Telemetry snapshot showing response schema/protocol fields and timing spans.
+- Inference debug bundle showing one traced position through pack, transport, model output, decode, response validation, and failure ownership.
+- Mutation/corruption report covering stale buffers, stale ids, wrong row counts, bad masks, wrong shapes, and non-finite outputs.
 
 ## Hard Exit Gates
 
@@ -345,6 +364,8 @@ No inference wait can block indefinitely.
 Transport owns shared-memory, queue, heartbeat, backpressure, shutdown, and cleanup lifecycle.
 Dense, sparse, global graph, and pair scoring adapters round-trip through the inference server.
 All responses include and pass telemetry/schema/protocol assertions.
+Corrupt, stale, or mutated inference payloads fail before policy/search consumes them.
+Inference debug payload can localize failures to pack, transport, collate, model forward, scatter, decode, or response validation.
 Pair-capable adapters expose capabilities only; PairStrategy controls pair row generation and consumption.
 No private worker/dashboard/inference tensor rebuild path remains in migrated runtime imports.
 Old submit lifecycle paths are deleted or disconnected from runtime imports.

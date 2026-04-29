@@ -73,6 +73,8 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Delete or quarantine dashboard code that rebuilds model inputs, legal rows, candidates, pair rows, graph payloads, replay projection, or D6 facts outside canonical services.
 - Dashboard errors must point to the failing owner: engine/legal, candidate builder, pair table builder, graph builder, inference adapter, train adapter, policy provider, replay projector, or checkpoint manifest.
 - Dashboard tests must prove displayed model inputs match training inputs for golden positions.
+- Dashboard must be able to load or generate a single-position debug bundle and compare engine state, contracts, D6 transforms, training targets, model inputs, raw model outputs, policy-provider priors, pair strategy output, MCTS result, and replay record identity.
+- Dashboard mismatch views must show both sides of the comparison, the hashes/schema/source fields that disagree, and the likely owner subsystem. It must not hide mismatches behind generic "invalid input" messages.
 
 ## Autotune Work
 - Introduce typed `ModelRecipe` as the only tuning unit.
@@ -92,6 +94,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Add scheduler logs for every decision, including promotion, early stop, retry, budget reduction, watchdog abort, and final recommendation.
 - Add no-progress watchdogs for self-play progress, inference response progress, training batch progress, evaluation progress, and artifact/report writing.
 - Logs must be actionable: each validation failure, stall, abort, or poor score should include the likely subsystem to inspect and the relevant trace ids.
+- Poor-learning reports should include enough debug-bundle references to distinguish model underperformance from bad targets, bad legal rows, bad D6 transforms, policy mapping errors, MCTS misuse, replay corruption, or scheduler/runtime failures.
 - Delete or quarantine old autotune scripts that mutate raw config, encode model-family internals, or contain runtime sizing architecture branches.
 
 ## Required Deletions And Quarantine
@@ -135,6 +138,8 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Dashboard fixture parity: dashboard/training/replay inputs match on golden positions.
 - Dashboard required views render from `ContractInspector` or read-only services only.
 - Dashboard display assertions cover hash/source/version/trace fields.
+- Dashboard debug-bundle view displays engine, contracts, D6, targets, model outputs, policy priors, MCTS, and replay comparisons for golden positions.
+- Dashboard mismatch tests corrupt one subsystem at a time and assert the displayed owner subsystem is correct.
 - Dashboard has no private reconstruction imports for legal, D6, candidates, pairs, graph, model inputs, or replay projection.
 - Autotune accepts valid recipes and rejects incompatible recipes in dry-run before launch.
 - Autotune mutates typed `ModelRecipe` values only; raw config mutation tests fail.
@@ -143,6 +148,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Scheduler decision tests assert reason codes and score components.
 - No-progress watchdog tests cover self-play, inference, training, evaluation, and artifact writing.
 - Autotune logs include actionable validation, lifecycle, scheduler, abort, and next-debugging-action messages.
+- Autotune poor-learning reports link to trace/debug bundles or summarize the likely failure class across model, training targets, engine, D6, policy mapping, MCTS, replay, and runtime scheduling.
 - Import audits reject old scripts, runtime sizing architecture branches, deprecated aliases, and dashboard reconstruction helpers.
 
 ## Hard Gates
@@ -162,6 +168,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Evaluation works for every registered family through `PolicyProvider`, with no dense-only assumptions.
 - Dashboard is a contract inspector, not a sampler/trainer/model-input reconstructor.
 - Dashboard required views expose the hashes, sources, versions, manifests, and traces needed to debug mismatches.
+- Dashboard can localize single-position behavior mismatches across engine, contracts, D6, targets, model outputs, policy priors, MCTS, and replay.
 - Autotune runs through typed recipes, family spaces, runtime sweeps, scoring, manifests, reporting, scheduler decisions, watchdogs, and actionable logs.
 - Old scripts, private reconstruction paths, and architecture-branch runtime sizing code are deleted or quarantined away from runtime imports.
 - Mandatory tests, import audits, artifacts, and hard gates pass.

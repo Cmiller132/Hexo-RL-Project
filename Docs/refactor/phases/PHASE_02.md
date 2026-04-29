@@ -49,6 +49,19 @@ No runtime path may privately rebuild:
 - graph semantic tokens or relations
 - D6-transformed candidate/pair/graph inputs outside the contract APIs
 
+## Detailed Verification Requirements
+The builders introduced here must be verified as if the previous candidate, pair, and graph paths may contain subtle bugs. Do not use old runtime output as the only oracle.
+
+Required verification:
+- Golden positions must include opening, first-placement, second-placement known-first, terminal/near-terminal, pair-heavy, graph-token-heavy, and invalid-history cases.
+- Candidate rows must be verified for legal-row identity, dense-index mapping, mask correctness, target mass, recall diagnostics, ordering, schema version, hash, and source.
+- Pair rows must be verified for phase, unordered first-placement identity, ordered known-first second-placement semantics, selected-first validation, caps, row ordering, D6 behavior, schema version, hash, and source.
+- Graph semantics must be verified for token identity, relation identity, legal-row links, candidate links, pair links, phase labels, relation schema version, graph schema version, and hash.
+- Tensorized graph/candidate/pair batches must be pure projections from contracts. Mutating a tensor batch must not mutate the source contract unless the batch explicitly owns a copy and validation proves it.
+- D6 transforms must be verified with inverse and composition tests across candidates, pairs, graph tokens, graph relations, masks, and targets.
+- Negative tests must corrupt candidate rows, pair rows, graph row links, masks, counts, hashes, schema versions, known-first references, relation ids, and tensor shapes, and each failure must identify the owning builder/projection.
+- A single-position debug bundle must extend the Phase 01 payload with candidates, pair rows, graph semantics, tensor shapes, masks, target mass, D6 variant identity, hashes, warnings, and builder timings.
+
 ## Delete or Demote
 Delete:
 - private candidate construction in sampler/dashboard/worker
@@ -77,6 +90,9 @@ Demote only as a short-lived projection:
 - Phase tests: opening, first-placement turn, second-placement known-first turn, pair-heavy state, and graph token-heavy state.
 - Cap tests: full pair enumeration fails without an explicit capped strategy.
 - Projection tests: any remaining pair tensor batch object has no semantic fields not derivable from `PairActionTable`.
+- Mutation tests: graph/candidate/pair tensor projections cannot mutate canonical contracts or silently change validated identities.
+- Corruption tests: stale hashes, wrong schema versions, wrong known-first rows, bad relation ids, bad masks, duplicate candidate rows, and illegal pair rows fail loudly.
+- Debug bundle tests: the single-position debug payload can identify candidate-builder, pair-table-builder, graph-semantic-builder, or tensorizer ownership for failures.
 - Import audits: no private candidate, pair, legal, D6, history, graph semantic, or graph tensor rebuild paths remain in runtime consumers.
 
 ## Required Artifacts
@@ -85,6 +101,7 @@ Demote only as a short-lived projection:
 - Migration notes listing deleted private builders and any temporary projection-only shims.
 - Import audit output showing old private builder paths are absent from runtime imports.
 - Trace examples showing candidate count, pair possible/selected counts, graph token/relation counts, and tensorization timing.
+- Single-position debug bundle sample for candidate, pair, graph semantic, graph tensor, mask, target, D6, and mutation-safety verification.
 
 ## Hard Exit Gates
 - `CandidateContractBuilder` is the only production candidate-table builder.
@@ -95,6 +112,8 @@ Demote only as a short-lived projection:
 - Golden-position parity tests pass exactly across self-play, replay sampler, training, evaluation debug, and dashboard fixtures.
 - Pair tables are phase-aware, cap-aware, D6-equivariant, and telemetry-visible.
 - Graph tensorization is proven to be a pure projection from graph semantic contract plus shared legal/candidate/pair contracts.
+- Candidate, pair, and graph projections are mutation-safe and corruption-tested.
+- The debug bundle localizes failures to the correct builder or projection owner.
 - Import audits find no runtime-private candidate, pair, graph semantic, graph tensor, legal, D6, or compact-history reconstruction paths.
 - No pair scoring or full pair enumeration is introduced by this phase without an explicit capped `PairStrategy`.
 - CI fails hard on any parity mismatch, forbidden import, uncapped pair generation, or private builder reintroduction.
