@@ -3,6 +3,7 @@ import pytest
 from hexorl.eval.scorecard import (
     compute_phase3_scorecard,
     final_score_from_league_lcb,
+    milestone_k_hard_gate_failures,
     should_prune_phase3_trial,
 )
 from hexorl.eval.tactical_suite import (
@@ -105,6 +106,33 @@ def test_scorecard_penalizes_illegal_crash_and_truncation_rates():
     }
     result = compute_phase3_scorecard(metrics, epoch=12)
     assert result.score == -0.10 * 2.0 - 0.20 * 3.0
+    assert not result.hard_pass
+
+
+def test_scorecard_enforces_milestone_k_bug_sentinels():
+    failures = milestone_k_hard_gate_failures(
+        {
+            "illegal_move_rate": 0.0,
+            "post_terminal_move_attempts": 1.0,
+            "replay_mismatch_rate": 0.0,
+            "d6_mismatch_rate": 0.0,
+            "legal_mask_mismatch_rate": 0.0,
+            "oracle_threat_mismatch_rate": 0.0,
+            "missing_legal_action_rows": 0.0,
+            "pair_mask_violation_rate": 0.0,
+            "target_leakage_check_status": "fail",
+        }
+    )
+    assert "post_terminal_move_attempts" in failures
+    assert "target_leakage_check_status" in failures
+
+    result = compute_phase3_scorecard(
+        {
+            "post_terminal_move_attempts": 1.0,
+            "target_leakage_check_status": "fail",
+        },
+        epoch=12,
+    )
     assert not result.hard_pass
 
 

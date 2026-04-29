@@ -469,6 +469,34 @@ def _normalize_pair_visit_targets(rows) -> list[tuple[tuple[int, int], tuple[int
     return [(first, second, float(weight / total)) for first, second, weight in parsed]
 
 
+def _pair_policy_target_is_complete(
+    pair_policy_v2: list[tuple[tuple[int, int], tuple[int, int], float]],
+    legal_rows: np.ndarray,
+    placements_remaining: int,
+) -> bool:
+    """Return whether a first-placement joint target covers every legal pair row."""
+    if int(placements_remaining) < 2:
+        return True
+    legal = np.asarray(legal_rows, dtype=np.int32).reshape(-1, 2)
+    legal_count = int(legal.shape[0])
+    if legal_count < 2:
+        return True
+    expected = legal_count * (legal_count - 1) // 2
+    if len(pair_policy_v2) != expected:
+        return False
+    legal_set = {(int(q), int(r)) for q, r in legal.tolist()}
+    seen: set[frozenset[tuple[int, int]]] = set()
+    for first, second, prob in pair_policy_v2:
+        if float(prob) < 0.0:
+            return False
+        a = (int(first[0]), int(first[1]))
+        b = (int(second[0]), int(second[1]))
+        if a == b or a not in legal_set or b not in legal_set:
+            return False
+        seen.add(frozenset({a, b}))
+    return len(seen) == expected
+
+
 # ── Mock MCTS Engine ─────────────────────────────────────────────────────────
 
 class MockMCTSEngine:
@@ -737,7 +765,16 @@ class MockMCTSEngine:
         return self._q_values.tolist()
 
     def root_pair_visit_targets(self):
-        return []
+        if self._move_count == 0 or self._num_children < 2:
+            return []
+        rows = []
+        visits = self._visits if self._visits is not None else np.ones(self._num_children, dtype=np.uint32)
+        moves = [(i - self._num_children // 2, 0) for i in range(self._num_children)]
+        for i in range(len(moves)):
+            for j in range(i + 1, len(moves)):
+                weight = int(max(1, min(int(visits[i]), int(visits[j]))))
+                rows.append((moves[i][0], moves[i][1], moves[j][0], moves[j][1], weight))
+        return rows
 
     def move_history_bytes(self) -> bytes:
         """Return mock packed move history."""
@@ -1704,6 +1741,17 @@ class SelfPlayWorker:
                 if hasattr(engine, "root_pair_visit_targets")
                 else []
             )
+            legal_root = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+            root_placements_remaining_for_targets = (
+                int(getattr(engine._game, "placements_remaining", 1))
+                if HAS_ENGINE and hasattr(engine, "_game")
+                else (1 if move_idx == 0 else 2 if move_idx % 2 == 1 else 1)
+            )
+            pair_policy_complete = _pair_policy_target_is_complete(
+                pair_policy_v2,
+                legal_root,
+                root_placements_remaining_for_targets,
+            )
             prior_summary = (
                 engine.prior_source_summary()
                 if hasattr(engine, "prior_source_summary")
@@ -1808,7 +1856,6 @@ class SelfPlayWorker:
             )
             target_mass = sum(prob for _q, _r, prob in policy_v2)
             missing_mass = max(0.0, 1.0 - target_mass) if policy_v2 else 1.0
-            legal_root = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
             winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
                 tensor_3d,
                 legal_root,
@@ -1880,6 +1927,7 @@ class SelfPlayWorker:
                     policy_target=policy,
                     policy_target_v2=policy_v2,
                     pair_policy_target_v2=pair_policy_v2,
+                    pair_policy_complete=pair_policy_complete,
                     target_policy_mass_outside_window=outside_mass,
                     missing_target_policy_mass=missing_mass,
                     candidate_recall_mcts_top1=candidate_probe.recall_top1,

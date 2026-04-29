@@ -1255,6 +1255,31 @@ def test_first_placement_pair_target_requires_recorded_joint_table():
     assert processed[1].pair_policy_target_v2 == [((1, 0), (2, 0), 1.0)]
 
 
+def test_graph_pair_training_rejects_incomplete_first_placement_pair_target():
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+        pair_policy_target_v2=[],
+        pair_policy_complete=False,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_pair_policy=True,
+        include_graph_policy=True,
+    )
+
+    with pytest.raises(ValueError, match="complete search-observed"):
+        next(iter(dataset))
+
+
 def test_sparse_policy_loss_masks_invalid_candidates():
     logits = torch.tensor([[0.0, 2.0, -5.0], [1.0, 0.0, 0.0]])
     target = torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])

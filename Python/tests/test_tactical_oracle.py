@@ -100,3 +100,14 @@ def test_history_oracle_rejects_illegal_origin_via_engine_replay():
 
     with pytest.raises(ValueError, match="origin"):
         scan_tactical_oracle_from_history(bad_opening)
+
+
+def test_history_oracle_requires_engine_oracle_for_production(monkeypatch):
+    import hexorl.action_contract.tactical_oracle as oracle_mod
+
+    monkeypatch.setattr(oracle_mod, "_engine_game_class", lambda: None)
+    with pytest.raises(RuntimeError, match="engine tactical oracle is required"):
+        scan_tactical_oracle_from_history(b"")
+
+    result = scan_tactical_oracle_from_history(b"", allow_python_fallback=True)
+    assert result.win_now_cells == ()

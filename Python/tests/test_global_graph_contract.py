@@ -17,6 +17,7 @@ from hexorl.graph import (
     transform_policy_target,
     transform_qr,
 )
+from hexorl.graph.batch import graph_capacity_report, validate_graph_ipc_capacity
 from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.model.network import build_model_from_config
 from hexorl.selfplay.worker import _graph_batch_with_pair_rows
@@ -131,6 +132,41 @@ def test_global_graph_builder_includes_required_token_families_and_relations():
         assert int(token_type) in token_types
     assert graph.relation_type.shape == (graph.token_type.shape[0], graph.token_type.shape[0])
     assert graph.relation_bias.shape[1:] == graph.relation_type.shape
+
+
+def test_global_graph_features_expose_rich_token_family_fields():
+    graph = build_graph_batch_from_history(_hist((0, 0, 0), (1, 1, 0), (1, 0, 1)))
+    assert graph.schema_version >= 2
+    assert graph.token_features.shape[1] >= 48
+    legal_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.LEGAL))
+    assert legal_rows.size > 0
+    assert np.any(graph.token_features[legal_rows, 16:19] > 0.0)
+    window_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.WINDOW6))
+    assert window_rows.size > 0
+    assert np.any(graph.token_features[window_rows, 19:21] > 0.0)
+    line_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.LINE))
+    assert line_rows.size > 0
+    assert np.any(graph.token_features[line_rows, 21:25] > 0.0)
+
+
+def test_global_graph_capacity_report_fails_without_dropping_rows():
+    graph = build_graph_batch_from_history(_hist((0, 0, 0)), include_pair_rows=False)
+    report = graph_capacity_report(graph)
+    assert report.legal_count == graph.legal_qr.shape[0]
+    assert report.strategy
+
+    huge = graph_capacity_report(graph).__class__(
+        token_count=9999,
+        legal_count=graph.legal_qr.shape[0],
+        opp_legal_count=graph.opp_legal_qr.shape[0],
+        pair_count=0,
+    )
+    assert "graph_token_capacity" in huge.failures()
+
+    graph = graph_batch_with_reference_pair_rows(graph, [])
+    validate_graph_ipc_capacity(
+        build_graph_batch_from_history(_hist(), include_pair_rows=False)
+    )
     assert int(RelationType.SAME_LINE) in set(int(x) for x in graph.relation_type.reshape(-1).tolist())
 
 

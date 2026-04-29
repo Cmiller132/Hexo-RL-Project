@@ -276,6 +276,9 @@ class InferenceClient:
             raise RuntimeError("InferenceClient not connected. Call connect() first.")
         if self._slot.req_mode is None:
             raise RuntimeError("inference queue does not expose graph IPC slots")
+        from hexorl.graph.batch import validate_graph_ipc_capacity
+
+        validate_graph_ipc_capacity(graph_batch)
 
         token_count = int(np.asarray(graph_batch.token_features).shape[0])
         legal_count = int(np.asarray(graph_batch.legal_qr).shape[0])

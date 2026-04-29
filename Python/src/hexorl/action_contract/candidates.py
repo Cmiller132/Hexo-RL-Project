@@ -309,12 +309,15 @@ def build_pair_candidate_batch(
     budget: int,
     candidate_mask: Sequence[bool] | None = None,
     legal_moves: Sequence[tuple[int, int]] | None = None,
+    known_first: tuple[int, int] | None = None,
 ) -> PairCandidateBatch:
     """Build a bounded unordered pair-action target over candidate row indices.
 
     Target pairs may be missing from the candidate table; that is represented
     as missing mass. Duplicated cells and pairs outside the supplied legal set
-    are contract violations and fail early.
+    are contract violations and fail early.  Second-placement rows may use the
+    already-placed `known_first` stone as the first coordinate; every other row
+    must contain two currently legal actions.
     """
     budget = max(1, int(budget))
     if candidate_mask is None:
@@ -353,13 +356,14 @@ def build_pair_candidate_batch(
         if legal_set is not None:
             first_legal = first in legal_set
             second_legal = second in legal_set
-            if not (first_legal and second_legal):
-                # Second-placement targets are ordered as
-                # `(known_first, legal_second)`. The known first stone is not a
-                # current legal move, so legacy candidate-pair scouts count it
-                # as missing mass instead of rejecting the record.
-                if first_legal == second_legal:
-                    raise ValueError(f"pair policy target contains illegal action pair: {key}")
+            second_placement_row = (
+                known_first is not None
+                and first == _as_qr(known_first)
+                and not first_legal
+                and second_legal
+            )
+            if not (first_legal and second_legal) and not second_placement_row:
+                raise ValueError(f"pair policy target contains illegal action pair: {key}")
         total_target_mass += float(prob)
         target_map[key] = target_map.get(key, 0.0) + float(prob)
         if key[0] in candidate_index and key[1] in candidate_index and key[0] != key[1]:

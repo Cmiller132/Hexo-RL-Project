@@ -114,6 +114,7 @@ class RingBuffer:
         self._pair_policy_v2_exact: List[List[tuple[tuple[int, int], tuple[int, int], float]]] = [
             [] for _ in range(capacity)
         ]
+        self._pair_policy_complete = np.zeros(capacity, dtype=np.bool_)
         self._outside_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._missing_policy_mass = np.zeros(capacity, dtype=np.float32)
         self._candidate_recall_top1 = np.zeros(capacity, dtype=np.float32)
@@ -436,6 +437,7 @@ class RingBuffer:
                 opp_policy_target_v2=opp_policy_v2,
                 opp_policy_legal_v2=opp_policy_legal_v2,
                 pair_policy_target_v2=pair_policy_v2,
+                pair_policy_complete=bool(self._pair_policy_complete[idx]),
                 target_policy_mass_outside_window=float(self._outside_policy_mass[idx]),
                 missing_target_policy_mass=float(self._missing_policy_mass[idx]),
                 candidate_recall_mcts_top1=float(self._candidate_recall_top1[idx]),
@@ -715,6 +717,7 @@ class RingBuffer:
             if self._pair_policy_v2_probs is not None:
                 self._pair_policy_v2_probs.fill(0.0)
             self._pair_policy_v2_counts.fill(0)
+            self._pair_policy_complete.fill(False)
             for store in (
                 self._policy_v2_exact,
                 self._opp_policy_v2_exact,
@@ -877,6 +880,7 @@ class RingBuffer:
                 for first, second, prob in pair_entries
                 if float(prob) > 0.0
             ]
+            self._pair_policy_complete[idx] = bool(record.pair_policy_complete)
             n_pair = min(len(pair_entries), self.max_policy_v2_entries)
             self._pair_policy_v2_counts[idx] = n_pair
             if self._pair_policy_v2_q1 is not None:
@@ -905,6 +909,7 @@ class RingBuffer:
         else:
             self._pair_policy_v2_exact[idx] = []
             self._pair_policy_v2_counts[idx] = 0
+            self._pair_policy_complete[idx] = False
 
         dropped_mass = sum(float(prob) for _q, _r, prob in entries[n:])
         self._outside_policy_mass[idx] = float(record.target_policy_mass_outside_window)
