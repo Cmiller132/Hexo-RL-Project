@@ -847,11 +847,11 @@ class Phase3Supervisor:
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
         elif self.host.cuda_available and self.host.cuda_memory_gb < 16.0 and high_search_non_graph:
-            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 6)
+            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 3)
             cfg.selfplay.batch_size_per_worker = min(max(int(cfg.selfplay.batch_size_per_worker), 16), 16)
             cfg.inference.max_batch_size = min(
                 max(int(cfg.inference.max_batch_size), cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
-                192,
+                128,
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
         if family.graph or family.sparse_policy or (family.architecture == "restnet" and not high_search_non_graph):
@@ -872,11 +872,11 @@ class Phase3Supervisor:
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
         elif stage != "3A_calibration" and recipe.full_sims >= 512:
-            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 6)
+            cfg.selfplay.num_workers = min(int(cfg.selfplay.num_workers), 3)
             cfg.selfplay.batch_size_per_worker = min(max(int(cfg.selfplay.batch_size_per_worker), 16), 16)
             cfg.inference.max_batch_size = min(
                 max(int(cfg.inference.max_batch_size), cfg.selfplay.num_workers * cfg.selfplay.batch_size_per_worker + 64),
-                192,
+                128,
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
         configure_torch_runtime(cfg, self.host)
@@ -1220,11 +1220,11 @@ class Phase3Supervisor:
         high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
         if high_search_non_graph:
             # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
-            # heavy. Sweep enough workers to feed the GPU, but keep low-memory
-            # WSL hosts below the observed 6-worker RAM cliff.
+            # heavy. On the 24 GB WSL / 12 GB CUDA host, 5 workers crossed the
+            # keepalive memory guard and 4 was only marginally faster than 3.
             worker_values = sorted(set(worker_values + [2, 3, 4, 5, 6]))
             if self._low_memory_cuda_host():
-                worker_values = [value for value in worker_values if value <= 5]
+                worker_values = [value for value in worker_values if value <= 3]
         worker_budget = max(1, int(self.host.logical_cpus) - max(1, int(cfg.runtime.selfplay_cpu_reserve)))
         max_workers = min(worker_budget, max(worker_values + [base_workers]))
         if high_search_non_graph and self._low_memory_cuda_host() and worker_values:
@@ -1299,6 +1299,10 @@ class Phase3Supervisor:
         # look fast while pushing WSL into OOM reset territory.
         high_search_non_graph = bool(not trial.family.graph and not trial.family.sparse_policy and trial.static.full_sims >= 512)
         if isinstance(record, dict):
+            candidate = record.get("candidate") or {}
+            workers = int(candidate.get("workers", 0) or 0) if isinstance(candidate, dict) else 0
+            if high_search_non_graph and self._low_memory_cuda_host() and workers > 3:
+                return False
             if "memory" not in record:
                 return not high_search_non_graph
             return not self._runtime_sweep_memory_unsafe(record)
