@@ -10,6 +10,8 @@ Supersedes: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_20260429.md`
 
 Intent: this is not a compatibility-preserving reshuffle. This is a cohesive project cleanup. Legacy paths, duplicate helpers, deprecated aliases, and stale experiments should be removed unless they are actively needed by the new architecture. Existing runs/checkpoints/replay files can be archived before the cutover, but the main runtime should not carry long-lived compatibility shims.
 
+Execution companion: detailed phased rollout and verification gates are documented under `Docs/refactor/` (`README.md`, `PHASED_IMPLEMENTATION_PLAN.md`, `PHASE_CHECKLIST.md`).
+
 ## Executive Summary
 
 Hexo has the right technical pieces, but the current system is difficult to reason about because ownership is spread across many layers:
