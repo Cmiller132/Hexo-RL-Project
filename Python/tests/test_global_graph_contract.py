@@ -18,9 +18,10 @@ from hexorl.graph import (
     transform_qr,
 )
 from hexorl.graph.batch import graph_capacity_report, validate_graph_ipc_capacity
+from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.model.network import build_model_from_config
-from hexorl.selfplay.worker import _graph_batch_with_pair_rows
+from hexorl.selfplay.worker import _align_global_logits_to_rust_legal, _graph_batch_with_pair_rows
 from hexorl.train.trainer import Trainer
 
 
@@ -44,6 +45,35 @@ def build_graph_batch_from_history(history, **kwargs):
     return _build_graph_batch_from_history(history, **kwargs)
 
 
+def test_global_graph_policy_logits_align_to_rust_legal_order():
+    graph_legal = np.asarray([[1, 0], [0, 1], [2, -1]], dtype=np.int32)
+    rust_legal = np.asarray([[2, -1], [1, 0], [0, 1]], dtype=np.int32)
+    logits = np.asarray([10.0, 20.0, 30.0], dtype=np.float32)
+
+    aligned_legal, aligned_logits = _align_global_logits_to_rust_legal(
+        graph_legal,
+        rust_legal,
+        logits,
+        context="test",
+    )
+
+    assert np.array_equal(aligned_legal, rust_legal)
+    assert aligned_logits.tolist() == pytest.approx([30.0, 10.0, 20.0])
+
+
+def test_global_graph_policy_alignment_rejects_true_set_mismatch():
+    graph_legal = np.asarray([[1, 0], [0, 1], [2, -1]], dtype=np.int32)
+    rust_legal = np.asarray([[2, -1], [1, 0], [3, -1]], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="legal_qr set mismatch"):
+        _align_global_logits_to_rust_legal(
+            graph_legal,
+            rust_legal,
+            np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
+            context="test",
+        )
+
+
 def test_global_graph_builder_preserves_all_legal_rows():
     history = _hist((0, 0, 0), (1, 1, 0), (1, 0, 1))
     graph = build_graph_batch_from_history(history, radius=2)
@@ -55,6 +85,11 @@ def test_global_graph_builder_preserves_all_legal_rows():
     assert (0, 0) not in {tuple(qr) for qr in graph.legal_qr.tolist()}
     legal_token_types = graph.token_type[graph.legal_token_indices]
     assert np.all(legal_token_types == int(GraphTokenType.LEGAL))
+
+
+def test_global_graph_ipc_capacity_allows_full_legal_scout_requests():
+    assert MAX_GRAPH_TOKENS >= 1024
+    assert MAX_GRAPH_ACTIONS >= 1024
 
 
 def test_global_graph_rejects_sub_rust_legal_radius():

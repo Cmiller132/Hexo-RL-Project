@@ -169,12 +169,13 @@ def scan_tactical_oracle_from_game(
     if not allow_python_fallback:
         raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
 
-    if hasattr(game, "legal_moves_near"):
-        legal_moves = game.legal_moves_near(int(near_radius))
-    elif hasattr(game, "legal_moves"):
-        legal_moves = game.legal_moves()
-    else:
-        legal_moves = legal_moves_from_stones(stones, near_radius)
+    if legal_moves is None:
+        if hasattr(game, "legal_moves_near"):
+            legal_moves = game.legal_moves_near(int(near_radius))
+        elif hasattr(game, "legal_moves"):
+            legal_moves = game.legal_moves()
+        else:
+            legal_moves = legal_moves_from_stones(stones, near_radius)
     return scan_tactical_oracle(
         stones,
         current_player,

@@ -638,7 +638,7 @@ def test_dense_projection_uses_all_v2_visits_before_topk():
     assert policy[action_to_board_index(1, 0)] == pytest.approx(1 / 3)
 
 
-def test_ring_buffer_preserves_v2_targets_beyond_prefix_capacity():
+def test_ring_buffer_truncates_primary_v2_targets_to_compact_width():
     rec = PositionRecord(
         move_history=b"",
         policy_target={action_to_board_index(0, 0): 1.0},
@@ -655,10 +655,21 @@ def test_ring_buffer_preserves_v2_targets_beyond_prefix_capacity():
 
     out = buffer[0]
     assert out is not None
-    assert out.policy_target_v2 == rec.policy_target_v2
-    assert out.opp_policy_target_v2 == rec.opp_policy_target_v2
+    assert [(q, r) for q, r, _prob in out.policy_target_v2] == [(0, 0), (1, 0)]
+    assert [prob for _q, _r, prob in out.policy_target_v2] == pytest.approx([0.5, 0.3], rel=1e-3)
+    assert out.missing_target_policy_mass == pytest.approx(0.2)
+    assert [(q, r) for q, r, _prob in out.opp_policy_target_v2] == [(3, 0), (4, 0), (5, 0)]
+    assert [prob for _q, _r, prob in out.opp_policy_target_v2] == pytest.approx([0.6, 0.4, 0.1], rel=1e-3)
     assert out.opp_policy_legal_v2 == rec.opp_policy_legal_v2
-    assert out.pair_policy_target_v2 == rec.pair_policy_target_v2
+    assert [(first, second) for first, second, _prob in out.pair_policy_target_v2] == [
+        ((0, 0), (1, 0)),
+        ((0, 0), (2, 0)),
+        ((1, 0), (2, 0)),
+    ]
+    assert [prob for _first, _second, prob in out.pair_policy_target_v2] == pytest.approx(
+        [0.7, 0.3, 0.1],
+        rel=1e-3,
+    )
 
 
 def test_sparse_sampler_outputs_candidate_targets():
@@ -1335,6 +1346,28 @@ def test_policy_target_top64_is_preserved_when_configured():
     assert out is not None
     assert len(out.policy_target) == 64
     assert abs(sum(out.policy_target.values()) - 1.0) < 1e-6
+
+
+def test_compact_replay_estimate_scales_to_200k_samples():
+    buffer = RingBuffer(
+        capacity=20_000,
+        max_policy_entries=64,
+        max_policy_v2_entries=256,
+        store_opp_policy=False,
+        store_pair_policy=False,
+        store_sparse_diagnostics=False,
+    )
+
+    estimate = buffer.memory_estimate()
+    projected_200k_mib = estimate["estimated_total_mib"] * 10.0
+
+    assert buffer.max_policy_v2_entries == 256
+    assert estimate["feature_groups"] == {
+        "opp_policy": False,
+        "pair_policy": False,
+        "sparse_diagnostics": False,
+    }
+    assert projected_200k_mib < 2000.0
 
 
 def test_run_epoch_appends_selfplay_to_existing_replay(monkeypatch, tmp_path):

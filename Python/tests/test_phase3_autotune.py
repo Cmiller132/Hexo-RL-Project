@@ -483,7 +483,7 @@ def test_finalist_pool_includes_staged_global_graph_scouts():
         assert by_name[name].sparse_policy is False
 
 
-def test_global_graph_config_uses_graph_native_heads_and_legal_replay_width(tmp_path):
+def test_global_graph_config_uses_graph_native_heads_and_compact_replay_width(tmp_path):
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
     supervisor.base_cfg = module.Config()
@@ -521,7 +521,8 @@ def test_global_graph_config_uses_graph_native_heads_and_legal_replay_width(tmp_
     assert cfg.model.sparse_policy is False
     assert "policy_place" in cfg.model.heads
     assert "policy" not in cfg.model.heads
-    assert replay.max_policy_v2_entries == module.FULL_GLOBAL_POLICY_ROWS
+    assert replay.max_policy_v2_entries <= module.REPLAY_POLICY_WIDTH_CAP
+    assert replay.max_policy_v2_entries < module.FULL_GLOBAL_POLICY_ROWS
     assert replay.memory_estimate()["feature_groups"]["opp_policy"] is False
 
 
@@ -562,10 +563,13 @@ def test_crop_replay_width_is_capped_below_full_global_rows(tmp_path):
 
     assert replay.max_policy_v2_entries == 256
     assert replay.max_policy_v2_entries < module.FULL_GLOBAL_POLICY_ROWS
-    assert replay.memory_estimate()["feature_groups"]["pair_policy"] is False
+    feature_groups = replay.memory_estimate()["feature_groups"]
+    assert feature_groups["pair_policy"] is False
+    assert feature_groups["opp_policy"] is False
+    assert feature_groups["sparse_diagnostics"] is False
 
 
-def test_replay_buffer_skips_disabled_opp_and_pair_arrays():
+def test_replay_buffer_skips_disabled_optional_storage():
     module = _load_phase3_autotune_module()
 
     replay = module.RingBuffer(
@@ -574,16 +578,15 @@ def test_replay_buffer_skips_disabled_opp_and_pair_arrays():
         max_policy_v2_entries=16,
         store_opp_policy=False,
         store_pair_policy=False,
+        store_sparse_diagnostics=False,
     )
 
-    assert replay._opp_policy_v2_q is None
-    assert replay._opp_policies is None
-    assert replay._pair_policy_v2_q1 is None
     assert replay.memory_estimate()["feature_groups"] == {
         "opp_policy": False,
         "pair_policy": False,
-        "sparse_diagnostics": True,
+        "sparse_diagnostics": False,
     }
+    assert replay.memory_estimate()["optional_target_blob_mib"] == 0.0
 
 
 def test_global_graph_candidate_recall_is_not_sparse_penalized():

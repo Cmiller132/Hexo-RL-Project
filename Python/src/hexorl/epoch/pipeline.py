@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
@@ -97,9 +97,17 @@ def run_epoch(
         else RingBuffer(
             capacity=cfg.buffer.capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
+            max_policy_v2_entries=min(
+                max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+                512,
+            ),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
+            **replay_feature_flags(
+                cfg.model.heads,
+                architecture=cfg.model.architecture,
+                sparse_policy=cfg.model.sparse_policy,
+            ),
         )
     )
 
@@ -279,7 +287,15 @@ def run_tiny_training_smoke(
         capacity=cfg.buffer.capacity,
         recency_decay=cfg.buffer.recency_decay,
         num_lookahead=1,
-        max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
+        max_policy_v2_entries=min(
+            max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+            512,
+        ),
+        **replay_feature_flags(
+            cfg.model.heads,
+            architecture=cfg.model.architecture,
+            sparse_policy=cfg.model.sparse_policy,
+        ),
     )
     replay.extend(_make_bootstrap_positions(cfg, 16))
 

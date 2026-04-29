@@ -51,6 +51,49 @@ PRIOR_SOURCE_DEFAULT = 3
 PRIOR_SOURCE_PAIR = 4
 
 
+def _align_global_logits_to_rust_legal(
+    graph_legal: np.ndarray,
+    rust_legal: np.ndarray,
+    logits: np.ndarray,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return legal rows/logits in the exact order Rust MCTS expects."""
+    graph_legal = np.asarray(graph_legal, dtype=np.int32).reshape(-1, 2)
+    rust_legal = np.asarray(rust_legal, dtype=np.int32).reshape(-1, 2)
+    logits = np.asarray(logits, dtype=np.float32).reshape(-1)
+    if logits.shape[0] < graph_legal.shape[0]:
+        raise ValueError(
+            f"{context}: policy_place has {logits.shape[0]} rows for "
+            f"{graph_legal.shape[0]} graph legal moves"
+        )
+    if graph_legal.shape != rust_legal.shape:
+        raise ValueError(
+            f"{context}: legal row count mismatch graph={graph_legal.shape[0]} "
+            f"rust={rust_legal.shape[0]}"
+        )
+    if np.array_equal(graph_legal, rust_legal):
+        return rust_legal, logits[: rust_legal.shape[0]]
+
+    graph_index: dict[tuple[int, int], int] = {}
+    duplicate_graph_rows: list[tuple[int, int]] = []
+    for idx, qr in enumerate(graph_legal.tolist()):
+        key = (int(qr[0]), int(qr[1]))
+        if key in graph_index:
+            duplicate_graph_rows.append(key)
+        graph_index[key] = idx
+    rust_keys = [(int(q), int(r)) for q, r in rust_legal.tolist()]
+    missing = [key for key in rust_keys if key not in graph_index]
+    extras = sorted(set(graph_index) - set(rust_keys))
+    if duplicate_graph_rows or missing or extras:
+        raise ValueError(
+            f"{context}: legal_qr set mismatch "
+            f"duplicates={duplicate_graph_rows[:5]} missing={missing[:5]} extra={extras[:5]}"
+        )
+    order = np.asarray([graph_index[key] for key in rust_keys], dtype=np.int64)
+    return rust_legal, logits[order]
+
+
 def _graph_batch_with_pair_rows(
     graph_batch: GraphBatch,
     pair_first_indices: np.ndarray,
@@ -1291,15 +1334,8 @@ class SelfPlayWorker:
                         graph_out = client.submit_graph(graph_batch)
                         graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
                         rust_legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
-                        if graph_legal.shape != rust_legal.shape or not np.array_equal(graph_legal, rust_legal):
-                            raise ValueError("graph root legal_qr does not match Rust legal moves")
+                        policy_place = np.asarray(graph_out["policy_place"], dtype=np.float32)
                         graph_value = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
-                        engine.expand_root_with_global_priors(
-                            legal_bytes,
-                            graph_legal,
-                            np.asarray(graph_out["policy_place"], dtype=np.float32),
-                            graph_value,
-                        )
                         root_placements_remaining = (
                             int(getattr(engine._game, "placements_remaining", 1))
                             if HAS_ENGINE and hasattr(engine, "_game")
@@ -1316,6 +1352,18 @@ class SelfPlayWorker:
                         else:
                             pair_qr = np.zeros((0, 4), dtype=np.int32)
                             pair_logits = np.zeros(0, dtype=np.float32)
+                        graph_legal, policy_place = _align_global_logits_to_rust_legal(
+                            graph_legal,
+                            rust_legal,
+                            policy_place,
+                            context="graph root inference",
+                        )
+                        engine.expand_root_with_global_priors(
+                            legal_bytes,
+                            graph_legal,
+                            policy_place,
+                            graph_value,
+                        )
                         if (
                             self.pair_policy_enabled
                             and root_placements_remaining >= 2
@@ -1554,15 +1602,11 @@ class SelfPlayWorker:
                                 )
                                 graph_out = client.submit_graph(graph_batch)
                                 graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
-                                if graph_legal.shape != legal.shape or not np.array_equal(graph_legal, legal):
-                                    raise ValueError(
-                                        "graph inference legal_qr does not match Rust legal moves at leaf"
-                                    )
                                 logits = np.asarray(graph_out["policy_place"], dtype=np.float32)
-                                source = np.full(legal.shape[0], PRIOR_SOURCE_SPARSE, dtype=np.uint8)
+                                source = np.full(graph_legal.shape[0], PRIOR_SOURCE_SPARSE, dtype=np.uint8)
                                 if (
                                     self.pair_policy_enabled
-                                    and legal.shape[0] > 0
+                                    and graph_legal.shape[0] > 0
                                 ):
                                     if int(graph_batch.placements_remaining) == 1:
                                         first_qr = _last_move_qr(bytes(leaf_history_bytes))
@@ -1573,10 +1617,10 @@ class SelfPlayWorker:
                                                 second_placement=True,
                                                 first_qr=first_qr,
                                             )
-                                            if pair_qr.shape[0] == legal.shape[0] and pair_logits.shape[0] >= legal.shape[0]:
+                                            if pair_qr.shape[0] == graph_legal.shape[0] and pair_logits.shape[0] >= graph_legal.shape[0]:
                                                 logits = _blend_action_logits(
-                                                    logits[: legal.shape[0]],
-                                                    pair_logits[: legal.shape[0]],
+                                                    logits[: graph_legal.shape[0]],
+                                                    pair_logits[: graph_legal.shape[0]],
                                                     self.pair_prior_mix,
                                                 )
                                                 source[:] = PRIOR_SOURCE_PAIR
@@ -1584,8 +1628,8 @@ class SelfPlayWorker:
                                         pair_blended = False
                                         if "policy_pair_first" in graph_out:
                                             logits = _blend_action_logits(
-                                                logits[: legal.shape[0]],
-                                                np.asarray(graph_out["policy_pair_first"], dtype=np.float32)[: legal.shape[0]],
+                                                logits[: graph_legal.shape[0]],
+                                                np.asarray(graph_out["policy_pair_first"], dtype=np.float32)[: graph_legal.shape[0]],
                                                 self.pair_prior_mix,
                                             )
                                             pair_blended = True
@@ -1595,20 +1639,26 @@ class SelfPlayWorker:
                                             second_placement=False,
                                         )
                                         if pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
-                                            pair_action_logits = _pair_logits_to_action_logits(pair_qr, pair_logits, legal)
+                                            pair_action_logits = _pair_logits_to_action_logits(pair_qr, pair_logits, graph_legal)
                                             logits = _blend_action_logits(
-                                                logits[: legal.shape[0]],
+                                                logits[: graph_legal.shape[0]],
                                                 pair_action_logits,
                                                 self.pair_prior_mix,
                                             )
                                             pair_blended = True
                                         if pair_blended:
                                             source[:] = PRIOR_SOURCE_PAIR
+                                graph_legal, logits = _align_global_logits_to_rust_legal(
+                                    graph_legal,
+                                    legal,
+                                    logits,
+                                    context="graph leaf inference",
+                                )
                                 graph_values[row] = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
-                                legal_rows.append(graph_legal)
+                                legal_rows.append(legal)
                                 legal_logits.append(logits)
                                 legal_sources.append(source)
-                                max_width = max(max_width, int(graph_legal.shape[0]))
+                                max_width = max(max_width, int(legal.shape[0]))
                             sparse_qr = np.zeros((count, max_width, 2), dtype=np.int32)
                             sparse_logits = np.zeros((count, max_width), dtype=np.float32)
                             sparse_counts = np.zeros(count, dtype=np.uint16)

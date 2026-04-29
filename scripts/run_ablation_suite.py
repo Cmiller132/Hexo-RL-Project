@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.config import Config, load_config
 from hexorl.dashboard.recorder import RunRecorder
 from hexorl.epoch import run_epoch
@@ -253,8 +253,14 @@ def _run_ablation(
     replay = RingBuffer(
         capacity=cfg.buffer.capacity,
         max_policy_entries=cfg.selfplay.policy_target_top_k,
+        max_policy_v2_entries=min(max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget), 512),
         recency_decay=cfg.buffer.recency_decay,
         num_lookahead=len(cfg.buffer.lookahead_horizons),
+        **replay_feature_flags(
+            cfg.model.heads,
+            architecture=cfg.model.architecture,
+            sparse_policy=cfg.model.sparse_policy,
+        ),
     )
     trainer = None
     last_record: dict[str, Any] = {}

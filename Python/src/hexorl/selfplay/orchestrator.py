@@ -17,7 +17,7 @@ from typing import Optional, List
 
 from hexorl.config import Config
 from hexorl.inference.server import InferenceServer
-from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.dashboard.recorder import RunRecorder
 
@@ -51,9 +51,17 @@ class SelfPlayOrchestrator:
         self._buffer = RingBuffer(
             capacity=buffer_capacity,
             max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget, 2048),
+            max_policy_v2_entries=min(
+                max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
+                512,
+            ),
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
+            **replay_feature_flags(
+                cfg.model.heads,
+                architecture=cfg.model.architecture,
+                sparse_policy=cfg.model.sparse_policy,
+            ),
         )
 
         # Worker management

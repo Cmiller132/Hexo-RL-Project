@@ -35,7 +35,7 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
-from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.config import Config, load_config
 from hexorl.dashboard.recorder import RunRecorder
 from hexorl.epoch import run_epoch
@@ -568,18 +568,15 @@ class Phase3Supervisor:
             int(cfg.selfplay.policy_target_top_k),
             int(getattr(cfg.model, "candidate_budget", 256)),
         )
-        if family.global_graph:
-            return max(base_width, FULL_GLOBAL_POLICY_ROWS)
         return min(base_width, REPLAY_POLICY_WIDTH_CAP)
 
     def _replay_feature_flags(self, cfg: Config, family: FamilySpec) -> dict[str, bool]:
-        heads = set(getattr(cfg.model, "heads", []))
-        pair_heads = {"pair_policy"} | GLOBAL_GRAPH_PAIR_HEADS
-        return {
-            "store_opp_policy": "opp_policy" in heads,
-            "store_pair_policy": bool(heads & pair_heads),
-            "store_sparse_diagnostics": True,
-        }
+        return replay_feature_flags(
+            getattr(cfg.model, "heads", []),
+            architecture=getattr(cfg.model, "architecture", "cnn"),
+            sparse_policy=bool(getattr(cfg.model, "sparse_policy", False)),
+            graph=bool(family.graph),
+        )
 
     def _make_replay_buffer(
         self,
@@ -599,7 +596,7 @@ class Phase3Supervisor:
 
     def _replay_memory_estimate(self, replay: RingBuffer, family: FamilySpec) -> dict[str, Any]:
         estimate = replay.memory_estimate() if hasattr(replay, "memory_estimate") else {}
-        estimate["policy_width_mode"] = "global_legal_rows" if family.global_graph else "candidate_capped"
+        estimate["policy_width_mode"] = "compact_candidate_capped"
         estimate["full_global_policy_rows"] = FULL_GLOBAL_POLICY_ROWS
         estimate["non_global_policy_width_cap"] = REPLAY_POLICY_WIDTH_CAP
         return estimate
@@ -1309,18 +1306,16 @@ class Phase3Supervisor:
             worker_values = [1, 2]
         high_search_non_graph = bool(not trial.family.graph and int(trial.static.full_sims) >= 512)
         if high_search_non_graph:
-            # Dense CNN/ResTNet high-search runs are expected to be CPU/MCTS
-            # heavy. On the 24 GB WSL / 12 GB CUDA host, even 2 workers crossed
-            # the keepalive memory guard for 384-move high-sim probes after
-            # swap had already been exercised, so one stable worker beats a
-            # faster-looking probe that resets the comparison.
-            worker_values = sorted(set(worker_values + [2, 3, 4, 5, 6]))
+            # Compact replay removes the main fixed-width RAM sink. Probe back
+            # toward the historical worker counts and let measured RAM/swap
+            # telemetry reject only candidates that are actually unsafe.
+            worker_values = sorted(set(worker_values + [1, 2, 3, 4]))
             if self._low_memory_cuda_host():
                 base_workers = 1
                 if getattr(trial.family, "architecture", "") == "restnet":
-                    worker_values = [1, 2]
-                else:
                     worker_values = [1, 2, 3]
+                else:
+                    worker_values = [1, 2, 3, 4]
         worker_budget = max(1, int(self.host.logical_cpus) - max(1, int(cfg.runtime.selfplay_cpu_reserve)))
         max_workers = min(worker_budget, max(worker_values + [base_workers]))
         if high_search_non_graph and self._low_memory_cuda_host() and worker_values:
@@ -1401,7 +1396,7 @@ class Phase3Supervisor:
         if isinstance(record, dict):
             candidate = record.get("candidate") or {}
             workers = int(candidate.get("workers", 0) or 0) if isinstance(candidate, dict) else 0
-            if high_search_non_graph and self._low_memory_cuda_host() and workers > 3:
+            if high_search_non_graph and self._low_memory_cuda_host() and workers > 4:
                 return False
             if "memory" not in record:
                 return not high_search_non_graph

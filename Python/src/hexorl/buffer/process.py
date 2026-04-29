@@ -15,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 
-from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 
@@ -75,8 +75,18 @@ class BufferProcess:
     def _run(self):
         ring = RingBuffer(
             capacity=self.capacity,
+            max_policy_entries=self.cfg.selfplay.policy_target_top_k,
+            max_policy_v2_entries=min(
+                max(self.cfg.selfplay.policy_target_top_k, self.cfg.model.candidate_budget),
+                512,
+            ),
             recency_decay=self.cfg.buffer.recency_decay,
             num_lookahead=len(self.cfg.buffer.lookahead_horizons),
+            **replay_feature_flags(
+                self.cfg.model.heads,
+                architecture=self.cfg.model.architecture,
+                sparse_policy=self.cfg.model.sparse_policy,
+            ),
         )
 
         while True:
