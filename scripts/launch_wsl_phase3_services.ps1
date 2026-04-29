@@ -8,7 +8,7 @@ param(
     [int]$RuntimeSweepMaxCandidates = 6,
     [int]$MaxGameMoves = 384,
     [int]$MaxActiveTrials = 12,
-    [string]$AshaResources = "2,5,10",
+    [string]$AshaResources = "8,12,14",
     [int]$ChampionMinEpochs = 20,
     [switch]$NoStartProcess
 )
