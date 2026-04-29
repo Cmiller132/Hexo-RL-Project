@@ -16,6 +16,15 @@ not be cited as evidence that BOHB or PB2 has been implemented or validated.
 
 ## Current Status
 
+## 2026-04-29 00:55 WSL Log Time - Automation And Memory Intervention
+
+- Updated heartbeat automation `overnight-phase-2-3-autotune-monitor` to check this current run every 30 minutes and intervene autonomously using `Docs/TUNING_ORCHESTRATOR_GUIDE_20260428.md`.
+- Current run root is `/root/hexo_runs/phase2_phase3_autotune_384moves_simsweep_20260429_merge232a39b_ext4`; WSL repo copy is `/root/Hexo-RL-Project-ext4`.
+- A 5-worker dense 384-move runtime sweep crossed the keepalive memory guard (`available_gb < 3`) while `cal_best_current_33` was calibrating. The supervisor survived and marked the 5-worker candidate memory-unsafe, but the margin was too thin.
+- Patched and deployed the safer low-memory policy: dense high-search non-graph sweeps now cap at 3 workers, cached dense selections above 3 workers are rejected on this host, and launch/monitor defaults use `RUNTIME_SWEEP_WORKERS=2,3` with two sweep candidates.
+- Restarted the WSL keepalive stack cleanly after stopping stale supervisor/dashboard/monitor processes. Active supervisor relaunched with `--runtime-sweep-workers 2,3`, `--runtime-sweep-max-candidates 2`, and ASHA rungs `8,12,14`.
+- Post-restart validation is healthy: the dashboard is live on `127.0.0.1:8765`, swap remains `0`, `cal_best_current_33` regenerated 2- and 3-worker sweep results, selected 3 workers at about `640 positions/min`, and the stale 4-worker cache entry was ignored.
+
 ## 17:35 EDT Heartbeat Health Check
 
 - Heartbeat ran without requesting approval/escalation.
