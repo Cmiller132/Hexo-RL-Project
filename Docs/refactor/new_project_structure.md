@@ -349,9 +349,10 @@ heads.
 models/
 |-- capabilities.py
 |-- checkpoint.py
+|-- constants.py
+|-- crop_network.py
 |-- factory.py
 |-- global_graph.py
-|-- network.py
 |-- registry.py
 |-- specs.py
 |-- families/
@@ -368,6 +369,14 @@ Responsibilities:
 - inference manifest lookup
 - loss plan and default recipe/tune-space lookup
 - checkpoint save/load/inspect through `CheckpointManager`
+- crop-input `HexNet` composition in `crop_network.py`
+- reusable crop trunk blocks and graph-hybrid encoder in `trunks/*`
+- neural output heads and value-bin utilities in `heads/*`
+
+Important deletion: `models/network.py` has been removed. Runtime code should
+not import it or recreate it as a facade; Phase 03 ownership tests now assert
+that heads, trunks, and production source do not depend on
+`hexorl.models.network`.
 
 Important nuance: `models/factory.py` is not a purely passive model builder.
 It is the facet registry owner and can resolve train adapters and inference
@@ -838,6 +847,11 @@ What changed:
   `models/families/*`, made `models/heads/*` and `models/trunks/*` real
   component modules, and reduced `models/factory.py` to registry/public API
   routing.
+- Corrective pass: deleted the overstuffed `models/network.py` module. Crop
+  model composition now lives in `models/crop_network.py`, trunk blocks live in
+  focused `models/trunks/*` modules, output heads live in focused
+  `models/heads/*` modules, and value-bin conversion helpers live with the
+  value head implementation.
 - Corrective pass: `CheckpointManager.inspect()` now reads a lightweight
   `checkpoint_manifest.json` member from the checkpoint archive without
   loading model weights.

@@ -1,3 +1,6 @@
+import ast
+from pathlib import Path
+
 import torch
 
 from hexorl.config import Config
@@ -6,6 +9,9 @@ from hexorl.models.families import builtin_descriptors
 from hexorl.models.factory import REGISTRY, build_model
 from hexorl.models.registry import FamilyComponents, ModelFamilyDescriptor, ModelFamilyRegistry
 from hexorl.models.specs import REQUIRED_MODEL_KINDS, ModelSpec
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MODELS_ROOT = PROJECT_ROOT / "Python" / "src" / "hexorl" / "models"
 
 
 def _cfg(architecture: str) -> Config:
@@ -39,8 +45,24 @@ def test_builtin_family_modules_own_descriptor_construction():
 
 
 def test_head_and_trunk_modules_expose_used_components():
-    from hexorl.models.heads import GLOBAL_GRAPH_OUTPUT_HEADS, GRAPH_HYBRID_POLICY_HEADS
+    from hexorl.models.heads import (
+        GLOBAL_GRAPH_OUTPUT_HEADS,
+        GRAPH_HYBRID_POLICY_HEADS,
+        AuxPolicyHead,
+        AxisHead,
+        AxisMapHead,
+        MovesLeftHead,
+        PairPolicyHead,
+        PolicyHead,
+        RegretRankHead,
+        SparsePolicyHead,
+        ValueBinnedHead,
+    )
     from hexorl.models.trunks import (
+        GatedResBlock,
+        HexConv2d,
+        SparseHexGraphHybrid0Encoder,
+        SpatialTransformerBlock,
         build_dense_cnn_model,
         build_global_relation_graph_model,
         build_graph_hybrid_model,
@@ -59,6 +81,69 @@ def test_head_and_trunk_modules_expose_used_components():
     assert build_restnet_model.__module__ == "hexorl.models.trunks.restnet"
     assert build_graph_hybrid_model.__module__ == "hexorl.models.trunks.graph_hybrid"
     assert build_global_relation_graph_model.__module__ == "hexorl.models.trunks.global_graph"
+    assert PolicyHead.__module__ == "hexorl.models.heads.policy"
+    assert ValueBinnedHead.__module__ == "hexorl.models.heads.value"
+    assert RegretRankHead.__module__ == "hexorl.models.heads.regret"
+    assert SparsePolicyHead.__module__ == "hexorl.models.heads.sparse_policy"
+    assert PairPolicyHead.__module__ == "hexorl.models.heads.pair_policy"
+    assert AuxPolicyHead.__module__ == "hexorl.models.heads.tactical"
+    assert AxisHead.__module__ == "hexorl.models.heads.tactical"
+    assert AxisMapHead.__module__ == "hexorl.models.heads.tactical"
+    assert MovesLeftHead.__module__ == "hexorl.models.heads.tactical"
+    assert HexConv2d.__module__ == "hexorl.models.trunks.dense_cnn"
+    assert GatedResBlock.__module__ == "hexorl.models.trunks.dense_cnn"
+    assert SpatialTransformerBlock.__module__ == "hexorl.models.trunks.restnet"
+    assert SparseHexGraphHybrid0Encoder.__module__ == "hexorl.models.trunks.graph_hybrid"
+
+
+def test_crop_components_are_not_owned_by_legacy_network_module():
+    assert not (MODELS_ROOT / "network.py").exists()
+
+    head_sources = {
+        path.name: ast.parse(path.read_text(encoding="utf-8"))
+        for path in sorted((MODELS_ROOT / "heads").glob("*.py"))
+        if path.name != "__init__.py"
+    }
+    forbidden_network_imports: dict[str, list[str]] = {}
+    for filename, tree in head_sources.items():
+        imported = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "hexorl.models.network"
+            for alias in node.names
+        ]
+        if imported:
+            forbidden_network_imports[filename] = imported
+    assert forbidden_network_imports == {}
+
+    trunk_sources = {
+        path.name: ast.parse(path.read_text(encoding="utf-8"))
+        for path in sorted((MODELS_ROOT / "trunks").glob("*.py"))
+        if path.name != "__init__.py"
+    }
+    forbidden_trunk_network_imports: dict[str, list[str]] = {}
+    for filename, tree in trunk_sources.items():
+        imported = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "hexorl.models.network"
+            for alias in node.names
+        ]
+        if imported:
+            forbidden_trunk_network_imports[filename] = imported
+    assert forbidden_trunk_network_imports == {}
+
+    runtime_imports: dict[str, list[int]] = {}
+    for path in sorted((PROJECT_ROOT / "Python" / "src" / "hexorl").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "hexorl.models.network"
+        ]
+        if lines:
+            runtime_imports[str(path.relative_to(PROJECT_ROOT))] = lines
+    assert runtime_imports == {}
 
 
 def test_every_registered_family_validates_default_recipe():

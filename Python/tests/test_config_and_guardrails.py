@@ -13,7 +13,7 @@ from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
 from hexorl.models.checkpoint import CheckpointManager
 from hexorl.models.factory import build_model
-from hexorl.models.network import HexConv2d, GatedResBlock
+from hexorl.models.trunks.dense_cnn import GatedResBlock, HexConv2d
 
 
 def test_config_rejects_lookahead_head_without_matching_horizon():

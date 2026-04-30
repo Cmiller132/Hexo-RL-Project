@@ -11,6 +11,7 @@
 | `commands/ci_routing_plan.md` | CI plan | Phase 03 CI routing |
 | `commands/COMMAND_INDEX.md` | command index | command transcript index |
 | `import_audits/import_audit_command_plan.md` | audit plan | planned import/deletion audits |
+| `import_audits/head_ownership_audit_20260430.md` | audit evidence | crop model wrapper, heads, and trunk implementations owned by focused modules; legacy `models/network.py` removed |
 | `fixtures_or_references/phase03_fixture_plan.md` | fixture plan | required model/train/checkpoint fixture coverage |
 | `commands/command_transcripts.md` | command evidence | passing focused, touched, audit, and MCTS probe commands |
 | `import_audits/import_deletion_audit.md` | audit evidence | old path deleted; banned runtime gates clean; `rg` blocked by OS |

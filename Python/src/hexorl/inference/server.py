@@ -19,7 +19,7 @@ from hexorl.config import Config
 from hexorl.models.checkpoint import CheckpointManager
 from hexorl.models.factory import build_inference_model, model_uses_global_graph
 from hexorl.models.specs import model_spec_from_config
-from hexorl.models.network import HexNet
+from hexorl.models.heads.value import bins_to_value
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.protocol import (
     InferenceOutputValidationError,
@@ -660,7 +660,7 @@ class InferenceServer:
         post_t0 = time.monotonic()
         p = self._bounded_policy_logits(out["policy"], head_name="policy")
         value_logits = self._bounded_value_logits(out["value"], head_name="value")
-        v = HexNet.bins_to_value(value_logits).float().clamp(-1.0, 1.0)
+        v = bins_to_value(value_logits).float().clamp(-1.0, 1.0)
         self._assert_finite_tensor(v, head_name="value_scalar")
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
@@ -716,7 +716,7 @@ class InferenceServer:
             raise RuntimeError("global graph model did not return policy_place")
         place = self._bounded_policy_logits(out["policy_place"], head_name="policy_place")
         value_logits = self._bounded_value_logits(out["value"], head_name="value")
-        values = HexNet.bins_to_value(value_logits).float().clamp(-1.0, 1.0)
+        values = bins_to_value(value_logits).float().clamp(-1.0, 1.0)
         self._assert_finite_tensor(values, head_name="value_scalar")
         opp = self._bounded_policy_logits(out["opp_policy"], head_name="opp_policy") if "opp_policy" in out else None
         pair_first = self._bounded_policy_logits(out["policy_pair_first"], head_name="policy_pair_first") if "policy_pair_first" in out else None

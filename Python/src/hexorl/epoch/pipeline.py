@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from hexorl.config import Config
 from hexorl.engine.rust import hex_game_class
 from hexorl.models.factory import build_model, model_uses_global_graph
-from hexorl.models.network import HexNet
+from hexorl.models.crop_network import HexNet
 from hexorl.replay.codec import ReplayGameRecord, replay_game_from_selfplay
 from hexorl.replay.sampler import ReplayDataset
 from hexorl.replay.storage import ReplayStorage
