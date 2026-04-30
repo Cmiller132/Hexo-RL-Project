@@ -1,7 +1,7 @@
 """Self-play orchestrator — supervisor process for N self-play workers.
 
 Spawns workers, manages the inference server, collects game records,
-pushes to the ring buffer, and monitors throughput.
+pushes to canonical replay storage, and monitors throughput.
 
 §6.3 of SYSTEM_DESIGN.md — Workers are daemon=False so they survive
 orchestrator restarts. On crash: drops the in-progress game, respawns.
@@ -17,7 +17,8 @@ from typing import Optional, List
 
 from hexorl.config import Config
 from hexorl.inference.server import InferenceServer
-from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+from hexorl.replay.codec import ReplayGameRecord
+from hexorl.replay.storage import ReplayStorage
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.dashboard.recorder import RunRecorder
 
@@ -47,22 +48,7 @@ class SelfPlayOrchestrator:
         self._recorder = recorder
         self._record_epoch = epoch
 
-        # Ring buffer
-        self._buffer = RingBuffer(
-            capacity=buffer_capacity,
-            max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=min(
-                max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
-                512,
-            ),
-            recency_decay=cfg.buffer.recency_decay,
-            num_lookahead=len(cfg.buffer.lookahead_horizons),
-            **replay_feature_flags(
-                cfg.model.heads,
-                architecture=cfg.model.architecture,
-                sparse_policy=cfg.model.sparse_policy,
-            ),
-        )
+        self._replay = ReplayStorage(capacity=buffer_capacity, prefetch_records=cfg.train.prefetch_batches)
 
         # Worker management
         self._workers: List[mp.Process] = []
@@ -196,7 +182,7 @@ class SelfPlayOrchestrator:
     # ── Record Collection ────────────────────────────────────────────────
 
     def _collect_records(self):
-        """Continuously drain game records from the worker queue into the buffer."""
+        """Continuously drain canonical replay records from the worker queue."""
         while not self._stop_event.is_set() or not self._record_queue.empty():
             try:
                 game_record = self._record_queue.get(timeout=0.5)
@@ -212,16 +198,18 @@ class SelfPlayOrchestrator:
             # Targets are already computed by the worker before pushing.
             # Do not reprocess — it overwrites correct EMA lookahead values.
 
+            if not isinstance(game_record, ReplayGameRecord):
+                raise TypeError("self-play collector accepts only ReplayGameRecord")
+
             if self._recorder is not None:
-                self._recorder.game(game_record, source="selfplay", epoch=self._record_epoch)
+                self._recorder.game(game_record.to_game_record(), source="selfplay", epoch=self._record_epoch)
 
             is_truncated = bool(getattr(game_record, "truncated", False))
             valid_positions = list(game_record.positions)
             if is_truncated and not self.cfg.selfplay.train_on_truncated_games:
-                for pos in valid_positions:
-                    pos.value_weight = 0.0
+                valid_positions = []
             if valid_positions:
-                self._buffer.extend(valid_positions)
+                self._replay.append_game(game_record)
 
             with self._stats_lock:
                 self._games_done += 1
@@ -251,8 +239,8 @@ class SelfPlayOrchestrator:
                 "positions_done": self._positions_done,
                 "games_per_min": self._games_done / elapsed * 60.0,
                 "positions_per_min": self._positions_done / elapsed * 60.0,
-                "buffer_size": len(self._buffer),
-                "buffer_capacity": self._buffer.capacity,
+                "buffer_size": len(self._replay),
+                "buffer_capacity": self._replay.capacity,
                 "workers_alive": sum(1 for p in workers if p.is_alive()),
                 "workers_total": len(workers),
                 "elapsed_s": elapsed,
@@ -261,8 +249,12 @@ class SelfPlayOrchestrator:
             return stats
 
     @property
-    def buffer(self) -> RingBuffer:
-        return self._buffer
+    def buffer(self) -> ReplayStorage:
+        return self._replay
+
+    @property
+    def replay(self) -> ReplayStorage:
+        return self._replay
 
     @property
     def progress(self) -> float:

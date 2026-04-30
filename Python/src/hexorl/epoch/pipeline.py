@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import struct
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -20,13 +20,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from hexorl.buffer.ring import RingBuffer, replay_feature_flags
-from hexorl.buffer.sampler import ReplayDataset
-from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 from hexorl.engine.rust import hex_game_class
 from hexorl.models.factory import build_model, model_uses_global_graph
 from hexorl.models.network import HexNet
+from hexorl.replay.codec import ReplayGameRecord, replay_game_from_selfplay
+from hexorl.replay.sampler import ReplayDataset
+from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import (
@@ -64,7 +64,7 @@ def run_epoch(
     *,
     model: Optional[HexNet] = None,
     trainer: Optional[Trainer] = None,
-    buffer: Optional[RingBuffer] = None,
+    buffer: Optional[ReplayStorage] = None,
     output_dir: Optional[Path] = None,
     bootstrap_games: int = 0,
     use_selfplay: bool = False,
@@ -103,30 +103,17 @@ def run_epoch(
     replay = (
         buffer
         if buffer is not None
-        else RingBuffer(
+        else ReplayStorage(
             capacity=cfg.buffer.capacity,
-            max_policy_entries=cfg.selfplay.policy_target_top_k,
-            max_policy_v2_entries=min(
-                max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
-                512,
-            ),
-            recency_decay=cfg.buffer.recency_decay,
-            num_lookahead=len(cfg.buffer.lookahead_horizons),
-            **replay_feature_flags(
-                cfg.model.heads,
-                architecture=cfg.model.architecture,
-                sparse_policy=cfg.model.sparse_policy,
-            ),
+            prefetch_records=cfg.train.prefetch_batches,
         )
     )
 
     if bootstrap_games > 0:
         bootstrap_records = _make_bootstrap_game_records(cfg, bootstrap_games)
-        bootstrap_positions: List[PositionRecord] = []
         for game in bootstrap_records:
-            bootstrap_positions.extend(game.positions)
             recorder.game(game, source="bootstrap")
-        replay.extend(bootstrap_positions)
+            replay.append_game(_to_replay_game(cfg, game, config_identity="bootstrap"))
         recorder.metric(
             {"buffer": replay.stats, "bootstrap_games": bootstrap_games},
             phase="bootstrap",
@@ -148,16 +135,14 @@ def run_epoch(
             epoch=selfplay_epoch,
         )
         if buffer is None:
-            replay = orchestrator.buffer
+            replay = orchestrator.replay
         else:
             base_game_id = replay.max_game_id + 1 if len(replay) else 0
             game_id_map: dict[int, int] = {}
-            appended_positions: List[PositionRecord] = []
-            for pos in orchestrator.buffer.records():
-                if pos.game_id not in game_id_map:
-                    game_id_map[pos.game_id] = base_game_id + len(game_id_map)
-                appended_positions.append(replace(pos, game_id=game_id_map[pos.game_id]))
-            replay.extend(appended_positions)
+            for game in orchestrator.replay.games():
+                if game.game_id not in game_id_map:
+                    game_id_map[game.game_id] = base_game_id + len(game_id_map)
+                replay.append_game(game)
         recorder.metric(orchestrator.stats, phase="selfplay")
 
     train_stats: Dict[str, float] = {}
@@ -166,7 +151,8 @@ def run_epoch(
         if len(replay) < cfg.train.batch_size:
             needed = cfg.train.batch_size - len(replay)
             games = max(1, (needed + 5) // 6)
-            replay.extend(_make_bootstrap_positions(cfg, games, start_game_id=replay.max_game_id + 1))
+            for game in _make_bootstrap_game_records(cfg, games, start_game_id=replay.max_game_id + 1):
+                replay.append_game(_to_replay_game(cfg, game, config_identity="bootstrap_fill"))
 
         dataset = ReplayDataset(
             replay,
@@ -292,21 +278,12 @@ def run_tiny_training_smoke(
     output_dir = Path(output_dir or cfg.run.output_dir.format(name="tiny-smoke"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    replay = RingBuffer(
+    replay = ReplayStorage(
         capacity=cfg.buffer.capacity,
-        recency_decay=cfg.buffer.recency_decay,
-        num_lookahead=1,
-        max_policy_v2_entries=min(
-            max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
-            512,
-        ),
-        **replay_feature_flags(
-            cfg.model.heads,
-            architecture=cfg.model.architecture,
-            sparse_policy=cfg.model.sparse_policy,
-        ),
+        prefetch_records=cfg.train.prefetch_batches,
     )
-    replay.extend(_make_bootstrap_positions(cfg, 16))
+    for game in _make_bootstrap_game_records(cfg, 16):
+        replay.append_game(_to_replay_game(cfg, game, config_identity="tiny_smoke"))
 
     dataset = ReplayDataset(
         replay,
@@ -365,6 +342,16 @@ def _make_bootstrap_positions(
     return records
 
 
+def _to_replay_game(cfg: Config, game: GameRecord, *, config_identity: str) -> ReplayGameRecord:
+    return replay_game_from_selfplay(
+        game,
+        lookahead_horizons=cfg.buffer.lookahead_horizons,
+        lookahead_lambdas=cfg.buffer.lookahead_lambdas,
+        config_identity=config_identity,
+        checkpoint_identity="bootstrap" if config_identity.startswith("bootstrap") else "",
+    )
+
+
 def _make_bootstrap_game_records(
     cfg: Config,
     num_games: int,
@@ -374,11 +361,6 @@ def _make_bootstrap_game_records(
     games: List[GameRecord] = []
     for game_id in range(start_game_id, start_game_id + num_games):
         game = _make_synthetic_game(cfg, game_id)
-        process_game_record(
-            game,
-            lookahead_horizons=cfg.buffer.lookahead_horizons,
-            lookahead_lambdas=cfg.buffer.lookahead_lambdas,
-        )
         games.append(game)
     return games
 
@@ -463,7 +445,6 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
         truncated=(terminal_reason != "win"),
         terminal_reason=terminal_reason,
     )
-    process_game_record(game)
     return game
 
 

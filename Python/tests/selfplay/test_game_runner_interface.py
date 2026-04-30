@@ -25,4 +25,4 @@ def test_runner_uses_explicit_dependencies_not_worker_runtime(runner_factory):
 
     assert result.ok is True
     assert writer.records[0].game_id == 3
-    assert result.game_record is writer.records[0]
+    assert result.record_write.record_hash == writer.records[0].game_hash

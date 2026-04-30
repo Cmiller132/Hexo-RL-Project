@@ -9,7 +9,8 @@ from typing import Any
 
 from hexorl.contracts.identity import stable_digest
 from hexorl.contracts.validation import ContractValidationError
-from hexorl.selfplay.records import COMPACT_VERSION_V2, GameRecord
+from hexorl.replay.codec import REPLAY_RECORD_SCHEMA_VERSION, ReplayGameRecord, replay_game_from_selfplay
+from hexorl.selfplay.records import GameRecord
 from hexorl.selfplay.telemetry import SelfPlayTelemetrySink
 
 
@@ -82,11 +83,19 @@ class QueueSelfPlayRecordWriter(SelfPlayRecordWriter):
                 }
                 record.rgsc_prb_snapshot = self.rgsc_service.snapshot_entries()
 
+            replay_record = replay_game_from_selfplay(
+                record,
+                lookahead_horizons=self.lookahead_horizons,
+                lookahead_lambdas=self.lookahead_lambdas,
+                config_identity=getattr(run_request, "config_identity", ""),
+                checkpoint_identity=getattr(run_request, "checkpoint_identity", ""),
+            )
+
             self.last_operation = "queue_put"
             backpressure_events = 0
             while True:
                 try:
-                    self.output_queue.put(record, timeout=self.put_timeout_s)
+                    self.output_queue.put(replay_record, timeout=self.put_timeout_s)
                     break
                 except queue.Full:
                     backpressure_events += 1
@@ -110,9 +119,9 @@ class QueueSelfPlayRecordWriter(SelfPlayRecordWriter):
             result = RecordWriteResult(
                 ok=True,
                 game_id=int(record.game_id),
-                positions_written=len(record.positions),
-                record_hash=record_hash(record),
-                schema_version=COMPACT_VERSION_V2,
+                positions_written=len(replay_record.positions),
+                record_hash=replay_record.game_hash,
+                schema_version=REPLAY_RECORD_SCHEMA_VERSION,
                 elapsed_ms=elapsed,
                 backpressure_events=backpressure_events,
             )
@@ -133,7 +142,7 @@ class QueueSelfPlayRecordWriter(SelfPlayRecordWriter):
                 game_id=int(getattr(record, "game_id", -1)),
                 positions_written=0,
                 record_hash="",
-                schema_version=COMPACT_VERSION_V2,
+                schema_version=REPLAY_RECORD_SCHEMA_VERSION,
                 elapsed_ms=elapsed,
                 error=str(exc),
             )
@@ -142,7 +151,7 @@ class QueueSelfPlayRecordWriter(SelfPlayRecordWriter):
 class InMemorySelfPlayRecordWriter(SelfPlayRecordWriter):
     def __init__(self, *, telemetry_sink: SelfPlayTelemetrySink) -> None:
         self.telemetry_sink = telemetry_sink
-        self.records: list[GameRecord] = []
+        self.records: list[ReplayGameRecord] = []
         self.last_operation = "idle"
         self.last_elapsed_ms = 0.0
 
@@ -150,15 +159,16 @@ class InMemorySelfPlayRecordWriter(SelfPlayRecordWriter):
         t0 = time.monotonic()
         self.last_operation = "memory_write"
         validate_game_record(record)
-        self.records.append(record)
+        replay_record = replay_game_from_selfplay(record)
+        self.records.append(replay_record)
         elapsed = (time.monotonic() - t0) * 1000.0
         self.last_elapsed_ms = elapsed
         return RecordWriteResult(
             ok=True,
             game_id=int(record.game_id),
-            positions_written=len(record.positions),
-            record_hash=record_hash(record),
-            schema_version=COMPACT_VERSION_V2,
+            positions_written=len(replay_record.positions),
+            record_hash=replay_record.game_hash,
+            schema_version=REPLAY_RECORD_SCHEMA_VERSION,
             elapsed_ms=elapsed,
         )
 
@@ -184,7 +194,7 @@ def validate_game_record(record: GameRecord) -> None:
 def record_hash(record: GameRecord) -> str:
     payload = (
         "GameRecord",
-        COMPACT_VERSION_V2,
+        REPLAY_RECORD_SCHEMA_VERSION,
         int(record.game_id),
         float(record.outcome),
         tuple(

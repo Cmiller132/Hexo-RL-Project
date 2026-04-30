@@ -1,0 +1,44 @@
+{
+  "bounded": true,
+  "host_profile": {
+    "processor": "AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD",
+    "python": "3.14.0",
+    "release": "11",
+    "system": "Windows"
+  },
+  "memory_current_bytes": 47000736,
+  "memory_peak_bytes": 47047051,
+  "phase": "07",
+  "prefetch_records": 4,
+  "project_elapsed_s": 1.1347294000443071,
+  "project_records": 512,
+  "project_samples_per_sec": 451.20889612978056,
+  "projector_batch_samples": {
+    "memory_bytes": 1951616.0,
+    "project_ms": 61.37820001458749,
+    "project_samples_per_sec": 521.3577457858767,
+    "records": 32.0
+  },
+  "storage": {
+    "avg_missing_target_policy_mass": 0.0,
+    "avg_target_policy_mass_outside_window": 0.0,
+    "capacity": 4096,
+    "critical_count": 0.0,
+    "critical_overflow_count": 0.0,
+    "games_written": 128,
+    "high_watermark": 384,
+    "last_error": "",
+    "last_error_owner": "",
+    "memory_high_watermark_bytes": 464384,
+    "positions_written": 384,
+    "read_samples": 512,
+    "read_samples_per_sec": 135.56470364272374,
+    "rejected_records": 0,
+    "size": 384,
+    "write_backpressure_events": 0,
+    "write_samples_per_sec": 101.6735277320428
+  },
+  "write_elapsed_s": 2.614974699972663,
+  "write_records": 384,
+  "write_samples_per_sec": 146.8465450178215
+}

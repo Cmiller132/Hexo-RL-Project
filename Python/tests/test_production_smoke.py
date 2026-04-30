@@ -2,16 +2,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from hexorl.contracts.candidates import CANDIDATE_FEATURE_VERSION
-from hexorl.buffer.ring import RingBuffer
-from hexorl.buffer.sampler import ReplayDataset
 from hexorl.config import Config
 from hexorl.dashboard.checkpoints import scan_checkpoints
 from hexorl.dashboard.recorder import RunRecorder
 from hexorl.dashboard.replay import replay_game
 from hexorl.epoch.pipeline import _make_bootstrap_game_records
 from hexorl.eval.scorecard import compute_phase3_scorecard
-from hexorl.models.factory import build_model
-from hexorl.train.losses import compute_losses
+from hexorl.models.factory import build_model, train_adapter_for
+from hexorl.replay.codec import replay_game_from_selfplay
+from hexorl.replay.sampler import ReplayDataset
+from hexorl.replay.storage import ReplayStorage
 
 
 def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path):
@@ -46,17 +46,16 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
     for game in game_records:
         recorder.game(game, source="bootstrap", epoch=1)
 
-    replay_buffer = RingBuffer(
-        capacity=cfg.buffer.capacity,
-        max_policy_entries=cfg.selfplay.policy_target_top_k,
-        max_policy_v2_entries=min(
-            max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget),
-            512,
-        ),
-        num_lookahead=0,
-    )
+    replay_buffer = ReplayStorage(capacity=cfg.buffer.capacity)
     for game in game_records:
-        replay_buffer.extend(game.positions)
+        replay_buffer.append_game(
+            replay_game_from_selfplay(
+                game,
+                lookahead_horizons=cfg.buffer.lookahead_horizons,
+                lookahead_lambdas=cfg.buffer.lookahead_lambdas,
+                config_identity="test-production",
+            )
+        )
 
     dataset = ReplayDataset(
         replay_buffer,
@@ -71,24 +70,12 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
         candidate_budget=cfg.model.candidate_budget,
     )
     batch = next(iter(DataLoader(dataset, batch_size=None, num_workers=0)))
-    tensors, policies, values, _lookahead, aux_targets = batch
-    targets = {"policy": policies, "value": values, **aux_targets}
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     model.train()
-    predictions = model(
-        tensors,
-        candidate_features=targets.get("candidate_features"),
-        candidate_indices=targets.get("candidate_indices"),
-        candidate_mask=targets.get("candidate_mask"),
-        pair_candidate_indices=targets.get("pair_candidate_indices"),
-        pair_candidate_mask=targets.get("pair_candidate_mask"),
-    )
-    total_loss, per_head = compute_losses(
-        predictions,
-        targets,
-        loss_weights=cfg.train.loss_weights,
-        n_bins=model.n_bins,
-    )
+    adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
+    projected = adapter.project_batch(batch)
+    predictions = adapter.forward(projected)
+    total_loss, per_head = adapter.losses(predictions, projected.targets, n_bins=model.n_bins)
     total_loss.backward()
     with torch.no_grad():
         for param in model.parameters():
@@ -123,8 +110,7 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
 
     assert checkpoint_path.exists()
     assert train_stats["loss_total"] >= 0.0
-    assert "pair_fallback_prior_use" in replay_buffer.stats
-    assert "fallback_prior_use_on_mcts_topk" in replay_buffer.stats
+    assert replay_buffer.stats["positions_written"] > 0
 
     indexed = scan_checkpoints(tmp_path, recorder.store, run_id="tiny-production")
     assert indexed

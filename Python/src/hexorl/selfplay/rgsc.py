@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from hexorl.buffer.regret_buffer import PrioritizedRegretBuffer
+from hexorl.selfplay.regret_buffer import PrioritizedRegretBuffer
 from hexorl.contracts.history import (
     MoveHistory,
     encode_move_history as contract_encode_move_history,

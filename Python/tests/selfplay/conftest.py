@@ -52,7 +52,7 @@ class FakeEngineAdapter:
         self.is_over = False
         self.winner = 0
         self._game = SimpleNamespace(current_player=0, placements_remaining=1)
-        self._legal = np.asarray([[0, 0], [1, 0]], dtype=np.int32)
+        self._legal = np.asarray([[0, 0]], dtype=np.int32)
 
     def init_root(self):
         tensor = np.zeros((13, 33, 33), dtype=np.float32)
@@ -71,7 +71,7 @@ class FakeEngineAdapter:
         return True
 
     def get_results(self):
-        return [0, 1], [0, 0], [3, 1], 0.5
+        return [0], [0], [3], 0.5
 
     def root_pair_visit_targets(self):
         return []

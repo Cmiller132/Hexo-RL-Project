@@ -186,8 +186,8 @@ class GameRecord:
     def to_compact_bytes(self) -> bytes:
         """Serialize the game record into compact bytes for buffer storage.
 
-        V2 records start with a magic/version prefix. from_compact_bytes still
-        accepts legacy records that started directly with game_id/outcome.
+        Phase 07 runtime replay uses ``hexorl.replay.codec``. This compact
+        helper is retained only for frozen fixtures and requires the V2 magic.
         """
         parts = bytearray()
 
@@ -311,19 +311,13 @@ class GameRecord:
         offset = 0
 
         is_v2 = data[:4] == COMPACT_MAGIC_V2
-        if is_v2:
-            offset += 4
-            version, game_id, outcome, num_pos = struct.unpack_from("<HIfI", data, offset)
-            offset += struct.calcsize("<HIfI")
-            if not (COMPACT_VERSION_MIN <= version <= COMPACT_VERSION_V2):
-                raise ValueError(f"Unsupported compact GameRecord version {version}")
-        else:
-            game_id = struct.unpack_from("<I", data, offset)[0]
-            offset += 4
-            outcome = struct.unpack_from("<f", data, offset)[0]
-            offset += 4
-            num_pos = struct.unpack_from("<I", data, offset)[0]
-            offset += 4
+        if not is_v2:
+            raise ValueError("Legacy magic-less GameRecord payloads are not accepted by runtime")
+        offset += 4
+        version, game_id, outcome, num_pos = struct.unpack_from("<HIfI", data, offset)
+        offset += struct.calcsize("<HIfI")
+        if not (COMPACT_VERSION_MIN <= version <= COMPACT_VERSION_V2):
+            raise ValueError(f"Unsupported compact GameRecord version {version}")
 
         positions = []
         for _ in range(num_pos):
@@ -742,8 +736,8 @@ def pair_policy_v2_from_place_target(
 ) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
     """Diagnostic-only synthetic pair target from place-action probabilities.
 
-    Production training must use search-observed pair targets assigned in
-    ``hexorl.buffer.targets``. This helper is retained for legacy tests and
+    Production training must use search-observed pair targets assigned before
+    canonical replay encoding. This helper is retained for frozen tests and
     diagnostics that explicitly want the synthetic product baseline.
     """
     merged: dict[tuple[int, int], float] = {}

@@ -3,8 +3,8 @@ import multiprocessing as mp
 import pytest
 import torch
 
-from hexorl.buffer import RingBuffer
 from hexorl.config import Config
+from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
 from hexorl.search.pair_strategy import PairStrategySpec
 from hexorl.selfplay.game_runner import create_default_game_runner
@@ -91,13 +91,9 @@ def test_compute_losses_raises_when_no_loss_can_be_computed():
         )
 
 
-def test_ring_buffer_rejects_invalid_dimensions():
+def test_replay_storage_rejects_invalid_dimensions():
     with pytest.raises(ValueError, match="capacity"):
-        RingBuffer(capacity=0)
-    with pytest.raises(ValueError, match="max_policy_entries"):
-        RingBuffer(capacity=4, max_policy_entries=0)
-    with pytest.raises(ValueError, match="num_lookahead"):
-        RingBuffer(capacity=4, num_lookahead=-1)
+        ReplayStorage(capacity=0)
 
 
 def test_model_ema_decay_keeps_most_shadow_weight():

@@ -13,8 +13,8 @@ def test_golden_runner_aligns_engine_rows_policy_mcts_and_replay(runner_factory)
     record = writer.records[0]
     position = record.positions[0]
     assert result.ok is True
-    assert position.policy_target_v2 == [(0, 0, 0.75), (1, 0, 0.25)]
-    assert position.policy_target
+    assert position.policy_target_v2 == ((0, 0, 1.0),)
+    assert position.policy_target_dense
     assert record.final_move_history.endswith((0).to_bytes(4, "little", signed=True))
 
 

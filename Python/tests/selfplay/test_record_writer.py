@@ -1,10 +1,7 @@
 import queue
 
-from hexorl.selfplay.record_writer import (
-    InMemorySelfPlayRecordWriter,
-    QueueSelfPlayRecordWriter,
-    record_hash,
-)
+from hexorl.replay.codec import REPLAY_RECORD_SCHEMA_VERSION, ReplayGameRecord
+from hexorl.selfplay.record_writer import InMemorySelfPlayRecordWriter, QueueSelfPlayRecordWriter
 from hexorl.selfplay.records import GameRecord, PositionRecord
 from hexorl.selfplay.telemetry import InMemorySelfPlayTelemetrySink
 
@@ -40,8 +37,9 @@ def test_replay_records_are_written_outside_worker_with_hash_and_schema():
 
     assert result.ok is True
     assert result.positions_written == 1
-    assert result.record_hash == record_hash(writer.records[0])
-    assert result.schema_version == 9
+    assert isinstance(writer.records[0], ReplayGameRecord)
+    assert result.record_hash == writer.records[0].game_hash
+    assert result.schema_version == REPLAY_RECORD_SCHEMA_VERSION
 
 
 def test_record_writer_backpressure_is_structured():

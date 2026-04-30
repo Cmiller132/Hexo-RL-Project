@@ -56,6 +56,24 @@ class TrainAdapter:
     loss_plan: Any
 
     def project_batch(self, batch: Any, *, channels_last: bool = False) -> ProjectedTrainingBatch:
+        if getattr(batch, "source", "") == "replay/projector.py":
+            aux_targets = dict(batch.aux_targets)
+            tensors = self._to_device(batch.tensors)
+            if channels_last and tensors.ndim == 4:
+                tensors = tensors.contiguous(memory_format=torch.channels_last)
+            targets = {
+                "policy": self._to_device(batch.policies),
+                "value": self._to_device(batch.values),
+            }
+            lookahead_keys = [f"lookahead_{h}" for h in getattr(self.cfg.buffer, "lookahead_horizons", [])]
+            for key, value in zip(lookahead_keys, batch.lookahead):
+                targets[key] = self._to_device(value)
+            for key, value in aux_targets.items():
+                targets[key] = self._to_device(value)
+            if not getattr(self.cfg.selfplay, "train_policy_on_full_search_only", True):
+                targets.pop("policy_weight", None)
+            return self._project_targets_to_model_inputs(tensors, targets)
+
         aux_targets: dict[str, Any] = {}
         if len(batch) == 5:
             tensors, policies, values, lookahead_list, aux_targets = batch
@@ -80,6 +98,9 @@ class TrainAdapter:
         if not getattr(self.cfg.selfplay, "train_policy_on_full_search_only", True):
             targets.pop("policy_weight", None)
 
+        return self._project_targets_to_model_inputs(tensors, targets)
+
+    def _project_targets_to_model_inputs(self, tensors: Any, targets: dict[str, torch.Tensor]) -> ProjectedTrainingBatch:
         if self.spec.is_global_graph:
             self.validate_graph_targets(targets)
             kwargs = {
@@ -192,6 +213,8 @@ class TrainAdapter:
             _require_shape_match("model_output:policy", outputs["policy"], targets["policy"])
 
     def _to_device(self, value: Any) -> Any:
+        if hasattr(value, "__array__") and not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
         if isinstance(value, torch.Tensor):
             return value.to(self.device, non_blocking=True).clone()
         return value

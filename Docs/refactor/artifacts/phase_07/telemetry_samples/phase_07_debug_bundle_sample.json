@@ -1,0 +1,16 @@
+{
+  "phase": "07",
+  "owner": "replay.projector",
+  "record_identity": {
+    "schema_version": 1,
+    "history_hash": "golden fixture asserted in test",
+    "legal_table_hash": "golden fixture asserted in test",
+    "record_hash": "golden fixture asserted in test"
+  },
+  "projection_identity": {
+    "source": "replay/projector.py",
+    "projection_id": "stable_digest(ProjectedReplayBatch)",
+    "target_keys": ["policy", "value", "sparse_policy_target", "candidate_mask"]
+  },
+  "failure_owners": ["replay.codec", "replay.storage", "replay.sampler", "replay.projector", "train_adapter"]
+}
