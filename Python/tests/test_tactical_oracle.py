@@ -1,7 +1,7 @@
 ﻿import pytest
 
 from hexorl.contracts.candidates import CandidateContractBuilder
-from hexorl.action_contract.tactical_oracle import (
+from hexorl.engine.tactical import (
     TACTICAL_SCAN_RADIUS,
     scan_tactical_oracle,
     scan_tactical_oracle_from_game,
@@ -103,7 +103,7 @@ def test_history_oracle_rejects_illegal_origin_via_engine_replay():
 
 
 def test_history_oracle_requires_engine_oracle_for_production(monkeypatch):
-    import hexorl.action_contract.tactical_oracle as oracle_mod
+    import hexorl.engine.tactical as oracle_mod
 
     monkeypatch.setattr(oracle_mod, "_engine_game_class", lambda: None)
     with pytest.raises(RuntimeError, match="engine tactical oracle is required"):

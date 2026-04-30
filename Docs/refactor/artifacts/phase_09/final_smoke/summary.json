@@ -1,0 +1,110 @@
+{
+  "elapsed_s": 0.1500454999622889,
+  "eval": {
+    "move": [
+      0,
+      0
+    ],
+    "trace": {
+      "inference_protocol": "local_model_eval_v1",
+      "input_contract": "crop_tensor_v1",
+      "legal_row_count": 1,
+      "model_family": "graph_hybrid",
+      "output_contract": "row_mapped_policy_value_v1",
+      "pair_rows_scored": 0,
+      "provider_type": "GraphHybridPolicyProvider",
+      "timings_ms": {
+        "policy_provider_ms": 2.2513000294566154,
+        "provider_call_ms": 2.467099984642118
+      },
+      "trace_id": "d3474d0385ed4db384138112a6398771",
+      "warnings": []
+    }
+  },
+  "host": {
+    "cuda_available": true,
+    "device": "cuda",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0",
+    "torch": "2.10.0+cu126"
+  },
+  "ok": true,
+  "registered_families": [
+    "dense_cnn",
+    "global_line_window",
+    "global_relation_graph",
+    "global_xattn",
+    "graph_hybrid",
+    "restnet"
+  ],
+  "replay": {
+    "game_hash": "e5d40fb00fb388bc57aa8b28bc09414adde7ea2fce6e2a8420f4496e0261055b",
+    "position_count": 8,
+    "storage_stats": {
+      "avg_missing_target_policy_mass": 0.0,
+      "avg_target_policy_mass_outside_window": 0.01138610178373121,
+      "capacity": 32,
+      "critical_count": 0.0,
+      "critical_overflow_count": 0.0,
+      "games_written": 1,
+      "high_watermark": 8,
+      "last_error": "",
+      "last_error_owner": "",
+      "memory_high_watermark_bytes": 22128,
+      "positions_written": 8,
+      "read_samples": 2,
+      "read_samples_per_sec": 14.25190672292782,
+      "rejected_records": 0,
+      "size": 8,
+      "write_backpressure_events": 0,
+      "write_samples_per_sec": 57.00762689171128
+    }
+  },
+  "representative_train_family_set": [
+    "graph_hybrid"
+  ],
+  "schema_version": 1,
+  "train": {
+    "batch_source": "replay/projector.py",
+    "family": "graph_hybrid",
+    "loss_parts": {
+      "pair_policy": -0.0,
+      "policy": -0.0,
+      "sparse_policy": 0.37334224581718445,
+      "value": -0.0
+    },
+    "loss_total": 0.37334224581718445,
+    "target_keys": [
+      "axis",
+      "candidate_critical_count",
+      "candidate_critical_overflow_count",
+      "candidate_critical_overflow_examples",
+      "candidate_features",
+      "candidate_indices",
+      "candidate_mask",
+      "candidate_missing_mass",
+      "candidate_qr",
+      "moves_left",
+      "moves_left_weight",
+      "opp_policy",
+      "opp_policy_weight",
+      "pair_candidate_features",
+      "pair_candidate_indices",
+      "pair_candidate_mask",
+      "pair_candidate_missing_mass",
+      "pair_candidate_row_indices",
+      "pair_candidate_row_mask",
+      "pair_policy_target",
+      "pair_policy_weight",
+      "policy",
+      "policy_weight",
+      "regret_rank",
+      "regret_value",
+      "regret_weight",
+      "sparse_policy_target",
+      "sparse_policy_weight",
+      "value",
+      "value_weight"
+    ]
+  }
+}

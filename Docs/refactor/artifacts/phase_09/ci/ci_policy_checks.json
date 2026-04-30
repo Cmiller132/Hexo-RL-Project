@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "phase": "09",
+  "checks": [
+    {
+      "name": "phase09-architecture-policy",
+      "tier": "pr_required",
+      "command": "python tools/refactor/phase09_policy_audit.py --output Docs/refactor/artifacts/phase_09/import_audits/phase09_policy_audit.json",
+      "owner": "S5 Quality/CI/Docs",
+      "artifact": "Docs/refactor/artifacts/phase_09/import_audits/phase09_policy_audit.json",
+      "enforces": [
+        "no old model/buffer/action_contract runtime packages",
+        "no banned old runtime imports",
+        "no runtime architecture-string gates outside spec/registry validation",
+        "no direct Rust MCTS owner outside engine adapter",
+        "no dashboard private reconstruction imports",
+        "no duplicate FFI byte decoders outside contract/engine owners"
+      ]
+    },
+    {
+      "name": "python-v2-shard",
+      "tier": "pr_required",
+      "command": "pytest Python/tests/contracts Python/tests/engine Python/tests/models Python/tests/inference Python/tests/search Python/tests/replay Python/tests/train Python/tests/eval Python/tests/tuning Python/tests/dashboard Python/tests/phase09 -q",
+      "owner": "S5 Quality/CI/Docs",
+      "artifact": "pytest output and uploaded policy artifacts",
+      "enforces": [
+        "contracts",
+        "engine",
+        "model registry",
+        "inference",
+        "search",
+        "replay",
+        "train",
+        "eval",
+        "tuning",
+        "dashboard",
+        "phase09 policy"
+      ]
+    },
+    {
+      "name": "dashboard-build",
+      "tier": "pr_required",
+      "command": "npm ci && npm run build",
+      "working_directory": "Python/dashboard_frontend",
+      "owner": "S4 Replay/Training/Eval/Dashboard",
+      "artifact": "frontend build output"
+    },
+    {
+      "name": "final-v2-smoke",
+      "tier": "scheduled final",
+      "command": "python tools/refactor/phase09_final_smoke.py && python tools/refactor/phase09_performance_probe.py && python tools/refactor/phase09_artifact_validator.py",
+      "owner": "S5 Quality/CI/Docs",
+      "artifact": "Docs/refactor/artifacts/phase_09/"
+    }
+  ]
+}

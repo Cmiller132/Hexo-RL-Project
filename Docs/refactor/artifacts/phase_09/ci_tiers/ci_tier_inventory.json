@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "phase": "09",
+  "checks": [
+    {
+      "name": "cargo test --workspace",
+      "tier": "pr_required",
+      "owner": "Rust boundary",
+      "timeout_minutes": 30,
+      "runner": "ubuntu-latest",
+      "command": "cargo test --workspace",
+      "artifact_path": "GitHub Actions rust-fast logs",
+      "promotion_rule": "Required on PR and push to protected branches"
+    },
+    {
+      "name": "cargo clippy/fmt/release",
+      "tier": "pr_required",
+      "owner": "Rust boundary",
+      "timeout_minutes": 30,
+      "runner": "ubuntu-latest",
+      "command": "cargo fmt --all -- --check && cargo test --workspace --release && cargo clippy --workspace --release -- -D warnings",
+      "artifact_path": "GitHub Actions rust-fast logs",
+      "promotion_rule": "Required on PR and push to protected branches"
+    },
+    {
+      "name": "python-v2-shard",
+      "tier": "pr_required",
+      "owner": "Quality/CI",
+      "timeout_minutes": 60,
+      "runner": "ubuntu-latest with maturin-built _engine",
+      "command": "pytest Python/tests/contracts Python/tests/engine Python/tests/models Python/tests/inference Python/tests/search Python/tests/replay Python/tests/train Python/tests/eval Python/tests/tuning Python/tests/dashboard Python/tests/phase09 -q",
+      "artifact_path": "GitHub Actions python-v2-policy-artifacts",
+      "promotion_rule": "Required for V2 runtime changes"
+    },
+    {
+      "name": "phase09-architecture-policy",
+      "tier": "pr_required",
+      "owner": "Quality/CI",
+      "timeout_minutes": 10,
+      "runner": "ubuntu-latest",
+      "command": "python tools/refactor/phase09_policy_audit.py --output Docs/refactor/artifacts/phase_09/import_audits/phase09_policy_audit.json",
+      "artifact_path": "Docs/refactor/artifacts/phase_09/import_audits/phase09_policy_audit.json",
+      "promotion_rule": "Blocks any banned import/path/string-gate regression"
+    },
+    {
+      "name": "dashboard-build",
+      "tier": "pr_required",
+      "owner": "Dashboard",
+      "timeout_minutes": 20,
+      "runner": "ubuntu-latest node20",
+      "command": "npm ci && npm run build",
+      "artifact_path": "GitHub Actions dashboard-build logs",
+      "promotion_rule": "Required for dashboard/frontend changes and final closure"
+    },
+    {
+      "name": "deep-oracle",
+      "tier": "scheduled",
+      "owner": "Rust boundary",
+      "timeout_minutes": 60,
+      "runner": "ubuntu-latest",
+      "command": "cargo test --workspace --release -- --ignored --test-threads=1",
+      "artifact_path": "GitHub Actions deep-oracle logs",
+      "promotion_rule": "Scheduled and workflow_dispatch before final V2 closure"
+    },
+    {
+      "name": "final-v2-smoke",
+      "tier": "final",
+      "owner": "Quality/CI",
+      "timeout_minutes": 45,
+      "runner": "ubuntu-latest with maturin-built _engine",
+      "command": "python tools/refactor/phase09_final_smoke.py && python tools/refactor/phase09_performance_probe.py && python tools/refactor/phase09_artifact_validator.py",
+      "artifact_path": "Docs/refactor/artifacts/phase_09/",
+      "promotion_rule": "Scheduled/workflow_dispatch final closure artifact"
+    }
+  ]
+}

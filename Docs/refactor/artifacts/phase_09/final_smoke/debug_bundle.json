@@ -1,0 +1,353 @@
+{
+  "contracts": {
+    "candidates": {
+      "candidate_count": 1,
+      "contract": "CandidateTable",
+      "facts": {
+        "checkpoint_manifest_version": 1,
+        "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+        "inference_protocol_version": 1,
+        "model_family": "dense_cnn",
+        "model_spec_version": 1,
+        "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+        "recipe_id": "dashboard-default",
+        "replay_schema_version": 1,
+        "source": "rust",
+        "trace_id": ""
+      },
+      "feature_names": [
+        "q_norm",
+        "r_norm",
+        "s_norm",
+        "hex_distance_norm",
+        "inside_crop",
+        "crop_q_norm",
+        "crop_r_norm",
+        "legal_rank_norm",
+        "winning_cell",
+        "forced_block",
+        "outside_crop",
+        "critical_cell"
+      ],
+      "feature_version": 2,
+      "inspector": {
+        "dispatcher": "ContractInspector",
+        "elapsed_ms": 0.2516999957151711,
+        "service": "CandidatesInspector"
+      },
+      "missing_mass": 0.0,
+      "rows": [
+        {
+          "dense_index": 544,
+          "q": 0,
+          "r": 0,
+          "row": 0,
+          "target_prob": 1.0
+        }
+      ],
+      "source": "rust",
+      "table_hash": "28a19d0c747fce2cf968f6eb8bbf2e9e8027eeceb83357ecb9a189b85a464bb0",
+      "target_mass": 1.0,
+      "trace": {
+        "span_timings": {},
+        "trace_id": ""
+      },
+      "view": "candidates"
+    },
+    "d6": {
+      "available": true,
+      "view": "d6"
+    },
+    "graph": {
+      "capacity": {
+        "failures": [],
+        "fits_ipc": true,
+        "max_actions": 768,
+        "max_pairs": 4096,
+        "max_tokens": 768,
+        "strategy": "preserve_legal_stone_tactical_rows_fail_or_chunk_context"
+      },
+      "current_player": 0,
+      "facts": {
+        "checkpoint_manifest_version": 1,
+        "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+        "inference_protocol_version": 1,
+        "model_family": "dense_cnn",
+        "model_spec_version": 1,
+        "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+        "recipe_id": "dashboard-default",
+        "replay_schema_version": 1,
+        "source": "rust",
+        "trace_id": ""
+      },
+      "feature_dim": 48,
+      "graph_hash": "b678141aee5d777a5e4e421d1a53ef10575ff6e4b83dd19c799508ebb97250e8",
+      "inspector": {
+        "dispatcher": "ContractInspector",
+        "elapsed_ms": 1.0501999640837312,
+        "service": "GraphInspector"
+      },
+      "legal_count": 1,
+      "legal_qr": [
+        {
+          "q": 0,
+          "r": 0
+        }
+      ],
+      "opp_legal_count": 216,
+      "pair_count": 0,
+      "placements_remaining": 1,
+      "relation_bias_shape": [
+        1,
+        8,
+        8
+      ],
+      "relation_counts": {
+        "D6_ORBIT_RELATION": 8,
+        "SAME_LINE": 56
+      },
+      "relation_schema_version": 1,
+      "schema_version": 2,
+      "source": "graph/semantic_builder.py",
+      "target_masses": {
+        "opp_policy": 0.0,
+        "pair": 0.0,
+        "pair_first": 0.0,
+        "policy": 1.0
+      },
+      "token_count": 8,
+      "token_counts": {
+        "COMPONENT": 0,
+        "COVER_SET": 0,
+        "HOT_CELL": 0,
+        "LEGAL": 1,
+        "LINE": 3,
+        "PAIR_ACTION": 0,
+        "PLAYER": 2,
+        "STATE": 1,
+        "STONE": 0,
+        "TURN": 1,
+        "WINDOW6": 0
+      },
+      "trace": {
+        "span_timings": {},
+        "trace_id": ""
+      },
+      "view": "graph"
+    },
+    "legal": {
+      "facts": {
+        "checkpoint_manifest_version": 1,
+        "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+        "inference_protocol_version": 1,
+        "model_family": "dense_cnn",
+        "model_spec_version": 1,
+        "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+        "recipe_id": "dashboard-default",
+        "replay_schema_version": 1,
+        "source": "rust",
+        "trace_id": ""
+      },
+      "inspector": {
+        "dispatcher": "ContractInspector",
+        "elapsed_ms": 0.2609000075608492,
+        "service": "LegalTableInspector"
+      },
+      "legal_table": {
+        "contract": "LegalActionTable",
+        "current_player": 0,
+        "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+        "legal_count": 1,
+        "occupied_count": 0,
+        "placements_remaining": 1,
+        "radius": 8,
+        "rows": [
+          [
+            0,
+            0
+          ]
+        ],
+        "schema_version": 1,
+        "source": "rust:legal",
+        "table_hash": "6c3c4adfbd425534c1f6fd2cb72657a78342f31d003c9ae27c80acb731ae10c6"
+      },
+      "offset_q": -16,
+      "offset_r": -16,
+      "trace": {
+        "span_timings": {},
+        "trace_id": ""
+      },
+      "view": "legal-table"
+    },
+    "pairs": {
+      "available": false,
+      "facts": {
+        "checkpoint_manifest_version": 1,
+        "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+        "inference_protocol_version": 1,
+        "model_family": "dense_cnn",
+        "model_spec_version": 1,
+        "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+        "recipe_id": "dashboard-default",
+        "replay_schema_version": 1,
+        "source": "rust",
+        "trace_id": ""
+      },
+      "inspector": {
+        "dispatcher": "ContractInspector",
+        "elapsed_ms": 0.179799972102046,
+        "service": "PairsInspector"
+      },
+      "missing_mass": 0.0,
+      "rows": [],
+      "target_mass": 0.0,
+      "trace": {
+        "span_timings": {},
+        "trace_id": ""
+      },
+      "view": "pairs"
+    }
+  },
+  "engine": {
+    "facts": {
+      "checkpoint_manifest_version": 1,
+      "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+      "inference_protocol_version": 1,
+      "model_family": "dense_cnn",
+      "model_spec_version": 1,
+      "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+      "recipe_id": "dashboard-default",
+      "replay_schema_version": 1,
+      "source": "rust",
+      "trace_id": ""
+    },
+    "history_b64": "",
+    "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+    "inspector": {
+      "dispatcher": "ContractInspector",
+      "elapsed_ms": 0.029799994081258774,
+      "service": "HistoryInspector"
+    },
+    "move_count": 0,
+    "rows": [],
+    "trace": {
+      "span_timings": {},
+      "trace_id": ""
+    },
+    "view": "history"
+  },
+  "facts": {
+    "checkpoint_manifest_version": 1,
+    "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+    "inference_protocol_version": 1,
+    "model_family": "dense_cnn",
+    "model_spec_version": 1,
+    "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+    "recipe_id": "dashboard-default",
+    "replay_schema_version": 1,
+    "source": "rust",
+    "trace_id": "phase09-final-smoke"
+  },
+  "inspector": {
+    "dispatcher": "ContractInspector",
+    "elapsed_ms": 1.8154000281356275,
+    "service": "DebugBundleInspector"
+  },
+  "mcts": {
+    "token_ids": [],
+    "token_lifecycle": "engine_adapter_root_batch_tokens"
+  },
+  "model_outputs": {
+    "contract": "policy_provider_output_v1",
+    "facts": {
+      "checkpoint_manifest_version": 1,
+      "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+      "inference_protocol_version": 1,
+      "model_family": "dense_cnn",
+      "model_spec_version": 1,
+      "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+      "recipe_id": "dashboard-default",
+      "replay_schema_version": 1,
+      "source": "rust",
+      "trace_id": ""
+    },
+    "head_names": [],
+    "inspector": {
+      "dispatcher": "ContractInspector",
+      "elapsed_ms": 0.009999959729611874,
+      "service": "ModelOutputInspector"
+    },
+    "model_family": "dense_cnn",
+    "output_hash": "17d3f7c36697a4f7f417c84d5897fb97835753fcce626247b7a99e0eecc193b7",
+    "source": "policy_provider",
+    "trace": {
+      "span_timings": {},
+      "trace_id": ""
+    },
+    "view": "model-output"
+  },
+  "policy_priors": {
+    "heads": [
+      "policy",
+      "value",
+      "sparse_policy"
+    ]
+  },
+  "replay": {
+    "contract": "ReplayGameRecord",
+    "facts": {
+      "checkpoint_manifest_version": 1,
+      "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+      "inference_protocol_version": 1,
+      "model_family": "dense_cnn",
+      "model_spec_version": 1,
+      "recipe_config_hash": "9cd9c8c7bdf7d54d84011653c7bd884e764ecb8cee4b3b81c945b43b6a34c8f7",
+      "recipe_id": "dashboard-default",
+      "replay_schema_version": 1,
+      "source": "rust",
+      "trace_id": ""
+    },
+    "identity": {
+      "game_hash": "e5d40fb00fb388bc57aa8b28bc09414adde7ea2fce6e2a8420f4496e0261055b",
+      "position_hash": "cd51299244ebb6a0a9405c76fd4815486a8ddd9dad44de8e6f1444936849cbfb"
+    },
+    "inspector": {
+      "dispatcher": "ContractInspector",
+      "elapsed_ms": 0.005199981387704611,
+      "service": "ReplayInspector"
+    },
+    "schema_version": 1,
+    "source": "replay/codec.py",
+    "trace": {
+      "span_timings": {},
+      "trace_id": ""
+    },
+    "view": "replay"
+  },
+  "rust_suspicion": {
+    "engine_source": "rust",
+    "ffi_protocol_source": "hexgame-py protocol",
+    "invariant_probe_status": "checked_by_engine_tests",
+    "structured_rust_error_owner": "search.engine_adapter",
+    "tactical_status_kind": "not_present"
+  },
+  "targets": {
+    "pair_policy_target": [],
+    "policy_target": [
+      [
+        0,
+        0,
+        1.0
+      ]
+    ]
+  },
+  "trace": {
+    "ffi_protocol_source": "hexgame-py protocol",
+    "invariant_probe_status": "checked_by_engine_tests",
+    "mcts_token_lifecycle": "engine_adapter_root_batch_tokens",
+    "span_timings": {},
+    "structured_rust_error_owner": "search.engine_adapter",
+    "trace_id": "phase09-final-smoke"
+  },
+  "view": "debug-bundle"
+}

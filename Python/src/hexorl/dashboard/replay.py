@@ -1,4 +1,4 @@
-﻿"""Replay reconstruction and board-debug helpers for the dashboard."""
+"""Replay reconstruction and board-debug helpers for the dashboard."""
 
 from __future__ import annotations
 

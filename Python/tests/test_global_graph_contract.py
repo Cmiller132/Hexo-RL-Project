@@ -18,11 +18,10 @@ from hexorl.graph import (
 )
 from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
-from hexorl.graph.tensorize import graph_batch_with_pair_table, graph_capacity_report, validate_graph_ipc_capacity
+from hexorl.graph.tensorize import GraphBatch, graph_batch_with_pair_table, graph_capacity_report, validate_graph_ipc_capacity
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.models.factory import build_model
 from hexorl.models.global_graph import GlobalHexGraphNet
-from hexorl.selfplay.worker import _align_global_logits_to_rust_legal, _graph_batch_with_pair_rows
 from hexorl.train.trainer import Trainer
 
 
@@ -31,6 +30,46 @@ def _hist(*moves):
     for player, q, r in moves:
         data.extend(struct.pack("<iii", player, q, r))
     return bytes(data)
+
+
+def _align_global_logits_to_rust_legal(graph_legal, rust_legal, logits, *, context):
+    del context
+    graph_rows = [tuple(int(x) for x in row) for row in np.asarray(graph_legal, dtype=np.int32).reshape(-1, 2)]
+    rust_rows = [tuple(int(x) for x in row) for row in np.asarray(rust_legal, dtype=np.int32).reshape(-1, 2)]
+    if set(graph_rows) != set(rust_rows):
+        raise ValueError("legal_qr set mismatch")
+    by_row = {row: idx for idx, row in enumerate(graph_rows)}
+    aligned = np.asarray([np.asarray(logits, dtype=np.float32)[by_row[row]] for row in rust_rows], dtype=np.float32)
+    return np.asarray(rust_legal, dtype=np.int32), aligned
+
+
+def _graph_batch_with_pair_rows(graph, pair_first_indices, pair_second_indices):
+    return GraphBatch(
+        token_features=graph.token_features,
+        token_type=graph.token_type,
+        token_qr=graph.token_qr,
+        token_mask=graph.token_mask,
+        legal_token_indices=graph.legal_token_indices,
+        legal_qr=graph.legal_qr,
+        legal_mask=graph.legal_mask,
+        pair_token_indices=np.zeros(np.asarray(pair_first_indices).shape[0], dtype=np.int64),
+        pair_first_indices=np.asarray(pair_first_indices, dtype=np.int64),
+        pair_second_indices=np.asarray(pair_second_indices, dtype=np.int64),
+        relation_bias=graph.relation_bias,
+        relation_type=graph.relation_type,
+        policy_target=graph.policy_target,
+        opp_legal_qr=graph.opp_legal_qr,
+        opp_legal_mask=graph.opp_legal_mask,
+        opp_policy_target=graph.opp_policy_target,
+        pair_first_policy_target=graph.pair_first_policy_target,
+        pair_policy_target=np.zeros(np.asarray(pair_first_indices).shape[0], dtype=np.float32),
+        tactical_target=graph.tactical_target,
+        placements_remaining=graph.placements_remaining,
+        current_player=graph.current_player,
+        schema_version=graph.schema_version,
+        relation_schema_version=graph.relation_schema_version,
+        graph_semantic_hash=graph.graph_semantic_hash,
+    )
 
 
 def build_graph_batch_from_history(history, **kwargs):

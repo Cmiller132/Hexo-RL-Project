@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.engine.tactical import scan_tactical_oracle_from_history
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all
 from hexorl.contracts.candidates import (

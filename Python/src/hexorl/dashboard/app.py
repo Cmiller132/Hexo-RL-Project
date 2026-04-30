@@ -1,4 +1,4 @@
-﻿"""FastAPI dashboard application factory."""
+"""FastAPI dashboard application factory."""
 
 from __future__ import annotations
 

@@ -9,7 +9,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.engine.tactical import scan_tactical_oracle_from_history
 from hexorl.config import Config
 from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.history import encode_move_history

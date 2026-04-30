@@ -1,0 +1,37 @@
+{
+  "accepted_regressions": [],
+  "command": "python tools/refactor/phase09_performance_probe.py",
+  "comparison_baseline": {
+    "source": "Docs/refactor/artifacts/phase_00/performance",
+    "status": "metadata-compatible; runner-normalized scheduled comparison enforced by CI tier inventory"
+  },
+  "config_hash": "phase09-default-smoke",
+  "elapsed_s": 1.1757054000045173,
+  "git_sha": "filled_by_manifest",
+  "host_profile": {
+    "cuda_available": true,
+    "device": "cuda",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0",
+    "torch": "2.10.0+cu126"
+  },
+  "latency_ms": {
+    "train_step_p50_proxy": 69.80743332921217,
+    "train_step_p95_proxy": 69.80743332921217
+  },
+  "queue_backpressure": {
+    "bounded_queue_policy": "covered_by inference/selfplay/replay tests",
+    "timeouts": "covered_by protocol mismatch and no-indefinite-wait tests"
+  },
+  "runner_profile": "local-phase09-smoke",
+  "schema_version": 1,
+  "throughput": {
+    "inference_positions_per_s_proxy": 28.650244030144915,
+    "mcts_positions_per_s_proxy": 0.0,
+    "replay_samples_per_s_proxy": 0.0,
+    "selfplay_positions_per_s_proxy": 0.0,
+    "train_batches_per_s": 14.325122015072457,
+    "train_samples_per_s": 28.650244030144915
+  },
+  "workload": "synthetic final-V2 hot-path proxy"
+}

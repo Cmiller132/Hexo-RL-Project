@@ -16,7 +16,7 @@ from hexorl.config import Config
 from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.identity import stable_digest
 from hexorl.contracts.legal import LegalActionTable
-from hexorl.action_contract.tactical_oracle import (
+from hexorl.engine.tactical import (
     scan_tactical_oracle_from_game,
     scan_tactical_oracle_from_history,
 )

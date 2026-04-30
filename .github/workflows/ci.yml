@@ -87,7 +87,7 @@ jobs:
 
   python-fast:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -112,11 +112,107 @@ jobs:
           . .venv/bin/activate
           maturin develop --manifest-path crates/hexgame-py/Cargo.toml --features python
 
-      - name: Run Python smoke, invariants, and inference tests
+      - name: Run V2 Python shard
         run: |
           . .venv/bin/activate
           pytest \
-            Python/tests/test_engine_smoke.py \
-            Python/tests/test_engine_invariants.py \
-            Python/tests/test_inference_server.py \
-            -v
+            Python/tests/contracts \
+            Python/tests/engine \
+            Python/tests/models \
+            Python/tests/inference \
+            Python/tests/search \
+            Python/tests/replay \
+            Python/tests/train \
+            Python/tests/eval \
+            Python/tests/tuning \
+            Python/tests/dashboard \
+            Python/tests/phase09 \
+            -q
+
+      - name: Upload Python policy artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-v2-policy-artifacts
+          path: Docs/refactor/artifacts/phase_09/import_audits/
+
+  architecture-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Run Phase 09 architecture policy audit
+        run: python tools/refactor/phase09_policy_audit.py --output Docs/refactor/artifacts/phase_09/import_audits/phase09_policy_audit.json
+
+      - name: Upload architecture policy audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase09-architecture-policy
+          path: Docs/refactor/artifacts/phase_09/import_audits/phase09_policy_audit.json
+
+  dashboard-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: Python/dashboard_frontend/package-lock.json
+
+      - name: Install dashboard dependencies
+        working-directory: Python/dashboard_frontend
+        run: npm ci
+
+      - name: Build dashboard frontend
+        working-directory: Python/dashboard_frontend
+        run: npm run build
+
+  final-v2-smoke:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+          python -m pip install -e "Python[dev]"
+
+      - name: Build and install extension
+        run: |
+          . .venv/bin/activate
+          maturin develop --manifest-path crates/hexgame-py/Cargo.toml --features python
+
+      - name: Generate final smoke bundle
+        run: |
+          . .venv/bin/activate
+          python tools/refactor/phase09_final_smoke.py --output-dir Docs/refactor/artifacts/phase_09/final_smoke
+          python tools/refactor/phase09_performance_probe.py --output Docs/refactor/artifacts/phase_09/performance/performance_comparison.json
+          python tools/refactor/phase09_artifact_validator.py Docs/refactor/artifacts/phase_09 --output Docs/refactor/artifacts/phase_09/verification/artifact_validation_report.json
+
+      - name: Upload final V2 smoke bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase09-final-v2-smoke
+          path: Docs/refactor/artifacts/phase_09/

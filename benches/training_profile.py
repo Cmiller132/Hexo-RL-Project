@@ -9,9 +9,10 @@ import torch
 
 from hexorl.config import load_config
 from hexorl.epoch.pipeline import _make_bootstrap_game_records
-from hexorl.buffer.ring import RingBuffer
-from hexorl.buffer.sampler import ReplayDataset
-from hexorl.model.network import HexNet
+from hexorl.models.network import HexNet
+from hexorl.replay.codec import replay_game_from_selfplay
+from hexorl.replay.sampler import ReplayDataset
+from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import autotune_config, configure_torch_runtime
 from hexorl.train.losses import compute_losses
 
@@ -103,14 +104,20 @@ def _train_step(model, optimizer, scaler, x, targets, weights, fp16: bool) -> No
 
 
 def profile_replay(cfg, batch_size: int, batches: int, bootstrap_games: int) -> None:
-    replay = RingBuffer(
+    replay = ReplayStorage(
         capacity=max(cfg.buffer.capacity, bootstrap_games * cfg.selfplay.max_game_moves),
-        max_policy_entries=cfg.selfplay.policy_target_top_k,
-        recency_decay=cfg.buffer.recency_decay,
-        num_lookahead=len(cfg.buffer.lookahead_horizons),
+        prefetch_records=cfg.train.prefetch_batches,
     )
     for game in _make_bootstrap_game_records(cfg, bootstrap_games):
-        replay.extend(game.positions)
+        replay.append_game(
+            replay_game_from_selfplay(
+                game,
+                lookahead_horizons=cfg.buffer.lookahead_horizons,
+                lookahead_lambdas=cfg.buffer.lookahead_lambdas,
+                config_identity="training_profile",
+                checkpoint_identity="benchmark",
+            )
+        )
     dataset = ReplayDataset(
         replay,
         batch_size=batch_size,

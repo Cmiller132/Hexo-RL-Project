@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Python", "src"
 from pathlib import Path
 from hexorl.train.trainer import Trainer
 from hexorl.config import load_config
-from hexorl.model.network import HexNet
+from hexorl.models.network import HexNet
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)

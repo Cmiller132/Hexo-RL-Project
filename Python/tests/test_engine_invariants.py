@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping, Sequence
 
 import pytest
 
-from hexorl.action_contract.tactical_oracle import (
+from hexorl.engine.tactical import (
     TACTICAL_SCAN_RADIUS,
     legal_moves_from_stones,
     scan_tactical_oracle_from_history,

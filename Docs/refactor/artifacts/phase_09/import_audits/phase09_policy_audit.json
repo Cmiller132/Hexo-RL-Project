@@ -1,0 +1,32 @@
+{
+  "checks": {
+    "absent_runtime_paths": [
+      "Python/src/hexorl/model",
+      "Python/src/hexorl/buffer",
+      "Python/src/hexorl/action_contract"
+    ],
+    "architecture_gate_allowlist": [
+      "Python/src/hexorl/config/schema.py",
+      "Python/src/hexorl/models/factory.py",
+      "Python/src/hexorl/models/specs.py"
+    ],
+    "dashboard_private_allowlist": [
+      "Python/src/hexorl/dashboard/contract_inspector.py"
+    ],
+    "mcts_allowlist": [
+      "Python/src/hexorl/engine/rust.py",
+      "Python/src/hexorl/search/engine_adapter.py"
+    ],
+    "scan_roots": [
+      "Python/src/hexorl",
+      "Python/scripts",
+      "scripts",
+      "benches",
+      ".github/workflows"
+    ]
+  },
+  "cwd": "D:\\Hexo\\Hexo-RL-Project",
+  "findings": [],
+  "ok": true,
+  "schema_version": 1
+}

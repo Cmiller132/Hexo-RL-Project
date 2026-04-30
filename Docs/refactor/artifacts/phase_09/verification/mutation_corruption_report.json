@@ -1,0 +1,8 @@
+{
+  "bad_replay_magic_rejected": true,
+  "bad_replay_magic_rejected_error": "malformed replay header: missing HXR7 magic [owner=replay.codec]",
+  "bad_schema_rejected": true,
+  "bad_schema_rejected_error": "unknown replay schema version 999 [owner=replay.codec]",
+  "stale_hash_error": "stale legal hash for replay record [owner=replay.codec]",
+  "stale_hash_rejected": true
+}

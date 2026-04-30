@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from hexorl.contracts.identity import stable_digest
+from hexorl.models.specs import GLOBAL_MODEL_KINDS
 from hexorl.tuning.recipes import ModelRecipe
 from hexorl.tuning.runtime_sweep import HostProfile, RuntimeSpec
 from hexorl.tuning.scoring import ScoreComponents
@@ -36,7 +37,7 @@ class TrialManifest:
             "recipe": self.recipe.to_manifest(),
             "model_family": self.recipe.model_family,
             "model_spec_version": self.recipe.model_spec_version,
-            "input_contract": "global_graph_v1" if self.recipe.model_family.startswith("global_") else "crop_tensor_v1",
+            "input_contract": "global_graph_v1" if self.recipe.model_family in GLOBAL_MODEL_KINDS else "crop_tensor_v1",
             "output_contract": "policy_provider_output_v1",
             "action_contract": "legal_action_table_v1",
             "runtime_spec": self.runtime.to_manifest(),

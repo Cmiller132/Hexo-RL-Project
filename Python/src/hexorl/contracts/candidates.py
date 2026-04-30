@@ -9,7 +9,10 @@ import numpy as np
 
 from hexorl.contracts.identity import ContractIdentity, ndarray_digest, readonly_array, stable_digest
 from hexorl.contracts.validation import ContractValidationError, validate_source
-from hexorl.selfplay.records import BOARD_SIZE, PolicyTargetV2, action_to_board_index
+
+
+BOARD_SIZE = 33
+PolicyTargetV2 = list[tuple[int, int, float]]
 
 
 CANDIDATE_SCHEMA_VERSION = 2
@@ -523,6 +526,14 @@ def _unique_qr(items: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
             seen.add(qr)
             out.append(qr)
     return out
+
+
+def action_to_board_index(q: int, r: int, offset_q: int = -16, offset_r: int = -16) -> int:
+    gi = int(q) - int(offset_q)
+    gj = int(r) - int(offset_r)
+    if not (0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE):
+        return -1
+    return gi * BOARD_SIZE + gj
 
 
 def build_candidate_set(

@@ -15,10 +15,10 @@ from pathlib import Path
 
 import torch
 
-from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.config import Config, load_config
 from hexorl.dashboard.recorder import RunRecorder
 from hexorl.epoch import run_epoch
+from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
 
 
@@ -80,17 +80,9 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     recorder = RunRecorder.for_run_dir(output_dir)
 
-    replay = RingBuffer(
+    replay = ReplayStorage(
         capacity=cfg.buffer.capacity,
-        max_policy_entries=cfg.selfplay.policy_target_top_k,
-        max_policy_v2_entries=min(max(cfg.selfplay.policy_target_top_k, cfg.model.candidate_budget), 512),
-        recency_decay=cfg.buffer.recency_decay,
-        num_lookahead=len(cfg.buffer.lookahead_horizons),
-        **replay_feature_flags(
-            cfg.model.heads,
-            architecture=cfg.model.architecture,
-            sparse_policy=cfg.model.sparse_policy,
-        ),
+        prefetch_records=cfg.train.prefetch_batches,
     )
 
     trainer = None

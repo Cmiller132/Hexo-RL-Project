@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "phase": "09",
+  "retention": {
+    "pr_artifacts_days": 14,
+    "deep_scheduled_artifacts_days": 90,
+    "phase_exit_artifacts": "checked into Docs/refactor/artifacts/phase_09",
+    "final_v2_artifacts": "retained with release/conformance bundle"
+  },
+  "manifest_validation": {
+    "command": "python tools/refactor/phase09_artifact_validator.py Docs/refactor/artifacts/phase_09 --output Docs/refactor/artifacts/phase_09/verification/artifact_validation_report.json",
+    "required": true
+  }
+}

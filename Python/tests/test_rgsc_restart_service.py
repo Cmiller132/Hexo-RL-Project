@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from hexorl.selfplay.records import GameRecord, PositionRecord
-from hexorl.buffer.regret_buffer import PrioritizedRegretBuffer
+from hexorl.selfplay.regret_buffer import PrioritizedRegretBuffer
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history, restore_game_from_history
 
 

@@ -1,0 +1,8 @@
+{
+  "far_coordinate_mismatches": "covered_by legal/candidate contract validation",
+  "illegal_pair_rows": "covered_by Python/tests/contracts/test_phase02_builders.py",
+  "invalid_policy_lengths": "covered_by Rust MCTSError tests and engine adapter tests",
+  "malformed_ffi_bytes": "covered_by Python/tests/engine/test_phase01_engine_contract_parity.py",
+  "stale_mcts_tokens": "covered_by Python/tests/search/test_engine_adapter.py",
+  "structured_error_owner": "search.engine_adapter"
+}

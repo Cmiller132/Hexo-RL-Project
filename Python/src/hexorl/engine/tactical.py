@@ -1,4 +1,4 @@
-"""Tactical oracle adapters for Hexo candidate construction.
+"""Engine-backed tactical oracle adapters for Hexo candidate construction.
 
 Production callers use the Rust engine hot-window oracle.  The Python scanner
 remains available only as an explicit fixture/diagnostic helper.
@@ -11,7 +11,6 @@ from itertools import combinations
 from typing import Iterable, Mapping, Sequence
 
 from hexorl.contracts.history import MoveHistory
-from hexorl.selfplay.records import action_to_board_index
 from hexorl.engine.history import game_from_history
 from hexorl.engine.legal import legal_rows_from_stones
 from hexorl.engine.rust import hex_game_class
@@ -21,6 +20,7 @@ AXES: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
 WIN_LENGTH = 6
 PLACEMENT_RADIUS = 8
 TACTICAL_SCAN_RADIUS = PLACEMENT_RADIUS
+BOARD_SIZE = 33
 
 
 @dataclass(frozen=True)
@@ -215,7 +215,7 @@ def scan_tactical_oracle(
         + tuple(open_five)
         + tuple(cover_cells)
     )
-    outside = tuple(cell for cell in tactical if action_to_board_index(cell[0], cell[1], offset_q, offset_r) < 0)
+    outside = tuple(cell for cell in tactical if _action_to_board_index(cell[0], cell[1], offset_q, offset_r) < 0)
 
     return TacticalOracleResult(
         status=_tactical_status_from_scan(bool(win_now), bool(forced_unique), bool(cover_pairs), int(placements_remaining)),
@@ -349,7 +349,7 @@ def _result_from_engine_payload(
     open_five = _unique_qr(_coerce_cells(payload.get("open_five_cells", ())))
     pairs = _coerce_pairs(payload.get("cover_pairs", ()))
     tactical = _unique_qr(win_now + forced + cover + open_four + open_five)
-    outside = tuple(cell for cell in tactical if action_to_board_index(cell[0], cell[1], offset_q, offset_r) < 0)
+    outside = tuple(cell for cell in tactical if _action_to_board_index(cell[0], cell[1], offset_q, offset_r) < 0)
     return TacticalOracleResult(
         status=str(payload.get("status", "quiet")),
         current_player=int(payload.get("current_player", 0)),
@@ -362,6 +362,14 @@ def _result_from_engine_payload(
         cover_pairs=pairs,
         outside_crop_cells=outside,
     )
+
+
+def _action_to_board_index(q: int, r: int, offset_q: int = -16, offset_r: int = -16) -> int:
+    gi = int(q) - int(offset_q)
+    gj = int(r) - int(offset_r)
+    if not (0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE):
+        return -1
+    return gi * BOARD_SIZE + gj
 
 
 def _coerce_cells(raw: object) -> tuple[tuple[int, int], ...]:

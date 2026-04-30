@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "phase": "09",
+  "open_quarantines": [],
+  "policy": {
+    "required_gate_may_be_flaky": false,
+    "quarantine_requires": ["owner", "issue", "expiry", "affected_v2_rows", "deterministic_replacement_coverage"],
+    "closure_claims_from_manual_only_checks_allowed": false
+  }
+}

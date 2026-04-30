@@ -620,7 +620,7 @@ The repository is now a working single-machine prototype rather than a stub-only
 
 1. `hexorl.inference` provides the shared-memory inference server/client path with adaptive batching, CUDA autocast, CUDA stream support, and queued model-weight hot swap for EMA inference.
 2. `hexorl.selfplay` provides worker and orchestrator processes with cooperative stop signaling.
-3. `hexorl.buffer` provides the ring buffer, compact record processing, recency/PCR/regret sampling, dense policy symmetry transforms, and a dedicated `BufferProcess` owner for process-isolated replay storage.
+3. `hexorl.replay` provides canonical replay records, storage, sampling, projection, recency/PCR/regret weighting, and replay-backed training batches.
 4. `hexorl.train` provides multi-head loss computation, missing-target skips, optimizer/scheduler handling, AMP on CUDA, gradient clipping, and EMA.
 5. `hexorl.epoch.pipeline` wires bootstrap data, optional self-play, replay sampling, training, and checkpointing into `run_epoch`; `run_tiny_training_smoke` performs a real multi-epoch CPU check with one trainer lifecycle.
 6. `hexorl.eval` provides classical arena evaluation plus helpers for loading checkpoints and using trained models as move functions.

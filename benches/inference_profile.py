@@ -8,7 +8,7 @@ import time
 import torch
 
 from hexorl.config import load_config
-from hexorl.model.network import HexNet
+from hexorl.models.network import HexNet
 from hexorl.runtime import autotune_config, configure_torch_runtime
 
 

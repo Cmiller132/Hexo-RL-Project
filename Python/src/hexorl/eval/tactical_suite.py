@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 import math
 from typing import Callable, Iterable
 
-from hexorl.action_contract.tactical_oracle import (
+from hexorl.engine.tactical import (
     legal_moves_from_stones,
     scan_tactical_oracle,
 )

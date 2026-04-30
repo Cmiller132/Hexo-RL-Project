@@ -1,0 +1,130 @@
+{
+  "family_space": {
+    "block_choices": [
+      1,
+      2
+    ],
+    "candidate_budget_choices": [
+      128,
+      256,
+      512
+    ],
+    "channel_choices": [
+      16,
+      32
+    ],
+    "family": "graph_hybrid",
+    "graph_layer_choices": [
+      1
+    ],
+    "graph_token_budget_choices": [
+      256
+    ],
+    "pair_strategy_choices": [
+      "none",
+      "diagnostic_full_pair"
+    ]
+  },
+  "rejected_raw_config": {
+    "message": "autotune must mutate ModelRecipe through typed RecipeTransform values, not untyped dictionaries",
+    "ok": false
+  },
+  "report": {
+    "aborted": [],
+    "promoted": [],
+    "rejected": [],
+    "retried": [],
+    "selected": [
+      {
+        "likely_owner": "tuning/scheduler",
+        "reason_code": "validation_passed",
+        "score_components": {
+          "stability": 1.0,
+          "stall_penalty": 0.0,
+          "throughput": 1.0,
+          "utilization": 1.0
+        },
+        "trace_ids": [
+          "phase09-final-smoke"
+        ],
+        "trial_id": "phase09-smoke"
+      }
+    ],
+    "stopped": []
+  },
+  "valid_recipe": {
+    "checks": [
+      {
+        "check": "family_capability",
+        "message": "graph_hybrid is registered",
+        "ok": true,
+        "owner": "registry"
+      },
+      {
+        "check": "head_loss",
+        "message": "loss plan is descriptor-owned",
+        "ok": true,
+        "owner": "train adapter"
+      },
+      {
+        "check": "input_output_action_contract",
+        "message": "contracts are descriptor-owned",
+        "ok": true,
+        "owner": "inference adapter"
+      },
+      {
+        "check": "inference_protocol",
+        "message": "v1",
+        "ok": true,
+        "owner": "inference protocol"
+      },
+      {
+        "check": "checkpoint_manifest",
+        "message": "manifest provider is registered",
+        "ok": true,
+        "owner": "checkpoint manifest"
+      },
+      {
+        "check": "pair_strategy",
+        "message": "none",
+        "ok": true,
+        "owner": "pair strategy"
+      },
+      {
+        "check": "runtime_budget",
+        "message": "runtime spec fits host profile",
+        "ok": true,
+        "owner": "runtime_sweep"
+      }
+    ],
+    "ok": true,
+    "recipe": {
+      "blocks": 1,
+      "candidate_budget": 8,
+      "channels": 4,
+      "config_hash": "5f9ff9f0b7b29694ef66ff9ece4e4d3b11f74c0548fb2962ac1e62e75f9de3a0",
+      "graph_layers": 1,
+      "graph_token_budget": 256,
+      "heads": [
+        "policy",
+        "value",
+        "sparse_policy"
+      ],
+      "inference_protocol_version": 1,
+      "model_family": "graph_hybrid",
+      "model_spec_version": 1,
+      "pair_strategy": "none",
+      "pair_strategy_max_pairs": 0,
+      "recipe_id": "phase09-smoke-graph",
+      "seed": 0
+    }
+  },
+  "watchdog": {
+    "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter",
+    "event": "watchdog_abort",
+    "likely_owner": "selfplay worker/game runner",
+    "subsystem": "selfplay",
+    "threshold_s": 30.0,
+    "trace_id": "phase09-smoke"
+  }
+}

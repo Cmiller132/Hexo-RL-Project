@@ -1,4 +1,4 @@
-﻿"""Canonical graph semantic contract builder for Hexo."""
+"""Canonical graph semantic contract builder for Hexo."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.engine.tactical import scan_tactical_oracle_from_history
 from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.history import MoveHistory, turn_state_after
 from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
