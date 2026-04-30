@@ -57,7 +57,7 @@ def _shm_name(base: str, worker_id: int) -> str:
         "req_pair_indices": "qpi",
         "req_pair_mask": "qpm",
         "res_pair_logits": "rpl",
-        "req_mode": "qm",
+        "req_kind": "qm",
         "req_graph_meta": "qgm",
         "req_graph_token_features": "qgtf",
         "req_graph_token_type": "qgtt",
@@ -163,8 +163,8 @@ class WorkerSlots:
 
         self.req_count_shm: Optional[SharedMemory] = None
         self.req_count: Optional[np.ndarray] = None
-        self.req_mode_shm: Optional[SharedMemory] = None
-        self.req_mode: Optional[np.ndarray] = None
+        self.req_kind_shm: Optional[SharedMemory] = None
+        self.req_kind: Optional[np.ndarray] = None
 
         self.res_policy_shm: Optional[SharedMemory] = None
         self.res_policy: Optional[np.ndarray] = None
@@ -263,11 +263,11 @@ class WorkerSlots:
             (1,), dtype=np.uint32, buffer=self.req_count_shm.buf
         )
         self.req_count[0] = 0
-        self.req_mode_shm = _create_shm(
-            _shm_name("req_mode", self.worker_id), 1
+        self.req_kind_shm = _create_shm(
+            _shm_name("req_kind", self.worker_id), 1
         )
-        self.req_mode = np.ndarray((1,), dtype=np.uint8, buffer=self.req_mode_shm.buf)
-        self.req_mode[0] = 0
+        self.req_kind = np.ndarray((1,), dtype=np.uint8, buffer=self.req_kind_shm.buf)
+        self.req_kind[0] = 0
 
         self.res_policy_shm = _create_shm(
             _shm_name("res_policy", self.worker_id),
@@ -532,10 +532,10 @@ class WorkerSlots:
         self.req_count = np.ndarray(
             (1,), dtype=np.uint32, buffer=self.req_count_shm.buf
         )
-        self.req_mode_shm = SharedMemory(
-            name=_shm_name("req_mode", self.worker_id), create=False
+        self.req_kind_shm = SharedMemory(
+            name=_shm_name("req_kind", self.worker_id), create=False
         )
-        self.req_mode = np.ndarray((1,), dtype=np.uint8, buffer=self.req_mode_shm.buf)
+        self.req_kind = np.ndarray((1,), dtype=np.uint8, buffer=self.req_kind_shm.buf)
 
         self.res_policy_shm = SharedMemory(
             name=_shm_name("res_policy", self.worker_id), create=False
@@ -683,7 +683,7 @@ class WorkerSlots:
         for attr in (
             "req_tensor_shm",
             "req_count_shm",
-            "req_mode_shm",
+            "req_kind_shm",
             "res_policy_shm",
             "res_value_shm",
             "res_regret_rank_shm",

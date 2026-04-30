@@ -158,7 +158,7 @@ def _score_graph_pair_chunks(
             pair_first = np.full(width, first_token, dtype=np.int64)
             pair_second = legal_tokens[start:stop]
             chunk = _graph_batch_with_pair_rows(graph_batch, pair_first, pair_second)
-            out = client.submit_graph(chunk)
+            out = client.evaluate_global_graph(chunk)
             logits = np.asarray(out.get("policy_pair_second", out.get("policy_pair_joint", [])), dtype=np.float32)[:width]
             pair_qr = np.column_stack([
                 np.full(width, int(first[0]), dtype=np.int32),
@@ -195,7 +195,7 @@ def _score_graph_pair_chunks(
                         np.asarray(first_rows, dtype=np.int64),
                         np.asarray(second_rows, dtype=np.int64),
                     )
-                    out = client.submit_graph(chunk)
+                    out = client.evaluate_global_graph(chunk)
                     logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
                     pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
                     first_rows.clear()
@@ -207,7 +207,7 @@ def _score_graph_pair_chunks(
                 np.asarray(first_rows, dtype=np.int64),
                 np.asarray(second_rows, dtype=np.int64),
             )
-            out = client.submit_graph(chunk)
+            out = client.evaluate_global_graph(chunk)
             logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
             pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
 
@@ -276,7 +276,7 @@ def _score_crop_pair_chunks(
             )
             pair_indices = np.asarray([[0, idx] for idx in range(1, len(candidate_rows))], dtype=np.int64)
             pair_mask = np.ones(pair_indices.shape[0], dtype=np.bool_)
-            _p, _v, _sparse, pair_logits = client.submit_sparse_pair(
+            _p, _v, _sparse, pair_logits = client.evaluate_pair_scoring(
                 root_tensor,
                 1,
                 indices.reshape(1, -1),
@@ -314,7 +314,7 @@ def _score_crop_pair_chunks(
                 )
                 pair_indices = np.asarray([[0, idx] for idx in range(1, len(candidate_rows))], dtype=np.int64)
                 pair_mask = np.ones(pair_indices.shape[0], dtype=np.bool_)
-                _p, _v, _sparse, pair_logits = client.submit_sparse_pair(
+                _p, _v, _sparse, pair_logits = client.evaluate_pair_scoring(
                     root_tensor,
                     1,
                     indices.reshape(1, -1),
@@ -1410,7 +1410,7 @@ class SelfPlayWorker:
                             max_pair_rows=0,
                             include_pair_rows=False,
                         )
-                        graph_out = client.submit_graph(graph_batch)
+                        graph_out = client.evaluate_global_graph(graph_batch)
                         graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
                         rust_legal = decode_legal_bytes(legal_bytes)
                         policy_place = np.asarray(graph_out["policy_place"], dtype=np.float32)
@@ -1529,7 +1529,7 @@ class SelfPlayWorker:
                                 forward_features = cand.features[active_rows]
                                 forward_mask = cand.mask[active_rows]
                                 t_forward = time.monotonic()
-                                p, v, sparse = client.submit_sparse(
+                                p, v, sparse = client.evaluate_sparse(
                                     root_tensor,
                                     1,
                                     forward_indices.reshape(1, -1),
@@ -1685,7 +1685,7 @@ class SelfPlayWorker:
                                     max_pair_rows=0,
                                     include_pair_rows=False,
                                 )
-                                graph_out = client.submit_graph(graph_batch)
+                                graph_out = client.evaluate_global_graph(graph_batch)
                                 graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
                                 logits = np.asarray(graph_out["policy_place"], dtype=np.float32)
                                 source = np.full(graph_legal.shape[0], PRIOR_SOURCE_SPARSE, dtype=np.uint8)
@@ -1813,7 +1813,7 @@ class SelfPlayWorker:
                                     cand_counts[row] = width
                                 sparse_prior_candidate_build_ms += (time.monotonic() - t_build) * 1000.0
                                 t_forward = time.monotonic()
-                                p, v, sparse = client.submit_sparse(
+                                p, v, sparse = client.evaluate_sparse(
                                     batch_4d.astype(np.float32, copy=False),
                                     count,
                                     cand_indices,
@@ -1930,11 +1930,11 @@ class SelfPlayWorker:
                                 max_pair_rows=0,
                                 include_pair_rows=False,
                             )
-                            out = client.submit_graph(graph)
+                            out = client.evaluate_global_graph(graph)
                             regret_rank = float(np.asarray(out.get("regret_rank", [0.0]), dtype=np.float32)[0])
-                        elif dense_regret_available and hasattr(client, "submit_regret_rank"):
+                        elif dense_regret_available and hasattr(client, "evaluate_regret_rank"):
                             tensor_i, _oq, _or, _legal = self._encode_tensor_meta(move_bytes)
-                            regret_rank = float(client.submit_regret_rank(tensor_i.reshape(1, 13, 33, 33), 1)[0])
+                            regret_rank = float(client.evaluate_regret_rank(tensor_i.reshape(1, 13, 33, 33), 1)[0])
                         else:
                             continue
                         if regret_rank > 0.0 and np.isfinite(regret_rank):

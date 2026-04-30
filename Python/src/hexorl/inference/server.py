@@ -20,6 +20,11 @@ from hexorl.models.checkpoint import CheckpointManager
 from hexorl.models.factory import build_inference_model, model_uses_global_graph
 from hexorl.models.network import HexNet
 from hexorl.runtime import configure_torch_runtime
+from hexorl.inference.protocol import (
+    InferenceOutputValidationError,
+    InferenceRequestKind,
+    REQUEST_CODE_TO_KIND,
+)
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
     GRAPH_SCHEMA_VERSION,
@@ -62,8 +67,8 @@ class InferenceServer:
         initial_state_dict: Optional[dict] = None,
     ):
         self.cfg = cfg
-        self._global_graph_mode = model_uses_global_graph(cfg)
-        required_heads = {"value"} if self._global_graph_mode else {"policy", "value"}
+        self._global_graph_kind = model_uses_global_graph(cfg)
+        required_heads = {"value"} if self._global_graph_kind else {"policy", "value"}
         missing_heads = sorted(required_heads - set(cfg.model.heads))
         if missing_heads:
             raise ValueError(
@@ -271,9 +276,9 @@ class InferenceServer:
             if not ready_workers:
                 continue
 
-            graph_request = self._ready_workers_graph_mode(ready_workers)
-            if graph_request is not None:
-                ready_workers = graph_request
+            homogeneous_workers = self._ready_workers_same_request_kind(ready_workers)
+            if homogeneous_workers is not None:
+                ready_workers = homogeneous_workers
 
             build_t0 = time.monotonic()
             if self._is_graph_request(ready_workers):
@@ -394,12 +399,16 @@ class InferenceServer:
         if not ready_workers:
             return False
         slot = self._queue.get_slot(ready_workers[0])
-        return bool(getattr(slot, "req_mode", np.array([0], dtype=np.uint8))[0] == 1)
+        kind = REQUEST_CODE_TO_KIND.get(int(getattr(slot, "req_kind", np.array([0], dtype=np.uint8))[0]))
+        return kind in (
+            InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE,
+            InferenceRequestKind.GRAPH_PAIR_POLICY_VALUE,
+        )
 
-    def _ready_workers_graph_mode(self, ready_workers: List[int]) -> Optional[List[int]]:
-        """Keep a drained batch homogeneous when graph and dense workers race."""
+    def _ready_workers_same_request_kind(self, ready_workers: List[int]) -> Optional[List[int]]:
+        """Keep a drained batch homogeneous by typed request kind."""
         modes = [
-            int(getattr(self._queue.get_slot(worker_id), "req_mode", np.array([0], dtype=np.uint8))[0])
+            int(getattr(self._queue.get_slot(worker_id), "req_kind", np.array([0], dtype=np.uint8))[0])
             for worker_id in ready_workers
         ]
         if not modes or all(mode == modes[0] for mode in modes):
@@ -448,7 +457,7 @@ class InferenceServer:
         self,
         ready_workers: List[int],
     ) -> Tuple[dict[str, torch.Tensor], List[int], int]:
-        if not self._global_graph_mode:
+        if not self._global_graph_kind:
             raise RuntimeError("graph IPC request received by a non-global-graph inference server")
         metas = []
         for worker_id in ready_workers:
@@ -634,14 +643,10 @@ class InferenceServer:
         model_ms = (time.monotonic() - model_t0) * 1000.0
 
         post_t0 = time.monotonic()
-        p = self._sanitize_policy_logits(out["policy"])
-        value_logits = self._sanitize_value_logits(out["value"])
-        v = torch.nan_to_num(
-            HexNet.bins_to_value(value_logits).float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp_(-1.0, 1.0)
+        p = self._bounded_policy_logits(out["policy"], head_name="policy")
+        value_logits = self._bounded_value_logits(out["value"], head_name="value")
+        v = HexNet.bins_to_value(value_logits).float().clamp(-1.0, 1.0)
+        self._assert_finite_tensor(v, head_name="value_scalar")
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
         download_t0 = time.monotonic()
@@ -651,11 +656,13 @@ class InferenceServer:
         pair = None
         regret = None
         if sparse_inputs is not None and "sparse_policy" in out:
-            sparse = self._sanitize_policy_logits(out["sparse_policy"]).cpu().numpy()
+            sparse = self._bounded_policy_logits(out["sparse_policy"], head_name="sparse_policy").cpu().numpy()
         if sparse_inputs is not None and "pair_policy" in out:
-            pair = self._sanitize_policy_logits(out["pair_policy"]).cpu().numpy()
+            pair = self._bounded_policy_logits(out["pair_policy"], head_name="pair_policy").cpu().numpy()
         if "regret_rank" in out:
-            regret = torch.nan_to_num(out["regret_rank"].detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy()
+            regret_tensor = out["regret_rank"].detach().float().reshape(-1)
+            self._assert_finite_tensor(regret_tensor, head_name="regret_rank")
+            regret = regret_tensor.cpu().numpy()
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -692,23 +699,21 @@ class InferenceServer:
         post_t0 = time.monotonic()
         if "policy_place" not in out:
             raise RuntimeError("global graph model did not return policy_place")
-        place = self._sanitize_policy_logits(out["policy_place"])
-        value_logits = self._sanitize_value_logits(out["value"])
-        values = torch.nan_to_num(
-            HexNet.bins_to_value(value_logits).float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp_(-1.0, 1.0)
-        opp = self._sanitize_policy_logits(out["opp_policy"]) if "opp_policy" in out else None
-        pair_first = self._sanitize_policy_logits(out["policy_pair_first"]) if "policy_pair_first" in out else None
+        place = self._bounded_policy_logits(out["policy_place"], head_name="policy_place")
+        value_logits = self._bounded_value_logits(out["value"], head_name="value")
+        values = HexNet.bins_to_value(value_logits).float().clamp(-1.0, 1.0)
+        self._assert_finite_tensor(values, head_name="value_scalar")
+        opp = self._bounded_policy_logits(out["opp_policy"], head_name="opp_policy") if "opp_policy" in out else None
+        pair_first = self._bounded_policy_logits(out["policy_pair_first"], head_name="policy_pair_first") if "policy_pair_first" in out else None
         pair_joint = None
         pair_second = None
         if "policy_pair_joint" in out:
-            pair_joint = self._sanitize_policy_logits(out["policy_pair_joint"])
+            pair_joint = self._bounded_policy_logits(out["policy_pair_joint"], head_name="policy_pair_joint")
         if "policy_pair_second" in out:
-            pair_second = self._sanitize_policy_logits(out["policy_pair_second"])
+            pair_second = self._bounded_policy_logits(out["policy_pair_second"], head_name="policy_pair_second")
         regret = out.get("regret_rank")
+        if regret is not None:
+            self._assert_finite_tensor(regret, head_name="regret_rank")
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
         download_t0 = time.monotonic()
@@ -729,24 +734,23 @@ class InferenceServer:
         return place_np, values_np, opp_np, pair_first_np, pair_joint_np, pair_second_np, regret_np
 
     @staticmethod
-    def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
-        """Keep policy logits finite before handing them to Rust MCTS."""
-        return torch.nan_to_num(
-            logits.float(),
-            nan=0.0,
-            posinf=80.0,
-            neginf=-80.0,
-        ).clamp_(-80.0, 80.0)
+    def _bounded_policy_logits(logits: torch.Tensor, *, head_name: str) -> torch.Tensor:
+        """Validate and bound finite policy logits before handing them to Rust MCTS."""
+        out = logits.float()
+        InferenceServer._assert_finite_tensor(out, head_name=head_name)
+        return out.clone().clamp(-80.0, 80.0)
 
     @staticmethod
-    def _sanitize_value_logits(logits: torch.Tensor) -> torch.Tensor:
-        """Keep value logits finite so softmax cannot produce NaNs."""
-        return torch.nan_to_num(
-            logits.float(),
-            nan=0.0,
-            posinf=80.0,
-            neginf=-80.0,
-        ).clamp_(-80.0, 80.0)
+    def _bounded_value_logits(logits: torch.Tensor, *, head_name: str) -> torch.Tensor:
+        """Validate and bound finite value logits before scalar conversion."""
+        out = logits.float()
+        InferenceServer._assert_finite_tensor(out, head_name=head_name)
+        return out.clone().clamp(-80.0, 80.0)
+
+    @staticmethod
+    def _assert_finite_tensor(tensor: torch.Tensor, *, head_name: str) -> None:
+        if not torch.isfinite(tensor).all():
+            raise InferenceOutputValidationError(f"inference model output contains non-finite values: {head_name}")
 
     def _prepare_host_batch(self):
         """Allocate a reusable staging buffer for request gathering."""
@@ -790,6 +794,7 @@ class InferenceServer:
             if pair_logits is not None:
                 p = pair_logits.shape[1]
                 slot.res_pair_logits[:count, :p] = pair_logits[offset:offset + count]
+            slot.req_kind[0] = 0
             offset += count
 
     def _scatter_graph_results(
@@ -844,7 +849,7 @@ class InferenceServer:
                 slot.res_graph_pair_logits[:pair_count] = pair_joint_logits[row, :pair_count]
             if pair_count and pair_second_logits is not None:
                 slot.res_graph_pair_second_logits[:pair_count] = pair_second_logits[row, :pair_count]
-            slot.req_mode[0] = 0
+            slot.req_kind[0] = 0
 
     # â”€â”€ Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

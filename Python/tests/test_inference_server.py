@@ -204,18 +204,14 @@ class TestInferenceServer(unittest.TestCase):
         server.join(timeout=5.0)
         server_q.close()
 
-    def test_non_finite_outputs_are_sanitized_before_mcts(self):
+    def test_non_finite_outputs_are_rejected_before_mcts(self):
         policy = torch.tensor([[float("nan"), float("inf"), -float("inf"), 5.0]])
         value = torch.tensor([[float("nan"), float("inf"), -float("inf"), 0.0]])
 
-        clean_policy = InferenceServer._sanitize_policy_logits(policy)
-        clean_value = InferenceServer._sanitize_value_logits(value)
-
-        self.assertTrue(torch.isfinite(clean_policy).all())
-        self.assertTrue(torch.isfinite(clean_value).all())
-        self.assertEqual(clean_policy[0, 0].item(), 0.0)
-        self.assertEqual(clean_policy[0, 1].item(), 80.0)
-        self.assertEqual(clean_policy[0, 2].item(), -80.0)
+        with self.assertRaises(RuntimeError):
+            InferenceServer._bounded_policy_logits(policy, head_name="policy")
+        with self.assertRaises(RuntimeError):
+            InferenceServer._bounded_value_logits(value, head_name="value")
 
 
 @unittest.skipUnless(HAS_ENGINE, "Rust _engine extension not available")
