@@ -5,8 +5,9 @@ Converge candidate construction, pair-action construction, and global graph inpu
 
 This phase removes private rebuild paths. A position should produce exactly one canonical `CandidateTable`, exactly one canonical phase-aware `PairActionTable` when pair rows are requested, and exactly one graph semantic contract that is tensorized by pure projection.
 
-## Target Modules
-Create or complete the shared builders:
+## Primary Ownership Areas
+Create or complete the shared semantic authorities. The listed modules are the preferred ownership layout; an equivalent layout is acceptable only if the interface-freeze artifact preserves the same public contracts, runtime consumers, deletion gates, and tests.
+
 - `Python/src/hexorl/contracts/candidates.py`
 - `Python/src/hexorl/contracts/pairs.py`
 - `Python/src/hexorl/graph/semantic_builder.py`
@@ -14,7 +15,7 @@ Create or complete the shared builders:
 - `Python/src/hexorl/graph/collate.py`
 - shared fixture helpers under `Python/src/hexorl/replay/fixtures.py` or the equivalent test fixture owner
 
-The canonical builder APIs are:
+The canonical semantic authorities are expected to expose or approve these public APIs:
 - `CandidateContractBuilder`
 - `PairActionTableBuilder`
 - `GraphSemanticBuilder`
@@ -22,13 +23,13 @@ The canonical builder APIs are:
 - graph collator/batch projection utilities
 
 ## V2 Requirements to Implement
-- `CandidateContractBuilder` is the only owner of `CandidateTable` rows, dense indices, candidate features, masks, targets, missing mass, recall, diagnostics, and contract hash.
-- `PairActionTableBuilder` is the only owner of canonical pair-action rows, first/second row references, phase semantics, known-first handling, generation mode, possible-pair counts, selected-pair counts, and table hash.
+- Candidate construction has one semantic authority for `CandidateTable` rows, dense indices, masks, targets, missing mass, recall, diagnostics, and contract hash. Registered feature or selector extensions may add data only through this authority's validation and hashing path.
+- Pair construction has one semantic authority for canonical pair-action rows, first/second row references, phase semantics, known-first handling, generation mode, possible-pair counts, selected-pair counts, and table hash. `PairStrategy` owns selection, scoring intent, and caps; it may not redefine pair-row identity.
 - First-placement unordered pairs and second-placement known-first pairs are separate phases with explicit masks and validation.
 - Crop pair candidates and global graph `PAIR_ACTION` rows must derive from `PairActionTable`.
 - `PairCandidateBatch` must be deleted. If an intermediate tensor object is temporarily required, it must be a thin projection from `PairActionTable`, must not own semantics, and must be named/documented as a projection.
 - Full `A * (A - 1) / 2` pair generation is forbidden unless an explicit `PairStrategy` requests it and supplies hard caps.
-- Graph semantic construction and graph tensorization must be split. `GraphSemanticBuilder` owns tokens, semantic rows, relation identities, and debug metadata. `GraphTensorizer` and collator own only tensor layout, padding, batching, and device-facing projection.
+- Graph semantic construction and graph tensorization must be split. `GraphSemanticBuilder` or its approved equivalent owns final token identity, semantic rows, relation identities, and debug metadata. Registered token/relation families may contribute blocks only through the final graph validator. `GraphTensorizer` and collator own only tensor layout, padding, batching, and device-facing projection.
 - Graph tensorization must be a pure projection from graph semantic contract plus legal/candidate/pair contracts. It must not regenerate legal rows, candidates, pair rows, tactical facts, history, or D6 transforms.
 - Self-play, replay projector/sampler, training adapters, evaluation debug paths, dashboard fixtures, dashboard inspectors, and model-input fixture generation must consume the same builders.
 - Dashboard fixtures must prove the displayed candidate, pair, and graph views are sourced from the same contracts as training and self-play.
@@ -93,19 +94,21 @@ Demote only as a short-lived projection:
 - Mutation tests: graph/candidate/pair tensor projections cannot mutate canonical contracts or silently change validated identities.
 - Corruption tests: stale hashes, wrong schema versions, wrong known-first rows, bad relation ids, bad masks, duplicate candidate rows, and illegal pair rows fail loudly.
 - Debug bundle tests: the single-position debug payload can identify candidate-builder, pair-table-builder, graph-semantic-builder, or tensorizer ownership for failures.
+- Extension-proof tests: a fake candidate feature block, graph token/relation family, or pair selector can be registered through approved interfaces without editing unrelated runtime consumers or bypassing canonical validation.
 - Import audits: no private candidate, pair, legal, D6, history, graph semantic, or graph tensor rebuild paths remain in runtime consumers.
 
 ## Required Artifacts
 - Golden fixture bundle for candidate, pair, graph semantic, and graph tensor projection checks.
 - Builder API documentation with field ownership and invariants.
+- Extension API examples showing how feature blocks, token/relation families, and pair selectors contribute data without owning canonical row identity.
 - Migration notes listing deleted private builders and any temporary projection-only shims.
 - Import audit output showing old private builder paths are absent from runtime imports.
 - Trace examples showing candidate count, pair possible/selected counts, graph token/relation counts, and tensorization timing.
 - Single-position debug bundle sample for candidate, pair, graph semantic, graph tensor, mask, target, D6, and mutation-safety verification.
 
 ## Hard Exit Gates
-- `CandidateContractBuilder` is the only production candidate-table builder.
-- `PairActionTableBuilder` is the only production pair-action-row builder.
+- Candidate construction has one production semantic authority for candidate-table identity and validation.
+- Pair construction has one production semantic authority for pair-action-row identity and validation.
 - `PairCandidateBatch` is deleted or reduced to a tensor-only projection from `PairActionTable` with no independent semantics.
 - `GraphSemanticBuilder` owns graph semantics; `GraphTensorizer`/collator only project, pad, batch, and validate tensors.
 - Self-play, replay, sampler, training, evaluation, dashboard inspectors, and dashboard fixtures all consume shared builders.
@@ -113,6 +116,7 @@ Demote only as a short-lived projection:
 - Pair tables are phase-aware, cap-aware, D6-equivariant, and telemetry-visible.
 - Graph tensorization is proven to be a pure projection from graph semantic contract plus shared legal/candidate/pair contracts.
 - Candidate, pair, and graph projections are mutation-safe and corruption-tested.
+- Approved extension points are tested without becoming second semantic owners.
 - The debug bundle localizes failures to the correct builder or projection owner.
 - Import audits find no runtime-private candidate, pair, graph semantic, graph tensor, legal, D6, or compact-history reconstruction paths.
 - No pair scoring or full pair enumeration is introduced by this phase without an explicit capped `PairStrategy`.

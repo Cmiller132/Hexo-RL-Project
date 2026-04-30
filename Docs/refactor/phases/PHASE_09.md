@@ -47,7 +47,18 @@ If a migration tool remains, it must live outside `Python/src/hexorl/`, be docum
 
 ## CI Policy Gates
 
-Add or update CI so the following are enforced by commands, import audits, or policy tests:
+Add or update CI according to `Docs/refactor/CI_STRATEGY.md`. Phase 09 closure requires the tiered CI contract, not a single ad hoc workflow.
+
+Final closure requires:
+
+- all PR-required jobs green on the final SHA
+- latest scheduled/deep gate green for the final SHA, or rerun manually on the final SHA with artifacts attached
+- final V2 closure workflow green
+- import/policy audits green with machine-readable artifacts
+- final smoke/debug bundle archived
+- performance comparison artifacts present with any accepted regression documented by owner and threshold update
+
+CI must enforce the following by commands, import audits, or policy tests:
 
 ```text
 cargo test --workspace
@@ -83,6 +94,10 @@ Rust suspicion gates reject malformed FFI bytes, stale MCTS tokens, invalid poli
 cargo public-api or equivalent public surface drift check
 panic/assert/unwrap inventory with public/FFI misuse classification
 machine-normalized benchmark metadata and scheduled regression comparison artifacts
+CI tier inventory mapping every required check to tier, owner, timeout, runner requirement, artifact path, and promotion rule
+artifact retention/manifest validation for phase and final evidence
+flaky/quarantine policy with owner, issue, expiry, affected V2 rows, and deterministic replacement coverage
+contract examples/docs audit for public contracts, adapters, protocol objects, debug bundles, and extension points
 ```
 
 Use AST/import-graph checks where regex would be too brittle.
@@ -110,6 +125,7 @@ structured logs/traces for self-play and autotune
 single-position behavior debug bundle generation
 mutation/corruption verification for one golden position
 Rust invariant and FFI protocol negative verification for one golden position
+performance comparison using stable HostProfile/runner metadata for inference, MCTS, replay, training, and self-play hot paths
 ```
 
 ## V2 Requirement Matrix Closure
@@ -138,6 +154,7 @@ manual verification only
 ## Mandatory Tests
 
 - Full CI matrix green.
+- CI tier inventory, artifact retention policy, flaky/quarantine report, and performance comparison artifacts green on the final SHA.
 - Import graph and banned-path checks green.
 - Final end-to-end smoke archived.
 - Behavior debug bundle test proves one position can be traced across engine, contracts, D6, targets, model outputs, policy mapping, MCTS, replay, dashboard, and autotune report references.
@@ -157,12 +174,15 @@ Docs/refactor/artifacts/phase_09/deletion_manifest/
 Docs/refactor/artifacts/phase_09/final_smoke/
 Docs/refactor/artifacts/phase_09/telemetry_samples/
 Docs/refactor/artifacts/phase_09/verification/
+Docs/refactor/artifacts/phase_09/performance/
+Docs/refactor/artifacts/phase_09/ci_tiers/
 Docs/refactor/artifacts/phase_09/final_conformance_report.md
 ```
 
 ## Exit Criteria
 
 - CI automatically enforces all V2 architecture invariants.
+- CI tiers, artifact retention, flaky/quarantine policy, performance budgets, and final closure gates are documented and active.
 - No compatibility shims remain in the main runtime path.
 - No banned imports or behavior gates remain.
 - Final smoke proves the cohesive runtime flow works end to end.

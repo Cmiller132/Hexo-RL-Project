@@ -21,7 +21,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 ## V2 Requirements
 - Arena evaluation must use `PolicyProvider` for every registered model family.
 - Evaluation must not assume dense policy output, dense action indices, dense-only model inputs, or architecture-name dispatch.
-- Dashboard must use `ContractInspector` and read-only services only.
+- Dashboard must use `ContractInspector` as a dispatcher over read-only inspector services only.
 - Dashboard must display contract hash, source, schema/version, checkpoint manifest version, inference protocol version, model family, recipe identity, and trace id wherever those facts are available.
 - Dashboard must not privately reconstruct legal rows, D6 transforms, candidates, pair rows, graph tokens, graph relations, model inputs, model outputs, replay projections, or checkpoint cleanup.
 - Autotune must use typed `ModelRecipe`, `family_spaces`, `runtime_sweep`, `scoring`, `manifests`, and `reporting`.
@@ -32,7 +32,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Old scripts and runtime sizing branches superseded by typed tuning entrypoints must be deleted or quarantined outside runtime imports.
 
 ## Evaluation Work
-- Convert `PolicyPlayer` to call `ModelFamily.build_policy_provider(...)` or registry-equivalent construction for every registered family.
+- Convert `PolicyPlayer` to obtain policy providers through the model registry/facet system for every registered family.
 - Ensure dense CNN, RestNet, graph hybrid, global graph, and future families evaluate through the same `PolicyProvider` interface.
 - Add registry enumeration in arena smoke tests so no registered family is skipped accidentally.
 - Route pair behavior through `PairStrategy`; evaluation must not consume pair priors merely because a model has a pair-capable head.
@@ -41,7 +41,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Preserve scorecard/league behavior while making player construction recipe/manifest based.
 
 ## Dashboard Work
-- Make `ContractInspector` the single backend entry point for inspecting histories, legal tables, tactical reports, candidates, pairs, graph contracts, D6 transforms, model inputs, model outputs, replay positions, and traces.
+- Make `ContractInspector` the single backend dispatcher for inspecting histories, legal tables, tactical reports, candidates, pairs, graph contracts, D6 transforms, model inputs, model outputs, replay positions, and traces. It must delegate to focused read-only inspectors rather than becoming the implementation home for every view.
 - Allow dashboard routes to depend only on contracts, inspectors, checkpoint manifests, registry metadata, and read-only services.
 - Required views:
   - `/history`
@@ -76,11 +76,13 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Dashboard must be able to load or generate a single-position debug bundle and compare engine state, contracts, D6 transforms, training targets, model inputs, raw model outputs, policy-provider priors, pair strategy output, MCTS result, and replay record identity.
 - Dashboard mismatch views must show both sides of the comparison, the hashes/schema/source fields that disagree, and the likely owner subsystem. It must not hide mismatches behind generic "invalid input" messages.
 - Dashboard engine views must display Rust suspicion evidence when present: engine source, FFI protocol source, invariant-probe status, tactical status kind, MCTS token ids, and structured Rust error ownership.
+- A fake inspector/view extension must be registerable without adding sampler/trainer/model-input reconstruction or editing unrelated dashboard route internals.
 
 ## Autotune Work
 - Introduce typed `ModelRecipe` as the only tuning unit.
 - Implement family-specific search spaces in `tuning/family_spaces.py`; spaces come from registered families, not script-local architecture branches.
-- Implement `runtime_sweep` as typed `RuntimeSpec` candidates with host-profile validation, token/row/batch/memory budgets, and no-progress watchdog settings.
+- Implement `runtime_sweep` as typed `RuntimeSpec` candidates with host-profile validation, token/row/batch/memory budgets, throughput/utilization knobs, and no-progress watchdog settings.
+- `RuntimeSpec` must keep host-utilization knobs separate from model semantics, including self-play workers, Rust threads, Torch threads, DataLoader workers, inference max batch, microbatch wait, leaf batch size, record queue capacity, replay prefetch, train batch size, optional compile flags, memory fraction, and watchdog thresholds where applicable.
 - Implement scoring as named components, including quality, throughput, stability, resource use, validation failures, stall penalties, and budget penalties.
 - Implement manifests for every trial, including recipe identity, model family, model spec version, input/output/action contracts, runtime spec, host profile, git SHA, command, seeds, validation results, scheduler decisions, trace ids, artifacts, and final score components.
 - Implement reporting that explains selected, rejected, aborted, retried, promoted, and stopped trials with reasons.
@@ -121,6 +123,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Dashboard fixture parity report for required views.
 - Autotune dry-run validation report for at least one valid and one rejected recipe per family.
 - Runtime sweep report with watchdog configuration and simulated no-progress outcome.
+- Runtime utilization sweep report with throughput, utilization, stability, stall, and budget score components.
 - Import audit report for eval/dashboard/tuning banned dependencies.
 - Deletion/quarantine report naming removed scripts, quarantined scripts, and remaining approved one-off tools.
 
@@ -139,6 +142,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - No pair scoring occurs during evaluation unless `PairStrategy` explicitly enables it.
 - Dashboard fixture parity: dashboard/training/replay inputs match on golden positions.
 - Dashboard required views render from `ContractInspector` or read-only services only.
+- Dashboard extension test proves a fake inspector/view can be registered without private reconstruction or unrelated route edits.
 - Dashboard display assertions cover hash/source/version/trace fields.
 - Dashboard debug-bundle view displays engine, contracts, D6, targets, model outputs, policy priors, MCTS, and replay comparisons for golden positions.
 - Dashboard debug-bundle view displays Rust invariant status, FFI protocol source, tactical status, MCTS token lifecycle, and structured Rust errors when available.
@@ -148,6 +152,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Autotune mutates typed `ModelRecipe` values only; raw config mutation tests fail.
 - Family spaces exist for every registered family.
 - Runtime sweep validates host limits, row/token budgets, memory budgets, and watchdog configuration.
+- Runtime sweep validates throughput/utilization knobs independently of model-family semantics.
 - Scheduler decision tests assert reason codes and score components.
 - No-progress watchdog tests cover self-play, inference, training, evaluation, and artifact writing.
 - Autotune logs include actionable validation, lifecycle, scheduler, abort, and next-debugging-action messages.
@@ -158,10 +163,12 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - `arena can evaluate every registered family through PolicyProvider`
 - `dashboard/training inputs match on golden positions`
 - `dashboard uses ContractInspector/read-only services only`
+- `ContractInspector dispatches to focused inspectors and supports extension without becoming a mega-object`
 - `dashboard displays hash/source/version/trace facts`
 - `autotune rejects incompatible recipes during dry-run`
 - `autotune mutates ModelRecipe, not raw config fields`
 - `runtime sweeps have no-progress watchdogs`
+- `runtime sweeps score host utilization and throughput separately from model semantics`
 - `scheduler decisions are logged with reasons`
 - `old scripts and runtime sizing architecture branches are deleted or quarantined`
 - `import audits find no banned eval/dashboard/tuning dependencies`

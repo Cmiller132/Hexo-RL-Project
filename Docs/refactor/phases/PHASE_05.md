@@ -299,6 +299,8 @@ Hard rules:
 - Root pair-prior application may use first, joint, or second pair priors only when the explicit `PairStrategy` requested that root behavior and row identities match the canonical `PairActionTable`.
 - MCTS telemetry reports whether `pair_first`, `pair_second`, `pair_joint`, tactical pairs, or no pairs influenced the decision.
 - Pair-prior application is a no-op for empty `PairEvaluation`, and the trace must show that no pair influence occurred.
+- Rust owns tree traversal, selection, and backprop hot paths. Python receives contiguous leaf batches and returns contiguous priors/values; no Python per-node or per-leaf model-forward hot loop may be introduced.
+- `EngineAdapter` timing must split `init_root`, root expansion, pair-prior application, `select_leaves`, inference wait, `expand_and_backprop`, `sample_action`, `re_root`, and token/error handling.
 
 ## Detailed Policy And MCTS Verification
 This phase must verify the model-to-search boundary as if subtle mapping bugs already exist.
@@ -310,6 +312,7 @@ Required verification:
 - Verify that non-finite logits, non-finite values, all-zero prior mass, stale legal hashes, stale pair hashes, duplicate rows, and wrong protocol versions fail before MCTS.
 - Verify that stale root tokens, stale batch tokens, invalid policy lengths, invalid value lengths, bad sparse metadata, non-finite priors, far-coordinate actions, illegal pair-row identities, and malformed Rust/PyO3 protocol inputs fail with structured ownership before they can poison tree state.
 - Verify that MCTS cannot mutate the `SearchEvaluation`, `PairEvaluation`, legal table, pair table, or policy-provider response.
+- Verify that MCTS leaf batches are sized for inference batching and that hot-path validation stays cheap while stale-token, row identity, shape, and finite checks remain mandatory.
 - Verify that search traces report raw prior source, normalized prior, MCTS visit count, selected move, value estimate, pair influence, and fallback reason when a fallback is explicitly allowed.
 - Add a single-position policy/search debug bundle containing contracts, raw model outputs, decoded outputs, priors, pair evaluation, MCTS input, MCTS output, selected move, hashes, and timings.
 
@@ -425,6 +428,7 @@ Produce these artifacts before marking the phase complete:
 - `PairStrategySpec` schema and validation tests for root/leaf/full caps.
 - Default recipe/config evidence showing `none` for global graph families, including `global_xattn`.
 - MCTS trace sample showing policy provider, pair strategy, legal row count, pair rows possible, selected pair rows, scored pair rows, and pair influence.
+- MCTS performance profile with split timings for root init, selection, inference wait, backprop, sampling, token failures, leaf batch size, and positions/sec or moves/sec.
 - MCTS error trace samples for stale root token, stale batch token, malformed priors, sparse metadata mismatch, and pair-row mismatch.
 - Single-position policy/search debug bundle showing raw outputs, decoded outputs, row-mapped priors, pair evaluation, MCTS inputs/outputs, hashes, trace ids, and selected move.
 - Mutation/corruption verification proof for policy outputs, legal rows, pair rows, priors, and MCTS inputs.
@@ -459,6 +463,7 @@ SearchEvaluation priors are row-mapped for dense, restnet, graph_hybrid, and glo
 PolicyProvider acceptance tests pass for dense/restnet/graph_hybrid/global_graph.
 EngineAdapter is the only Python caller of Rust MCTS.
 EngineAdapter uses only canonical fallible MCTS APIs and preserves root/batch token validation.
+EngineAdapter preserves batched Rust MCTS hot paths and records split timing/performance artifacts.
 MCTS failures are structured Python errors with trace ids and Rust error ownership, not panics or compatibility strings.
 No pair scoring happens without PairStrategy.
 No pair scoring happens from head presence, pair_prior_mix, config side effects, or architecture prefix.

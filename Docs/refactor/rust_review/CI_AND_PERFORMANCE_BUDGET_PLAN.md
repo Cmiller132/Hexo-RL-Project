@@ -4,6 +4,8 @@ Date: 2026-04-29
 
 Purpose: define fast pull-request gates, separated deep CI, and concrete performance budgets for the current Rust/Python engine slice.
 
+This is the Rust-specific annex to `Docs/refactor/CI_STRATEGY.md` and `Docs/refactor/PERFORMANCE_STRATEGY.md`. The central refactor CI policy owns tiering, artifact retention, flaky/quarantine rules, and final V2 closure. This annex supplies the Rust engine checks and benchmark areas that feed those central gates.
+
 ## Fast PR Gates
 
 Fast CI should run on push and pull request:
@@ -29,6 +31,8 @@ Scheduled and manual workflows own expensive tests:
 
 Deep oracle tests remain separate from PR gates so a pull request gets quick correctness feedback while longer stochastic/oracle coverage still runs regularly.
 
+Artifact retention and flaky-test handling follow `Docs/refactor/CI_STRATEGY.md`. Required Rust suspicion checks may not be silently skipped; if a deep Rust oracle becomes flaky, it needs an owner, issue, expiry, continued scheduled execution, and a deterministic PR replacement that covers the same invariant.
+
 ## Performance Budget Matrix
 
 These are planning budgets for the benchmark suite and profiling scripts. They are concrete enough to wire into gates once baseline data is captured on stable hardware.
@@ -40,6 +44,7 @@ These are planning budgets for the benchmark suite and profiling scripts. They a
 | Tactical status | Criterion `tactical_status` plus multi-threat fixtures | No more than 10% regression and no fixture over 2x baseline. | Capture Criterion baseline after tactical fixtures are added. |
 | MCTS select/backprop | Criterion `single_mcts_full_sim` and a future split select/backprop bench | No more than 10% regression for full sim; split phases get separate baselines before gating. | Add benches for `select_leaves` and `expand_and_backprop` using deterministic mock policies. |
 | Tree extraction | Python smoke/profile around `extract_tree_node_states` | No more than 15% regression for fixed min-visits/tree size once baseline is recorded. | Add a Python benchmark script beside existing `benches/threaded_inference_benchmark.py`. |
+| Python/Rust inference boundary | Maturin build plus engine/inference smoke profile | No unbounded wait; no stale-token or malformed-byte acceptance; latency/throughput recorded with HostProfile. | Feed Phase 04/05/09 performance artifacts and central scheduled comparison. |
 
 ## Why Hard Perf Gates Are Deferred
 

@@ -42,6 +42,7 @@ The current runtime still uses `hexorl.buffer` paths. This phase must explicitly
 - Old replay/buffer decode code is removed from runtime imports.
 - Any retained old decode logic lives only under `tools/migration/` or frozen test fixtures.
 - There are no runtime imports from `buffer/` or old replay paths in self-play, sampler, training, or epoch runtime. Dashboard/eval import removal is enforced in Phase 08.
+- Replay storage, sampler, projector, and train handoff use bounded queues, observable backpressure, vectorized projection, and prefetch policies derived from HostProfile/runtime budgets.
 
 ## Canonical Record Boundary
 New replay records must preserve the data needed to reconstruct and validate canonical contracts without model-family-specific assumptions:
@@ -78,6 +79,7 @@ Rules:
 - Legal rows, candidates, pair rows, targets, masks, graph inputs, and loss inputs are derived from canonical contract builders and adapters.
 - D6 replay augmentation, if active in this phase, must transform canonical contracts rather than mutate already-projected tensors privately.
 - Sample-to-loss smoke coverage proves that a sampled record becomes a finite loss through the projector path.
+- Projection hot paths must batch records, avoid per-sample device transfers, report memory use, and expose write/read/project samples/sec.
 
 ## Detailed Replay Verification
 
@@ -93,6 +95,7 @@ Required verification:
 - projector outputs must be reproducible from the record and canonical builders only
 - corruption tests must identify whether the failure belongs to codec, storage, sampler, projector, contract builder, or train adapter
 - the single-position behavior debug bundle must include replay record content, decoded content, projector output identities, and sample-to-loss identity checks
+- performance verification must identify replay writer queue depth, storage throughput, sampler throughput, projector throughput, prefetch wait time, memory high-watermark, and train input starvation if present
 
 ## Migration Boundary
 Old replay data may be converted, but not consumed by runtime code.
@@ -137,6 +140,7 @@ Any migration script must be explicit about input schema, output schema, validat
 - Tests proving old replay/buffer decode exists only in `tools/migration/` or frozen fixtures.
 - Tests proving sampler reads only new records and fails hard on old replay payloads.
 - Tests proving records produced before the Rust hardening slice are either migrated offline with explicit validation or rejected by runtime readers.
+- Performance/backpressure tests proving replay write/read/project paths are bounded, vectorized, and observable under synthetic and self-play-shaped load.
 
 ## Required Artifacts
 - New replay schema/version documentation.
@@ -148,6 +152,7 @@ Any migration script must be explicit about input schema, output schema, validat
 - Migration tool notes for any retained old replay conversion path.
 - Import audit output or CI check covering forbidden runtime imports.
 - Sample-to-loss smoke output for each supported training adapter in scope.
+- Replay throughput and memory profile covering write/read/project samples/sec, queue high-watermarks, prefetch behavior, and train input wait time.
 
 ## Hard Gates
 - New self-play writes only new replay records.
@@ -159,6 +164,7 @@ Any migration script must be explicit about input schema, output schema, validat
 - Old replay/buffer decode is absent from runtime imports.
 - Old replay/buffer decode exists only in `tools/migration/` or frozen fixtures.
 - Roundtrip, corruption, projection, and sample-to-loss tests pass.
+- Replay performance/backpressure artifacts prove bounded queues and vectorized projection.
 - Import audits pass.
 - No evaluation, dashboard, or autotune work is included in this phase.
 

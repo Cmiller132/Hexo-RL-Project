@@ -21,7 +21,7 @@ Source of truth: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_V2_20260429.md`.
 
 ## Required End State
 
-`GameRunner` owns per-game execution and receives every behavioral dependency explicitly:
+`GameRunner` owns per-game orchestration and receives every behavioral dependency explicitly. The exact constructor shape may change during interface freeze, but the runner must compose service/pipeline outputs; it must not become a new home for candidate, pair, graph, replay, inference, or MCTS internals.
 
 ```python
 class GameRunner:
@@ -46,7 +46,8 @@ Required dependency contracts:
 - `EngineAdapter`: owns `PyHexGame` / `MCTSEngine` lifecycle, Rust replay/legal/MCTS calls, tokenized root/leaf state, and engine-specific call details.
 - `SelfPlayRecordWriter`: writes replay records; the runner does not write files directly.
 - `SelfPlayTelemetrySink`: emits structured events, summaries, traces, and stall diagnostics.
-- `SelfPlayContractBuilders`: bundles the canonical builders needed by the runner, including history/legal/tactical/candidate/pair/graph builders as applicable.
+- `SelfPlayContractBuilders` or approved pipeline interfaces: expose validated position/search contract results to the runner without allowing the runner to call canonical builder internals directly.
+- Runtime/resource spec: carries HostProfile-derived process, thread, queue, batch, and timeout budgets.
 
 `SelfPlayWorker` must be reduced to:
 
@@ -84,7 +85,7 @@ Any such logic must live in `contracts/`, `engine/`, `graph/`, `inference/`, `se
 
 - initialize a game from `GameRunRequest`
 - request legal/replay state through `EngineAdapter`
-- build canonical position/search contracts through `SelfPlayContractBuilders`, which consume validated Rust `RootInit`, legal bytes, pending leaf metadata, and compact history bytes rather than privately rebuilding legal/history/D6 facts
+- request canonical position/search contracts through approved builder or pipeline interfaces, which consume validated Rust `RootInit`, legal bytes, pending leaf metadata, and compact history bytes rather than privately rebuilding legal/history/D6 facts
 - request policy/value priors through `PolicyProvider`
 - request pair behavior only through `PairStrategy`
 - invoke search through `EngineAdapter`
@@ -94,6 +95,23 @@ Any such logic must live in `contracts/`, `engine/`, `graph/`, `inference/`, `se
 - return `GameRunResult` with counts, timings, hashes, warnings, and failure status
 
 `GameRunner` may not infer behavior from model-family names or architecture strings. Dense, graph hybrid, and global graph runs must use the same runner interface.
+
+## Host Utilization And Backpressure
+
+Self-play must have one resource owner, usually the orchestrator/runtime spec, for:
+
+- number of worker processes
+- inference server process per GPU or approved CPU-only profile
+- Rust thread budget
+- Torch thread budget
+- record writer queue capacity
+- inference queue capacity
+- leaf batch size
+- max in-flight requests per worker
+- replay writer backpressure behavior
+- shutdown and cancellation deadlines
+
+Worker count, Rust threads, Torch threads, DataLoader/prefetch threads, and inference batching must be budgeted together from `HostProfile` to avoid oversubscription. Saturated inference or replay queues must produce structured throttling, retryable failure, or cancellation; they must not cause unbounded waits.
 
 ## Self-Play Logging Requirements
 
@@ -115,6 +133,7 @@ Self-play logs must make these failure classes distinguishable:
 - priors missing, masked out, non-finite, or mapped to wrong rows
 - contract, tensor, policy, search, or replay payload mutated after validation
 - replay record content disagrees with the traced position contracts
+- CPU busy/idle imbalance, GPU underfill, inference queue saturation, or replay writer backpressure is causing low throughput
 
 Required event types:
 
@@ -128,6 +147,9 @@ Required event types:
 - `inference_protocol_mismatch`
 - `selfplay_position_debug_bundle`
 - `selfplay_mutation_guard_failure`
+- `selfplay_resource_profile`
+- `selfplay_backpressure`
+- `selfplay_batching_summary`
 
 Required heartbeat fields:
 
@@ -277,18 +299,18 @@ Required verification:
 - D6-augmented positions must prove history, legal rows, targets, model inputs, priors, and replay records stay semantically aligned
 - corrupt or stale hashes, schema versions, row ids, masks, model outputs, pair rows, and replay payloads must fail before record writing
 - no-progress diagnostics must include enough state to decide whether to inspect engine, contracts, inference, model forward, MCTS, or replay writing first
+- resource diagnostics must show worker idle time, CPU busy/idle balance, inference queue depth, batch fill rate, inference wait p95, replay queue depth, and backpressure events for self-play-shaped load
 
-## Concrete Work
+## Implementation Outcomes
 
-1. Add `GameRunRequest`, `GameRunResult`, and any narrow per-game state objects needed by `GameRunner`.
-2. Add `SelfPlayContractBuilders` as an explicit dependency bundle instead of ad hoc worker calls.
-3. Move the game loop from `SelfPlayWorker` to `GameRunner`.
-4. Move replay record creation and validation to `records.py` and `record_writer.py`.
-5. Move worker telemetry shape decisions to `telemetry.py`; worker only emits lifecycle/IPC events.
-6. Replace worker direct inference/search/MCTS calls with `PolicyProvider`, `PairStrategy`, and `EngineAdapter`.
-7. Remove worker architecture gates and pair-policy side effects.
-8. Ensure dense, graph hybrid, and global graph self-play use the same `GameRunner` interface.
-9. Keep RGSC restart/service logic lifecycle-oriented; it must not rebuild contracts or records privately.
+- `GameRunRequest`, `GameRunResult`, and narrow per-game state contracts exist where needed.
+- Game execution lives outside `SelfPlayWorker`.
+- Replay record creation and validation live outside `SelfPlayWorker`.
+- Worker telemetry shape decisions are centralized; the worker emits lifecycle/IPC events only.
+- Inference/search/MCTS flow through `PolicyProvider`, `PairStrategy`, and `EngineAdapter`.
+- Worker architecture gates and pair-policy side effects are removed.
+- Dense, graph hybrid, and global graph self-play use the same runner interface.
+- RGSC restart/service logic remains lifecycle-oriented and does not rebuild contracts or records privately.
 
 ## Mandatory Tests
 
@@ -307,6 +329,7 @@ Required verification:
   - stall diagnosis identifies IPC wait, engine wait, record writer wait, and pair-budget issues separately
   - position debug bundles contain engine, contract, D6, model input, raw output, policy, pair, MCTS, and replay sections
   - mutation guard failures identify the mutated payload and owning subsystem
+  - resource/backpressure events include HostProfile-derived budgets, queue depths, batch fill rate, worker idle time, inference wait p95, and replay writer pressure
 
 - `Python/tests/selfplay/test_record_writer.py`
   - replay records are assembled and validated outside `SelfPlayWorker`
@@ -365,6 +388,7 @@ This phase must leave behind:
 - mutation guard definitions for self-play payloads and projections
 - import-audit output captured in the phase PR or implementation notes
 - tests listed above, with deterministic fixtures or fakes
+- resource profile and backpressure artifacts for a self-play-shaped workload
 
 ## Hard Gates
 
@@ -377,6 +401,7 @@ This phase must leave behind:
 - Pair scoring is impossible unless `PairStrategy` explicitly enables it.
 - Default pair strategy reports zero pair rows scored.
 - Dense, graph hybrid, and global graph self-play run through the same `GameRunner` interface.
+- Self-play process/thread ownership follows HostProfile budgets and exposes inference/replay backpressure without unbounded waits.
 - Heartbeat, no-progress, game summary, policy timing, pair summary, and `ContractTrace` telemetry are emitted and tested.
 - Behavior debug bundles can localize model-behavior failures across engine, contracts, D6, targets, model outputs, policy mapping, MCTS, and replay.
 - Mutation guards catch post-validation changes to contract, tensor, policy, search, and replay payloads.

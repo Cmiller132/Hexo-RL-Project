@@ -47,36 +47,45 @@ Rules:
 - No `hexorl/model` compatibility facade, alias module, or shim may remain in runtime.
 - Migration tools may read old files or old checkpoint layouts, but they must be command-line/offline tools outside runtime.
 
-## Required ModelFamily Interface
-Every registered model family must implement the full interface below. No family may be registered with a partial placeholder.
+## Required Model Family Registration
+Every registered model family must expose a complete descriptor. The registry is the semantic authority for family identity, capabilities, specs, and component lookup, but it should not become a switchboard full of family-specific branches.
+
+Prefer facet-based registration:
 
 ```python
-class ModelFamily(Protocol):
+class ModelFamilyDescriptor(Protocol):
     name: str
     aliases: set[str]
     capabilities: CapabilitySet
-
-    def validate_spec(self, spec: ModelSpec) -> None: ...
-    def build_model(self, spec: ModelSpec) -> nn.Module: ...
-    def build_train_adapter(self, spec: ModelSpec) -> TrainAdapter: ...
-    def build_inference_adapter(self, spec: ModelSpec) -> InferenceAdapter: ...
-    def inference_manifest(self, spec: ModelSpec) -> InferenceProtocolManifest: ...
-    def build_policy_provider(self, spec: ModelSpec, runtime: RuntimeSpec) -> PolicyProvider: ...
-    def default_loss_plan(self, spec: ModelSpec) -> LossPlan: ...
-    def default_recipe(self, host: HostProfile) -> ModelRecipe: ...
-    def tune_space(self, host: HostProfile) -> RecipeSearchSpace: ...
+    spec_schema: type[ModelSpec]
+    components: FamilyComponents
 ```
 
-Interface requirements:
+Required facets:
 
-- `build_model` constructs only the model core: trunk, heads, and family wrapper.
-- `build_train_adapter` owns batch projection, target validation, loss input assembly, and output validation for training.
-- `build_inference_adapter` owns inference tensor packing, output decoding, shape validation, and legal-row mapping.
-- `inference_manifest` declares request kind, protocol version, row/token caps, output contracts, and required heads.
-- `build_policy_provider` returns the search-facing policy interface. Search and arena code consume policy providers, not model classes.
-- `default_loss_plan` declares finite, masked, turn-aware losses for every supported output target.
-- `default_recipe` produces a complete valid recipe for the family on a host profile.
-- `tune_space` returns only valid family-specific recipe mutations.
+```text
+ModelBuilder
+TrainAdapterFactory
+InferenceAdapterFactory
+PolicyProviderFactory
+LossPlanProvider
+RecipeProvider
+TuneSpaceProvider
+CheckpointManifestProvider
+```
+
+Registration requirements:
+
+- The descriptor must provide every required facet; no family may be registered with a partial placeholder.
+- Model building constructs only the model core: trunk, heads, and family wrapper.
+- The train-adapter facet owns batch projection, target validation, loss input assembly, output validation, and training performance assumptions.
+- The inference-adapter facet owns inference tensor packing, output decoding, shape validation, legal-row mapping, and manifest declaration.
+- The policy-provider facet returns the search-facing policy interface. Search and arena code consume policy providers, not model classes.
+- The loss-plan facet declares finite, masked, turn-aware losses for every supported output target.
+- The recipe facet produces a complete valid recipe for the family on a host profile.
+- The tune-space facet returns only valid family-specific recipe mutations.
+- The checkpoint-manifest facet writes enough information to inspect and load the family without architecture-string recovery.
+- A fake-family extension test must prove a new family can be registered by adding a descriptor/facets, not by editing trainer, inference, search, dashboard, or self-play internals.
 
 Aliases may exist only as registry-recognized migration names. They must not create non-registry behavior branches, and they must not keep deprecated architecture names alive outside spec validation and offline migration tooling.
 
@@ -144,6 +153,7 @@ Training verification rule:
 - Tensors produced from contracts must either own their memory or be guarded against mutation of the source contract after validation.
 - D6-augmented batches must prove target mass, legal-row identity, pair-row identity, and known-first semantics are preserved.
 - Negative tests must corrupt legal rows, target rows, pair targets, masks, graph links, tensor shapes, schema versions, and non-finite values, and each failure must identify whether the owner is replay projection, train adapter, model output validation, or loss planning.
+- Performance evidence must show vectorized batch projection, device-transfer behavior, and train-step throughput for each registered family or an approved representative family set. CUDA paths should use pinned transfers, AMP, channels-last layout, or compilation only when valid for the family and recorded in the manifest.
 
 ## Inference Adapter Manifest And Declaration
 Every family must declare its inference protocol through `inference_manifest(spec)`.
@@ -227,16 +237,14 @@ Strict checkpoint rules:
 - No silent `_orig_mod` stripping, key-prefix cleanup, shape skipping, partial-state loading, or old-name remapping in runtime.
 - Any old checkpoint conversion belongs to offline migration tooling and must emit a new strict manifest.
 
-## Actions
-- Create `models/registry.py` with registration, lookup, validation, and list APIs.
-- Create `models/specs.py` with discriminated model specs and spec-version handling.
-- Create `models/capabilities.py` with capability enums and validation helpers.
-- Split model assembly into trunks, heads, family wrappers, train adapters, inference adapters, policy providers, recipes, and checkpoint manifests.
-- Register `dense_cnn`, `restnet`, `graph_hybrid`, `global_xattn`, `global_line_window`, and `global_relation_graph`.
-- Convert trainer construction to `ModelFamilyRegistry -> TrainAdapter -> LossPlan`.
-- Convert checkpoint save/load/inspect to `CheckpointManager`.
-- Add strict validation for pair targets, conditional second-placement targets, legal-row alignment, caps, masks, and finite losses.
-- Remove runtime dependency on old `Python/src/hexorl/model/`.
+## Implementation Outcomes
+- Runtime uses one model registry/spec/capability system.
+- Model families register complete descriptors and facets.
+- Trainer construction flows through registry-owned train adapter and loss plan lookup.
+- Checkpoint save/load/inspect flows through `CheckpointManager`.
+- Pair targets, conditional second-placement targets, legal-row alignment, caps, masks, and finite losses are strictly validated.
+- Runtime dependency on old `Python/src/hexorl/model/` is removed.
+- Extension-proof tests demonstrate new-family registration without editing unrelated runtime internals.
 
 ## Delete
 Delete or remove from runtime imports:
@@ -263,6 +271,7 @@ test_every_registered_family_builds_inference_adapter_manifest
 test_every_registered_family_builds_policy_provider
 test_every_registered_family_declares_loss_plan
 test_every_registered_family_declares_tune_space
+test_fake_family_registers_without_runtime_internal_edits
 test_trainer_runs_one_batch_for_every_registered_family
 test_trainer_contains_no_architecture_or_model_class_branches
 test_pair_target_validation_rejects_opening_pair_loss
@@ -273,6 +282,7 @@ test_train_adapter_debug_bundle_reconstructs_replay_to_loss_inputs
 test_train_adapter_rejects_mutated_contract_after_projection
 test_train_adapter_rejects_stale_legal_row_identity
 test_train_adapter_rejects_corrupt_masks_or_nonfinite_targets
+test_train_adapter_projection_and_device_transfer_profile_is_recorded
 test_model_output_validation_rejects_wrong_rows_shapes_and_nonfinite_values
 test_checkpoint_manifest_round_trips
 test_checkpoint_inspect_does_not_load_weights
@@ -306,6 +316,8 @@ Produce these artifacts before marking the phase complete:
 registered model family list with capabilities
 default recipe validation output for every family
 one-batch trainer smoke output for every family
+facet/descriptor extension example for a fake family
+training throughput and device-transfer profile for each registered or approved representative family
 checkpoint manifest round-trip output
 checkpoint inspect-without-weights proof
 pair target validation proof for opening, first-placement, second-placement, and D6 cases
@@ -319,7 +331,8 @@ Phase 03 is complete only when all gates below pass:
 
 ```text
 every registered family builds
-every registered family exposes model, train adapter, inference adapter manifest/declaration, policy provider, loss plan, default recipe, and tune space
+every registered family exposes complete descriptor/facet registration for model, train adapter, inference adapter manifest/declaration, policy provider, loss plan, default recipe, tune space, and checkpoint manifest
+fake-family registration proves the registry is extensible without runtime switch edits
 every registered family trains one batch through the same trainer path
 trainer has no architecture branches, model-class branches, or output-key behavior inference
 checkpoint manifest save/load/inspect round-trips

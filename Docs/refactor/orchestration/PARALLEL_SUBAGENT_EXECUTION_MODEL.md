@@ -22,13 +22,16 @@ Only one subagent owns each public contract or interface. Other subagents consum
 Every phase runs these gates in order:
 
 1. **Scope Freeze:** Orchestrator names exact V2 requirement matrix rows and anti-goals.
-2. **Interface Freeze:** Public contracts, adapters, manifests, builders, or service APIs are reviewed before implementation.
-3. **Fixture Freeze:** Golden fixtures, baseline artifacts, and expected trace/log samples are named.
-4. **Parallel Implementation:** Subagents work only in non-overlapping write scopes.
-5. **Integration Branch:** Orchestrator integrates and resolves cross-boundary assumptions.
-6. **Deletion Sweep:** Phase-owned old paths are deleted or quarantined outside runtime.
-7. **Audit And Test:** Unit, integration, parity, performance, telemetry, and import checks run.
-8. **Conformance Review:** Orchestrator updates matrix rows and signs off or rejects the phase.
+2. **Agent Execution Contract:** Each assignment states Goal, Success Criteria, Constraints, Required Evidence, and Stop Rules.
+3. **Interface Freeze:** Public contracts, adapters, manifests, builders, or service APIs are reviewed before implementation.
+4. **Fixture Freeze:** Golden fixtures, baseline artifacts, and expected trace/log samples are named.
+5. **CI Routing:** S5 proposes CI tier, timeout, owner, and artifact path for every required check; the orchestrator approves before implementation.
+6. **Parallel Implementation:** Subagents work only in non-overlapping write scopes.
+7. **Integration Branch:** Orchestrator integrates and resolves cross-boundary assumptions.
+8. **Deletion Sweep:** Phase-owned old paths are deleted or quarantined outside runtime.
+9. **Audit And Test:** Unit, integration, parity, performance, telemetry, and import checks run.
+10. **Adversarial Review:** A reviewer tries to prove an old path, stale input, malformed payload, silent fallback, or partial implementation can still affect runtime.
+11. **Conformance Review:** Orchestrator updates matrix rows and signs off or rejects the phase.
 
 ## Strict Gate Protocol
 
@@ -47,6 +50,35 @@ A phase fails if any condition is unmet:
 - tests do not cover the invariant that changed
 - Rust-derived data is accepted without Python contract validation, stale-token checks, or structured error ownership
 - docs do not match shipped behavior
+- required checks are unclassified, manual-only, flaky without replacement coverage, or missing artifacts
+- performance-sensitive changes lack host/utilization evidence
+- new centralized owners lack extension-proof tests or executable examples
+
+## Subagent Completion Packet
+
+Each subagent final report for a phase must include:
+
+```text
+closed V2 rows
+runtime consumers changed
+files changed
+legacy paths deleted or quarantined
+tests and commands run with exit status
+artifacts produced
+performance/utilization evidence for hot paths
+contract examples/docs added where relevant
+known blockers, if any
+explicit statement that no skipped/deferred/manual-only requirement is being claimed complete
+```
+
+The orchestrator reconciles all completion packets into:
+
+```text
+Docs/refactor/artifacts/phase_XX/agent_completion_packet.md
+Docs/refactor/artifacts/phase_XX/evidence_reconciliation.md
+```
+
+Narrative status without command output, artifact paths, and deletion/import proof is not enough to close a matrix row.
 
 ## Phase-To-Subagent Split
 

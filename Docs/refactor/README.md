@@ -31,12 +31,24 @@ This does not make Rust a trusted oracle. It makes Rust the production rules bou
   - Universal and phase-level completion checklist used at signoff.
 - `PHASED_IMPLEMENTATION_PLAN.md`
   - Master program overview, sequencing, and promotion rules.
+- `ORCHESTRATION_AGENT_BOOTSTRAP.md`
+  - Exact initial prompt, document packet, process loop, and subagent assignment template for the orchestration agent.
+- `EXECUTION_QUALITY_GUARDRAILS.md`
+  - Defines agent-proof completion evidence, centralization boundaries, contract examples, performance/utilization expectations, CI tiers, and implementation-latitude rules.
+- `PERFORMANCE_STRATEGY.md`
+  - Defines runtime resource ownership, GPU batching, CPU/Rust utilization, hot-path validation, and benchmark artifact expectations.
+- `CI_STRATEGY.md`
+  - Defines local, PR, deep, scheduled, and final V2 CI tiers, including artifact retention and flaky-test policy.
 - `V2_REQUIREMENTS_MATRIX.md`
   - Requirement-level tracker. This is the orchestrator's master signoff surface.
 
 ## Non-Negotiable Rule
 
 A phase is not complete until all mandatory tests pass, artifacts are attached, the deletion/import audits pass, required telemetry samples exist, and the orchestrator signs off that no feature remains half-implemented, unconsumed, deferred, or spec-incomplete.
+
+## Implementation Latitude
+
+The phase docs are outcome specifications, not step-by-step recipes. Named contracts, protocol fields, deletion gates, and matrix requirements are binding. Internal file layout, helper names, and implementation sequencing may change when a cleaner design preserves the same semantic owner, runtime cutover, observability, performance evidence, tests, and deletion proof. Any such change must update the relevant phase doc and matrix row before implementation begins.
 
 ## No-Deferral Rule
 

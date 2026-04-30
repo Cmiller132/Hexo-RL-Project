@@ -26,6 +26,8 @@ Source of truth: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_V2_20260429.md`.
 
 Add `InferenceProtocolManifest` in `inference/protocol.py`.
 
+The protocol must use a stable base envelope plus request-kind payload schemas. The envelope owns identity, versioning, deadlines, tracing, manifest hashes, and transport metadata. Request-kind payload schemas own dense, sparse, graph, pair, or future family-specific payload details. Adding a new request kind must not require rewriting transport lifecycle code.
+
 Required manifest fields:
 
 ```text
@@ -95,6 +97,8 @@ adapter_capability_request
 slot_request_generation
 payload_refs
 deadline_ms
+payload_schema_version
+payload_kind
 ```
 
 Response contracts must include:
@@ -116,6 +120,8 @@ error_code
 ```
 
 No raw ad-hoc payload dict crosses the client/server boundary. Dicts are acceptable only as serialization internals behind typed protocol objects.
+
+A fake request kind must be registerable through the manifest and payload-schema path without adding architecture-string dispatch or changing shared transport lifecycle code.
 
 ## Handshake and Negotiation
 
@@ -180,6 +186,16 @@ Detailed verification:
 
 `inference/shm_transport.py` owns IPC setup, shared-memory allocation, queue wiring, heartbeat, backpressure, deadlines, teardown, and orphan cleanup. If implementation keeps the current `inference/shm_queue.py`, `client.py`, and `server.py` split, this phase must either move ownership into `shm_transport.py` or explicitly document the one surviving transport owner and delete duplicated lifecycle state elsewhere.
 
+`inference/batching.py` owns batching policy. It may be implemented under another phase-approved module name only if there is still one batching owner and the protocol/docs are updated before implementation.
+
+Batching requirements:
+
+- batch by compatible request kind, protocol, schema, and adapter capability
+- preserve GPU batching by avoiding per-leaf model forward calls
+- support adaptive microbatch wait, max batch size, max in-flight per worker, and fairness across producers
+- expose high/low watermarks, queue depth, fill rate, wait time, forward time, decode time, and retryable backpressure status
+- fail or throttle explicitly under saturation instead of creating unbounded waits
+
 Required lifecycle states:
 
 ```text
@@ -200,6 +216,7 @@ Rules:
 - Server shutdown drains accepted requests or marks them failed; it does not leave callers waiting on responses that will never arrive.
 - Backpressure is explicit. Oversized batches and saturated queues fail or return retryable status according to the manifest; they do not silently stall.
 - Transport cleanup owns shared-memory unlink/close and process ownership accounting.
+- Batching telemetry must be attached to Phase 04 artifacts for synthetic load and at least one self-play-shaped workload.
 
 ## Adapter Requirements
 
@@ -289,6 +306,7 @@ Required cases:
 - Capacity mismatch selects bounded minimum or fails if required minimum cannot be met.
 - Requested head missing from server manifest fails before enqueue.
 - Extra unrequested server head is ignored unless the adapter marks it required.
+- Fake request-kind registration works through the protocol envelope without transport lifecycle rewrites or architecture dispatch.
 
 Transport lifecycle:
 
@@ -307,6 +325,7 @@ Required cases:
 - Shared-memory segments are closed/unlinked by transport ownership.
 - Stale ready flags, stale trace ids, stale response buffers, and reused shared-memory contents fail validation.
 - Post-validation mutation of request/response metadata is detected before policy/search consumption.
+- Batching/backpressure tests cover queue saturation, fairness, timeout, retryable failure, and batch fill-rate telemetry.
 
 Adapters and responses:
 
@@ -359,6 +378,7 @@ Docs/refactor/artifacts/phase_04_handshake_matrix.md
 Docs/refactor/artifacts/phase_04_timeout_audit.md
 Docs/refactor/artifacts/phase_04_import_audit.md
 Docs/refactor/artifacts/phase_04_response_telemetry_snapshot.md
+Docs/refactor/artifacts/phase_04_batching_backpressure_profile.md
 Docs/refactor/artifacts/phase_04_inference_debug_bundle.md
 Docs/refactor/artifacts/phase_04_mutation_corruption_report.md
 ```
@@ -366,8 +386,10 @@ Docs/refactor/artifacts/phase_04_mutation_corruption_report.md
 Artifact contents:
 
 - Manifest examples for dense, sparse, global graph, and pair scoring requests.
+- Request-kind extension example proving envelope/payload separation.
 - Handshake compatibility matrix covering request kind, version, contract, capacity, and head negotiation.
 - Timeout audit listing every inference wait site and its finite deadline behavior.
+- Batching/backpressure profile with batch fill rate, queue depth, p50/p95 waits, timeout/retryable counts, and GPU utilization or proxy timing.
 - Import audit proving worker/dashboard/training do not call private inference tensor rebuild paths.
 - Telemetry snapshot showing response schema/protocol fields and timing spans.
 - Inference debug bundle showing one traced position through pack, transport, model output, decode, response validation, and failure ownership.
@@ -379,10 +401,12 @@ Phase 04 is not complete until all gates pass:
 
 ```text
 InferenceProtocolManifest is required for every client/server session.
+Base envelope plus request-kind payload schemas support extension without architecture dispatch.
 Server dispatches by request_kind and negotiated manifest, not architecture string.
 Protocol, schema, contract, capacity, and head mismatches fail before enqueue.
 No inference wait can block indefinitely.
 Transport owns shared-memory, queue, heartbeat, backpressure, shutdown, and cleanup lifecycle.
+Batching/backpressure preserves bounded waits and GPU-batchable request groups.
 Dense, sparse, global graph, and pair scoring adapters round-trip through the inference server.
 All responses include and pass telemetry/schema/protocol assertions.
 Corrupt, stale, or mutated inference payloads fail before policy/search consumes them.

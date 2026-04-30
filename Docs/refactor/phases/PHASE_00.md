@@ -67,18 +67,19 @@ No later phase may treat an undocumented local run, checkpoint, replay file, tra
 
 ## Required Deliverables
 1. Baseline freeze report covering functional behavior, smoke performance, CI timings, config values, and known instability.
-2. Git tag and archive manifest for the last pre-Python-foundation cutover commit, including the completed Rust refactor SHA it contains.
-3. Command transcripts for all mandatory checks and smoke commands.
-4. Config hashes for every baseline command that depends on config, recipe, checkpoint, or runtime flags.
-5. Immediate `global_xattn` guard proving `pair_strategy=none` unless explicitly overridden by a named strategy.
-6. Accidental pair scoring test that fails if pair rows are scored when pair strategy is absent or `none`.
-7. Structured logging samples for self-play, inference policy evaluation, pair strategy summary, graph request summary, autotune trial lifecycle, scheduler decision, and no-progress events.
-8. Trace samples containing the required timing spans from V2's `ContractTrace`.
-9. No-progress watchdog smoke showing a stalled self-play or runtime sweep emits a diagnosable event and exits or aborts predictably.
-10. Architecture-string dependency inventory.
-11. Deletion and legacy inventory with owning phase for every fallback, duplicate helper, deprecated alias, and stale runtime path found.
-12. Verification inventory listing golden positions, negative/corrupt cases, D6 variants, mutation-risk payloads, and independent oracle options for each boundary.
-13. Hard exit gate report signed by the orchestrator before Phase 01 starts.
+2. HostProfile and performance baseline covering CPU/GPU availability, inference throughput, self-play phase timings, replay projection throughput, and training step timing where locally available.
+3. Git tag and archive manifest for the last pre-Python-foundation cutover commit, including the completed Rust refactor SHA it contains.
+4. Command transcripts for all mandatory checks and smoke commands.
+5. Config hashes for every baseline command that depends on config, recipe, checkpoint, or runtime flags.
+6. Immediate `global_xattn` guard proving `pair_strategy=none` unless explicitly overridden by a named strategy.
+7. Accidental pair scoring test that fails if pair rows are scored when pair strategy is absent or `none`.
+8. Structured logging samples for self-play, inference policy evaluation, pair strategy summary, graph request summary, autotune trial lifecycle, scheduler decision, and no-progress events.
+9. Trace samples containing the required timing spans from V2's `ContractTrace`.
+10. No-progress watchdog smoke showing a stalled self-play or runtime sweep emits a diagnosable event and exits or aborts predictably.
+11. Architecture-string dependency inventory.
+12. Deletion and legacy inventory with owning phase for every fallback, duplicate helper, deprecated alias, and stale runtime path found.
+13. Verification inventory listing golden positions, negative/corrupt cases, D6 variants, mutation-risk payloads, and independent oracle options for each boundary.
+14. Hard exit gate report signed by the orchestrator before Phase 01 starts.
 
 ## Baseline Freeze
 Freeze the baseline before any Python/project architecture cutover edits.
@@ -98,6 +99,7 @@ Docs/refactor/artifacts/phase_00/git/git_state.txt
 Docs/refactor/artifacts/phase_00/git/tag.txt
 Docs/refactor/artifacts/phase_00/git/archive_manifest.md
 Docs/refactor/artifacts/phase_00/baseline/baseline_freeze.md
+Docs/refactor/artifacts/phase_00/performance/
 ```
 
 The freeze is invalid if the tag cannot be mapped to the command transcripts and config hashes used for the baseline.
@@ -318,6 +320,8 @@ training
 autotune or runtime sweep dry-run
 dashboard build if dashboard dependencies are present
 ```
+
+Also run the baseline performance probes listed in `Docs/refactor/PERFORMANCE_STRATEGY.md` where the local machine has the needed dependencies. Missing GPU access or unavailable benchmark tooling must be recorded explicitly rather than treated as a silent skip.
 
 Also create the verification inventory and transcript any lightweight checks used to build it. If a golden position or corruption case cannot be created in Phase 00, the inventory must assign it to the exact owner phase and explain why.
 

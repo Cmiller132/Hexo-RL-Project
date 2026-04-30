@@ -49,6 +49,7 @@ Contract rules:
 - Contracts do not import model, inference, search, train, dashboard, tuning, self-play orchestration, or process lifecycle code.
 - Contracts may expose cached or zero-copy views when hot paths need them.
 - Contracts may not hide subsystem behavior, perform inference, run search, build dashboards, or own process orchestration.
+- Every public contract must have executable examples or tests showing construction from the canonical source, malformed-input rejection, stable schema/source/hash identity, mutation safety for exposed views, projection into at least one runtime consumer, and a small debug payload for failure explanation.
 
 ### 2. Engine Boundary
 Create `Python/src/hexorl/engine/` as the only Python-facing Rust rules boundary. It wraps the compiled `_engine` PyO3 module; direct `_engine` imports are banned outside this package, tests, and explicit fixture tooling.
@@ -205,6 +206,7 @@ Allowed temporary adapters:
 Add focused tests under `Python/tests/contracts/` and `Python/tests/engine/`.
 
 Required contract tests:
+- executable contract examples for each public contract introduced in this phase
 - validation failure tests for every new contract type
 - equality stability tests
 - hash stability tests
