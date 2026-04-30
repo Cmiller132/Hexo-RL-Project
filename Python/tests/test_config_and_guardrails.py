@@ -1,5 +1,4 @@
 import multiprocessing as mp
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -7,7 +6,8 @@ import torch
 from hexorl.buffer import RingBuffer
 from hexorl.config import Config
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
-from hexorl.selfplay.worker import SelfPlayWorker, _score_graph_pair_chunks
+from hexorl.search.pair_strategy import PairStrategySpec
+from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
 from hexorl.models.checkpoint import CheckpointManager
@@ -380,7 +380,7 @@ def test_global_xattn_pair_strategy_defaults_to_none():
     queue = mp.Queue()
     try:
         worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
-        assert worker.global_graph_enabled is True
+        assert worker.uses_global_policy is True
         assert worker.pair_strategy == "none"
         assert worker.pair_policy_enabled is False
         assert worker.pair_strategy_summary()["pair_rows_scored"] == 0
@@ -449,16 +449,8 @@ def test_pair_scoring_requires_explicit_diagnostic_strategy_and_cap():
     finally:
         queue.close()
 
-    with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
-        _score_graph_pair_chunks(
-            client=object(),  # type: ignore[arg-type]
-            graph_batch=SimpleNamespace(
-                legal_qr=torch.zeros(2, 2, dtype=torch.int32).numpy(),
-                legal_token_indices=torch.arange(2).numpy(),
-            ),
-            second_placement=False,
-            max_pair_rows=0,
-        )
+    with pytest.raises(ValueError, match="max_full_pair_rows"):
+        PairStrategySpec(name="diagnostic_full_root", diagnostic=True, root_enabled=True, max_full_pair_rows=0)
 
 
 def test_restnet_config_rejects_invalid_attention_position():

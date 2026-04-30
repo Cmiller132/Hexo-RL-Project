@@ -21,7 +21,7 @@ def game_from_history(history: bytes | MoveHistory, *, allow_fixture: bool = Fal
     cls = hex_game_class(required=True)
     game = cls()
     if hasattr(game, "load_history"):
-        game.load_history(contract.encode())
+        game.load_history([(int(q), int(r), int(player)) for player, q, r in contract.rows])
         return game
     for player, q, r in contract.rows:
         current = getattr(game, "current_player", player)

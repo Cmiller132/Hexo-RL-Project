@@ -1,0 +1,84 @@
+{
+  "engine": "mock EngineAdapter perf fixture",
+  "expand_backprop_ms_total": 0.2715999726206064,
+  "host": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0"
+  },
+  "init_root_ms": 0.24359999224543571,
+  "leaf_batch_count": 8,
+  "leaf_batch_sizes": [
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4
+  ],
+  "leaf_batches": [
+    {
+      "backprop_ms": 0.04700000863522291,
+      "count": 4,
+      "select_ms": 0.7571000023745
+    },
+    {
+      "backprop_ms": 0.038300000596791506,
+      "count": 4,
+      "select_ms": 0.7611000328324735
+    },
+    {
+      "backprop_ms": 0.031800009310245514,
+      "count": 4,
+      "select_ms": 0.7139999652281404
+    },
+    {
+      "backprop_ms": 0.028799986466765404,
+      "count": 4,
+      "select_ms": 0.7097999914549291
+    },
+    {
+      "backprop_ms": 0.030099996365606785,
+      "count": 4,
+      "select_ms": 0.7137999637052417
+    },
+    {
+      "backprop_ms": 0.03090000245720148,
+      "count": 4,
+      "select_ms": 0.7319999858736992
+    },
+    {
+      "backprop_ms": 0.03290001768618822,
+      "count": 4,
+      "select_ms": 0.7260999991558492
+    },
+    {
+      "backprop_ms": 0.0317999511025846,
+      "count": 4,
+      "select_ms": 0.7154999766498804
+    }
+  ],
+  "num_simulations": 32,
+  "pair_influence": "none",
+  "pair_rows_possible": 0,
+  "pair_strategy": "none",
+  "positions_per_sec_proxy": 154.51890872087526,
+  "root_commit_ms": 0.11669995728880167,
+  "root_legal_rows": 10,
+  "sample_action_ms": 0.010400020983070135,
+  "scored_pair_rows": 0,
+  "select_leaves_ms_total": 5.8293999172747135,
+  "selected_action": [
+    4,
+    -1
+  ],
+  "selected_pair_rows": 0,
+  "timings_recorded_by_adapter": {
+    "expand_and_backprop": 0.18939992878586054,
+    "expand_root": 0.10000000474974513,
+    "init_root": 0.2410999732092023,
+    "sample_action": 0.009000010322779417,
+    "select_leaves": 5.820399906951934
+  }
+}

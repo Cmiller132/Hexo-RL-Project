@@ -1,0 +1,63 @@
+{
+  "inference_protocol": "fixture",
+  "legal_row_count": 12,
+  "legal_table_hash": "58e4c2d3f6676f61a16ba6e4d34028b30cbfadf9ef1ca8662e9e78cd7ae11646",
+  "mcts_result": {
+    "child_count": 12,
+    "first_moves": [
+      [
+        -4,
+        4
+      ],
+      [
+        -4,
+        4
+      ],
+      [
+        0,
+        5
+      ],
+      [
+        5,
+        -4
+      ],
+      [
+        -3,
+        4
+      ]
+    ],
+    "root_q": 0.5621679627803211,
+    "visit_sum": 657
+  },
+  "model_family": "dense_cnn",
+  "pair_influence": "none",
+  "pair_rows_possible": 66,
+  "pair_strategy": "none",
+  "policy_provider": "DebugFixtureProvider",
+  "root_generation": 1,
+  "root_prior_source_summary": {
+    "leaf_default_count": 0,
+    "leaf_dense_count": 0,
+    "leaf_expansion_count": 0,
+    "leaf_pair_count": 0,
+    "leaf_sparse_candidate_count": 0,
+    "leaf_sparse_count": 0,
+    "leaf_total_count": 0,
+    "pair_influence": "none",
+    "root_default_count": 0,
+    "root_dense_count": 12,
+    "root_pair_candidate_count": 0,
+    "root_pair_count": 0,
+    "root_sparse_candidate_count": 0,
+    "root_sparse_count": 0,
+    "root_total_count": 12
+  },
+  "scored_pair_rows": 0,
+  "search_evaluation_hash": "eb6991dcc5576a54b82b006757beceebfe732c0fca57dcca04903d1038020ff7",
+  "selected_pair_rows": 0,
+  "timings_ms": {
+    "expand_root": 0.09679998038336635,
+    "init_root": 0.2549000200815499
+  },
+  "trace_id": "220b462f84fd4fa48429fc98f546c9c7"
+}

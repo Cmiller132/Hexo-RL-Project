@@ -1,0 +1,166 @@
+{
+  "contracts": {
+    "context": {
+      "batch_generation": null,
+      "candidate_table_hash": "",
+      "history_hash": "81bbcee56f38d205c831e36b0840ec326479f06756d98fdb54eedc63b7af8897",
+      "legal_table_hash": "58e4c2d3f6676f61a16ba6e4d34028b30cbfadf9ef1ca8662e9e78cd7ae11646",
+      "model_family": "dense_cnn",
+      "model_spec_version": "v2",
+      "pair_strategy_id": "none",
+      "pair_table_hash": "",
+      "phase": "root",
+      "position_hash": "0f42e0b6fae4e3cb196629f1bfced4acd6667104c028edeacab638df02fa7161",
+      "root_generation": 1,
+      "trace_id": "220b462f84fd4fa48429fc98f546c9c7"
+    },
+    "legal_table": {
+      "contract": "LegalActionTable",
+      "current_player": 0,
+      "history_hash": "39136ff92b5912250dd02ec28023cf278168c82fb97f6a6dea285c7912b7843b",
+      "legal_count": 12,
+      "occupied_count": 0,
+      "placements_remaining": 1,
+      "radius": 8,
+      "rows": [
+        [
+          -7,
+          8
+        ],
+        [
+          -5,
+          5
+        ],
+        [
+          -4,
+          3
+        ],
+        [
+          -1,
+          6
+        ],
+        [
+          1,
+          -5
+        ],
+        [
+          1,
+          -2
+        ],
+        [
+          3,
+          6
+        ],
+        [
+          5,
+          -1
+        ],
+        [
+          6,
+          -2
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          7
+        ],
+        [
+          8,
+          -6
+        ]
+      ],
+      "schema_version": 1,
+      "source": "rust:legal",
+      "table_hash": "58e4c2d3f6676f61a16ba6e4d34028b30cbfadf9ef1ca8662e9e78cd7ae11646"
+    }
+  },
+  "decoded_outputs": {
+    "legal_dense_indices_first_5": [
+      321,
+      384,
+      415,
+      517,
+      572
+    ],
+    "prior_source_first_5": [
+      2,
+      2,
+      2,
+      2,
+      2
+    ]
+  },
+  "failure_localization_keys": [
+    "raw_model_outputs",
+    "decoded_outputs",
+    "row_mapped_priors",
+    "legal_table",
+    "pair_evaluation",
+    "mcts_input",
+    "mcts_output"
+  ],
+  "hashes": {
+    "evaluation_hash": "eb6991dcc5576a54b82b006757beceebfe732c0fca57dcca04903d1038020ff7",
+    "legal_table_hash": "58e4c2d3f6676f61a16ba6e4d34028b30cbfadf9ef1ca8662e9e78cd7ae11646",
+    "position_hash": "0f42e0b6fae4e3cb196629f1bfced4acd6667104c028edeacab638df02fa7161"
+  },
+  "mcts_input": {
+    "legal_bytes_len": 96,
+    "offset_q": 16,
+    "offset_r": 16,
+    "root_generation": 1
+  },
+  "mcts_output": {
+    "child_count": 12,
+    "first_moves": [
+      [
+        -4,
+        4
+      ],
+      [
+        -4,
+        4
+      ],
+      [
+        0,
+        5
+      ],
+      [
+        5,
+        -4
+      ],
+      [
+        -3,
+        4
+      ]
+    ],
+    "root_q": 0.5621679627803211,
+    "visit_sum": 657
+  },
+  "pair_evaluation": {
+    "scored_pair_rows": 0,
+    "selected_pair_rows": 0,
+    "strategy": "none",
+    "total_possible_pairs": 66
+  },
+  "raw_model_outputs": {
+    "fixture_row_logits_first_5": [
+      0.0555555559694767,
+      0.06060606241226196,
+      0.06565656512975693,
+      0.07070706784725189,
+      0.07575757801532745
+    ],
+    "value": 0.125
+  },
+  "row_mapped_priors_first_5": [
+    0.0555555559694767,
+    0.06060606241226196,
+    0.06565656512975693,
+    0.07070706784725189,
+    0.07575757801532745
+  ]
+}

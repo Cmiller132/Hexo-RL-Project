@@ -1,0 +1,29 @@
+{
+  "samples": [
+    {
+      "case": "stale_root_token",
+      "exception_type": "ContractValidationError",
+      "message": "stale root token [owner=EngineAdapter]"
+    },
+    {
+      "case": "stale_batch_token",
+      "exception_type": "ContractValidationError",
+      "message": "stale batch token [owner=EngineAdapter]"
+    },
+    {
+      "case": "malformed_priors_nonfinite",
+      "exception_type": "ContractValidationError",
+      "message": "SearchEvaluation contains non-finite value or priors [owner=SearchEvaluation]"
+    },
+    {
+      "case": "sparse_metadata_mismatch",
+      "exception_type": "ContractValidationError",
+      "message": "SearchEvaluation prior length must equal legal row count [owner=SearchEvaluation]"
+    },
+    {
+      "case": "pair_row_mismatch",
+      "exception_type": "ContractValidationError",
+      "message": "PairEvaluation rows/priors/source length mismatch [owner=PairEvaluation]"
+    }
+  ]
+}
