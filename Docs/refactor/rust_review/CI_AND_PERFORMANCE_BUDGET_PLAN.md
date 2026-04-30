@@ -45,6 +45,8 @@ These are planning budgets for the benchmark suite and profiling scripts. They a
 
 Hard performance gates are not enabled in this slice because the repository has Criterion benches but no checked-in machine-normalized baselines, no JSON comparison script, and no stable runner-specific threshold metadata. Enabling hard gates without that baseline would produce noisy failures instead of actionable regression signals.
 
+This deferral is acceptable only before final V2 closure. Phase 09 must not close until benchmark metadata, runner profiles, JSON comparison tooling, scheduled artifacts, and threshold ownership exist for every promoted budget.
+
 The next executable path is:
 
 1. Add a benchmark metadata file under `crates/hexgame-bench/` that records runner profile, command, benchmark ids, and accepted regression percentage.

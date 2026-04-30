@@ -15,6 +15,8 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] Cross-validation tests prove row identity, ordering, source, schema version, and hash stability across subsystem boundaries.
 - [ ] Mutation-safety tests prove cached views, tensors, replay payloads, and target projections cannot silently change after validation.
 - [ ] Corruption tests prove bad histories, illegal rows, stale hashes, bad masks, wrong D6 transforms, malformed targets, and protocol mismatches fail loudly.
+- [ ] Rust-derived payloads are treated as canonical but not self-validating: legal rows, compact history, tactics, MCTS tokens, pair rows, and FFI bytes have semantic validation plus negative tests.
+- [ ] Structured errors and logs identify whether a boundary failure came from Rust replay/legal/tactics/MCTS, PyO3 protocol decode, Python contract validation, inference decode, policy mapping, replay projection, or training target assembly.
 - [ ] A single-position debug bundle or equivalent trace can localize failures to the owning subsystem.
 - [ ] Performance smoke is compared to Phase 00 baseline where relevant.
 - [ ] Structured telemetry/logging samples are attached where relevant.
@@ -44,10 +46,12 @@ Use this checklist during execution. A phase is complete only if every box is ch
 
 ### Phase 01
 - [ ] `contracts/` and `engine/` packages created.
-- [ ] Rust is the production legal/history source.
+- [ ] Rust is the production legal/history source only through validated `engine/` wrappers; direct `_engine` imports are removed from runtime.
 - [ ] Python legal fallback is fixture-only.
 - [ ] Rust/Python parity passes for legal rows, compact history, D6 coordinates/history/legal/dense tensors.
 - [ ] Engine/legal verification checks semantic legality, row ordering, duplicate detection, terminal state, current player, and source/hash identity.
+- [ ] Engine wrappers consume the existing Rust/PyO3 protocol helpers instead of duplicating legal/history/pair byte parsing in Python or Rust.
+- [ ] Rust invariant hooks are exercised in engine parity/debug tests for representative legal, history, undo, tactical, and terminal states.
 - [ ] Contract mutation tests prove zero-copy/cached views cannot invalidate validated hashes silently.
 - [ ] Private production legal/history/D6 helpers removed or quarantined outside runtime.
 
@@ -84,6 +88,7 @@ Use this checklist during execution. A phase is complete only if every box is ch
 - [ ] Global graph pair heads have turn-aware, row-mapped, telemetry-visible contracts.
 - [ ] Policy and MCTS verification proves raw model outputs map to exactly the intended legal rows before search consumes them.
 - [ ] EngineAdapter rejects stale legal-row identity, stale pair-row identity, non-finite priors, and all-zero priors without explicit fallback reason.
+- [ ] EngineAdapter preserves canonical MCTS root/batch token lifecycle and converts Rust `MCTSError` failures into structured Python errors without panic wrappers or stringly fallbacks.
 
 ### Phase 06
 - [ ] `GameRunner` depends on providers/adapters/builders, not architecture/config strings.

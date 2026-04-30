@@ -15,12 +15,15 @@ Runtime code uses replay/codec.py, replay/storage.py, replay/sampler.py, and rep
 Old replay and buffer decode paths may exist only in tools/migration or frozen fixtures.
 ```
 
+The current runtime still uses `hexorl.buffer` paths. This phase must explicitly create `Python/src/hexorl/replay/` or move/rename the current buffer ownership into it, then delete runtime imports from the old buffer path for self-play, sampler, training, and epoch runtime. Dashboard/evaluation inspection removal is Phase 08 work unless a Phase 07 runtime import is actively used by sampling or training.
+
 ## Target Modules
 - `Python/src/hexorl/replay/codec.py`
 - `Python/src/hexorl/replay/storage.py`
 - `Python/src/hexorl/replay/sampler.py`
 - `Python/src/hexorl/replay/projector.py`
 - `Python/src/hexorl/replay/fixtures.py`
+- existing `Python/src/hexorl/buffer/` runtime paths as deletion or migration sources
 - `Python/src/hexorl/selfplay/record_writer.py`
 - `Python/src/hexorl/selfplay/records.py`
 - `Python/src/hexorl/train/adapters.py`
@@ -38,7 +41,7 @@ Old replay and buffer decode paths may exist only in tools/migration or frozen f
 - Training code may consume projected batches, but may not rebuild replay fields privately.
 - Old replay/buffer decode code is removed from runtime imports.
 - Any retained old decode logic lives only under `tools/migration/` or frozen test fixtures.
-- There are no runtime imports from `buffer/` or old replay paths.
+- There are no runtime imports from `buffer/` or old replay paths in self-play, sampler, training, or epoch runtime. Dashboard/eval import removal is enforced in Phase 08.
 
 ## Canonical Record Boundary
 New replay records must preserve the data needed to reconstruct and validate canonical contracts without model-family-specific assumptions:
@@ -48,11 +51,17 @@ record schema version
 game identity and position identity
 compact move history
 Rust-derived legal action table identity/hash
+Rust FFI protocol version or source marker for legal/history rows
+compact history row count/hash
+reconstructed Rust legal row hash
 policy/value/search targets
-candidate and pair target metadata where applicable
+policy target global row identity
+candidate and pair target metadata where applicable, including pair known-first/completeness metadata
 contract trace or validation metadata
 writer version and config/checkpoint identity
 ```
+
+Transient MCTS `root_generation` and `batch_generation` belong in debug traces only. They must not become replay semantics or training labels.
 
 Rules:
 
@@ -78,6 +87,7 @@ Required verification:
 
 - self-play traced position -> replay record -> decoded record -> projected contracts must preserve history hash, legal row ids, source, schema version, target identity, D6 identity, candidate/pair/graph identities, and record hash
 - record writing must reject stale legal hashes, stale schema versions, mismatched policy targets, mismatched value targets, bad pair known-first references, illegal masks, and non-finite target values
+- record writing must reject records whose compact history or legal rows cannot be replayed through the current Rust engine and centralized FFI protocol
 - storage round-trips must prove byte serialization does not reorder rows, drop source/version fields, alter target mass, or mutate nested payloads
 - D6 replay augmentation must prove inverse/composition, target mass preservation, row identity preservation, and no in-place mutation of source records
 - projector outputs must be reproducible from the record and canonical builders only
@@ -102,6 +112,7 @@ import hexorl.replay_legacy
 import old replay decode helpers from sampler/trainer/self-play
 branch on legacy replay schema in runtime sampler
 fallback to old buffer decode when new codec fails
+GameRecord.from_compact_bytes accepting magic-less legacy records in runtime
 ```
 
 Any migration script must be explicit about input schema, output schema, validation checks, and artifact location.
@@ -125,12 +136,14 @@ Any migration script must be explicit about input schema, output schema, validat
 - Import audit tests proving no runtime import of `buffer/` or old replay paths.
 - Tests proving old replay/buffer decode exists only in `tools/migration/` or frozen fixtures.
 - Tests proving sampler reads only new records and fails hard on old replay payloads.
+- Tests proving records produced before the Rust hardening slice are either migrated offline with explicit validation or rejected by runtime readers.
 
 ## Required Artifacts
 - New replay schema/version documentation.
 - Golden new replay fixture set with generator command and fixed seed.
 - Corruption fixture set or synthetic corruption test helper.
 - Replay verification report proving trace-to-record-to-projector identity preservation.
+- Rust replay/invariant verification report for golden replay records, including malformed-history and stale-legal negative cases.
 - Single-position behavior debug bundle replay section sample.
 - Migration tool notes for any retained old replay conversion path.
 - Import audit output or CI check covering forbidden runtime imports.

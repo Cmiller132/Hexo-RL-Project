@@ -10,6 +10,8 @@ Translate the V2 redesign into a strict, test-gated, breaking-refactor execution
 
 This program is not a compatibility migration. It is a controlled cutover to a cohesive architecture. A phase is not complete because a new path exists; it is complete only when the old runtime path it replaces is deleted, quarantined outside runtime, or proven unreachable by import/code-search gates.
 
+The Rust refactor has already completed its Phase 2 hardening slice before this Python/project execution plan begins. Treat that Rust work as the current baseline and intended production rules boundary, not as proof that the boundary is fully trusted. Phase 00 must capture the post-Rust baseline and every later phase must keep Rust outputs under semantic validation, structured error handling, and replayable debug evidence.
+
 ## Phase Sequence
 
 The program executes in strict order:
@@ -83,6 +85,14 @@ The following are phase blockers:
 
 The current project structure is not a trusted baseline. The refactor must verify behavior as if subtle bugs already exist in the engine boundary, encoders, D6 transforms, target builders, tensor projections, inference mapping, MCTS integration, and replay storage.
 
+The completed Rust hardening slice improves the engine boundary but does not remove this suspicion requirement. Later Python phases should treat Rust as the canonical production rules implementation and still validate every Rust-derived payload before it influences training or search. In practice this means:
+
+- Do not reintroduce Python legal/history/D6 fallbacks to compensate for Rust uncertainty.
+- Do wrap Rust outputs in Python contracts with schema, source, hash, row identity, and mutation checks.
+- Do keep stale root tokens, stale batch tokens, malformed FFI bytes, non-finite priors, invalid row lengths, and illegal move submissions as first-class negative tests.
+- Do add logging and debug bundles that identify whether a failure belongs to Rust replay/legal/tactics/MCTS, Python contract validation, inference decode, policy mapping, replay projection, or training target construction.
+- Do use Rust invariant hooks in debug, test, and probe paths where they narrow fault localization, while keeping hot paths performance-aware.
+
 Every phase that introduces or cuts over a data boundary must include:
 
 - golden position fixtures with known histories, legal rows, terminal status, D6 variants, targets, and expected failure cases
@@ -116,6 +126,8 @@ exit_gate_report.md
 ```
 
 `MANIFEST.md` must identify the git SHA, command lines, relevant config hashes, generated files, owners, and any intentional non-runtime migration tooling.
+
+Phase artifacts must be retained long enough to diagnose regressions across later phases. Deep oracle runs, performance baselines, malformed-input fixtures, telemetry samples, and behavior debug bundles must not be overwritten by later runs without a manifest entry that records the superseding artifact, runner profile, and git SHA.
 
 ## V2 Requirement Matrix
 

@@ -38,9 +38,12 @@ Python wrapper around HexGameState. Methods:
 
 ### PyMCTSEngine
 - `new(game, num_simulations, c_puct, near_radius, c_puct_init, constrain_threats, arena_sim_hint, seed)`
-- `init_root()` → (tensor_3d, offset_q, offset_r, legal_bytes) or None
-- `select_leaves(batch_size)` → (tensor_4d, count)
-- `expand_and_backprop(policies, values)`
+- `init_root()` → (tensor_3d, offset_q, offset_r, legal_bytes, root_generation) or None
+- `expand_root(policy, value, offset_q, offset_r, legal_bytes, root_generation)` and `expand_root_with_sparse_priors` / `expand_root_with_global_priors` validate the current root token, row identity, finite priors, and policy shape before expansion.
+- `select_leaves(batch_size)` → (tensor_4d, count, batch_generation)
+- `pending_leaf_metadata()` → legal rows and compact histories for the currently selected pending leaves; callers must pair this metadata with the returned `batch_generation`
+- `expand_and_backprop(policies, values, batch_generation)` and sparse/source variants reject stale batch tokens, wrong lengths, non-finite values, and malformed sparse metadata.
+- root pair-prior methods accept only canonical pair rows and fail on stale root tokens or invalid pair identities.
 - `sample_action(temperature, rng_state)` → (q, r)
 - `should_resign(threshold)` → bool
 - `re_root(q, r, new_num_simulations)` → PyResult

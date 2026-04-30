@@ -2,13 +2,15 @@
 
 These are maintainability/code-quality recommendations. They do not need the same defect verification as behavior hypotheses, but they should still be implemented with tests where they touch public behavior.
 
+Status note: this file is historical design input. The final active public API decision is recorded in `API_AND_FFI_PROTOCOL_PLAN.md`: stable facades are `rules`, `encoding`, `tactics`, and `classical`; `mcts` remains public only as an FFI exception for `hexgame-py`; the crate root should not preserve convenience re-exports of implementation details.
+
 ## Narrow The Public API
 
 `hexgame-core` currently publishes implementation modules directly and also re-exports selected public types. Prefer a smaller stable public surface:
 
-- keep rules-facing types re-exported from the crate root
+- keep stable facade modules for `rules`, `encoding`, `tactics`, and `classical`
 - make implementation modules private or `pub(crate)` where downstream callers do not need them
-- expose explicit API modules for `rules`, `encoding`, `search`, and `mcts` if deep paths are needed
+- keep `mcts` public only for the active Python FFI crate until a stable MCTS facade is intentionally designed
 
 Benefit: future internal refactors stop becoming public API compatibility problems.
 
@@ -83,4 +85,3 @@ Add lightweight benchmark/smoke budgets for correctness-sensitive hot paths:
 - tree-node extraction
 
 Benefit: robustness work can be balanced against self-play throughput.
-

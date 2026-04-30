@@ -31,6 +31,10 @@ Python/src/hexorl/model/ absent or non-runtime migration-only references absent
 Python/src/hexorl/buffer/ absent from runtime imports
 Python/src/hexorl/action_contract/ absent from runtime imports
 private legal/history/D6 helpers absent outside contracts/engine/tests/tools
+duplicate legal/history/pair FFI byte decoders absent outside the Rust PyO3 protocol owner
+stale `ThreatStatus` public docs or compatibility imports absent
+legacy Rust MCTS panic wrappers, tokenless lifecycle calls, and stringly MCTS error adapters absent from runtime
+Rust implementation modules are not re-exported from crate root unless an active facade/FFI exception justifies them
 worker-owned pair chunk helpers absent
 dashboard private reconstruction helpers absent
 autotune raw-config family mutation paths absent
@@ -65,6 +69,8 @@ no startswith("global_") behavior gates outside registry/spec tests
 no pair scoring outside search/pair_strategy.py
 no direct Rust MCTS calls outside search/engine_adapter.py
 no private legal/history/D6 parsers outside contracts/engine/tests/tools
+no duplicate legal/history/pair FFI byte decoders outside the Rust PyO3 protocol owner
+no legacy Rust MCTS panic wrappers, tokenless lifecycle calls, or stringly MCTS error adapters in runtime
 no runtime imports from old model/buffer/action_contract paths
 no dashboard route imports sampler-private builders
 no trainer model-class checks
@@ -73,6 +79,10 @@ no autotune raw config mutation for model-family behavior
 single-position behavior debug bundle covers engine/contracts/D6/targets/model/policy/MCTS/replay
 mutation guards reject post-validation payload changes
 corruption tests reject stale hashes, bad schema versions, wrong row identity, illegal masks, and non-finite model outputs
+Rust suspicion gates reject malformed FFI bytes, stale MCTS tokens, invalid policy lengths, far-coordinate mismatches, illegal pair rows, and invariant-probe failures with structured errors
+cargo public-api or equivalent public surface drift check
+panic/assert/unwrap inventory with public/FFI misuse classification
+machine-normalized benchmark metadata and scheduled regression comparison artifacts
 ```
 
 Use AST/import-graph checks where regex would be too brittle.
@@ -99,6 +109,7 @@ tuning recipe dry-run and rejected-recipe explanation
 structured logs/traces for self-play and autotune
 single-position behavior debug bundle generation
 mutation/corruption verification for one golden position
+Rust invariant and FFI protocol negative verification for one golden position
 ```
 
 ## V2 Requirement Matrix Closure
@@ -130,6 +141,7 @@ manual verification only
 - Import graph and banned-path checks green.
 - Final end-to-end smoke archived.
 - Behavior debug bundle test proves one position can be traced across engine, contracts, D6, targets, model outputs, policy mapping, MCTS, replay, dashboard, and autotune report references.
+- Rust suspicion bundle proves malformed protocol inputs, stale MCTS tokens, invariant-probe failures, and `MCTSError` ownership are diagnosable without Python fallback paths.
 - Mutation/corruption test suite proves stale hashes, bad schemas, wrong legal rows, mutated tensors, bad masks, bad pair rows, non-finite outputs, and replay mismatches fail loudly.
 - Dashboard build and route smoke pass.
 - Tuning dry-run and rejection-reason tests pass.
@@ -155,5 +167,6 @@ Docs/refactor/artifacts/phase_09/final_conformance_report.md
 - No banned imports or behavior gates remain.
 - Final smoke proves the cohesive runtime flow works end to end.
 - Final verification proves the runtime can localize subtle correctness failures without trusting the old implementation as the oracle.
+- Final verification keeps Rust canonical but suspicious: no hidden Python fallback exists, and every Rust-facing failure path has structured tests, logs, and debug-bundle evidence.
 - V2 requirement matrix is fully closed.
 - Final conformance report confirms complete, spec-compliant delivery.

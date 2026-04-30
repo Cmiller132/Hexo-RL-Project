@@ -18,6 +18,9 @@ Source of truth: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_V2_20260429.md`.
 - `Python/src/hexorl/inference/adapters/sparse.py`
 - `Python/src/hexorl/inference/adapters/global_graph.py`
 - `Python/src/hexorl/inference/adapters/pair_scoring.py`
+- `crates/hexgame-py/src/protocol.rs` as the Rust/PyO3 row-protocol owner consumed by inference-facing contracts
+
+`inference/protocol.py` owns the Python inference protocol. It does not own Rust FFI row encodings. Legal rows, board-piece rows, compact history rows, and pair-row byte/array layouts remain owned by `crates/hexgame-py/src/protocol.rs` and are surfaced through validated engine/contracts objects.
 
 ## Required Protocol Objects
 
@@ -39,6 +42,10 @@ graph_schema_version
 relation_schema_version
 candidate_contract_version
 pair_action_contract_version
+ffi_protocol_version
+legal_row_encoding
+history_row_encoding
+pair_row_encoding
 heads
 adapter_name
 adapter_version
@@ -62,7 +69,12 @@ dense_policy_value
 sparse_policy_value
 global_graph_policy_value
 pair_scoring
+sparse_pair_policy_value
+graph_pair_policy_value
+regret_rank_policy_value
 ```
+
+The concrete names should be aligned with current runtime modes during implementation, including dense crop, sparse candidate, sparse pair, global graph, graph pair, and regret-rank only if regret-rank remains a runtime path.
 
 Request contracts must include:
 
@@ -77,7 +89,10 @@ manifest_hash
 position_identity
 history_hash
 legal_table_hash
+legal_row_hash
+pair_row_hash
 adapter_capability_request
+slot_request_generation
 payload_refs
 deadline_ms
 ```
@@ -92,6 +107,7 @@ request_kind
 response_schema_version
 manifest_hash
 status
+slot_response_generation
 output_contract
 head_outputs
 telemetry
@@ -147,19 +163,22 @@ Fail-fast behavior:
 - Any protocol, request kind, schema, contract, capacity, or head mismatch raises `InferenceProtocolMismatch` before the first request is enqueued.
 - Mismatches are logged through `inference_protocol_mismatch` telemetry with the client manifest, server manifest, selected checkpoint manifest, and mismatch field.
 - There is no fallback to architecture-prefix dispatch, legacy submit methods, dense tensor reconstruction, or Python legal/candidate/pair rebuilding.
+- Inference requests that carry Rust-derived legal, history, candidate, or pair identities must fail before enqueue if the identity cannot be traced to validated contracts built from the centralized engine/FFI protocol.
 
 Detailed verification:
 
 - Inference tests must assume request packing, shared-memory transport, tensor collation, model forward, scatter, and decode can each corrupt, reorder, or stale-read data.
 - Request packing must preserve trace id, history hash, legal row ids, candidate row ids, pair row ids, graph token ids, graph relation ids, schema versions, caps, and masks.
-- Transport buffers must not allow stale request data, stale response data, stale ready flags, or post-validation mutation to appear as a valid response.
-- Response decoding must validate output shape, row identity, protocol version, model family, output contract, non-finite values, masks, and count fields before returning to `PolicyProvider`.
-- Negative tests must corrupt protocol versions, request kind, row counts, masks, token counts, pair counts, output shapes, stale ready flags, stale trace ids, and non-finite outputs.
+- Transport buffers must not allow stale request data, stale response data, stale ready flags, stale slot generations, or post-validation mutation to appear as a valid response. Ready flags alone are insufficient; per-slot request and response sequence counters are required before response read.
+- Response decoding must validate output shape, row identity, protocol version, model family, output contract, masks, count fields, and non-finite values before returning to `PolicyProvider`.
+- Non-finite model outputs are rejected at the protocol boundary. They must not be sanitized and allowed to continue into policy/search.
+- Negative tests must corrupt protocol versions, request kind, row counts, masks, token counts, pair counts, output shapes, stale ready flags, stale slot generations, stale trace ids, and non-finite outputs.
+- Negative tests must include Rust-boundary mismatch cases: stale legal-table hash, stale compact-history hash, malformed legal/history protocol bytes when constructing fixtures, and pair-row identities that cannot be traced back to `PairActionTable`.
 - A single-position inference debug payload must show packed request metadata, transport lifecycle timings, raw model output metadata, decoded output metadata, response hashes, and validation failures.
 
 ## Transport Lifecycle Ownership
 
-`inference/shm_transport.py` owns IPC setup, shared-memory allocation, queue wiring, heartbeat, backpressure, deadlines, teardown, and orphan cleanup.
+`inference/shm_transport.py` owns IPC setup, shared-memory allocation, queue wiring, heartbeat, backpressure, deadlines, teardown, and orphan cleanup. If implementation keeps the current `inference/shm_queue.py`, `client.py`, and `server.py` split, this phase must either move ownership into `shm_transport.py` or explicitly document the one surviving transport owner and delete duplicated lifecycle state elsewhere.
 
 Required lifecycle states:
 
@@ -228,6 +247,7 @@ Delete or fully disconnect these old paths during this phase:
 ```text
 client lifecycle duplication across submit methods
 old submit_* methods that own private queue/shared-memory setup
+submit_graph, submit_sparse_pair, req_mode, or equivalent mode-specific submit paths that bypass typed protocol validation
 server architecture.startswith("global_") dispatch
 server dispatch by model architecture string
 hidden fixed-cap assumptions not declared by protocol manifest
@@ -237,6 +257,7 @@ private global graph tensor rebuild paths in worker/dashboard/inference submit c
 private pair tensor rebuild paths in worker/dashboard/inference submit code
 implicit pair scoring triggered by pair head presence inside inference
 indefinite IPC waits, joins, queue gets, queue puts, and server polling loops
+server-side non-finite sanitization that hides invalid model outputs instead of returning structured protocol errors
 ```
 
 Short-lived compatibility wrappers are allowed only inside the migration branch for tests. They must not be imported by migrated runtime paths.

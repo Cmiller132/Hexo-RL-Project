@@ -84,7 +84,7 @@ Demote only as a short-lived projection:
 - Exact parity: self-play candidate table equals replay sampler candidate table equals dashboard candidate table for all golden positions.
 - Exact parity: training adapter candidate tensors are projections of the same `CandidateTable` used by self-play and dashboard fixtures.
 - Exact parity: crop pair rows and global graph `PAIR_ACTION` rows derive from the same `PairActionTable`.
-- Exact parity: graph legal rows match the Rust-backed `LegalActionTable`; graph code does not build legal rows privately.
+- Exact parity: graph legal rows match the validated Rust-backed `LegalActionTable`; graph code does not build legal rows privately, and independent golden fixtures or hand-audited legal-row references catch cases where Rust itself would be wrong.
 - Exact parity: graph tensor batches are pure projections from graph semantic contracts for golden positions.
 - D6 parity: candidate target mass, pair target mass, unordered first-placement pair identity, and second-placement known-first semantics are preserved.
 - Phase tests: opening, first-placement turn, second-placement known-first turn, pair-heavy state, and graph token-heavy state.

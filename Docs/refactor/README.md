@@ -8,6 +8,18 @@ Source of truth: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_V2_20260429.md`
 
 The goal is a breaking refactor into one cohesive project. These docs intentionally reject long-lived legacy support, compatibility facades in runtime code, duplicate old/new paths, and under-specified "convergence" work. A phase is complete only when its V2 requirements are implemented, consumed by runtime where applicable, tested, observable, and cleaned up.
 
+## Rust Refactor Baseline
+
+The Rust engine has completed the Phase 2 hardening slice documented under `rust_review/`. That changes the Python refactor starting point:
+
+- Rust exposes narrower facade modules for rules, encoding, tactics, and classical search.
+- The Python extension has centralized byte-protocol helpers for legal rows, compact history rows, board-piece rows, and pair rows.
+- MCTS no longer has legacy panic convenience wrappers in the active path; Python-facing search work must route through the robust canonical API and preserve root/batch token checks.
+- `TacticalStatus` is the public tactical model; `ThreatStatus` is not a compatibility target.
+- Rust now has stronger invariant hooks and WindowKey/eval-bound documentation.
+
+This does not make Rust a trusted oracle. It makes Rust the production rules boundary that must still be checked at every Python contract boundary with semantic parity, stale-token tests, corruption tests, structured errors, and debug bundles.
+
 ## Structure
 
 - `orchestration/PARALLEL_SUBAGENT_EXECUTION_MODEL.md`

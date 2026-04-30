@@ -2,9 +2,11 @@
 
 Date: 2026-04-29
 
-Purpose: Phase 1 of a two-phase Rust review for the Hexo game engine.
+Purpose: Rust review and hardening evidence for the Hexo game engine.
 
-This repository is intentionally separate from the V2 refactor plan. Phase 1 does not attempt to prove every issue. It forms hypotheses, records direct issues where the evidence is unambiguous, and defines how Phase 2 should verify or falsify each risk.
+This directory began as a separate two-phase Rust review, but it is now a required evidence annex for the V2 modular refactor. Phase 1 formed hypotheses, Phase 2 verified and fixed the highest-confidence engine issues, and the remaining Rust/API/CI/performance items now feed the V2 gates for engine, search, replay, telemetry, and final CI closure.
+
+Rust remains canonical but suspicious: improved Rust behavior is not a reason to skip Python contract validation, stale-token checks, malformed FFI tests, structured error handling, or debug-bundle evidence.
 
 ## Reading Order
 
@@ -18,6 +20,17 @@ This repository is intentionally separate from the V2 refactor plan. Phase 1 doe
 8. `IMPLEMENTATION_SEQUENCE_AND_COMPLETENESS_CHECKLIST.md` - sequencing and acceptance checklist.
 9. `subagents/` - detailed subagent reports by review area.
 10. `evidence/` - command summaries, risky pattern inventory, and public API inventory.
+
+## V2 Crosswalk
+
+| Rust review area | V2 row / phase | Required closure evidence |
+| --- | --- | --- |
+| Stable facades and root export narrowing | `V2-095`, Phase 09 | public API drift check, no stale tactical names, no root implementation-detail re-exports except documented FFI exception. |
+| PyO3 legal/history/pair protocol ownership | `V2-013`, `V2-095`, Phases 01/09 | malformed byte tests, duplicate parser audit, protocol source/version in debug bundles. |
+| Tokenized fallible MCTS lifecycle | `V2-056`, Phase 05 | stale root token tests, stale batch token tests, structured `MCTSError` mapping, no panic/tokenless runtime calls. |
+| Tactical source of truth | `V2-016`, Phases 01/09 | `TacticalStatus` consumed by contracts/search/debug; no recreated `ThreatStatus` compatibility model. |
+| Invariants, WindowKey, eval bounds | `V2-016`, `V2-095`, Phases 01/09 | invariant-hook probes, far-coordinate fixtures, release-mode recompute/oracle tests. |
+| CI and performance budgets | `V2-090`, `V2-094`, `V2-095`, Phase 09 | fast Rust/Python gates, deep oracle artifacts, checked-in perf metadata and scheduled comparison gates. |
 
 ## Review Semantics
 

@@ -9,17 +9,18 @@ that had clear, low-risk resolutions.  The continuation pass also re-checked
 each Phase 1 subagent section, applied additional unambiguous fixes, and split
 remaining work into explicit refactor/design buckets.
 
-Phase 2 is now complete as a verification and implementation pass for the
-highest-risk engine correctness items.  The continuation pass resolved the
-largest remaining correctness decisions by adding a chronological history API,
+Phase 2 is complete as a Rust verification and implementation pass for the
+highest-confidence engine correctness items. The continuation pass resolved the
+largest known correctness risks by adding a chronological history API,
 tokenizing asynchronous MCTS inference, widening MCTS-owned coordinates to
 `i32`, replacing bounded tactical-hot-window dependence with a complete sparse
 tactical scanner, and routing first-party MCTS callers through fallible APIs.
 
-The remaining work is now architectural cleanup rather than known correctness
-poisoning: narrowing the public crate API, centralizing FFI byte protocols,
-expanding performance budgets, and deciding how aggressive to be about removing
-older convenience wrappers that still panic on misuse in direct Rust tests.
+This does not certify Rust as an unquestioned oracle for the broader V2 refactor.
+The highest-confidence defects are fixed, but final V2 closure still depends on
+public API drift checks, panic/unwrap inventory, FFI protocol single-owner proof,
+release-mode invariant/oracle coverage, structured Rust error telemetry,
+WindowKey/eval-bound evidence, and performance gates with checked-in baselines.
 
 ## Completed Fixes
 
@@ -114,13 +115,13 @@ Continuation verification:
 - `pytest Python/tests/test_engine_invariants.py -v` passed: 13 passed.
 - `pytest Python/tests/test_inference_server.py -v` passed: 7 passed.
 
-Local macOS caveat:
+Later cleanup verification:
 
-- `cargo test --workspace --release` failed while linking the `hexgame-py` lib
-  test binary because the local macOS linker did not resolve Python symbols for
-  PyO3 (`_PyBaseObject_Type`, `_PyBytes_*`, etc.).  This is separate from the
-  extension workflow: `maturin develop` plus Python smoke tests passed, and the
-  non-PyO3 release test targets passed.
+- A subsequent full cleanup verification passed `cargo test --workspace --release`
+  locally after the Rust API/FFI cleanup work. Final V2 closure should still
+  require the same command on the configured CI runner plus the `maturin develop`
+  Python extension path so PyO3 linkage problems fail loudly instead of becoming
+  local-environment folklore.
 
 Prior Phase 2 verification:
 

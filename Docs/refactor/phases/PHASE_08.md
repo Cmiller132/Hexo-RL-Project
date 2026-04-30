@@ -75,6 +75,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Dashboard tests must prove displayed model inputs match training inputs for golden positions.
 - Dashboard must be able to load or generate a single-position debug bundle and compare engine state, contracts, D6 transforms, training targets, model inputs, raw model outputs, policy-provider priors, pair strategy output, MCTS result, and replay record identity.
 - Dashboard mismatch views must show both sides of the comparison, the hashes/schema/source fields that disagree, and the likely owner subsystem. It must not hide mismatches behind generic "invalid input" messages.
+- Dashboard engine views must display Rust suspicion evidence when present: engine source, FFI protocol source, invariant-probe status, tactical status kind, MCTS token ids, and structured Rust error ownership.
 
 ## Autotune Work
 - Introduce typed `ModelRecipe` as the only tuning unit.
@@ -95,6 +96,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Add no-progress watchdogs for self-play progress, inference response progress, training batch progress, evaluation progress, and artifact/report writing.
 - Logs must be actionable: each validation failure, stall, abort, or poor score should include the likely subsystem to inspect and the relevant trace ids.
 - Poor-learning reports should include enough debug-bundle references to distinguish model underperformance from bad targets, bad legal rows, bad D6 transforms, policy mapping errors, MCTS misuse, replay corruption, or scheduler/runtime failures.
+- Poor-learning reports should never collapse Rust failures into generic "engine issue" language. They must distinguish replay/legal generation, tactical status, FFI decode, invariant failure, MCTS token lifecycle, MCTS prior validation, and move-application failure when traces contain that detail.
 - Delete or quarantine old autotune scripts that mutate raw config, encode model-family internals, or contain runtime sizing architecture branches.
 
 ## Required Deletions And Quarantine
@@ -139,6 +141,7 @@ Phase 08 makes evaluation, dashboard/debugging, and autotuning consume the same 
 - Dashboard required views render from `ContractInspector` or read-only services only.
 - Dashboard display assertions cover hash/source/version/trace fields.
 - Dashboard debug-bundle view displays engine, contracts, D6, targets, model outputs, policy priors, MCTS, and replay comparisons for golden positions.
+- Dashboard debug-bundle view displays Rust invariant status, FFI protocol source, tactical status, MCTS token lifecycle, and structured Rust errors when available.
 - Dashboard mismatch tests corrupt one subsystem at a time and assert the displayed owner subsystem is correct.
 - Dashboard has no private reconstruction imports for legal, D6, candidates, pairs, graph, model inputs, or replay projection.
 - Autotune accepts valid recipes and rejects incompatible recipes in dry-run before launch.

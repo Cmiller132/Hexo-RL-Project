@@ -1,7 +1,7 @@
 # Phase 00 - Baseline Freeze, Guardrails, And Evidence
 
 ## Purpose
-Freeze the last pre-refactor state, capture enough evidence to compare every later phase against it, and install the smallest immediate safety rails required by V2 before broader architecture work begins.
+Freeze the post-Rust, pre-Python-foundation state, capture enough evidence to compare every later phase against it, and install the smallest immediate safety rails required by V2 before broader architecture work begins.
 
 This phase must exceed the V2 Phase 0 outline. It is not just setup. It creates the audit trail, runtime transcripts, structured diagnostics, pair-policy guard, legacy inventory, and hard exit gates that keep the breaking refactor controlled.
 
@@ -26,6 +26,12 @@ Baseline and inventory must cover at least:
 - Existing package families: `inference/`, `selfplay/`, `graph/`, `train/`, `eval/`, `dashboard/`, `tuning/`.
 - Rust rule source: `crates/hexgame-core/`, `crates/hexgame-py/`.
 - Current config, recipe, checkpoint, replay, run, dashboard, and autotune entrypoints.
+
+Rust-specific baseline note:
+
+- The starting Rust boundary already includes the Phase 2 hardening work from `Docs/refactor/rust_review/`.
+- Baseline evidence must record the current Rust commit and test status separately from older pre-hardening assumptions.
+- The inventory should classify Rust as the production rules source, not as an unquestioned oracle. Any suspected Rust failure must be narrowed with invariant hooks, FFI malformed-input tests, stale-token tests, and independent fixture checks rather than hidden Python fallback paths.
 
 ## Artifact Directory Requirements
 Create and use only:
@@ -61,7 +67,7 @@ No later phase may treat an undocumented local run, checkpoint, replay file, tra
 
 ## Required Deliverables
 1. Baseline freeze report covering functional behavior, smoke performance, CI timings, config values, and known instability.
-2. Git tag and archive manifest for the last pre-refactor commit.
+2. Git tag and archive manifest for the last pre-Python-foundation cutover commit, including the completed Rust refactor SHA it contains.
 3. Command transcripts for all mandatory checks and smoke commands.
 4. Config hashes for every baseline command that depends on config, recipe, checkpoint, or runtime flags.
 5. Immediate `global_xattn` guard proving `pair_strategy=none` unless explicitly overridden by a named strategy.
@@ -75,12 +81,12 @@ No later phase may treat an undocumented local run, checkpoint, replay file, tra
 13. Hard exit gate report signed by the orchestrator before Phase 01 starts.
 
 ## Baseline Freeze
-Freeze the baseline before any breaking refactor edits.
+Freeze the baseline before any Python/project architecture cutover edits.
 
 Required actions:
 
 - Record current branch, git SHA, dirty status, submodule status if any, and relevant environment information.
-- Tag the last pre-refactor commit with an explicit Phase 00 tag name.
+- Tag the last pre-Python-foundation cutover commit with an explicit Phase 00 tag name and record the completed Rust refactor SHA it contains.
 - Produce an archive manifest for important checkpoints, replay data, run outputs, dashboard artifacts, tuning results, configs, and fixtures.
 - Record whether each archived artifact is copied, linked, intentionally skipped, or unavailable.
 - Record restore instructions for every archived artifact class.
@@ -256,6 +262,8 @@ Required inventories:
 - Python legal fallbacks outside explicit fixtures.
 - Private compact-history parsers.
 - Private D6 helpers.
+- Python or Rust code that duplicates `crates/hexgame-py/src/protocol.rs` legal/history/pair byte decoding.
+- Any Python call path that can reach old Rust MCTS panic wrappers, stringly errors, or tokenless root/batch APIs.
 - Architecture-string gates and `startswith("global_")` behavior.
 - Pair enablement based on `pair_prior_mix`, pair head presence, or architecture names.
 - Candidate construction duplicated across worker, sampler, dashboard, graph, or training.
@@ -291,7 +299,12 @@ Docs/refactor/artifacts/phase_00/inventory/rust_python_boundary_inventory.md
 Run and transcript these exact checks unless the manifest records a blocker:
 
 ```text
+cargo fmt --all -- --check
 cargo test --workspace
+cargo test --workspace --release
+cargo clippy --workspace --release -- -D warnings
+maturin develop --manifest-path crates/hexgame-py/Cargo.toml --features python
+pytest Python/tests/test_engine_smoke.py Python/tests/test_engine_invariants.py Python/tests/test_inference_server.py -q
 pytest -q Python/tests
 python -m hexorl.cli --help
 ```
@@ -350,6 +363,7 @@ Hard gates:
 - Architecture-string inventory exists.
 - Deletion and legacy inventory exists with owning phases.
 - Rust/Python rule boundary inventory exists.
+- Rust/Python rule boundary inventory includes the completed Rust Phase 2 state, remaining suspicion points, protocol owners, MCTS token lifecycle, structured error gaps, and crash-containment requirements for panic/abort behavior.
 - All known blockers have owners and next actions.
 
 ## Exit Criteria

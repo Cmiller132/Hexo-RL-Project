@@ -1,7 +1,7 @@
 # Phase 01 - Engine + Contracts Foundation
 
 ## Purpose
-Establish the first hard boundary of the V2 architecture: Rust owns production game-state truth, Python exposes that truth through `engine/`, and pure versioned contracts describe the data that every later subsystem consumes.
+Establish the first hard boundary of the V2 architecture: Rust is the intended production game-state source, Python exposes that source only through validating `engine/` wrappers, and pure versioned contracts describe the data that every later subsystem consumes.
 
 This phase is not contracts-only. It creates the shared foundation for history, legal rows, D6 symmetry, targets, candidates, pairs, telemetry, validation, and debug inspection while removing production paths that privately rebuild rules data in Python.
 
@@ -51,7 +51,7 @@ Contract rules:
 - Contracts may not hide subsystem behavior, perform inference, run search, build dashboards, or own process orchestration.
 
 ### 2. Engine Boundary
-Create `Python/src/hexorl/engine/` as the only Python-facing Rust rules boundary.
+Create `Python/src/hexorl/engine/` as the only Python-facing Rust rules boundary. It wraps the compiled `_engine` PyO3 module; direct `_engine` imports are banned outside this package, tests, and explicit fixture tooling.
 
 Required modules:
 - `__init__.py`
@@ -67,14 +67,19 @@ Boundary rules:
 - `engine/history.py` owns Rust replay/history parity helpers.
 - `engine/encoding.py` owns Python-facing encode/decode calls over the Rust representation.
 - `engine/parity.py` contains shared parity harness helpers for tests.
+- Python wrappers must use the centralized Rust/PyO3 protocol owner in `crates/hexgame-py/src/protocol.rs` for legal rows, compact history rows, board-piece rows, and pair rows; they must not create a second byte layout or row-width interpretation.
 - Production code may not silently fall back from Rust legal rows to Python legal rows.
 - Any fixture-only fallback must be explicit, local to tests or fixture builders, and marked with `source="fixture"`.
 
 Engine verification rule:
 - Do not treat the current Rust/Python boundary as automatically correct.
+- Treat the completed Rust hardening work as the canonical implementation baseline, but keep suspicion at the boundary: every Rust result must either validate into a Python contract or fail with a structured owner-specific error.
 - Every Rust-exposed payload must be validated for semantic correctness, not only shape or row count.
 - Legal rows must be checked for duplicate cells, occupied cells, current-player correctness, phase correctness, terminal-state consistency, row ordering, dense-index mapping, and stable source/hash identity.
 - History replay must cross-check final board state, side to move, terminal result, placement counts, and rejected illegal transitions.
+- Tactical responses must use `TacticalStatus`; `ThreatStatus` must not be recreated as a Python compatibility model.
+- Debug and parity tests should exercise Rust invariant hooks, including candidate, hash, winner, move-history, eval/hot-window, and undo consistency where exposed.
+- FFI boundary logs and debug bundles must include method name, trace id, history hash, legal hash, root/batch token when present, row counts, dtype/shape/contiguity, duration, and failure class.
 - Engine output used by contracts must be copied, frozen, or guarded so later mutation cannot invalidate hashes, cached views, targets, or traces silently.
 
 ### 3. History Ownership
@@ -232,7 +237,7 @@ Required D6 tests:
 - Python/Rust D6 parity for coordinates
 - Python/Rust D6 parity for histories
 - Python/Rust D6 parity for legal rows
-- Python/Rust D6 parity for dense tensors where Rust support exists
+- Python/Rust D6 parity for dense tensors where Rust support exists; otherwise use indirect engine-state parity and document the missing exposed Rust D6 surface
 - composition invariant
 - inverse invariant
 - policy target mass preservation
@@ -250,6 +255,8 @@ Required boundary/import tests:
 - `contracts/` imports no forbidden runtime subsystem packages
 - production code imports legal/history/D6 from `contracts/` or `engine/`, not private helpers
 - no runtime import path uses fixture-only legal/history providers
+- no runtime code imports `_engine` directly outside `Python/src/hexorl/engine/`
+- no Python or Rust runtime path duplicates FFI byte decoding already owned by `crates/hexgame-py/src/protocol.rs`
 
 ## Import And `rg` Audits
 
@@ -263,6 +270,9 @@ Required searches:
 - forbidden imports from `contracts/` into model/inference/search/train/dashboard/tuning/self-play orchestration
 - runtime imports of fixture-only providers
 - `source="fallback"` or equivalent degraded legal/history sources
+- direct `_engine` imports outside `Python/src/hexorl/engine/`, tests, and explicit fixture tooling
+- duplicate legal/history/pair byte parsers outside `crates/hexgame-py/src/protocol.rs`
+- `ThreatStatus`, `threat_status`, or collapsed tactical compatibility names in new runtime code
 
 Expected audit result:
 - No production private legal/history/D6 owners remain.
@@ -314,6 +324,7 @@ All gates are required.
 - Rust/Python D6 parity passes.
 - Rust legal parity passes.
 - History encode/decode parity passes for golden histories.
+- Malformed FFI byte, invalid protocol row-width, direct `_engine` import, and Rust invariant-probe tests pass.
 - Contract validation, equality, hash, source, and import-purity tests pass.
 - `rg` audits find no production private legal/history/D6 parser or fallback owners.
 - Fixture-only fallbacks cannot be imported by production runtime paths.

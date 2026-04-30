@@ -43,7 +43,7 @@ Required dependency contracts:
 
 - `PolicyProvider`: evaluates policy/value outputs from typed position/search contracts.
 - `PairStrategy`: decides whether pair policy is used; default strategy is `none`.
-- `EngineAdapter`: owns Rust replay/legal/MCTS calls and hides engine-specific call details.
+- `EngineAdapter`: owns `PyHexGame` / `MCTSEngine` lifecycle, Rust replay/legal/MCTS calls, tokenized root/leaf state, and engine-specific call details.
 - `SelfPlayRecordWriter`: writes replay records; the runner does not write files directly.
 - `SelfPlayTelemetrySink`: emits structured events, summaries, traces, and stall diagnostics.
 - `SelfPlayContractBuilders`: bundles the canonical builders needed by the runner, including history/legal/tactical/candidate/pair/graph builders as applicable.
@@ -74,6 +74,7 @@ Required dependency contracts:
 - inference request shape decisions
 - pair enablement from `pair_prior_mix`, head presence, model family, or architecture name
 - checkpoint cleanup or model-state compatibility handling
+- `HAS_ENGINE` production fallback, `MockMCTSEngine`, `RealMCTSEngine`, uniform-policy fallback when inference fails, direct `client.submit_*`, direct pair chunk scoring, direct `_engine.MCTSEngine`, or direct `process_game_record`
 
 Any such logic must live in `contracts/`, `engine/`, `graph/`, `inference/`, `search/`, `models/`, `replay/`, or `selfplay/game_runner.py` as assigned by the V2 ownership map.
 
@@ -83,7 +84,7 @@ Any such logic must live in `contracts/`, `engine/`, `graph/`, `inference/`, `se
 
 - initialize a game from `GameRunRequest`
 - request legal/replay state through `EngineAdapter`
-- build canonical position/search contracts through `SelfPlayContractBuilders`
+- build canonical position/search contracts through `SelfPlayContractBuilders`, which consume validated Rust `RootInit`, legal bytes, pending leaf metadata, and compact history bytes rather than privately rebuilding legal/history/D6 facts
 - request policy/value priors through `PolicyProvider`
 - request pair behavior only through `PairStrategy`
 - invoke search through `EngineAdapter`
@@ -101,6 +102,8 @@ Self-play logs must make these failure classes distinguishable:
 - worker alive but waiting on IPC or inference
 - worker stuck before inference
 - Rust replay/legal generation slow or failing
+- Rust invariant check failing after replay, move application, undo, or MCTS traversal
+- stale MCTS root/batch tokens or structured Rust `MCTSError` failures
 - tactical, candidate, pair, graph semantic, or tensorization construction slow
 - pair scoring accidentally enabled or above budget
 - IPC request packed but not answered
@@ -108,6 +111,7 @@ Self-play logs must make these failure classes distinguishable:
 - MCTS expansion/backprop slow
 - record writing slow or failing
 - legal rows disagree between engine and contract
+- FFI protocol bytes malformed, stale, or decoded into unexpected row widths
 - priors missing, masked out, non-finite, or mapped to wrong rows
 - contract, tensor, policy, search, or replay payload mutated after validation
 - replay record content disagrees with the traced position contracts
@@ -135,6 +139,7 @@ Required heartbeat fields:
 - legal, candidate, pair, token, and relation counts
 - active model family, recipe id, policy provider, and pair strategy
 - pair rows possible and pair rows scored
+- root_generation, batch_generation, FFI protocol version, legal/history byte hashes, inference slot sequence, Rust MCTS error code, and whether any forbidden fallback was attempted
 - recent timing summary
 - warning count and last warning
 - no-progress duration
@@ -143,6 +148,7 @@ Required no-progress fields:
 
 - phase, elapsed time, last completed position, last IPC send/receive
 - last engine operation and duration
+- last Rust error code or invariant-probe failure, when present
 - last policy request id and wait duration
 - last record writer operation and duration
 - queue depth or transport state when available
@@ -238,6 +244,8 @@ The bundle must localize failures to one of:
 
 ```text
 engine replay/legal
+engine invariant hook
+PyO3 protocol decode
 contract validation
 D6 transform
 candidate builder
@@ -249,6 +257,7 @@ model forward/output validation
 policy provider row mapping
 pair strategy
 EngineAdapter/MCTS
+MCTS token lifecycle
 move application
 record writer/replay encoding
 ```
@@ -332,6 +341,7 @@ Run and satisfy these audits exactly:
 rg "architecture|startswith\\(\"global_|pair_prior_mix|pair_head|GlobalHexGraphNet|build_model_from_config" Python/src/hexorl/selfplay/worker.py
 rg "Candidate|PairAction|PAIR_ACTION|graph_token|graph_relation|chunk|MCTS|prior" Python/src/hexorl/selfplay/worker.py
 rg "Replay|record|writer|json|np.save|open\\(" Python/src/hexorl/selfplay/worker.py
+rg "HAS_ENGINE|MockMCTSEngine|RealMCTSEngine|_score_graph_pair_chunks|_score_crop_pair_chunks|_align_global_logits_to_rust_legal|_engine\\.MCTSEngine|client\\.submit_|process_game_record|uniform.*fallback" Python/src/hexorl/selfplay Python/src/hexorl/search
 rg "hexorl\\.selfplay\\.worker" Python/src/hexorl/search Python/src/hexorl/contracts Python/src/hexorl/graph Python/src/hexorl/replay
 ```
 

@@ -6,7 +6,7 @@ Source of truth: `Docs/MODULAR_HEXO_ARCHITECTURE_REDESIGN_V2_20260429.md`
 
 - **Orchestrator Agent:** owns phase scope, interface freeze, merge sequencing, conformance review, artifact audit, and V2 requirement matrix closure.
 - **Subagent 1 - Contracts/Engine/Schema:** contracts, engine boundary, parity schema, validation, source/version/hash policy.
-- **Subagent 2 - Runtime/Self-Play/Inference:** worker, game runner, IPC, inference transport, runtime wiring, observability.
+- **Subagent 2 - Runtime/Self-Play/Inference:** worker, game runner, IPC, inference transport, runtime wiring, observability, Rust FFI/MCTS failure localization.
 - **Subagent 3 - Models/Search/Tuning:** model registry, families, checkpoints, policy providers, pair strategies, recipe spaces.
 - **Subagent 4 - Replay/Training/Eval/Dashboard:** replay storage/projection, train adapters, eval players, dashboard inspectors.
 - **Subagent 5 - Quality/CI/Docs:** tests, fixtures, import audits, deletion manifests, telemetry artifacts, CI jobs, docs.
@@ -45,6 +45,7 @@ A phase fails if any condition is unmet:
 - dashboard, trainer, eval, or autotune reconstructs private approximations
 - required telemetry/log samples are missing
 - tests do not cover the invariant that changed
+- Rust-derived data is accepted without Python contract validation, stale-token checks, or structured error ownership
 - docs do not match shipped behavior
 
 ## Phase-To-Subagent Split
@@ -58,7 +59,7 @@ A phase fails if any condition is unmet:
 
 ### Phase 01 - Engine + Contracts Foundation
 - S1: contracts, schema/version/hash/source policy, validation.
-- S2: `engine/` Rust boundary and production fallback removal.
+- S2: `engine/` Rust boundary, direct `_engine` import removal, FFI protocol validation, and production fallback removal.
 - S3: model/search consumers updated to contract/engine outputs where phase-owned.
 - S4: replay/training/eval/dashboard fixture adapters for contract parity.
 - S5: Rust/Python parity tests, import audits, contract docs.
@@ -78,15 +79,15 @@ A phase fails if any condition is unmet:
 - S5: checkpoint manifest tests, registry docs, deletion manifest.
 
 ### Phase 04 - Inference Protocol And Adapters
-- S1: `InferenceProtocolManifest`, request/response schemas.
-- S2: transport lifecycle, handshake, timeout/fail-fast behavior.
+- S1: `InferenceProtocolManifest`, request/response schemas, Rust FFI protocol identities.
+- S2: transport lifecycle, slot generation counters, handshake, timeout/fail-fast behavior.
 - S3: dense/sparse/global/pair adapters and capability mapping.
 - S4: training/eval/dashboard interoperability expectations for inference outputs.
 - S5: protocol mismatch tests, response telemetry tests, latency/throughput artifacts.
 
 ### Phase 05 - PolicyProvider, PairStrategy, EngineAdapter
 - S1: search context/evaluation contracts and pair strategy schema.
-- S2: runtime integration and direct Rust MCTS call removal.
+- S2: runtime integration, tokenized Rust MCTS lifecycle, structured `MCTSError` mapping, and direct Rust MCTS call removal.
 - S3: policy providers, pair strategies, global graph pair-head consumption gates.
 - S4: replay/training pair metadata validation hooks.
 - S5: no-implicit-pair tests, cap tests, telemetry assertions, import audits.
@@ -114,7 +115,7 @@ A phase fails if any condition is unmet:
 
 ### Phase 09 - Final Deletion And CI Enforcement
 - S1: requirement matrix closure and schema/alias deletion proof.
-- S2: runtime import graph and engine/self-play/inference/search deletion proof.
+- S2: runtime import graph, Rust API/protocol/MCTS suspicion gates, and engine/self-play/inference/search deletion proof.
 - S3: model/checkpoint/train/eval/tuning deletion proof.
 - S4: replay/dashboard/final smoke verification.
 - S5: CI policy jobs, final conformance report, documentation cleanup.
@@ -127,5 +128,6 @@ A phase fails if any condition is unmet:
 - Deletion manifest and banned-import checks agree.
 - Contract version/source/hash fields are asserted in tests.
 - Required telemetry/log samples exist and are actionable.
+- Rust-facing artifacts include malformed FFI, stale MCTS token, invariant-probe, panic/unwrap inventory, and public API drift evidence.
 - No unresolved TODO/FIXME remains in changed runtime code for phase-owned work.
 - Rollback tag is created and recovery smoke is documented.

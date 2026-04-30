@@ -47,6 +47,8 @@ Do not add compatibility shims that keep the old direct worker-to-MCTS or worker
 position identity/history hash
 phase
 legal action table
+Rust root_generation when a root already exists
+Rust batch_generation when leaves are selected
 candidate table, if applicable
 pair action table request state, if applicable
 graph contract/tensor handle, if applicable
@@ -56,6 +58,19 @@ trace id
 ```
 
 `SearchContext` must not rebuild legal rows, candidates, graph rows, pair rows, compact history, or D6 transforms.
+
+Search must align with the canonical Rust MCTS lifecycle:
+
+```text
+init_root
+-> expand_root / expand_root_with_sparse_priors / expand_root_with_global_priors
+-> apply_root_pair_first_priors / apply_root_pair_priors / apply_root_pair_second_priors, when an explicit root strategy requests pair influence
+-> select_leaves
+-> expand_and_backprop / expand_and_backprop_with_sparse / expand_and_backprop_with_sparse_sources
+-> sample_action / re_root
+```
+
+Root and batch generation tokens are part of the search contract. A stale token means the request is invalid and must fail with ownership metadata; it must not be retried against an unverified tree.
 
 ### SearchEvaluation
 
@@ -216,6 +231,7 @@ Hard forbidden behavior:
 - No implicit pair scoring because architecture/model family starts with `global_`.
 - No leaf pair scoring unless `PairStrategySpec.leaf_enabled` is true and `max_leaf_pair_rows` is set.
 - No full pair scoring unless `name == "diagnostic_full_root"`, `diagnostic == true`, `root_enabled == true`, `leaf_enabled == false`, and `max_full_pair_rows` is set.
+- Leaf pair scoring remains disabled unless a canonical Rust leaf-pair API is added and validated. Current pair-prior influence is root-only.
 
 ## Global Graph Pair Head Contracts
 
@@ -255,9 +271,19 @@ Rust MCTS calls move behind one module:
 
 ```python
 class EngineAdapter:
+    def init_root(self, context: SearchContext) -> RootToken: ...
     def expand_root(self, evaluation: SearchEvaluation) -> None: ...
-    def apply_pair_priors(self, pair_eval: PairEvaluation) -> None: ...
+    def expand_root_with_sparse_priors(self, evaluation: SearchEvaluation) -> None: ...
+    def expand_root_with_global_priors(self, evaluation: SearchEvaluation) -> None: ...
+    def apply_root_pair_first_priors(self, pair_eval: PairEvaluation) -> None: ...
+    def apply_root_pair_priors(self, pair_eval: PairEvaluation) -> None: ...
+    def apply_root_pair_second_priors(self, pair_eval: PairEvaluation) -> None: ...
+    def select_leaves(self, context: SearchContext) -> LeafBatch: ...
     def expand_and_backprop(self, evaluations: list[SearchEvaluation]) -> None: ...
+    def expand_and_backprop_with_sparse(self, evaluations: list[SearchEvaluation]) -> None: ...
+    def expand_and_backprop_sparse_sources(self, evaluations: list[SearchEvaluation]) -> None: ...
+    def sample_action(self, context: SearchContext) -> SearchAction: ...
+    def re_root(self, action: SearchAction) -> RootToken: ...
 ```
 
 `EngineAdapter` is the only Python caller of Rust MCTS APIs.
@@ -268,6 +294,9 @@ Hard rules:
 - `EngineAdapter` accepts only `SearchEvaluation` and `PairEvaluation`, never raw model logits.
 - `EngineAdapter` validates legal row identity before expansion.
 - `EngineAdapter` validates pair row identity before pair-prior application.
+- `EngineAdapter` calls only the canonical fallible Rust MCTS API. It must not call or recreate legacy panic wrappers, stringly compatibility methods, or tokenless root/batch lifecycle helpers.
+- Rust `MCTSError` values and PyO3 `ValueError` failures must be mapped into structured Python exceptions/telemetry with the failing operation, trace id, root token, batch token when present, legal-table hash, pair-table hash, and prior source.
+- Root pair-prior application may use first, joint, or second pair priors only when the explicit `PairStrategy` requested that root behavior and row identities match the canonical `PairActionTable`.
 - MCTS telemetry reports whether `pair_first`, `pair_second`, `pair_joint`, tactical pairs, or no pairs influenced the decision.
 - Pair-prior application is a no-op for empty `PairEvaluation`, and the trace must show that no pair influence occurred.
 
@@ -279,6 +308,7 @@ Required verification:
 - Verify that every prior accepted by MCTS maps to exactly one `LegalActionTable` row with matching row id, dense index, coordinate, phase, schema version, source hash, and trace id.
 - Verify that masked rows cannot receive prior mass and legal rows cannot disappear silently.
 - Verify that non-finite logits, non-finite values, all-zero prior mass, stale legal hashes, stale pair hashes, duplicate rows, and wrong protocol versions fail before MCTS.
+- Verify that stale root tokens, stale batch tokens, invalid policy lengths, invalid value lengths, bad sparse metadata, non-finite priors, far-coordinate actions, illegal pair-row identities, and malformed Rust/PyO3 protocol inputs fail with structured ownership before they can poison tree state.
 - Verify that MCTS cannot mutate the `SearchEvaluation`, `PairEvaluation`, legal table, pair table, or policy-provider response.
 - Verify that search traces report raw prior source, normalized prior, MCTS visit count, selected move, value estimate, pair influence, and fallback reason when a fallback is explicitly allowed.
 - Add a single-position policy/search debug bundle containing contracts, raw model outputs, decoded outputs, priors, pair evaluation, MCTS input, MCTS output, selected move, hashes, and timings.
@@ -348,6 +378,10 @@ test_engine_adapter_validates_pair_row_identity
 test_engine_adapter_empty_pair_eval_is_noop
 test_engine_adapter_rejects_mutated_search_evaluation
 test_engine_adapter_rejects_stale_hashes_duplicate_rows_and_nonfinite_priors
+test_engine_adapter_rejects_stale_root_token
+test_engine_adapter_rejects_stale_batch_token
+test_engine_adapter_maps_mcts_error_to_structured_python_error
+test_engine_adapter_uses_no_legacy_panic_or_tokenless_mcts_api
 test_policy_search_debug_bundle_localizes_mapping_or_mcts_failure
 test_mcts_integration_consumes_policy_provider_outputs
 test_mcts_integration_consumes_pair_strategy_outputs_when_enabled
@@ -370,6 +404,7 @@ Run these audits and save the command/output summaries as phase artifacts:
 rg -n "architecture\\.startswith|startswith\\(\"global_|global_graph_enabled|global_xattn|pair_prior_mix|pair_head_present" Python/src/hexorl
 rg -n "score_pair|pair_chunk|pair.*forward|policy_pair_first|policy_pair_second|policy_pair_joint|PairPolicyHead" Python/src/hexorl/selfplay Python/src/hexorl/search Python/src/hexorl/inference
 rg -n "mcts|MCTS|expand_root|expand_and_backprop|apply_pair_priors" Python/src/hexorl
+rg -n "MockMCTSEngine|RealMCTSEngine|_engine\\.MCTSEngine|try_|tokenized|init_root\\(|select_leaves\\(|Result<.*, String>|panic wrapper|unwrap\\(" Python/src/hexorl crates/hexgame-py/src crates/hexgame-core/src/mcts.rs
 rg -n "from hexorl\\.engine|import hexorl\\.engine" Python/src/hexorl/search Python/src/hexorl/selfplay Python/src/hexorl/eval
 ```
 
@@ -378,6 +413,7 @@ Expected audit outcomes:
 - Architecture string checks remain only in model registry/spec tests or migration-only code, not runtime search/self-play paths.
 - Pair scoring names in runtime code are owned by `search/pair_strategy.py` and inference adapters only.
 - Rust MCTS API imports/calls are owned by `search/engine_adapter.py` only.
+- No Python search path or PyO3 wrapper uses legacy panic wrappers, stringly MCTS errors, tokenless root/batch lifecycle calls, `MockMCTSEngine`, or `RealMCTSEngine` in runtime.
 - Evaluation reaches models through `PolicyProvider`, not dense-only direct model calls.
 
 ## Required Artifacts
@@ -389,6 +425,7 @@ Produce these artifacts before marking the phase complete:
 - `PairStrategySpec` schema and validation tests for root/leaf/full caps.
 - Default recipe/config evidence showing `none` for global graph families, including `global_xattn`.
 - MCTS trace sample showing policy provider, pair strategy, legal row count, pair rows possible, selected pair rows, scored pair rows, and pair influence.
+- MCTS error trace samples for stale root token, stale batch token, malformed priors, sparse metadata mismatch, and pair-row mismatch.
 - Single-position policy/search debug bundle showing raw outputs, decoded outputs, row-mapped priors, pair evaluation, MCTS inputs/outputs, hashes, trace ids, and selected move.
 - Mutation/corruption verification proof for policy outputs, legal rows, pair rows, priors, and MCTS inputs.
 - Import audit output summary proving `EngineAdapter` is the only Rust MCTS caller.
@@ -407,6 +444,8 @@ pair enablement from pair head presence
 pair enablement from architecture prefix
 direct MCTS prior wiring in worker
 direct Rust MCTS calls outside EngineAdapter
+legacy MCTS panic wrappers or tokenless API calls
+worker-owned `RealMCTSEngine` and `MockMCTSEngine`; production wrappers belong under `search/engine_adapter.py`, test fakes under tests
 dense-only evaluation policy assumptions
 ```
 
@@ -419,6 +458,8 @@ SelfPlayWorker contains no architecture string checks.
 SearchEvaluation priors are row-mapped for dense, restnet, graph_hybrid, and global_graph.
 PolicyProvider acceptance tests pass for dense/restnet/graph_hybrid/global_graph.
 EngineAdapter is the only Python caller of Rust MCTS.
+EngineAdapter uses only canonical fallible MCTS APIs and preserves root/batch token validation.
+MCTS failures are structured Python errors with trace ids and Rust error ownership, not panics or compatibility strings.
 No pair scoring happens without PairStrategy.
 No pair scoring happens from head presence, pair_prior_mix, config side effects, or architecture prefix.
 PairStrategySpec requires explicit root/leaf/full caps for any scoring mode that can generate rows.
