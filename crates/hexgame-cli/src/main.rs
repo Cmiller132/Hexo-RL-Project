@@ -1,4 +1,5 @@
-use hexgame_core::{Hex, HexGameState, MCTSEngine};
+use hexgame_core::mcts::MCTSEngine;
+use hexgame_core::rules::{Hex, HexGameState};
 use std::env;
 use std::io::{self, Write};
 use std::time::Instant;

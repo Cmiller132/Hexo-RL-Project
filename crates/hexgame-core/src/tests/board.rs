@@ -50,6 +50,7 @@ mod tests {
                 } else {
                     let _ = game.place(q, r);
                 }
+                game.assert_consistent();
                 assert_legal_matches_bruteforce(&game, 2);
                 assert_legal_matches_bruteforce(&game, PLACEMENT_RADIUS);
             }

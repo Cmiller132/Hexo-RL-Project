@@ -1,5 +1,6 @@
 pub mod encode;
 pub mod engine;
+mod protocol;
 
 use pyo3::prelude::*;
 

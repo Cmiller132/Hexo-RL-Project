@@ -69,9 +69,9 @@ The Refactor's workspace split exists specifically to solve a build-time problem
 - `EvalState` in `eval/state.rs` owns: `score`, `ThreatCounts` per player, `HotWindows`, `Box<[u16; 11163]>`, `delta_stack: Vec<EvalDelta>`.
 - `HotWindows` uses `SmallVec<[WindowKey; 32]>` per player — zero-allocation inline buffer (never spills to heap in practice).
 - `WindowKey(u32)` packs `(q, r, dir)` into 32 bits — used as cheap `HashSet`/`HashMap` keys without heap allocation.
-- `ThreatStatus` enum in `threats.rs` cleanly models: `Quiet`, `WinningTurn(Turn)`, `MustBlock(BlockConstraint)`, `Unblockable`.
+- `TacticalStatus` enum in `threats.rs` cleanly models: `Quiet`, `WinningTurns`, `MustBlock(BlockConstraint)`, `Unblockable`.
 - `board.rs` introduces **two** candidate sets: `candidates` (radius 2) and `placement_candidates` (radius 8) — the latter enables O(1) legality checks.
-- `threat_status()` is a **standalone function** (not a method), computed once per node and reused.
+- `tactical_status()` is a **standalone function** (not a method), computed once per node and reused.
 
 ### 2.3 MCTS Engine
 
@@ -107,7 +107,7 @@ Both implementations are very similar:
 
 **Minor differences:**
 - Refactor's `search.rs` uses `Turn::pair(a, b)` canonicalization (ensures `a <= b`) for TT consistency.
-- Refactor uses `HotWindows` + `ThreatStatus` from the factored eval module rather than inline hot window logic.
+- Refactor uses `HotWindows` + `TacticalStatus` from the factored eval module rather than inline hot window logic.
 
 ### 2.5 Evaluation & Pattern System
 

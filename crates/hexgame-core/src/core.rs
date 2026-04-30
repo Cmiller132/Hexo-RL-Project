@@ -209,61 +209,57 @@ pub const PLACEMENT_RADIUS: i32 = 8;
 /// three principal hex directions.
 ///
 /// `WindowKey` replaces the old `(i32, i32, u8)` tuple for hot-window lookups.
-/// It packs `q`, `r` and `dir` into a single `u32` so that it can be used
-/// directly as a cheap `HashMap` / `HashSet` key without heap allocation.
-///
-/// # Bit layout
-///
-/// ```text
-/// [ dir:2 | r:15 (signed, -16384..16383) | q:15 (signed, -16384..16383) ]
-/// ```
-///
-/// Both coordinates are stored in two's-complement form and sign-extended on
-/// extraction.
+/// It stores full `i32` coordinates plus a validated direction index. This is
+/// intentionally wider than the bounded eval grid: release builds must never
+/// alias distant windows by truncating coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WindowKey(u32);
+pub struct WindowKey {
+    q: i32,
+    r: i32,
+    dir: u8,
+}
 
 impl WindowKey {
     /// Create a new `WindowKey` from axial coordinates and a direction index.
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if `q` or `r` are outside the range
-    /// `-16384..=16383` or if `dir` is not a valid `HEX_DIRECTIONS` index (0..3).
+    /// Panics if `dir` is not a valid `HEX_DIRECTIONS` index (0..3).  Use
+    /// [`WindowKey::try_new`] for runtime direction values that should be
+    /// rejected without panicking.
     #[inline(always)]
     pub const fn new(q: i32, r: i32, dir: u8) -> Self {
-        debug_assert!(
-            q >= -16384 && q <= 16383,
-            "q coordinate out of 15-bit signed range"
-        );
-        debug_assert!(
-            r >= -16384 && r <= 16383,
-            "r coordinate out of 15-bit signed range"
-        );
-        debug_assert!(dir < 3, "dir must be a valid HEX_DIRECTIONS index (0..3)");
-
-        let q_bits = (q as u32) & 0x7FFF;
-        let r_bits = (r as u32) & 0x7FFF;
-        let dir_bits = (dir as u32) & 0x3;
-        Self((dir_bits << 30) | (r_bits << 15) | q_bits)
+        assert!(dir < 3, "dir must be a valid HEX_DIRECTIONS index (0..3)");
+        Self { q, r, dir }
     }
 
-    /// Extract the `q` coordinate (15-bit signed, sign-extended to `i32`).
+    /// Fallibly create a `WindowKey` from axial coordinates and a runtime
+    /// direction index.
+    #[inline(always)]
+    pub const fn try_new(q: i32, r: i32, dir: u8) -> Option<Self> {
+        if dir < 3 {
+            Some(Self { q, r, dir })
+        } else {
+            None
+        }
+    }
+
+    /// Extract the `q` coordinate.
     #[inline(always)]
     pub const fn q(self) -> i32 {
-        sign_extend_15(self.0 & 0x7FFF)
+        self.q
     }
 
-    /// Extract the `r` coordinate (15-bit signed, sign-extended to `i32`).
+    /// Extract the `r` coordinate.
     #[inline(always)]
     pub const fn r(self) -> i32 {
-        sign_extend_15((self.0 >> 15) & 0x7FFF)
+        self.r
     }
 
     /// Extract the direction index (`0..3`).
     #[inline(always)]
     pub const fn dir(self) -> u8 {
-        ((self.0 >> 30) & 0x3) as u8
+        self.dir
     }
 
     /// Return the [`Hex`] at `offset` steps along this window's direction.
@@ -271,21 +267,9 @@ impl WindowKey {
     /// `offset` may be negative to step backward.  The direction vector is
     /// taken from [`HEX_DIRECTIONS`].
     #[inline(always)]
-    #[cfg(test)]
     pub fn cell_at(self, offset: i32) -> Hex {
         let (dq, dr) = HEX_DIRECTIONS[self.dir() as usize];
         Hex::new(self.q() + dq * offset, self.r() + dr * offset)
-    }
-}
-
-/// Sign-extend a 15-bit two's-complement value to a full `i32`.
-const fn sign_extend_15(raw: u32) -> i32 {
-    // The sign bit for a 15-bit value is bit 14 (0x4000).
-    if raw & 0x4000 != 0 {
-        // Set all upper bits to 1 so the i32 interpretation becomes negative.
-        (raw | 0xFFFF8000) as i32
-    } else {
-        raw as i32
     }
 }
 
@@ -301,7 +285,7 @@ const fn sign_extend_15(raw: u32) -> i32 {
 /// # Examples
 ///
 /// ```
-/// use hexgame_core::{hex_distance, Hex};
+/// use hexgame_core::rules::{hex_distance, Hex};
 ///
 /// assert_eq!(hex_distance(Hex::ORIGIN, Hex::ORIGIN), 0);
 /// assert_eq!(hex_distance(Hex::new(0, 0), Hex::new(3, 0)), 3);

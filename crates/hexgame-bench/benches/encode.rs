@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use hexgame_core::encoding;
-use hexgame_core::{hex_distance, Hex, HexGameState, PLACEMENT_RADIUS};
+use hexgame_core::rules::{hex_distance, Hex, HexGameState, PLACEMENT_RADIUS};
 use std::collections::HashSet;
 
 fn bench_encode_board(c: &mut Criterion) {

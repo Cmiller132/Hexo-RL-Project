@@ -22,15 +22,13 @@
 //!
 //! ## Module Architecture
 //!
-//! | Module | Responsibility |
-//! |--------|---------------|
 //! | Facade | Responsibility |
 //! |--------|---------------|
 //! | crate root / [`rules`] | Hex coordinates, rules, turns, and game state |
 //! | [`encoding`] | Unified 13-channel neural-network tensor encoder |
-//! | [`tactics`] | Complete tactical status and compatibility threat status |
+//! | [`tactics`] | Complete tactical status and mask helpers |
 //! | [`classical`] | Turn-based alpha-beta search |
-//! | crate root | Neural MCTS with PUCT |
+//! | [`mcts`] | Neural MCTS with PUCT, exposed for the Python FFI crate |
 //!
 //! ## Dependency Graph
 //!
@@ -42,10 +40,9 @@
 //!
 //! ## Key Types
 //!
-//! - [`HexGameState`] — the main game state; supports incremental place/unplace.
-//! - [`Turn`] — a single placement or a pair of placements.
+//! - [`HexGameState`](rules::HexGameState) — the main game state; supports incremental place/unplace.
+//! - [`Turn`](rules::Turn) — a single placement or a pair of placements.
 //! - [`TacticalStatus`](tactics::TacticalStatus) — the tactical classification of a position (winning, must-block, etc.).
-//! - [`EvalState`](eval::state::EvalState) — incremental pattern evaluation with `O(1)` updates per stone.
 //!
 //! ## Testing Strategy
 //!
@@ -59,7 +56,7 @@ mod board;
 mod core;
 mod encoder;
 mod eval;
-mod mcts;
+pub mod mcts;
 mod search;
 mod threats;
 
@@ -94,9 +91,3 @@ pub mod tactics {
 pub mod classical {
     pub use crate::search::{iterative_deepening, SearchResult};
 }
-
-// Re-exports for convenient access.
-pub use board::{GameError, HexGameState, MoveRecord};
-pub use core::{hex_distance, Hex, Turn, WindowKey, HEX_DIRECTIONS, PLACEMENT_RADIUS, WIN_LENGTH};
-pub use mcts::{MCTSEngine, MCTSError};
-pub use threats::{live_cells, tactical_status, TacticalStatus};

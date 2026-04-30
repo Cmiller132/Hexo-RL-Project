@@ -1,4 +1,4 @@
-use hexgame_core::{GameError, Hex, HexGameState, PLACEMENT_RADIUS, WIN_LENGTH};
+use hexgame_core::rules::{GameError, Hex, HexGameState, PLACEMENT_RADIUS, WIN_LENGTH};
 
 #[cfg(test)]
 mod tests {
@@ -689,6 +689,7 @@ mod tests {
         let mut g = HexGameState::new();
         g.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0)], 0, 2)
             .unwrap();
+        g.assert_consistent();
 
         let eval0 = g.eval().score();
         let fives0 = [g.eval().counts(0).fives(), g.eval().counts(1).fives()];
@@ -697,7 +698,9 @@ mod tests {
         let hot0 = g.eval().hot_len(0);
 
         g.place(3, 0).unwrap();
+        g.assert_consistent();
         g.unplace().unwrap();
+        g.assert_consistent();
 
         assert_eq!(g.eval().score(), eval0);
         assert_eq!(
@@ -728,15 +731,18 @@ mod tests {
         ) {
             let mut game = HexGameState::new();
             let _ = game.place(0, 0);
+            game.assert_consistent();
             let mut placed = 0usize;
             for (q, r) in moves {
                 if game.place(q, r).is_ok() {
                     placed += 1;
+                    game.assert_consistent();
                 }
             }
             let _hash_before = game.zobrist();
             for _ in 0..placed + 1 {
                 game.unplace().unwrap();
+                game.assert_consistent();
             }
             assert_eq!(game.zobrist(), 0, "zobrist after full unplace must be zero");
             assert_eq!(game.move_count(), 0);

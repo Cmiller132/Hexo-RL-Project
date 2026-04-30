@@ -87,9 +87,9 @@ mod tests {
 
     #[test]
     fn windowkey_roundtrip_mixed() {
-        let key = WindowKey::new(-16384, 16383, 0);
-        assert_eq!(key.q(), -16384);
-        assert_eq!(key.r(), 16383);
+        let key = WindowKey::new(i32::MIN, i32::MAX, 0);
+        assert_eq!(key.q(), i32::MIN);
+        assert_eq!(key.r(), i32::MAX);
         assert_eq!(key.dir(), 0);
     }
 
@@ -102,10 +102,25 @@ mod tests {
     }
 
     #[test]
-    fn windowkey_max_positive_coords() {
-        let key = WindowKey::new(16383, 16383, 0);
-        assert_eq!(key.q(), 16383);
-        assert_eq!(key.r(), 16383);
+    fn windowkey_full_i32_coords_do_not_alias() {
+        let min = WindowKey::new(i32::MIN, -1, 0);
+        let max = WindowKey::new(i32::MAX, -1, 0);
+        assert_eq!(min.q(), i32::MIN);
+        assert_eq!(max.q(), i32::MAX);
+        assert_ne!(min, max);
+    }
+
+    #[test]
+    fn windowkey_try_new_rejects_invalid_dir() {
+        assert!(WindowKey::try_new(0, 0, 3).is_none());
+        assert!(WindowKey::try_new(0, 0, u8::MAX).is_none());
+        assert_eq!(WindowKey::try_new(0, 0, 2), Some(WindowKey::new(0, 0, 2)));
+    }
+
+    #[test]
+    #[should_panic(expected = "dir must be a valid HEX_DIRECTIONS index")]
+    fn windowkey_new_rejects_invalid_dir_in_all_builds() {
+        let _ = WindowKey::new(0, 0, 3);
     }
 
     #[test]
@@ -160,8 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn windowkey_size_is_u32() {
-        assert_eq!(std::mem::size_of::<WindowKey>(), 4);
+    fn windowkey_size_is_explicit_value() {
+        assert_eq!(std::mem::size_of::<WindowKey>(), 12);
     }
 
     // ------------------------------------------------------------------

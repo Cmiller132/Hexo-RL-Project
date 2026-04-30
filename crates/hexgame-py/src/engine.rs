@@ -1,3 +1,4 @@
+use crate::protocol;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -6,12 +7,9 @@ use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyR
 
 use hexgame_core::classical as search;
 use hexgame_core::encoding as encoder;
+use hexgame_core::mcts::MCTSEngine;
+use hexgame_core::rules::{GameError, Hex, HexGameState, HEX_DIRECTIONS, WIN_LENGTH};
 use hexgame_core::tactics::{tactical_status, TacticalStatus};
-use hexgame_core::Hex;
-use hexgame_core::MCTSEngine;
-use hexgame_core::HEX_DIRECTIONS;
-use hexgame_core::WIN_LENGTH;
-use hexgame_core::{GameError, HexGameState};
 
 use std::time::Duration;
 
@@ -38,23 +36,6 @@ struct RootSnapshot {
     offset_r: i32,
     legal: Vec<Hex>,
     root_generation: u64,
-}
-
-fn decode_legal_bytes(legal_bytes: &[u8]) -> PyResult<Vec<Hex>> {
-    if !legal_bytes.len().is_multiple_of(8) {
-        return Err(PyErr::new::<PyValueError, _>(format!(
-            "legal_bytes length {} is not a multiple of 8",
-            legal_bytes.len()
-        )));
-    }
-
-    let mut legal = Vec::with_capacity(legal_bytes.len() / 8);
-    for chunk in legal_bytes.chunks_exact(8) {
-        let q = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
-        let r = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-        legal.push(Hex::new(q, r));
-    }
-    Ok(legal)
 }
 
 fn validate_root_snapshot(
@@ -506,11 +487,7 @@ impl PyHexGame {
     /// shipping large move lists across the FFI boundary.
     fn legal_moves_near_bytes<'py>(&self, py: Python<'py>, radius: i32) -> Bound<'py, PyBytes> {
         let moves = self.inner.legal_moves_near_sorted(radius);
-        let mut buf: Vec<u8> = Vec::with_capacity(moves.len() * 8);
-        for h in &moves {
-            buf.extend_from_slice(&h.q.to_le_bytes());
-            buf.extend_from_slice(&h.r.to_le_bytes());
-        }
+        let buf = protocol::encode_legal_rows(&moves);
         PyBytes::new(py, &buf)
     }
 
@@ -518,13 +495,8 @@ impl PyHexGame {
     ///
     /// Use `np.frombuffer(data, dtype=np.int32).reshape(-1, 3)` in Python.
     fn board_pieces_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let board = self.inner.stones();
-        let mut buf: Vec<u8> = Vec::with_capacity(board.len() * 12);
-        for (&h, &p) in board.iter() {
-            buf.extend_from_slice(&h.q.to_le_bytes());
-            buf.extend_from_slice(&h.r.to_le_bytes());
-            buf.extend_from_slice(&(p as i32).to_le_bytes());
-        }
+        let buf =
+            protocol::encode_board_piece_rows(self.inner.stones().iter().map(|(&h, &p)| (h, p)));
         PyBytes::new(py, &buf)
     }
 
@@ -532,13 +504,7 @@ impl PyHexGame {
     ///
     /// Use `np.frombuffer(data, dtype=np.int32).reshape(-1, 3)` in Python.
     fn move_history_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let hist = self.inner.move_history();
-        let mut buf: Vec<u8> = Vec::with_capacity(hist.len() * 12);
-        for r in hist {
-            buf.extend_from_slice(&(r.player() as i32).to_le_bytes());
-            buf.extend_from_slice(&r.cell().q.to_le_bytes());
-            buf.extend_from_slice(&r.cell().r.to_le_bytes());
-        }
+        let buf = protocol::encode_compact_history_rows(self.inner.move_history());
         PyBytes::new(py, &buf)
     }
 
@@ -590,11 +556,7 @@ impl PyHexGame {
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray3::from_owned_array(py, arr);
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(legal_moves.len() * 8);
-        for h in &legal_moves {
-            legal_buf.extend_from_slice(&h.q.to_le_bytes());
-            legal_buf.extend_from_slice(&h.r.to_le_bytes());
-        }
+        let legal_buf = protocol::encode_legal_rows(&legal_moves);
         Ok((arr, offset_q, offset_r, PyBytes::new(py, &legal_buf)))
     }
 
@@ -864,11 +826,7 @@ impl PyMCTSEngine {
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray3::from_owned_array(py, arr);
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(init.legal_moves.len() * 8);
-        for h in &init.legal_moves {
-            legal_buf.extend_from_slice(&h.q.to_le_bytes());
-            legal_buf.extend_from_slice(&h.r.to_le_bytes());
-        }
+        let legal_buf = protocol::encode_legal_rows(&init.legal_moves);
         self.root_snapshot = Some(RootSnapshot {
             offset_q: init.offset_q,
             offset_r: init.offset_r,
@@ -908,7 +866,7 @@ impl PyMCTSEngine {
                 "policy logits contain non-finite values",
             ));
         }
-        let legal = decode_legal_bytes(legal_bytes)?;
+        let legal = protocol::decode_legal_rows(legal_bytes)?;
         validate_root_snapshot(
             &self.root_snapshot,
             Some((offset_q, offset_r)),
@@ -972,7 +930,7 @@ impl PyMCTSEngine {
                 qr.shape()[0]
             )));
         }
-        let legal = decode_legal_bytes(legal_bytes)?;
+        let legal = protocol::decode_legal_rows(legal_bytes)?;
         validate_root_snapshot(
             &self.root_snapshot,
             Some((offset_q, offset_r)),
@@ -1020,7 +978,7 @@ impl PyMCTSEngine {
                 qr.shape()[0]
             )));
         }
-        let legal = decode_legal_bytes(legal_bytes)?;
+        let legal = protocol::decode_legal_rows(legal_bytes)?;
         validate_root_snapshot(&self.root_snapshot, None, &legal, root_generation)?;
         let global_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner
@@ -1037,9 +995,6 @@ impl PyMCTSEngine {
         pair_mix: f32,
     ) -> PyResult<()> {
         let qr = pair_qr.as_array();
-        if qr.ndim() != 2 || qr.shape()[1] != 4 {
-            return Err(PyValueError::new_err("pair_qr must have shape (N, 4)"));
-        }
         let logits = pair_logits
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
@@ -1050,10 +1005,7 @@ impl PyMCTSEngine {
                 qr.shape()[0]
             )));
         }
-        let pair_actions: Vec<(i32, i32, i32, i32)> = qr
-            .outer_iter()
-            .map(|row| (row[0], row[1], row[2], row[3]))
-            .collect();
+        let pair_actions = protocol::decode_pair_rows(qr, "pair_qr")?;
         self.inner
             .apply_root_pair_priors(&pair_actions, logits, pair_mix)
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
@@ -1079,9 +1031,6 @@ impl PyMCTSEngine {
         pair_mix: f32,
     ) -> PyResult<()> {
         let qr = pair_qr.as_array();
-        if qr.ndim() != 2 || qr.shape()[1] != 4 {
-            return Err(PyValueError::new_err("pair_qr must have shape (N, 4)"));
-        }
         let logits = pair_logits
             .as_slice()
             .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
@@ -1092,10 +1041,7 @@ impl PyMCTSEngine {
                 qr.shape()[0]
             )));
         }
-        let pair_actions: Vec<(i32, i32, i32, i32)> = qr
-            .outer_iter()
-            .map(|row| (row[0], row[1], row[2], row[3]))
-            .collect();
+        let pair_actions = protocol::decode_pair_rows(qr, "pair_qr")?;
         self.inner
             .apply_root_pair_second_priors(&pair_actions, logits, pair_mix)
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
@@ -1167,11 +1113,7 @@ impl PyMCTSEngine {
             .pending_leaf_metadata()
             .into_iter()
             .map(|(oq, or_, legal, history)| {
-                let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
-                for h in &legal {
-                    legal_buf.extend_from_slice(&h.q.to_le_bytes());
-                    legal_buf.extend_from_slice(&h.r.to_le_bytes());
-                }
+                let legal_buf = protocol::encode_legal_rows(&legal);
                 (
                     oq,
                     or_,
@@ -1634,7 +1576,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(classical_self_play, m)?)?;
     m.add("FEATURE_COUNT", encoder::FEATURE_COUNT)?;
     m.add("WIN_LENGTH", WIN_LENGTH)?;
-    m.add("PLACEMENT_RADIUS", hexgame_core::PLACEMENT_RADIUS)?;
+    m.add("PLACEMENT_RADIUS", hexgame_core::rules::PLACEMENT_RADIUS)?;
     m.add("BOARD_SIZE", encoder::BOARD_SIZE)?;
     m.add("NUM_CHANNELS", encoder::NUM_CHANNELS)?;
     m.add("TENSOR_SIZE", encoder::TENSOR_SIZE)?;

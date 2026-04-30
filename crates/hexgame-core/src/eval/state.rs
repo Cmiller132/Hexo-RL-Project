@@ -201,6 +201,27 @@ fn update_hot(
     }
 }
 
+fn recompute_window_index(stones: &std::collections::HashMap<Hex, u8>, key: WindowKey) -> usize {
+    let mut idx = 0usize;
+    for (off, place_value) in POW3.iter().enumerate().take(WIN_LENGTH as usize) {
+        let cell = key.cell_at(off as i32);
+        if let Some(&player) = stones.get(&cell) {
+            idx += (player as usize + 1) * place_value;
+        }
+    }
+    idx
+}
+
+fn accumulate_counts(counts: &mut ThreatCounts, own: u8, other: u8) {
+    if own >= 5 && other == 0 {
+        counts.fives += 1;
+    } else if own == 4 && other == 0 {
+        counts.fours += 1;
+    } else if own == 3 && other == 0 {
+        counts.threes += 1;
+    }
+}
+
 /// Iterate the 18 windows that touch `cell`.
 ///
 /// Passes `dir` and `off` directly to the callback to avoid re-deriving
@@ -346,55 +367,78 @@ impl EvalState {
 
             self.indices[gi] = old_idx as u16;
         });
-
-        #[cfg(debug_assertions)]
-        self.assert_invariants();
     }
 
-    /// Debug-only consistency check.
+    /// Debug/test consistency check against an independent full-grid scan.
     ///
-    /// Recomputes the hot-window sets from scratch by scanning the entire
-    /// win grid and comparing with the incremental cache.  Expensive, but
-    /// invaluable for catching incremental-update bugs.
-    #[cfg(debug_assertions)]
-    fn assert_invariants(&self) {
+    /// This validates only the bounded incremental eval grid. Tactical
+    /// correctness for sparse board rules lives in `board` / `threats` and
+    /// must not depend on eval-grid coverage.
+    pub(crate) fn assert_consistent_with_stones(
+        &self,
+        stones: impl IntoIterator<Item = (Hex, u8)>,
+        expected_delta_len: Option<usize>,
+    ) {
         use crate::eval::grid::WIN_GRID_RADIUS;
+        use std::collections::{HashMap, HashSet};
 
-        let mut expected = [
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-        ];
+        let stones: HashMap<Hex, u8> = stones.into_iter().collect();
+        let mut expected_score = 0;
+        let mut expected_counts = [ThreatCounts::default(); 2];
+        let mut expected_hot = [HashSet::new(), HashSet::new()];
+
+        if let Some(expected_len) = expected_delta_len {
+            assert_eq!(
+                self.delta_stack.len(),
+                expected_len,
+                "eval delta stack length mismatch"
+            );
+        }
+
         for q in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
             for r in -WIN_GRID_RADIUS..=WIN_GRID_RADIUS {
                 for dir in 0..3u8 {
+                    let key = WindowKey::new(q, r, dir);
+                    let idx = recompute_window_index(&stones, key);
                     let gi = win_grid_idx(q, r, dir);
-                    let idx = self.indices[gi] as usize;
+                    assert_eq!(
+                        self.indices[gi] as usize, idx,
+                        "eval window index mismatch at ({q}, {r}, dir {dir})"
+                    );
+
+                    expected_score += PATTERN_VALUES[idx];
                     let (p0, p1) = PATTERN_COUNTS[idx];
+                    accumulate_counts(&mut expected_counts[0], p0, p1);
+                    accumulate_counts(&mut expected_counts[1], p1, p0);
                     if p0 >= 4 && p1 == 0 {
-                        expected[0].insert(WindowKey::new(q, r, dir));
+                        expected_hot[0].insert(key);
                     }
                     if p1 >= 4 && p0 == 0 {
-                        expected[1].insert(WindowKey::new(q, r, dir));
+                        expected_hot[1].insert(key);
                     }
                 }
             }
         }
 
-        // Compare recomputed with actual (order-independent because swap_remove
-        // may reorder the internal SmallVec).
+        assert_eq!(self.score, expected_score, "eval score mismatch");
+        assert_eq!(self.counts, expected_counts, "eval threat counts mismatch");
+
         for player in 0..2 {
-            let actual: std::collections::HashSet<_> = self.hot.iter(player).collect();
+            let actual: HashSet<_> = self.hot.iter(player).collect();
             assert_eq!(
-                actual.len(),
-                expected[player as usize].len(),
-                "hot window count mismatch for player {}",
-                player
+                actual, expected_hot[player as usize],
+                "hot window mismatch for player {player}"
             );
-            assert_eq!(
-                actual, expected[player as usize],
-                "hot window mismatch for player {}",
-                player
-            );
+
+            for key in actual.iter().chain(expected_hot[player as usize].iter()) {
+                let idx = recompute_window_index(&stones, *key);
+                let (p0, p1) = PATTERN_COUNTS[idx];
+                let (own, other) = if player == 0 { (p0, p1) } else { (p1, p0) };
+                assert!(
+                    own >= 4 && other == 0,
+                    "selected hot window is not hot for player {player}: {key:?}"
+                );
+            }
         }
     }
 

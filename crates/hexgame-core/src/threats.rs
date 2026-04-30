@@ -14,9 +14,9 @@
 //! threat windows is usually mandatory.
 //!
 //! The core workflow is:
-//! 1. `threat_status(game)` — classify the position (Quiet / WinningTurn /
+//! 1. `tactical_status(game)` — classify the position (Quiet / WinningTurns /
 //!    MustBlock / Unblockable).
-//! 2. `turn_satisfies_status(&status, turn)` — test a candidate turn against
+//! 2. `turn_satisfies_tactical(&status, turn)` — test a candidate turn against
 //!    the pre-computed status.
 //! 3. `generate_threat_turns(game, out, opp_buf, my_buf)` — produce candidate
 //!    turns for quiescence search from live cells (crate-internal).
@@ -30,55 +30,23 @@ use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 // -------------------------------------------------------------------------
-// ThreatStatus
+// Test-only compact compatibility status
 // -------------------------------------------------------------------------
 
-/// Classification of the current tactical situation.
-///
-/// This enum tells the search layer what kind of moves are legal at the
-/// current node.  It is cheap to compute (O(hot_windows)) and should be
-/// evaluated **once per node**, then reused for every candidate turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 #[cfg(test)]
-pub enum ThreatStatus {
-    /// No immediate threats for either side.
-    ///
-    /// The search is free to consider any legal turn.  This is the common
-    /// case in the opening and middlegame.
+pub(crate) enum ThreatStatus {
     Quiet,
-
-    /// The current player can force a win this turn.
-    ///
-    /// The returned `Turn` is the **only** winning continuation.  All other
-    /// turns can be pruned because the game ends as soon as the 6th stone
-    /// is placed.  A 5-window produces a single-placement win; a 4-window
-    /// with at least 2 placements remaining produces a two-placement win.
     WinningTurn(Turn),
-
-    /// The current player must block one or more opponent threat windows.
-    ///
-    /// The enclosed [`BlockConstraint`] describes exactly which cells (and
-    /// which pairs of cells) cover every opponent threat window.  Any turn
-    /// that does not satisfy the constraint loses immediately.
     MustBlock(BlockConstraint),
-
-    /// Opponent threats cannot be blocked with the remaining placements.
-    ///
-    /// This means the opponent has at least two disjoint threat windows
-    /// (or a single window with more empty cells than we have placements).
-    /// The position is effectively lost; the search returns a large negative
-    /// score.  The threat filter does **not** constrain moves in this state
-    /// (the branch is hopeless regardless of what we play).
     Unblockable,
 }
 
 /// Complete tactical classification for filtering and training masks.
 ///
-/// Unlike [`ThreatStatus::WinningTurn`], this representation keeps every
-/// immediate winning continuation.  Search and encoders should use this as
-/// the source of truth; [`threat_status`] is retained as a compact compatibility
-/// view for older callers.
+/// This representation keeps every immediate winning continuation. Search
+/// and encoders use it as the source of truth for pruning and legal masks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum TacticalStatus {
@@ -320,13 +288,8 @@ pub fn tactical_status(game: &HexGameState) -> TacticalStatus {
     }
 }
 
-/// Classify the current tactical situation.
-///
-/// This compatibility API collapses complete winning-turn output down to the
-/// first deterministic winning turn.  Use [`tactical_status`] when filtering
-/// moves or training masks.
 #[cfg(test)]
-pub fn threat_status(game: &HexGameState) -> ThreatStatus {
+pub(crate) fn threat_status(game: &HexGameState) -> ThreatStatus {
     match tactical_status(game) {
         TacticalStatus::Quiet => ThreatStatus::Quiet,
         TacticalStatus::WinningTurns(turns) => ThreatStatus::WinningTurn(turns[0]),
@@ -335,13 +298,8 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
     }
 }
 
-/// Check whether a single turn is legal under threat constraints,
-/// given a pre-computed threat status.
-///
-/// This function is O(pairs) in the worst case and should be called via
-/// `retain` on a turn vector after computing `threat_status` once per node.
 #[cfg(test)]
-pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
+pub(crate) fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
     match status {
         // Quiet positions impose no restrictions.
         ThreatStatus::Quiet => true,

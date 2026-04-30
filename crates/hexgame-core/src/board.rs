@@ -257,7 +257,7 @@ pub(crate) type Stones = FxHashMap<Hex, u8>;
 /// # Example
 ///
 /// ```
-/// use hexgame_core::HexGameState;
+/// use hexgame_core::rules::HexGameState;
 ///
 /// let mut g = HexGameState::new();
 /// g.place(0, 0).unwrap();   // Player 0 opens
@@ -750,6 +750,42 @@ impl HexGameState {
         v
     }
 
+    /// Expensive debug/test consistency check for the complete engine state.
+    ///
+    /// This recomputes sparse board invariants independently from the
+    /// incremental caches. The eval comparison is intentionally limited to
+    /// the finite eval grid; sparse tactical win correctness is checked here.
+    pub fn assert_consistent(&self) {
+        assert_eq!(
+            self.move_history.len(),
+            self.move_count as usize,
+            "move history length must match move_count"
+        );
+
+        let expected_hash = self.stones.iter().fold(0u64, |hash, (&cell, &player)| {
+            hash ^ zobrist_piece(player, cell)
+        });
+        assert_eq!(self.zobrist, expected_hash, "zobrist hash mismatch");
+
+        assert_eq!(
+            self.candidates.rc,
+            Self::recompute_candidates(&self.stones, self.candidates.radius),
+            "radius-2 candidate cache mismatch"
+        );
+        assert_eq!(
+            self.placement_candidates.rc,
+            Self::recompute_candidates(&self.stones, self.placement_candidates.radius),
+            "placement candidate cache mismatch"
+        );
+
+        self.assert_history_consistent();
+        self.assert_winner_consistent();
+        self.eval.assert_consistent_with_stones(
+            self.stones.iter().map(|(&cell, &player)| (cell, player)),
+            Some(self.move_history.len()),
+        );
+    }
+
     /// The opponent's most recent completed turn as an ordered list of cells.
     ///
     /// Returns one cell for Player 0's opening turn, otherwise two cells.
@@ -877,5 +913,164 @@ impl HexGameState {
                 }
             }
         }
+    }
+
+    fn recompute_candidates(stones: &Stones, radius: i32) -> FxHashMap<Hex, u32> {
+        let mut expected = FxHashMap::default();
+        for &cell in stones.keys() {
+            for dq in -radius..=radius {
+                for dr in -radius..=radius {
+                    let h = Hex::new(cell.q + dq, cell.r + dr);
+                    if hex_distance(cell, h) <= radius && !stones.contains_key(&h) {
+                        *expected.entry(h).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        expected
+    }
+
+    fn assert_history_consistent(&self) {
+        let mut stones = FxHashMap::default();
+        let mut current_player = 0;
+        let mut placements_remaining = 1;
+        let mut winner = None;
+        let mut winning_line = None;
+
+        for (idx, rec) in self.move_history.iter().enumerate() {
+            assert_eq!(
+                rec.current_player_before, current_player,
+                "history current_player_before mismatch at record {idx}"
+            );
+            assert_eq!(
+                rec.placements_remaining_before, placements_remaining,
+                "history placements_remaining_before mismatch at record {idx}"
+            );
+            assert_eq!(
+                rec.winner_before, winner,
+                "history winner_before mismatch at record {idx}"
+            );
+            assert_eq!(
+                rec.winning_line_before, winning_line,
+                "history winning_line_before mismatch at record {idx}"
+            );
+            assert!(
+                stones.insert(rec.cell, rec.player).is_none(),
+                "history contains duplicate cell at record {idx}: {:?}",
+                rec.cell
+            );
+
+            if winner.is_none() {
+                if let Some(line) = Self::find_winning_line_in(&stones, rec.cell, rec.player) {
+                    winner = Some(rec.player);
+                    winning_line = Some(line);
+                    placements_remaining = 0;
+                    continue;
+                }
+            }
+
+            placements_remaining -= 1;
+            if placements_remaining == 0 {
+                current_player = 1 - current_player;
+                placements_remaining = 2;
+            }
+        }
+
+        assert_eq!(stones, self.stones, "history replay does not match stones");
+    }
+
+    fn assert_winner_consistent(&self) {
+        match (self.winner, self.winning_line) {
+            (None, None) => {
+                for (&cell, &player) in &self.stones {
+                    assert!(
+                        Self::find_winning_line_in(&self.stones, cell, player).is_none(),
+                        "non-terminal state contains a winning line for player {player}"
+                    );
+                }
+            }
+            (Some(player), Some(line)) => {
+                Self::assert_line_valid(&self.stones, player, &line);
+                let last = self
+                    .move_history
+                    .last()
+                    .expect("winner set without move history");
+                assert_eq!(last.player, player, "last move must belong to winner");
+                assert_eq!(
+                    Self::find_winning_line_in(&self.stones, last.cell, player),
+                    Some(line),
+                    "stored winning line does not match sparse recompute from last move"
+                );
+                assert_eq!(
+                    self.placements_remaining, 0,
+                    "terminal state must have zero placements remaining"
+                );
+            }
+            (None, Some(_)) => panic!("winning_line set without winner"),
+            (Some(_), None) => panic!("winner set without winning_line"),
+        }
+    }
+
+    fn assert_line_valid(stones: &Stones, player: u8, line: &[Hex; WIN_LENGTH as usize]) {
+        for &cell in line {
+            assert_eq!(
+                stones.get(&cell),
+                Some(&player),
+                "winning line includes a cell not owned by the winner"
+            );
+        }
+
+        let step = (line[1].q - line[0].q, line[1].r - line[0].r);
+        let valid_axis = HEX_DIRECTIONS
+            .iter()
+            .any(|&(dq, dr)| step == (dq, dr) || step == (-dq, -dr));
+        assert!(valid_axis, "winning line is not on a principal axis");
+        for pair in line.windows(2) {
+            assert_eq!(
+                (pair[1].q - pair[0].q, pair[1].r - pair[0].r),
+                step,
+                "winning line is not contiguous"
+            );
+        }
+    }
+
+    fn find_winning_line_in(
+        stones: &Stones,
+        last: Hex,
+        player: u8,
+    ) -> Option<[Hex; WIN_LENGTH as usize]> {
+        for &(dq, dr) in &HEX_DIRECTIONS {
+            let mut backward = Self::collect_run_in(stones, last, -dq, -dr, player);
+            backward.reverse();
+            let forward = Self::collect_run_in(stones, last, dq, dr, player);
+
+            let pivot = backward.len();
+            let mut line = backward;
+            line.push(last);
+            line.extend_from_slice(&forward);
+
+            if line.len() >= WIN_LENGTH as usize {
+                return Some(Self::select_segment(&line, pivot));
+            }
+        }
+        None
+    }
+
+    fn collect_run_in(
+        stones: &Stones,
+        origin: Hex,
+        dq: i32,
+        dr: i32,
+        player: u8,
+    ) -> SmallVec<[Hex; 6]> {
+        let mut tiles = SmallVec::new();
+        let mut q = origin.q + dq;
+        let mut r = origin.r + dr;
+        while stones.get(&Hex::new(q, r)) == Some(&player) {
+            tiles.push(Hex::new(q, r));
+            q += dq;
+            r += dr;
+        }
+        tiles
     }
 }

@@ -95,8 +95,47 @@ def test_mcts_rejects_mutated_root_legal_bytes():
         engine.expand_root(policy, 0.0, oq, or_, rows.tobytes(), root_token)
 
 
+def test_mcts_rejects_malformed_root_legal_bytes():
+    engine, policy, oq, or_, legal_bytes, root_token = _initialized_mcts_root()
+    with pytest.raises(ValueError, match="legal_bytes length .* multiple of 8"):
+        engine.expand_root(policy, 0.0, oq, or_, bytes(legal_bytes) + b"\x00", root_token)
+
+
+def test_mcts_rejects_stale_root_token():
+    engine, policy, oq, or_, legal_bytes, root_token = _initialized_mcts_root()
+    with pytest.raises(ValueError, match="root token mismatch"):
+        engine.expand_root(policy, 0.0, oq, or_, legal_bytes, root_token + 1)
+
+
+def test_mcts_rejects_stale_batch_token():
+    engine, policy, oq, or_, legal_bytes, root_token = _initialized_mcts_root()
+    engine.expand_root(policy, 0.0, oq, or_, legal_bytes, root_token)
+    _tensor_batch, count, batch_token = engine.select_leaves(2)
+    policies = np.ones((count, _engine.BOARD_SIZE ** 2), dtype=np.float32).reshape(-1)
+    values = np.zeros(count, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="batch token mismatch"):
+        engine.expand_and_backprop(policies, values, batch_token + 1)
+
+
+@pytest.mark.parametrize("method", ["apply_root_pair_priors", "apply_root_pair_second_priors"])
+def test_mcts_rejects_malformed_pair_rows(method):
+    engine, policy, oq, or_, legal_bytes, root_token = _initialized_mcts_root()
+    engine.expand_root(policy, 0.0, oq, or_, legal_bytes, root_token)
+    pair_qr = np.zeros((1, 3), dtype=np.int32)
+    pair_logits = np.zeros(1, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="pair_qr must have shape"):
+        getattr(engine, method)(pair_qr, pair_logits, 0.5)
+
+
 def test_mcts_rejects_non_finite_root_policy():
     engine, policy, oq, or_, legal_bytes, root_token = _initialized_mcts_root()
     policy[0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
         engine.expand_root(policy, 0.0, oq, or_, legal_bytes, root_token)
+
+
+def test_encode_compact_record_rejects_malformed_history_bytes():
+    with pytest.raises(ValueError, match="history_bytes length .* multiple of 12"):
+        _engine.encode_compact_record(b"\x00", 2)

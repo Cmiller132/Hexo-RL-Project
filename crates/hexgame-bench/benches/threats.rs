@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use hexgame_core::rules::HexGameState;
 use hexgame_core::tactics::tactical_status;
-use hexgame_core::HexGameState;
 
 fn bench_tactical_status(c: &mut Criterion) {
     let mut game = HexGameState::new();

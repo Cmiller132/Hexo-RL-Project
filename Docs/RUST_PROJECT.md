@@ -61,7 +61,7 @@ The codebase follows a strict layered architecture with zero circular dependenci
 ├─────────────────────────────────────────────────────────────────┤
 │                         threats                                 │
 │                     src/threats.rs                               │
-│            ThreatStatus, blocking, live cells                   │
+│            TacticalStatus, blocking, live cells                 │
 ├─────────────────────────────────────────────────────────────────┤
 │                          board                                  │
 │                      src/board.rs                               │
@@ -83,7 +83,7 @@ The codebase follows a strict layered architecture with zero circular dependenci
 
 **Dependency rule:** `core → eval → board → threats → {search, mcts, encoder} → pybridge`
 
-**Visibility:** `board`, `core`, `encoder`, `eval` are `pub` — these form the stable public API. `mcts`, `search`, and `threats` are `pub(crate)` — internal search engines are not yet stable for downstream Rust consumers, but are accessible to the Python bridge and tests within the crate.
+**Visibility:** stable downstream imports go through `hexgame_core::rules`, `hexgame_core::encoding`, `hexgame_core::tactics`, and `hexgame_core::classical`. `mcts` remains public only because the sibling Python FFI crate wraps it directly; it is not re-exported from the crate root.
 
 ---
 
@@ -100,7 +100,7 @@ src/
 │   ├── hot.rs              # HotWindows (SmallVec-backed threat cache)
 │   └── state.rs            # EvalState: incremental score, counts, delta stack
 ├── board.rs                # HexGameState: rules, placement, undo, Zobrist, win detection
-├── threats.rs              # ThreatStatus, threat_status(), live_cells()
+├── threats.rs              # TacticalStatus, tactical_status(), live_cells()
 ├── encoder.rs              # 13-channel NN tensor encoder + classical feature extraction
 ├── search.rs               # Alpha-beta with iterative deepening, TT, quiescence
 ├── mcts.rs                 # Arena-allocated MCTS with PUCT, virtual loss, batch leaves
@@ -314,13 +314,13 @@ Classifies the tactical situation, checks turn legality under threat constraints
 
 **Key types:**
 
-- **`ThreatStatus`** — Enum: `Quiet` (no threats), `WinningTurn(Turn)` (forced win exists), `MustBlock(BlockConstraint)` (must play specific cells/pairs), `Unblockable` (cannot stop opponent). **`MustBlock` stores `BlockConstraint` directly** (no heap `Box` — the struct fits on the stack).
+- **`TacticalStatus`** — Enum: `Quiet` (no threats), `WinningTurns(SmallVec<[Turn; 32]>)` (all immediate wins), `MustBlock(BlockConstraint)` (must play specific cells/pairs), `Unblockable` (cannot stop opponent). **`MustBlock` stores `BlockConstraint` directly** (no heap `Box` — the struct fits on the stack).
 - **`BlockConstraint`** — Exact blocking sets: `cells: SmallVec<[Hex; 16]>` (single-placement intersection) and `pairs: SmallVec<[(Hex, Hex); 32]>` (exact 2-placement covering pairs). Accessors: `cells() -> &[Hex]`, `pairs() -> &[(Hex, Hex)]`.
 
 **Key public functions:**
 
-1. **`threat_status(game) -> ThreatStatus`** — Full tactical classification. Short-circuits: checks instant wins first, then builds `BlockConstraint`.
-2. **`turn_satisfies_status(status, turn) -> bool`** — Membership test against pre-computed constraint. `O(1)` for single-placement, `O(pairs)` for 2-placement.
+1. **`tactical_status(game) -> TacticalStatus`** — Full tactical classification. Short-circuits: checks all instant wins first, then builds `BlockConstraint`.
+2. **`turn_satisfies_tactical(status, turn) -> bool`** — Membership test against pre-computed constraint. `O(1)` for single-placement, `O(pairs)` for 2-placement.
 3. **`live_cells(game, player, out: &mut Vec<Hex>)`** — Enumerates empty cells in hot windows (caller-owned buffer, reusable). Uses a local `FxHashSet` for `O(1)` deduplication instead of `O(n²)` linear scan.
 
 **Crate-private:** `generate_threat_turns(game, out, opp_buf, my_buf)` — Produces candidate turns for quiescence search from live cells. Takes caller-owned scratch buffers.
@@ -623,7 +623,7 @@ All hot-path data structures use stack-allocated or inline storage:
 
 - `WindowKey` — packed `u32` (no heap).
 - `HotWindows` — `SmallVec<[WindowKey; 32]>` (inline, 512 bytes total).
-- `BlockConstraint` — stored directly in `ThreatStatus::MustBlock` (no `Box`). Inner vectors use `SmallVec<[Hex; 16]>` and `SmallVec<[(Hex, Hex); 32]>`.
+- `BlockConstraint` — stored directly in `TacticalStatus::MustBlock` (no `Box`). Inner vectors use `SmallVec<[Hex; 16]>` and `SmallVec<[(Hex, Hex); 32]>`.
 - `winning_line` — `Option<[Hex; 6]>` (stack array, no per-placement allocation).
 - `opponent_last_turn_cells` — `SmallVec<[Hex; 2]>` (inline for typical 1–2 cells).
 - `opponent_threat_windows` — flat `(SmallVec<[Hex; 32]>, SmallVec<[u8; 16]>)` tuple; no per-window clones.

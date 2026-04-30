@@ -31,6 +31,10 @@
 //! any axis.  Games that extend farther simply do not get incremental
 //! evaluation for the out-of-bounds windows; this is a known and acceptable
 //! approximation that keeps the table tiny (≈ 11 k entries).
+//!
+//! This bound is an evaluation bound only. Core legality, win detection, and
+//! tactical threat correctness are sparse-board responsibilities and must not
+//! depend on a window being present in this finite grid.
 
 /// Maximum axial distance from the origin stored in the win grid.
 ///
@@ -83,7 +87,7 @@ pub fn win_grid_idx(q: i32, r: i32, dir: u8) -> usize {
 /// four moves along a single axis, window origins can exceed radius 30, so the
 /// branch is exercised in long games.  Windows that fall outside the grid are
 /// simply skipped; they do not contribute to evaluation.  This is a known
-/// approximation, not a bug.
+/// static-eval approximation, not a tactical correctness guarantee.
 #[inline]
 pub fn win_grid_in_bounds(q: i32, r: i32) -> bool {
     let qi = q + WIN_GRID_RADIUS;

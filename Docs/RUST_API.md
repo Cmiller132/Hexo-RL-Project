@@ -2,20 +2,30 @@
 
 ## hexgame-core
 
-### Core Types
-- `Hex` — axial coordinate (q, r)
-- `Turn` — 1 or 2 placements
-- `HexGameState` — board state, place/unplace, win detection
-- `EvalState` — incremental pattern evaluation
-- `ThreatStatus` — threat classification
-- `MCTSEngine` — neural MCTS with PUCT
-- `MCTSError` — error type for MCTS operations
+### Stable Facades
+- `hexgame_core::rules` — coordinates, turns, board state, move records, rule constants, and rule errors.
+- `hexgame_core::encoding` — canonical 13-channel tensor encoding and shape constants.
+- `hexgame_core::tactics` — complete tactical classification, blocking constraints, and tactical mask/filter helpers.
+- `hexgame_core::classical` — classical alpha-beta search.
+
+### Rules Types
+- `rules::Hex` — axial coordinate (q, r)
+- `rules::Turn` — 1 or 2 placements
+- `rules::HexGameState` — board state, place/unplace, win detection
+- `rules::GameError` — rule error type
+
+### Tactics Types
+- `tactics::TacticalStatus` — complete tactical classification
+- `tactics::BlockConstraint` — exact cells/pairs that satisfy mandatory blocks
 
 ### Encoder Constants
-- `BOARD_SIZE = 33` — tensor width/height
-- `NUM_CHANNELS = 13` — feature channels
-- `BOARD_AREA = 33 * 33 = 1089` — policy output size
-- `TENSOR_SIZE = 13 * 33 * 33 = 14157`
+- `encoding::BOARD_SIZE = 33` — tensor width/height
+- `encoding::NUM_CHANNELS = 13` — feature channels
+- `encoding::BOARD_AREA = 33 * 33 = 1089` — policy output size
+- `encoding::TENSOR_SIZE = 13 * 33 * 33 = 14157`
+
+### Active Implementation Module
+- `hexgame_core::mcts::MCTSEngine` and `hexgame_core::mcts::MCTSError` remain public for the Python FFI crate. They are not re-exported from the crate root.
 
 ## hexgame-py (FFI)
 

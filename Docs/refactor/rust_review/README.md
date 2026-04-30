@@ -12,8 +12,12 @@ This repository is intentionally separate from the V2 refactor plan. Phase 1 doe
 2. `RISK_REGISTER.md` - severity/confidence triage.
 3. `PHASE_2_VERIFICATION_PLAN.md` - concrete tests and probes to run next.
 4. `STRUCTURE_REFACTOR_IDEAS.md` - maintainability and project-structure improvements.
-5. `subagents/` - detailed subagent reports by review area.
-6. `evidence/` - command summaries, risky pattern inventory, and public API inventory.
+5. `API_AND_FFI_PROTOCOL_PLAN.md` - stable facade API and Python FFI protocol ownership.
+6. `INVARIANTS_AND_BOUNDS_PLAN.md` - rules, tactics, WindowKey, and evaluation-bound invariants.
+7. `CI_AND_PERFORMANCE_BUDGET_PLAN.md` - fast CI, deep CI, and performance-budget gates.
+8. `IMPLEMENTATION_SEQUENCE_AND_COMPLETENESS_CHECKLIST.md` - sequencing and acceptance checklist.
+9. `subagents/` - detailed subagent reports by review area.
+10. `evidence/` - command summaries, risky pattern inventory, and public API inventory.
 
 ## Review Semantics
 

@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use hexgame_core::HexGameState;
-use hexgame_core::MCTSEngine;
+use hexgame_core::mcts::MCTSEngine;
+use hexgame_core::rules::HexGameState;
 
 fn bench_single_mcts_sim(c: &mut Criterion) {
     let mut game = HexGameState::new();

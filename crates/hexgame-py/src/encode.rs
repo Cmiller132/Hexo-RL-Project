@@ -1,5 +1,6 @@
+use crate::protocol;
 use hexgame_core::encoding::{self as encoder, BOARD_SIZE, NUM_CHANNELS, TENSOR_SIZE};
-use hexgame_core::HexGameState;
+use hexgame_core::rules::HexGameState;
 use numpy::{PyArray3, PyArray4, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -18,27 +19,16 @@ fn encode_compact_record<'py>(
     history_bytes: &[u8],
     near_radius: i32,
 ) -> PyResult<Bound<'py, PyArray4<f32>>> {
-    if !history_bytes.len().is_multiple_of(12) {
-        return Err(PyValueError::new_err(format!(
-            "history_bytes length {} is not a multiple of 12",
-            history_bytes.len()
-        )));
-    }
-    let num_moves = history_bytes.len() / 12;
-
-    // Copy bytes so the closure owns them (history_bytes lifetime doesn't cross thread boundary).
-    let bytes_owned: Vec<u8> = history_bytes.to_vec();
+    let history = protocol::decode_compact_history_rows(history_bytes)?;
+    let num_moves = history.len();
 
     let positions = py
         .allow_threads(move || -> Result<Vec<f32>, String> {
             let mut game = HexGameState::new();
             let mut positions = Vec::with_capacity((num_moves + 1) * TENSOR_SIZE);
-            for chunk in bytes_owned.chunks_exact(12) {
+            for (player, q, r) in history {
                 let tensor = encoder::encode_board(&game, near_radius, false).tensor;
                 positions.extend_from_slice(&tensor);
-                let player = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                let q = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                let r = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
                 if player != game.current_player() as i32 {
                     return Err(format!(
                         "history player mismatch: stored {}, expected {} before move ({}, {})",
