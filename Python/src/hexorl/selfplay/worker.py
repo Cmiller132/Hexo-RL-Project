@@ -913,25 +913,20 @@ class RealMCTSEngine:
         stage,
         sparse_mix,
     ):
-        if hasattr(self._engine, "expand_root_with_sparse_priors"):
-            self._engine.expand_root_with_sparse_priors(
-                policy,
-                value,
-                oq,
-                or_,
-                legal_bytes,
-                root_generation,
-                np.asarray(sparse_qr, dtype=np.int32),
-                np.asarray(sparse_logits, dtype=np.float32),
-                int(stage),
-                float(sparse_mix),
-            )
-        else:
-            self._engine.expand_root(policy, value, oq, or_, legal_bytes, root_generation)
+        self._engine.expand_root_with_sparse_priors(
+            policy,
+            value,
+            oq,
+            or_,
+            legal_bytes,
+            root_generation,
+            np.asarray(sparse_qr, dtype=np.int32),
+            np.asarray(sparse_logits, dtype=np.float32),
+            int(stage),
+            float(sparse_mix),
+        )
 
     def expand_root_with_global_priors(self, legal_bytes, root_generation, global_qr, global_logits, value):
-        if not hasattr(self._engine, "expand_root_with_global_priors"):
-            raise RuntimeError("Rust engine does not expose expand_root_with_global_priors")
         self._engine.expand_root_with_global_priors(
             legal_bytes,
             root_generation,
@@ -941,27 +936,24 @@ class RealMCTSEngine:
         )
 
     def apply_root_pair_priors(self, pair_qr, pair_logits, pair_mix):
-        if hasattr(self._engine, "apply_root_pair_priors"):
-            self._engine.apply_root_pair_priors(
-                np.asarray(pair_qr, dtype=np.int32),
-                np.asarray(pair_logits, dtype=np.float32),
-                float(pair_mix),
-            )
+        self._engine.apply_root_pair_priors(
+            np.asarray(pair_qr, dtype=np.int32),
+            np.asarray(pair_logits, dtype=np.float32),
+            float(pair_mix),
+        )
 
     def apply_root_pair_first_priors(self, pair_first_logits, pair_mix):
-        if hasattr(self._engine, "apply_root_pair_first_priors"):
-            self._engine.apply_root_pair_first_priors(
-                np.asarray(pair_first_logits, dtype=np.float32),
-                float(pair_mix),
-            )
+        self._engine.apply_root_pair_first_priors(
+            np.asarray(pair_first_logits, dtype=np.float32),
+            float(pair_mix),
+        )
 
     def apply_root_pair_second_priors(self, pair_qr, pair_logits, pair_mix):
-        if hasattr(self._engine, "apply_root_pair_second_priors"):
-            self._engine.apply_root_pair_second_priors(
-                np.asarray(pair_qr, dtype=np.int32),
-                np.asarray(pair_logits, dtype=np.float32),
-                float(pair_mix),
-            )
+        self._engine.apply_root_pair_second_priors(
+            np.asarray(pair_qr, dtype=np.int32),
+            np.asarray(pair_logits, dtype=np.float32),
+            float(pair_mix),
+        )
 
     def add_dirichlet_noise(self, noise, fraction):
         self._engine.add_dirichlet_noise(noise, fraction)
@@ -974,9 +966,7 @@ class RealMCTSEngine:
         return np.asarray(tensor_4d, dtype=np.float32), count, batch_generation
 
     def pending_leaf_metadata(self):
-        if hasattr(self._engine, "pending_leaf_metadata"):
-            return self._engine.pending_leaf_metadata()
-        return []
+        return self._engine.pending_leaf_metadata()
 
     def expand_and_backprop(self, policies, values, batch_generation):
         self._engine.expand_and_backprop(policies, values, batch_generation)
@@ -992,19 +982,16 @@ class RealMCTSEngine:
         sparse_mix,
         batch_generation,
     ):
-        if hasattr(self._engine, "expand_and_backprop_with_sparse"):
-            self._engine.expand_and_backprop_with_sparse(
-                policies,
-                values,
-                batch_generation,
-                np.asarray(sparse_qr, dtype=np.int32),
-                np.asarray(sparse_logits, dtype=np.float32),
-                np.asarray(sparse_counts, dtype=np.uint16),
-                int(stage),
-                float(sparse_mix),
-            )
-        else:
-            self._engine.expand_and_backprop(policies, values, batch_generation)
+        self._engine.expand_and_backprop_with_sparse(
+            policies,
+            values,
+            batch_generation,
+            np.asarray(sparse_qr, dtype=np.int32),
+            np.asarray(sparse_logits, dtype=np.float32),
+            np.asarray(sparse_counts, dtype=np.uint16),
+            int(stage),
+            float(sparse_mix),
+        )
 
     def expand_and_backprop_with_sparse_sources(
         self,
@@ -1018,29 +1005,17 @@ class RealMCTSEngine:
         sparse_mix,
         batch_generation,
     ):
-        if hasattr(self._engine, "expand_and_backprop_with_sparse_sources"):
-            self._engine.expand_and_backprop_with_sparse_sources(
-                policies,
-                values,
-                batch_generation,
-                np.asarray(sparse_qr, dtype=np.int32),
-                np.asarray(sparse_logits, dtype=np.float32),
-                np.asarray(sparse_counts, dtype=np.uint16),
-                np.asarray(sparse_sources, dtype=np.uint8),
-                int(stage),
-                float(sparse_mix),
-            )
-        else:
-            self.expand_and_backprop_with_sparse(
-                policies,
-                values,
-                sparse_qr,
-                sparse_logits,
-                sparse_counts,
-                stage,
-                sparse_mix,
-                batch_generation,
-            )
+        self._engine.expand_and_backprop_with_sparse_sources(
+            policies,
+            values,
+            batch_generation,
+            np.asarray(sparse_qr, dtype=np.int32),
+            np.asarray(sparse_logits, dtype=np.float32),
+            np.asarray(sparse_counts, dtype=np.uint16),
+            np.asarray(sparse_sources, dtype=np.uint8),
+            int(stage),
+            float(sparse_mix),
+        )
 
     def get_results(self):
         return self._engine.get_results()
@@ -1393,7 +1368,7 @@ class SelfPlayWorker:
                                 self.pair_prior_mix,
                             )
                         if self.pair_policy_enabled and pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
-                            if root_placements_remaining == 1 and hasattr(engine, "apply_root_pair_second_priors"):
+                            if root_placements_remaining == 1:
                                 engine.apply_root_pair_second_priors(
                                     pair_qr,
                                     pair_logits[: pair_qr.shape[0]],
@@ -1515,7 +1490,6 @@ class SelfPlayWorker:
                                     if (
                                         root_placements_remaining == 1
                                         and pair_qr.shape[0] > 0
-                                        and hasattr(engine, "apply_root_pair_second_priors")
                                     ):
                                         engine.apply_root_pair_second_priors(
                                             pair_qr,
@@ -1605,7 +1579,7 @@ class SelfPlayWorker:
 
                     if client is not None:
                         if self.global_graph_enabled:
-                            meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
+                            meta = engine.pending_leaf_metadata()
                             if len(meta) != count:
                                 raise ValueError("global graph leaf expansion requires pending leaf metadata")
                             graph_values = np.zeros(count, dtype=np.float32)
@@ -1693,31 +1667,19 @@ class SelfPlayWorker:
                                 sparse_sources[row, :width] = source[:width]
                                 sparse_counts[row] = width
                             sparse_prior_forward_ms += (time.monotonic() - t_forward) * 1000.0
-                            if hasattr(engine, "expand_and_backprop_with_sparse_sources"):
-                                engine.expand_and_backprop_with_sparse_sources(
-                                    np.zeros(count * 1089, dtype=np.float32),
-                                    graph_values,
-                                    sparse_qr,
-                                    sparse_logits,
-                                    sparse_counts,
-                                    sparse_sources,
-                                    2,
-                                    1.0,
-                                    batch_generation,
-                                )
-                            else:
-                                engine.expand_and_backprop_with_sparse(
-                                    np.zeros(count * 1089, dtype=np.float32),
-                                    graph_values,
-                                    sparse_qr,
-                                    sparse_logits,
-                                    sparse_counts,
-                                    2,
-                                    1.0,
-                                    batch_generation,
-                                )
+                            engine.expand_and_backprop_with_sparse_sources(
+                                np.zeros(count * 1089, dtype=np.float32),
+                                graph_values,
+                                sparse_qr,
+                                sparse_logits,
+                                sparse_counts,
+                                sparse_sources,
+                                2,
+                                1.0,
+                                batch_generation,
+                            )
                         elif self.sparse_policy_enabled and self.sparse_prior_stage >= 2:
-                            meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
+                            meta = engine.pending_leaf_metadata()
                             if len(meta) == count:
                                 cand_qr = np.zeros((count, self.candidate_budget, 2), dtype=np.int32)
                                 cand_indices = np.full((count, self.candidate_budget), -1, dtype=np.int64)

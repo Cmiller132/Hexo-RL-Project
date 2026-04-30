@@ -1,9 +1,8 @@
 //! Arena-allocated MCTS engine with PUCT, virtual loss, and batch leaf selection.
 //!
-//! The tree lives entirely in Rust. Python calls:
-//!   1. `select_leaves(batch_size)` → board tensors for GPU inference
-//!   2. `expand_and_backprop(policies, values)` → updates tree
-//!   3. `get_results()` → (moves, visits, root_value)
+//! The tree lives entirely in Rust. Callers exchange root and batch generation
+//! tokens with the engine so stale neural-network responses fail explicitly
+//! instead of mutating the wrong search tree.
 //!
 //! # MCTS algorithm overview
 //!
@@ -88,6 +87,8 @@ pub enum MCTSError {
     },
     /// Dirichlet noise had invalid values or zero mass.
     InvalidNoise(&'static str),
+    /// Prior metadata was malformed or inconsistent with the current root.
+    InvalidPrior(String),
     /// The tree contained an action that the game state rejected during traversal.
     IllegalTreeAction { q: i32, r: i32, node_idx: u32 },
 }
@@ -739,17 +740,8 @@ impl MCTSEngine {
 
     /// Encode the root board state and return tensor data for GPU evaluation.
     ///
-    /// # Returns
-    /// `Some((tensor, offset_q, offset_r, legal_moves))` where `tensor` is a
-    /// flat `Vec<f32>` of length `TENSOR_SIZE` (13×33×33).  Returns `None` if
-    /// the game is already over.
-    pub fn init_root(&mut self) -> Option<(Vec<f32>, i32, i32, Vec<Hex>)> {
-        self.init_root_tokenized()
-            .expect("init_root failed")
-            .map(|init| (init.tensor, init.offset_q, init.offset_r, init.legal_moves))
-    }
-
-    pub fn init_root_tokenized(&mut self) -> Result<Option<RootInit>, MCTSError> {
+    /// Returns `Ok(None)` if the game is already over.
+    pub fn init_root(&mut self) -> Result<Option<RootInit>, MCTSError> {
         if self.game.is_over() {
             return Ok(None);
         }
@@ -786,19 +778,6 @@ impl MCTSEngine {
     /// `offset_q` and `offset_r` map board coordinates to tensor indices.
     /// `legal` is the list of legal moves at the root.
     pub fn expand_root(
-        &mut self,
-        policy_logits: &[f32],
-        value: f32,
-        offset_q: i32,
-        offset_r: i32,
-        legal: &[Hex],
-    ) {
-        validate_policy_slice(policy_logits, BOARD_AREA).expect("expand_root failed");
-        validate_root_value(value).expect("expand_root failed");
-        self.expand_root_impl(policy_logits, offset_q, offset_r, legal);
-    }
-
-    pub fn try_expand_root(
         &mut self,
         root_generation: u64,
         policy_logits: &[f32],
@@ -838,41 +817,8 @@ impl MCTSEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn expand_root_with_sparse_priors(
-        &mut self,
-        policy_logits: &[f32],
-        value: f32,
-        offset_q: i32,
-        offset_r: i32,
-        legal: &[Hex],
-        sparse_actions: &[(i32, i32)],
-        sparse_logits: &[f32],
-        stage: u8,
-        sparse_mix: f32,
-    ) {
-        validate_policy_slice(policy_logits, BOARD_AREA)
-            .expect("expand_root_with_sparse_priors failed");
-        validate_root_value(value).expect("expand_root_with_sparse_priors failed");
-        if let Some(index) = sparse_logits.iter().position(|logit| !logit.is_finite()) {
-            panic!(
-                "expand_root_with_sparse_priors failed: {:?}",
-                MCTSError::NonFiniteSparsePolicy { leaf: 0, index }
-            );
-        }
-        self.expand_root_with_sparse_priors_impl(
-            policy_logits,
-            offset_q,
-            offset_r,
-            legal,
-            sparse_actions,
-            sparse_logits,
-            stage,
-            sparse_mix,
-        );
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn try_expand_root_with_sparse_priors(
+    pub fn expand_root_with_sparse_priors(
         &mut self,
         root_generation: u64,
         policy_logits: &[f32],
@@ -943,45 +889,49 @@ impl MCTSEngine {
         self.arena[self.root_idx as usize].player = player;
     }
 
-    pub fn expand_root_with_global_priors(
+    fn expand_root_with_global_priors_impl(
         &mut self,
         legal: &[Hex],
         global_actions: &[(i32, i32)],
         global_logits: &[f32],
         _value: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), MCTSError> {
         self.reset_prior_telemetry();
         if legal.len() != global_actions.len() {
-            return Err(format!(
+            return Err(MCTSError::InvalidPrior(format!(
                 "global prior legal row count mismatch: legal={} global_actions={}",
                 legal.len(),
                 global_actions.len()
-            ));
+            )));
         }
         if global_logits.len() < global_actions.len() {
-            return Err(format!(
+            return Err(MCTSError::InvalidPrior(format!(
                 "global prior logits length {} is smaller than legal rows {}",
                 global_logits.len(),
                 global_actions.len()
-            ));
+            )));
         }
         for (idx, (legal_hex, &(q, r))) in legal.iter().zip(global_actions.iter()).enumerate() {
             if legal_hex.q != q || legal_hex.r != r {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "global prior legal row mismatch at {idx}: Rust legal=({}, {}) graph legal=({}, {})",
                     legal_hex.q, legal_hex.r, q, r
-                ));
+                )));
             }
         }
         self.scratch_raw.clear();
         self.scratch_raw
             .extend(global_logits.iter().take(global_actions.len()).copied());
         if self.scratch_raw.iter().any(|value| !value.is_finite()) {
-            return Err("global prior logits contain non-finite values".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "global prior logits contain non-finite values".to_string(),
+            ));
         }
         softmax_in_place(&mut self.scratch_raw, &mut self.scratch_priors);
         if self.scratch_priors.len() != legal.len() {
-            return Err("global prior logits could not be normalized".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "global prior logits could not be normalized".to_string(),
+            ));
         }
         self.scratch_sources.clear();
         self.scratch_sources
@@ -996,18 +946,17 @@ impl MCTSEngine {
         Ok(())
     }
 
-    pub fn try_expand_root_with_global_priors(
+    pub fn expand_root_with_global_priors(
         &mut self,
         root_generation: u64,
         legal: &[Hex],
         global_actions: &[(i32, i32)],
         global_logits: &[f32],
         value: f32,
-    ) -> Result<(), String> {
-        self.validate_root_generation(root_generation)
-            .map_err(|err| format!("{err:?}"))?;
-        validate_root_value(value).map_err(|err| format!("{err:?}"))?;
-        self.expand_root_with_global_priors(legal, global_actions, global_logits, value)
+    ) -> Result<(), MCTSError> {
+        self.validate_root_generation(root_generation)?;
+        validate_root_value(value)?;
+        self.expand_root_with_global_priors_impl(legal, global_actions, global_logits, value)
     }
 
     /// Blend joint pair-action logits into root first-placement priors.
@@ -1021,7 +970,7 @@ impl MCTSEngine {
         pair_actions: &[(i32, i32, i32, i32)],
         pair_logits: &[f32],
         pair_mix: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), MCTSError> {
         if self.game.placements_remaining() < 2 {
             self.root_pair_candidate_count = 0;
             return Ok(());
@@ -1030,14 +979,16 @@ impl MCTSEngine {
         let start = root.children_start as usize;
         let count = root.children_count as usize;
         if count == 0 {
-            return Err("root must be expanded before applying pair priors".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "root must be expanded before applying pair priors".to_string(),
+            ));
         }
         if pair_logits.len() < pair_actions.len() {
-            return Err(format!(
+            return Err(MCTSError::InvalidPrior(format!(
                 "pair_logits length {} is smaller than pair_actions rows {}",
                 pair_logits.len(),
                 pair_actions.len()
-            ));
+            )));
         }
         if pair_actions.is_empty() {
             self.root_pair_candidate_count = 0;
@@ -1055,24 +1006,26 @@ impl MCTSEngine {
         let mut seen_pairs = std::collections::HashSet::with_capacity(pair_actions.len());
         for (row, &(q1, r1, q2, r2)) in pair_actions.iter().enumerate() {
             if q1 == q2 && r1 == r2 {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "duplicate coordinates are illegal for pair policy: ({q1}, {r1})"
-                ));
+                )));
             }
             let Some(first_idx) = root_actions.iter().position(|&(q, r)| q == q1 && r == r1) else {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "pair policy target contains illegal first action: ({q1}, {r1})"
-                ));
+                )));
             };
             let Some(second_idx) = root_actions.iter().position(|&(q, r)| q == q2 && r == r2)
             else {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "pair policy target contains illegal second action: ({q2}, {r2})"
-                ));
+                )));
             };
             let logit = pair_logits[row];
             if !logit.is_finite() {
-                return Err(format!("pair policy logit at row {row} is not finite"));
+                return Err(MCTSError::InvalidPrior(format!(
+                    "pair policy logit at row {row} is not finite"
+                )));
             }
             let key = if first_idx <= second_idx {
                 (first_idx, second_idx)
@@ -1080,9 +1033,9 @@ impl MCTSEngine {
                 (second_idx, first_idx)
             };
             if !seen_pairs.insert(key) {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "duplicate unordered pair policy row at {row}: ({q1}, {r1}) <-> ({q2}, {r2})"
-                ));
+                )));
             }
             valid_pairs.push((first_idx, second_idx, logit));
         }
@@ -1097,7 +1050,9 @@ impl MCTSEngine {
             denom += (logit - max_logit).exp();
         }
         if denom <= 0.0 || !denom.is_finite() {
-            return Err("pair policy logits could not be normalized".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "pair policy logits could not be normalized".to_string(),
+            ));
         }
         for &(first_idx, second_idx, logit) in &valid_pairs {
             let p = (logit - max_logit).exp() / denom;
@@ -1106,7 +1061,9 @@ impl MCTSEngine {
         }
         let mass_total: f32 = pair_mass.iter().sum();
         if mass_total <= 0.0 {
-            return Err("pair policy produced zero incident action mass".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "pair policy produced zero incident action mass".to_string(),
+            ));
         }
         for mass in &mut pair_mass {
             *mass /= mass_total;
@@ -1145,7 +1102,7 @@ impl MCTSEngine {
         &mut self,
         action_logits: &[f32],
         pair_mix: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), MCTSError> {
         if self.game.placements_remaining() < 2 {
             return Ok(());
         }
@@ -1153,18 +1110,22 @@ impl MCTSEngine {
         let start = root.children_start as usize;
         let count = root.children_count as usize;
         if count == 0 {
-            return Err("root must be expanded before applying pair-first priors".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "root must be expanded before applying pair-first priors".to_string(),
+            ));
         }
         if action_logits.len() < count {
-            return Err(format!(
+            return Err(MCTSError::InvalidPrior(format!(
                 "pair-first logits length {} is smaller than root legal rows {}",
                 action_logits.len(),
                 count
-            ));
+            )));
         }
         let logits = &action_logits[..count];
         if logits.iter().any(|value| !value.is_finite()) {
-            return Err("pair-first logits contain non-finite values".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "pair-first logits contain non-finite values".to_string(),
+            ));
         }
         let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut mass = vec![0.0f32; count];
@@ -1175,7 +1136,9 @@ impl MCTSEngine {
             denom += p;
         }
         if denom <= 0.0 || !denom.is_finite() {
-            return Err("pair-first logits could not be normalized".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "pair-first logits could not be normalized".to_string(),
+            ));
         }
         for value in &mut mass {
             *value /= denom;
@@ -1215,32 +1178,36 @@ impl MCTSEngine {
         pair_actions: &[(i32, i32, i32, i32)],
         pair_logits: &[f32],
         pair_mix: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), MCTSError> {
         if self.game.placements_remaining() != 1 {
             self.root_pair_candidate_count = 0;
             return Ok(());
         }
         let Some(last_move) = self.game.move_history().last() else {
-            return Err("second-placement pair prior requires a previous placement".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "second-placement pair prior requires a previous placement".to_string(),
+            ));
         };
         if last_move.player() != self.game.current_player() {
-            return Err("previous placement does not belong to the current player".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "previous placement does not belong to the current player".to_string(),
+            ));
         }
         let first_cell = last_move.cell();
         let root = &self.arena[self.root_idx as usize];
         let start = root.children_start as usize;
         let count = root.children_count as usize;
         if count == 0 {
-            return Err(
+            return Err(MCTSError::InvalidPrior(
                 "root must be expanded before applying second-placement pair priors".to_string(),
-            );
+            ));
         }
         if pair_logits.len() < pair_actions.len() {
-            return Err(format!(
+            return Err(MCTSError::InvalidPrior(format!(
                 "pair_logits length {} is smaller than pair_actions rows {}",
                 pair_logits.len(),
                 pair_actions.len()
-            ));
+            )));
         }
         if pair_actions.is_empty() {
             self.root_pair_candidate_count = 0;
@@ -1257,25 +1224,27 @@ impl MCTSEngine {
         let mut valid_pairs: Vec<(usize, f32)> = Vec::with_capacity(pair_actions.len());
         for (row, &(q1, r1, q2, r2)) in pair_actions.iter().enumerate() {
             if q1 == q2 && r1 == r2 {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "duplicate coordinates are illegal for pair policy: ({q1}, {r1})"
-                ));
+                )));
             }
             if q1 != first_cell.q || r1 != first_cell.r {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "pair policy first action ({q1}, {r1}) does not match current turn first placement ({}, {})",
                     first_cell.q, first_cell.r
-                ));
+                )));
             }
             let Some(second_idx) = root_actions.iter().position(|&(q, r)| q == q2 && r == r2)
             else {
-                return Err(format!(
+                return Err(MCTSError::InvalidPrior(format!(
                     "pair policy target contains illegal second action: ({q2}, {r2})"
-                ));
+                )));
             };
             let logit = pair_logits[row];
             if !logit.is_finite() {
-                return Err(format!("pair policy logit at row {row} is not finite"));
+                return Err(MCTSError::InvalidPrior(format!(
+                    "pair policy logit at row {row} is not finite"
+                )));
             }
             valid_pairs.push((second_idx, logit));
         }
@@ -1289,7 +1258,9 @@ impl MCTSEngine {
             denom += (logit - max_logit).exp();
         }
         if denom <= 0.0 || !denom.is_finite() {
-            return Err("pair policy logits could not be normalized".to_string());
+            return Err(MCTSError::InvalidPrior(
+                "pair policy logits could not be normalized".to_string(),
+            ));
         }
         let mut pair_mass = vec![0.0f32; count];
         for &(second_idx, logit) in &valid_pairs {
@@ -1392,18 +1363,7 @@ impl MCTSEngine {
     ///    the board into `batch_buf` using `encoder::encode_board_into`.
     /// 4. Undo all moves to restore the root game state.
     ///
-    /// # Returns
-    /// `(&[f32], u32)` — a reference to the internal batch buffer containing
-    /// `non_terminal_count × TENSOR_SIZE` floats, and the count of
-    /// non-terminal leaves.
-    pub fn select_leaves(&mut self, batch_size: u32) -> (&[f32], u32) {
-        let batch = self
-            .select_leaves_tokenized(batch_size)
-            .expect("select_leaves failed");
-        (batch.tensors, batch.non_terminal_count)
-    }
-
-    pub fn select_leaves_tokenized(&mut self, batch_size: u32) -> Result<LeafBatch<'_>, MCTSError> {
+    pub fn select_leaves(&mut self, batch_size: u32) -> Result<LeafBatch<'_>, MCTSError> {
         // Clamp batch size to the remaining simulation budget.
         let actual_batch = batch_size.min(self.num_simulations.saturating_sub(self.sims_done));
 
@@ -1546,17 +1506,7 @@ impl MCTSEngine {
     /// 3. Backpropagate the value up the search path, flipping sign at each
     ///    level so that every node stores values from its own player's
     ///    perspective.
-    pub fn expand_and_backprop(&mut self, policies: &[f32], values: &[f32]) {
-        if self.pending.is_empty() {
-            validate_policy_slice(policies, 0).expect("expand_and_backprop failed");
-            validate_values(values, 0).expect("expand_and_backprop failed");
-            return;
-        }
-        self.try_expand_and_backprop(self.batch_generation, policies, values)
-            .expect("expand_and_backprop failed");
-    }
-
-    pub fn try_expand_and_backprop(
+    pub fn expand_and_backprop(
         &mut self,
         batch_generation: u64,
         policies: &[f32],
@@ -1628,34 +1578,8 @@ impl MCTSEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn expand_and_backprop_with_sparse(
-        &mut self,
-        policies: &[f32],
-        values: &[f32],
-        sparse_actions: &[Vec<(i32, i32)>],
-        sparse_logits: &[Vec<f32>],
-        stage: u8,
-        sparse_mix: f32,
-    ) {
-        if self.pending.is_empty() {
-            validate_policy_slice(policies, 0).expect("expand_and_backprop_with_sparse failed");
-            validate_values(values, 0).expect("expand_and_backprop_with_sparse failed");
-            return;
-        }
-        self.try_expand_and_backprop_with_sparse(
-            self.batch_generation,
-            policies,
-            values,
-            sparse_actions,
-            sparse_logits,
-            stage,
-            sparse_mix,
-        )
-        .expect("expand_and_backprop_with_sparse failed");
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn try_expand_and_backprop_with_sparse(
+    pub fn expand_and_backprop_with_sparse(
         &mut self,
         batch_generation: u64,
         policies: &[f32],
@@ -1678,37 +1602,8 @@ impl MCTSEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn expand_and_backprop_with_sparse_sources(
-        &mut self,
-        policies: &[f32],
-        values: &[f32],
-        sparse_actions: &[Vec<(i32, i32)>],
-        sparse_logits: &[Vec<f32>],
-        sparse_sources: &[Vec<u8>],
-        stage: u8,
-        sparse_mix: f32,
-    ) {
-        if self.pending.is_empty() {
-            validate_policy_slice(policies, 0)
-                .expect("expand_and_backprop_with_sparse_sources failed");
-            validate_values(values, 0).expect("expand_and_backprop_with_sparse_sources failed");
-            return;
-        }
-        self.try_expand_and_backprop_with_sparse_sources(
-            self.batch_generation,
-            policies,
-            values,
-            sparse_actions,
-            sparse_logits,
-            sparse_sources,
-            stage,
-            sparse_mix,
-        )
-        .expect("expand_and_backprop_with_sparse_sources failed");
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn try_expand_and_backprop_with_sparse_sources(
+    pub fn expand_and_backprop_with_sparse_sources(
         &mut self,
         batch_generation: u64,
         policies: &[f32],
@@ -2402,7 +2297,11 @@ impl MCTSEngine {
     ///
     /// `rng_state` is an in-out XOR-shift state. The caller should seed it
     /// from the deterministic seed chain and pass it by mutable reference.
-    pub fn sample_action(&mut self, temperature: f32, rng_state: &mut u64) -> (i32, i32) {
+    pub fn sample_action(
+        &mut self,
+        temperature: f32,
+        rng_state: &mut u64,
+    ) -> Result<(i32, i32), MCTSError> {
         if *rng_state == 0 {
             *rng_state = self.seed.max(1);
         }
@@ -2411,7 +2310,9 @@ impl MCTSEngine {
         let count = root.children_count as usize;
 
         if count == 0 {
-            panic!("sample_action: root has no children");
+            return Err(MCTSError::InvalidRootState(
+                "sample_action requires an expanded root with at least one child",
+            ));
         }
 
         if temperature == 0.0 {
@@ -2420,7 +2321,7 @@ impl MCTSEngine {
                 .unwrap();
             let action = (self.arena[best].action.0, self.arena[best].action.1);
             self.seed = *rng_state;
-            return action;
+            return Ok(action);
         }
 
         let inv_t = 1.0 / temperature.max(1e-8);
@@ -2438,7 +2339,7 @@ impl MCTSEngine {
         if sum <= 0.0 {
             let action = (self.arena[start].action.0, self.arena[start].action.1);
             self.seed = *rng_state;
-            return action;
+            return Ok(action);
         }
         let r = next_uniform(rng_state) * sum;
         let mut acc = 0.0f32;
@@ -2448,13 +2349,13 @@ impl MCTSEngine {
                 let n = &self.arena[start + offset];
                 let action = (n.action.0, n.action.1);
                 self.seed = *rng_state;
-                return action;
+                return Ok(action);
             }
         }
         let last = start + count - 1;
         let action = (self.arena[last].action.0, self.arena[last].action.1);
         self.seed = *rng_state;
-        action
+        Ok(action)
     }
 
     /// Returns true if the root Q-value is below the resign threshold.

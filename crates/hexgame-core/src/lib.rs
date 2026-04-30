@@ -44,7 +44,7 @@
 //!
 //! - [`HexGameState`] — the main game state; supports incremental place/unplace.
 //! - [`Turn`] — a single placement or a pair of placements.
-//! - [`ThreatStatus`](threats::ThreatStatus) — the threat classification of a position (winning, must-block, etc.).
+//! - [`TacticalStatus`](tactics::TacticalStatus) — the tactical classification of a position (winning, must-block, etc.).
 //! - [`EvalState`](eval::state::EvalState) — incremental pattern evaluation with `O(1)` updates per stone.
 //!
 //! ## Testing Strategy
@@ -85,8 +85,8 @@ pub mod encoding {
 /// Stable tactical-analysis facade.
 pub mod tactics {
     pub use crate::threats::{
-        live_cells, tactical_mask_cells, tactical_status, threat_status, turn_satisfies_status,
-        turn_satisfies_tactical, BlockConstraint, TacticalStatus, ThreatStatus,
+        live_cells, tactical_mask_cells, tactical_status, turn_satisfies_tactical, BlockConstraint,
+        TacticalStatus,
     };
 }
 
@@ -99,4 +99,4 @@ pub mod classical {
 pub use board::{GameError, HexGameState, MoveRecord};
 pub use core::{hex_distance, Hex, Turn, WindowKey, HEX_DIRECTIONS, PLACEMENT_RADIUS, WIN_LENGTH};
 pub use mcts::{MCTSEngine, MCTSError};
-pub use threats::{live_cells, tactical_status, threat_status, TacticalStatus, ThreatStatus};
+pub use threats::{live_cells, tactical_status, TacticalStatus};

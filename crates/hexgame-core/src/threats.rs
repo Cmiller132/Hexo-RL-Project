@@ -40,6 +40,7 @@ use smallvec::SmallVec;
 /// evaluated **once per node**, then reused for every candidate turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
+#[cfg(test)]
 pub enum ThreatStatus {
     /// No immediate threats for either side.
     ///
@@ -324,6 +325,7 @@ pub fn tactical_status(game: &HexGameState) -> TacticalStatus {
 /// This compatibility API collapses complete winning-turn output down to the
 /// first deterministic winning turn.  Use [`tactical_status`] when filtering
 /// moves or training masks.
+#[cfg(test)]
 pub fn threat_status(game: &HexGameState) -> ThreatStatus {
     match tactical_status(game) {
         TacticalStatus::Quiet => ThreatStatus::Quiet,
@@ -338,6 +340,7 @@ pub fn threat_status(game: &HexGameState) -> ThreatStatus {
 ///
 /// This function is O(pairs) in the worst case and should be called via
 /// `retain` on a turn vector after computing `threat_status` once per node.
+#[cfg(test)]
 pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
     match status {
         // Quiet positions impose no restrictions.

@@ -206,12 +206,12 @@ fn cmd_bench() {
     for i in 0..num_games {
         let mut engine = MCTSEngine::new(game.clone(), 50, 1.5, 2, false, i as u64);
         if let Some(root) = engine
-            .init_root_tokenized()
+            .init_root()
             .expect("benchmark root initialization should succeed")
         {
             let uniform = vec![0.0f32; BOARD_AREA];
             engine
-                .try_expand_root(
+                .expand_root(
                     root.root_generation,
                     &uniform,
                     0.0,
@@ -223,14 +223,14 @@ fn cmd_bench() {
             while !engine.done() {
                 let (batch_generation, count) = {
                     let batch = engine
-                        .select_leaves_tokenized(2)
+                        .select_leaves(2)
                         .expect("benchmark leaf selection should succeed");
                     (batch.batch_generation, batch.non_terminal_count)
                 };
                 let p = vec![0.0f32; count as usize * BOARD_AREA];
                 let v = vec![0.1f32; count as usize];
                 engine
-                    .try_expand_and_backprop(batch_generation, &p, &v)
+                    .expand_and_backprop(batch_generation, &p, &v)
                     .expect("benchmark backpropagation should succeed");
             }
         }

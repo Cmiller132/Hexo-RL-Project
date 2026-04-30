@@ -7,6 +7,50 @@ use crate::mcts::{MCTSEngine, MCTSError};
 mod tests {
     use super::*;
 
+    fn init_root_parts(engine: &mut MCTSEngine) -> (i32, i32, Vec<Hex>, u64) {
+        let init = engine
+            .init_root()
+            .expect("init_root should not fail")
+            .expect("root should be non-terminal");
+        (
+            init.offset_q,
+            init.offset_r,
+            init.legal_moves,
+            init.root_generation,
+        )
+    }
+
+    fn expand_root(
+        engine: &mut MCTSEngine,
+        policy: &[f32],
+        oq: i32,
+        or_: i32,
+        legal: &[Hex],
+        root_generation: u64,
+    ) {
+        engine
+            .expand_root(root_generation, policy, 0.0, oq, or_, legal)
+            .expect("root expansion should succeed");
+    }
+
+    fn select_leaves(engine: &mut MCTSEngine, batch_size: u32) -> (u64, u32) {
+        let batch = engine
+            .select_leaves(batch_size)
+            .expect("leaf selection should succeed");
+        (batch.batch_generation, batch.non_terminal_count)
+    }
+
+    fn expand_and_backprop(
+        engine: &mut MCTSEngine,
+        batch_generation: u64,
+        policies: &[f32],
+        values: &[f32],
+    ) {
+        engine
+            .expand_and_backprop(batch_generation, policies, values)
+            .expect("backpropagation should succeed");
+    }
+
     /// Run MCTS twice with the same deterministic setup; verify visit distributions match.
     #[test]
     fn mcts_deterministic_replay() {
@@ -14,16 +58,16 @@ mod tests {
         let mut engine1 =
             MCTSEngine::with_arena_sim_hint(game.clone(), 50, 200, 1.5, 2, false, 19652.0, 0);
         // init_root returns (tensor, offset_q, offset_r, legal_moves)
-        let (_tensor1, oq, or_, legal1) = engine1.init_root().expect("init_root");
+        let (oq, or_, legal1, root_generation) = init_root_parts(&mut engine1);
         // Expand with uniform policy
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine1.expand_root(&uniform, 0.0, oq, or_, &legal1);
+        expand_root(&mut engine1, &uniform, oq, or_, &legal1, root_generation);
 
         while !engine1.done() {
-            let (_, count) = engine1.select_leaves(8);
+            let (batch_generation, count) = select_leaves(&mut engine1, 8);
             let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
-            engine1.expand_and_backprop(&policies, &values);
+            expand_and_backprop(&mut engine1, batch_generation, &policies, &values);
         }
         let (_, _, visits1, _) = engine1.get_results();
 
@@ -31,15 +75,15 @@ mod tests {
         let game2 = HexGameState::new();
         let mut engine2 =
             MCTSEngine::with_arena_sim_hint(game2, 50, 200, 1.5, 2, false, 19652.0, 0);
-        let (_tensor2, oq2, or2, legal2) = engine2.init_root().expect("init_root");
+        let (oq2, or2, legal2, root_generation) = init_root_parts(&mut engine2);
         let uniform2 = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine2.expand_root(&uniform2, 0.0, oq2, or2, &legal2);
+        expand_root(&mut engine2, &uniform2, oq2, or2, &legal2, root_generation);
 
         while !engine2.done() {
-            let (_, count) = engine2.select_leaves(8);
+            let (batch_generation, count) = select_leaves(&mut engine2, 8);
             let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
-            engine2.expand_and_backprop(&policies, &values);
+            expand_and_backprop(&mut engine2, batch_generation, &policies, &values);
         }
         let (_, _, visits2, _) = engine2.get_results();
         assert_eq!(
@@ -54,15 +98,15 @@ mod tests {
     fn mcts_reroot_visit_counts_preserved() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
         while !engine.done() {
-            let (_, count) = engine.select_leaves(8);
+            let (batch_generation, count) = select_leaves(&mut engine, 8);
             let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
-            engine.expand_and_backprop(&policies, &values);
+            expand_and_backprop(&mut engine, batch_generation, &policies, &values);
         }
         let (moves_q, moves_r, visits, _) = engine.get_results();
         assert!(!visits.is_empty(), "no children after search");
@@ -90,14 +134,14 @@ mod tests {
     fn mcts_root_value_bounded() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 80, 300, 1.5, 2, false, 19652.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
         // Use random values in [-1, 1] for each batch
         let mut seed = 42u64;
         while !engine.done() {
-            let (_, count) = engine.select_leaves(8);
+            let (batch_generation, count) = select_leaves(&mut engine, 8);
             let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
             let values: Vec<f32> = (0..count as usize)
                 .map(|_| {
@@ -107,7 +151,7 @@ mod tests {
                     (seed as f32 / u64::MAX as f32) * 2.0 - 1.0
                 })
                 .collect();
-            engine.expand_and_backprop(&policies, &values);
+            expand_and_backprop(&mut engine, batch_generation, &policies, &values);
         }
         let (_, _, _, root_q) = engine.get_results();
         assert!(
@@ -122,13 +166,13 @@ mod tests {
     fn mcts_expand_and_backprop_wrong_length_returns_err() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
         // Run a few selections to create pending leaves
         let (batch_generation, count) = {
-            let batch = engine.select_leaves_tokenized(8).expect("select_leaves");
+            let batch = engine.select_leaves(8).expect("select_leaves");
             (batch.batch_generation, batch.non_terminal_count)
         };
         assert!(count > 0);
@@ -137,7 +181,7 @@ mod tests {
         let wrong_policies = vec![0.0f32; count as usize * BOARD_AREA - 1];
         let values = vec![0.0f32; count as usize];
         let err = engine
-            .try_expand_and_backprop(batch_generation, &wrong_policies, &values)
+            .expand_and_backprop(batch_generation, &wrong_policies, &values)
             .expect_err("wrong-length batch should return Err");
         assert!(matches!(err, MCTSError::WrongPolicyLength { .. }));
     }
@@ -149,32 +193,30 @@ mod tests {
         let far = Hex::new(50_000, -50_000);
         let legal = vec![far, Hex::new(0, 0)];
         let policy = vec![0.0f32; BOARD_AREA];
+        let (_, _, _, root_generation) = init_root_parts(&mut engine);
 
-        engine.expand_root(&policy, 0.0, -16, -16, &legal);
+        expand_root(&mut engine, &policy, -16, -16, &legal, root_generation);
 
         let (moves_q, moves_r, _visits, _root_q) = engine.get_results();
         assert_eq!((moves_q[0], moves_r[0]), (far.q, far.r));
         engine.arena[1].visit_count = 1;
         let mut rng = 1;
-        assert_eq!(engine.sample_action(0.0, &mut rng), (far.q, far.r));
+        assert_eq!(
+            engine.sample_action(0.0, &mut rng).expect("sample action"),
+            (far.q, far.r)
+        );
     }
 
     #[test]
     fn mcts_stale_root_token_rejected() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 10, 1.5, 2, false, 0.0, 0);
-        let init1 = engine
-            .init_root_tokenized()
-            .expect("init_root")
-            .expect("root init");
-        let init2 = engine
-            .init_root_tokenized()
-            .expect("init_root")
-            .expect("root init");
+        let init1 = engine.init_root().expect("init_root").expect("root init");
+        let init2 = engine.init_root().expect("init_root").expect("root init");
         let policy = vec![0.0f32; BOARD_AREA];
 
         let err = engine
-            .try_expand_root(
+            .expand_root(
                 init1.root_generation,
                 &policy,
                 0.0,
@@ -192,7 +234,7 @@ mod tests {
         ));
 
         engine
-            .try_expand_root(
+            .expand_root(
                 init2.root_generation,
                 &policy,
                 0.0,
@@ -207,13 +249,10 @@ mod tests {
     fn mcts_stale_batch_token_rejected() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 8, 50, 1.5, 2, false, 0.0, 0);
-        let init = engine
-            .init_root_tokenized()
-            .expect("init_root")
-            .expect("root init");
+        let init = engine.init_root().expect("init_root").expect("root init");
         let policy = vec![0.0f32; BOARD_AREA];
         engine
-            .try_expand_root(
+            .expand_root(
                 init.root_generation,
                 &policy,
                 0.0,
@@ -224,12 +263,12 @@ mod tests {
             .expect("expand root");
 
         let first_token = {
-            let batch = engine.select_leaves_tokenized(2).expect("first select");
+            let batch = engine.select_leaves(2).expect("first select");
             assert!(batch.non_terminal_count > 0);
             batch.batch_generation
         };
         let (second_token, second_count) = {
-            let batch = engine.select_leaves_tokenized(2).expect("second select");
+            let batch = engine.select_leaves(2).expect("second select");
             assert!(batch.non_terminal_count > 0);
             (batch.batch_generation, batch.non_terminal_count)
         };
@@ -237,7 +276,7 @@ mod tests {
         let values = vec![0.0f32; second_count as usize];
 
         let err = engine
-            .try_expand_and_backprop(first_token, &policies, &values)
+            .expand_and_backprop(first_token, &policies, &values)
             .expect_err("stale batch token should be rejected");
         assert!(matches!(
             err,
@@ -246,7 +285,7 @@ mod tests {
         ));
 
         engine
-            .try_expand_and_backprop(second_token, &policies, &values)
+            .expand_and_backprop(second_token, &policies, &values)
             .expect("current batch token should backpropagate");
     }
 
@@ -254,13 +293,10 @@ mod tests {
     fn mcts_tokenized_happy_path_runs_to_completion() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 6, 50, 1.5, 2, false, 0.0, 0);
-        let init = engine
-            .init_root_tokenized()
-            .expect("init_root")
-            .expect("root init");
+        let init = engine.init_root().expect("init_root").expect("root init");
         let policy = vec![0.0f32; BOARD_AREA];
         engine
-            .try_expand_root(
+            .expand_root(
                 init.root_generation,
                 &policy,
                 0.0,
@@ -272,13 +308,13 @@ mod tests {
 
         while !engine.done() {
             let (batch_generation, count) = {
-                let batch = engine.select_leaves_tokenized(3).expect("select leaves");
+                let batch = engine.select_leaves(3).expect("select leaves");
                 (batch.batch_generation, batch.non_terminal_count)
             };
             let policies = vec![0.0f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
             engine
-                .try_expand_and_backprop(batch_generation, &policies, &values)
+                .expand_and_backprop(batch_generation, &policies, &values)
                 .expect("backprop batch");
         }
 
@@ -294,11 +330,11 @@ mod tests {
         let game = HexGameState::new();
         let mut engine =
             MCTSEngine::with_arena_sim_hint(game.clone(), 100, 300, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
-        let (_, count) = engine.select_leaves(8);
+        let (batch_generation, count) = select_leaves(&mut engine, 8);
         assert!(count > 0, "expected non-zero leaves");
         assert!(
             !engine.done(),
@@ -307,7 +343,7 @@ mod tests {
 
         let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
         let values = vec![0.0f32; count as usize];
-        engine.expand_and_backprop(&policies, &values);
+        expand_and_backprop(&mut engine, batch_generation, &policies, &values);
         assert!(
             !engine.done(),
             "done() must be false after only 8 of 100 sims"
@@ -318,13 +354,13 @@ mod tests {
     fn mcts_reroot_clears_pending_after_failed_batch() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
         let (moves_q, moves_r, visits_before, _) = engine.get_results();
         assert!(!visits_before.is_empty(), "root should have children");
-        let (_, count) = engine.select_leaves(8);
+        let (_batch_generation, count) = select_leaves(&mut engine, 8);
         assert!(count > 0, "expected pending non-terminal leaves");
         assert!(
             !engine.pending_leaf_metadata().is_empty(),
@@ -344,18 +380,18 @@ mod tests {
     fn mcts_repeated_select_rolls_back_previous_virtual_loss() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 10, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
         let root_idx = engine.root_idx as usize;
         assert_eq!(engine.arena[root_idx].visit_count, 0);
-        let (_, first_count) = engine.select_leaves(1);
+        let (_batch_generation, first_count) = select_leaves(&mut engine, 1);
         assert_eq!(first_count, 1);
         let first_pending_visit_count = engine.arena[root_idx].visit_count;
         assert_eq!(first_pending_visit_count, 1);
 
-        let (_, second_count) = engine.select_leaves(1);
+        let (_batch_generation, second_count) = select_leaves(&mut engine, 1);
         assert_eq!(second_count, 1);
         assert_eq!(
             engine.arena[root_idx].visit_count, first_pending_visit_count,
@@ -371,15 +407,15 @@ mod tests {
         assert_eq!(game.placements_remaining(), 2);
 
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
-        let (_, count) = engine.select_leaves(1);
+        let (batch_generation, count) = select_leaves(&mut engine, 1);
         assert_eq!(count, 1);
         let policies = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
         let values = vec![1.0f32];
-        engine.expand_and_backprop(&policies, &values);
+        expand_and_backprop(&mut engine, batch_generation, &policies, &values);
 
         let (_, _, _, root_q) = engine.get_results();
         assert!(
@@ -397,18 +433,22 @@ mod tests {
         dense[16 * 33 + 16] = 10.0;
         let sparse_actions = vec![(50, 50)];
         let sparse_logits = vec![20.0f32];
+        let (_, _, _, root_generation) = init_root_parts(&mut engine);
 
-        engine.expand_root_with_sparse_priors(
-            &dense,
-            0.0,
-            -16,
-            -16,
-            &legal,
-            &sparse_actions,
-            &sparse_logits,
-            2,
-            0.25,
-        );
+        engine
+            .expand_root_with_sparse_priors(
+                root_generation,
+                &dense,
+                0.0,
+                -16,
+                -16,
+                &legal,
+                &sparse_actions,
+                &sparse_logits,
+                2,
+                0.25,
+            )
+            .expect("sparse root priors should apply");
         let priors = engine.root_child_priors();
 
         assert!(
@@ -427,18 +467,30 @@ mod tests {
         let mut dense = vec![-10.0f32; BOARD_AREA];
         dense[16 * 33 + 16] = 3.0;
         dense[17 * 33 + 16] = 1.0;
-        dense_engine.expand_root(&dense, 0.0, -16, -16, &legal);
-        sparse_engine.expand_root_with_sparse_priors(
+        let (_, _, _, dense_root_generation) = init_root_parts(&mut dense_engine);
+        let (_, _, _, sparse_root_generation) = init_root_parts(&mut sparse_engine);
+        expand_root(
+            &mut dense_engine,
             &dense,
-            0.0,
             -16,
             -16,
             &legal,
-            &[(50, 50)],
-            &[20.0],
-            1,
-            1.0,
+            dense_root_generation,
         );
+        sparse_engine
+            .expand_root_with_sparse_priors(
+                sparse_root_generation,
+                &dense,
+                0.0,
+                -16,
+                -16,
+                &legal,
+                &[(50, 50)],
+                &[20.0],
+                1,
+                1.0,
+            )
+            .expect("sparse root priors should apply");
 
         assert_eq!(
             sparse_engine.root_child_priors(),
@@ -450,42 +502,48 @@ mod tests {
     fn mcts_sparse_stage1_only_uses_sparse_at_root() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 4, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
         let sparse_actions = vec![(legal[0].q, legal[0].r)];
         let sparse_logits = vec![10.0f32];
 
-        engine.expand_root_with_sparse_priors(
-            &dense,
-            0.0,
-            oq,
-            or_,
-            &legal,
-            &sparse_actions,
-            &sparse_logits,
-            1,
-            1.0,
-        );
+        engine
+            .expand_root_with_sparse_priors(
+                root_generation,
+                &dense,
+                0.0,
+                oq,
+                or_,
+                &legal,
+                &sparse_actions,
+                &sparse_logits,
+                1,
+                1.0,
+            )
+            .expect("sparse root priors should apply");
         let root_sources = engine.root_child_prior_sources();
         assert_eq!(
             root_sources[0], 1,
             "stage1 root should consume sparse prior"
         );
 
-        let (_, count) = engine.select_leaves(2);
+        let (batch_generation, count) = select_leaves(&mut engine, 2);
         assert!(count > 0);
         let policies = vec![0.0f32; count as usize * BOARD_AREA];
         let values = vec![0.0f32; count as usize];
         let leaf_sparse = vec![sparse_actions.clone(); count as usize];
         let leaf_logits = vec![sparse_logits.clone(); count as usize];
-        engine.expand_and_backprop_with_sparse(
-            &policies,
-            &values,
-            &leaf_sparse,
-            &leaf_logits,
-            1,
-            1.0,
-        );
+        engine
+            .expand_and_backprop_with_sparse(
+                batch_generation,
+                &policies,
+                &values,
+                &leaf_sparse,
+                &leaf_logits,
+                1,
+                1.0,
+            )
+            .expect("sparse backprop should succeed");
         let telemetry = engine.prior_source_telemetry();
         assert_eq!(
             telemetry.leaf_sparse_count, 0,
@@ -502,18 +560,22 @@ mod tests {
         let dense = vec![0.0f32; BOARD_AREA];
         let sparse_actions = vec![(50, 50)];
         let sparse_logits = vec![10.0f32];
+        let (_, _, _, root_generation) = init_root_parts(&mut engine);
 
-        engine.expand_root_with_sparse_priors(
-            &dense,
-            0.0,
-            -16,
-            -16,
-            &legal,
-            &sparse_actions,
-            &sparse_logits,
-            2,
-            1.0,
-        );
+        engine
+            .expand_root_with_sparse_priors(
+                root_generation,
+                &dense,
+                0.0,
+                -16,
+                -16,
+                &legal,
+                &sparse_actions,
+                &sparse_logits,
+                2,
+                1.0,
+            )
+            .expect("sparse root priors should apply");
 
         let telemetry = engine.prior_source_telemetry();
         assert_eq!(telemetry.root_total_count, 3);
@@ -524,7 +586,15 @@ mod tests {
         let default_legal = vec![Hex::new(80, 80), Hex::new(0, 0)];
         let mut default_engine =
             MCTSEngine::with_arena_sim_hint(HexGameState::new(), 1, 50, 1.5, 2, false, 0.0, 0);
-        default_engine.expand_root(&dense, 0.0, -16, -16, &default_legal);
+        let (_, _, _, root_generation) = init_root_parts(&mut default_engine);
+        expand_root(
+            &mut default_engine,
+            &dense,
+            -16,
+            -16,
+            &default_legal,
+            root_generation,
+        );
         let default_telemetry = default_engine.prior_source_telemetry();
         assert_eq!(default_telemetry.root_default_count, 1);
         assert_eq!(default_telemetry.root_dense_count, 1);
@@ -536,10 +606,10 @@ mod tests {
         game.place(0, 0).expect("opening move");
         assert_eq!(game.placements_remaining(), 2);
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 24, 100, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         assert!(legal.len() >= 3);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
 
         let pair_a = legal[0];
         let pair_b = legal[1];
@@ -556,10 +626,10 @@ mod tests {
         assert_eq!(telemetry.root_pair_count, 2);
 
         while !engine.done() {
-            let (_, count) = engine.select_leaves(4);
+            let (batch_generation, count) = select_leaves(&mut engine, 4);
             let policies = vec![0.0f32; count as usize * BOARD_AREA];
             let values = vec![0.0f32; count as usize];
-            engine.expand_and_backprop(&policies, &values);
+            expand_and_backprop(&mut engine, batch_generation, &policies, &values);
         }
         let (moves_q, moves_r, visits, _) = engine.get_results();
         let pair_visits: u32 = moves_q
@@ -597,9 +667,9 @@ mod tests {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
         let a = legal[0];
 
         let duplicate = engine.apply_root_pair_priors(&[(a.q, a.r, a.q, a.r)], &[1.0], 1.0);
@@ -625,9 +695,9 @@ mod tests {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
 
         let logits = vec![0.0f32; legal.len()];
         engine
@@ -644,9 +714,9 @@ mod tests {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
 
         let mut noise = vec![0.0f32; legal.len()];
         noise[0] = 2.0;
@@ -664,9 +734,9 @@ mod tests {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
 
         let mut noise = vec![1.0f32; legal.len()];
         noise[0] = f32::NAN;
@@ -683,18 +753,25 @@ mod tests {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
 
         let first = legal[0];
         engine
             .re_root(first.q, first.r, 1)
             .expect("reroot at first placement");
 
-        let (_tensor2, oq2, or2, second_legal) = engine.init_root().expect("second root");
+        let (oq2, or2, second_legal, root_generation) = init_root_parts(&mut engine);
         assert!(second_legal.len() >= 2);
-        engine.expand_root(&dense, 0.0, oq2, or2, &second_legal);
+        expand_root(
+            &mut engine,
+            &dense,
+            oq2,
+            or2,
+            &second_legal,
+            root_generation,
+        );
         let chosen_second = second_legal[1];
         engine
             .apply_root_pair_second_priors(
@@ -720,15 +797,22 @@ mod tests {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let dense = vec![0.0f32; BOARD_AREA];
-        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &dense, oq, or_, &legal, root_generation);
         let first = legal[0];
         engine
             .re_root(first.q, first.r, 1)
             .expect("reroot at first placement");
-        let (_tensor2, oq2, or2, second_legal) = engine.init_root().expect("second root");
-        engine.expand_root(&dense, 0.0, oq2, or2, &second_legal);
+        let (oq2, or2, second_legal, root_generation) = init_root_parts(&mut engine);
+        expand_root(
+            &mut engine,
+            &dense,
+            oq2,
+            or2,
+            &second_legal,
+            root_generation,
+        );
         let second = second_legal[0];
 
         let wrong_first =
@@ -744,11 +828,11 @@ mod tests {
     fn mcts_pending_leaf_metadata_matches_selected_leaves() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 8, 50, 1.5, 2, false, 0.0, 0);
-        let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
         let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
-        engine.expand_root(&uniform, 0.0, oq, or_, &legal);
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
 
-        let (_, count) = engine.select_leaves(4);
+        let (_batch_generation, count) = select_leaves(&mut engine, 4);
         let meta = engine.pending_leaf_metadata();
 
         assert_eq!(meta.len(), count as usize);

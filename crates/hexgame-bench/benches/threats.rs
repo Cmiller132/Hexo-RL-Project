@@ -1,8 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use hexgame_core::tactics::threat_status;
+use hexgame_core::tactics::tactical_status;
 use hexgame_core::HexGameState;
 
-fn bench_threat_status(c: &mut Criterion) {
+fn bench_tactical_status(c: &mut Criterion) {
     let mut game = HexGameState::new();
     game.place(0, 0).unwrap();
     let placements = [
@@ -31,12 +31,12 @@ fn bench_threat_status(c: &mut Criterion) {
         let _ = game.place(q, r);
     }
 
-    c.bench_function("threat_status", |b| {
+    c.bench_function("tactical_status", |b| {
         b.iter(|| {
-            black_box(threat_status(&game));
+            black_box(tactical_status(&game));
         });
     });
 }
 
-criterion_group!(benches, bench_threat_status);
+criterion_group!(benches, bench_tactical_status);
 criterion_main!(benches);

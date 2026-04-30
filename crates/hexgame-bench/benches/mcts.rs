@@ -35,12 +35,12 @@ fn bench_single_mcts_sim(c: &mut Criterion) {
             );
 
             if let Some(root) = engine
-                .init_root_tokenized()
+                .init_root()
                 .expect("bench root initialization should succeed")
             {
                 let policy = vec![0.0f32; 1089]; // BOARD_AREA uniform logits
                 engine
-                    .try_expand_root(
+                    .expand_root(
                         root.root_generation,
                         &policy,
                         0.0,
@@ -53,14 +53,14 @@ fn bench_single_mcts_sim(c: &mut Criterion) {
                 while !engine.done() {
                     let (batch_generation, count) = {
                         let batch = engine
-                            .select_leaves_tokenized(1)
+                            .select_leaves(1)
                             .expect("bench leaf selection should succeed");
                         (batch.batch_generation, batch.non_terminal_count)
                     };
                     let mock_policy = vec![0.0f32; count as usize * 1089]; // BOARD_AREA
                     let mock_values = vec![0.1f32; count as usize];
                     engine
-                        .try_expand_and_backprop(batch_generation, &mock_policy, &mock_values)
+                        .expand_and_backprop(batch_generation, &mock_policy, &mock_values)
                         .expect("bench backpropagation should succeed");
                 }
             }

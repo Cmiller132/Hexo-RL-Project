@@ -6,7 +6,7 @@ use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyR
 
 use hexgame_core::classical as search;
 use hexgame_core::encoding as encoder;
-use hexgame_core::tactics::{threat_status, ThreatStatus};
+use hexgame_core::tactics::{tactical_status, TacticalStatus};
 use hexgame_core::Hex;
 use hexgame_core::MCTSEngine;
 use hexgame_core::HEX_DIRECTIONS;
@@ -344,7 +344,7 @@ impl PyHexGame {
     /// Engine-backed tactical oracle using the incremental hot-window index.
     ///
     /// This is intentionally bounded to hot-window empties and exact
-    /// `ThreatStatus` constraints instead of rescanning every legal cell.
+    /// `TacticalStatus` constraints instead of rescanning every legal cell.
     #[pyo3(signature = (radius=8))]
     fn tactical_oracle<'py>(&self, py: Python<'py>, radius: i32) -> PyResult<Bound<'py, PyDict>> {
         let legal: std::collections::HashSet<Hex> = self
@@ -363,21 +363,23 @@ impl PyHexGame {
         let mut open_five = Vec::<Hex>::new();
 
         collect_hot_window_empties(&self.inner, current, &legal, &mut open_four, &mut open_five);
-        let status_text = match threat_status(&self.inner) {
-            ThreatStatus::Quiet => "quiet",
-            ThreatStatus::Unblockable => {
+        let status_text = match tactical_status(&self.inner) {
+            TacticalStatus::Quiet => "quiet",
+            TacticalStatus::Unblockable => {
                 collect_all_hot_empties(&self.inner, opponent, &legal, &mut forced);
                 cover.extend_from_slice(&forced);
                 "unblockable"
             }
-            ThreatStatus::WinningTurn(t) => {
-                win_now.push(t.first());
-                if let Some(second) = t.second() {
-                    win_now.push(second);
+            TacticalStatus::WinningTurns(turns) => {
+                for turn in turns {
+                    win_now.push(turn.first());
+                    if let Some(second) = turn.second() {
+                        win_now.push(second);
+                    }
                 }
                 "winning_turn"
             }
-            ThreatStatus::MustBlock(blocks) => {
+            TacticalStatus::MustBlock(blocks) => {
                 forced.extend_from_slice(blocks.cells());
                 cover.extend_from_slice(blocks.cells());
                 for &(a, b) in blocks.pairs() {
@@ -454,15 +456,20 @@ impl PyHexGame {
     /// * **Winning turn** — only the 1 or 2 cells that complete a 6-line.
     /// * **Must-block** — only the cells that block the opponent's immediate win.
     fn threat_constrained_moves(&self, radius: i32) -> Option<Vec<(i32, i32)>> {
-        match threat_status(&self.inner) {
-            ThreatStatus::Quiet | ThreatStatus::Unblockable => None,
-            ThreatStatus::WinningTurn(t) => {
-                let first = t.first();
-                let second = t.second();
+        match tactical_status(&self.inner) {
+            TacticalStatus::Quiet | TacticalStatus::Unblockable => None,
+            TacticalStatus::WinningTurns(turns) => {
                 let legal = self.inner.legal_moves_near(radius);
+                let mut allowed = Vec::new();
+                for turn in turns {
+                    allowed.push(turn.first());
+                    if let Some(second) = turn.second() {
+                        allowed.push(second);
+                    }
+                }
                 let result: Vec<(i32, i32)> = legal
                     .into_iter()
-                    .filter(|h| *h == first || second == Some(*h))
+                    .filter(|h| allowed.contains(h))
                     .map(|h| (h.q, h.r))
                     .collect();
                 if result.is_empty() {
@@ -471,7 +478,7 @@ impl PyHexGame {
                     Some(result)
                 }
             }
-            ThreatStatus::MustBlock(b) => {
+            TacticalStatus::MustBlock(b) => {
                 let legal = self.inner.legal_moves_near(radius);
                 let mut allowed = b.cells().to_vec();
                 for (a, c) in b.pairs() {
@@ -845,7 +852,7 @@ impl PyMCTSEngine {
     > {
         let Some(init) = self
             .inner
-            .init_root_tokenized()
+            .init_root()
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?
         else {
             self.root_snapshot = None;
@@ -909,7 +916,7 @@ impl PyMCTSEngine {
             root_generation,
         )?;
         self.inner
-            .try_expand_root(
+            .expand_root(
                 root_generation,
                 policy_slice,
                 value,
@@ -974,7 +981,7 @@ impl PyMCTSEngine {
         )?;
         let sparse_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner
-            .try_expand_root_with_sparse_priors(
+            .expand_root_with_sparse_priors(
                 root_generation,
                 policy_slice,
                 value,
@@ -1017,14 +1024,8 @@ impl PyMCTSEngine {
         validate_root_snapshot(&self.root_snapshot, None, &legal, root_generation)?;
         let global_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner
-            .try_expand_root_with_global_priors(
-                root_generation,
-                &legal,
-                &global_actions,
-                logits,
-                value,
-            )
-            .map_err(PyValueError::new_err)?;
+            .expand_root_with_global_priors(root_generation, &legal, &global_actions, logits, value)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.root_snapshot = None;
         Ok(())
     }
@@ -1055,7 +1056,7 @@ impl PyMCTSEngine {
             .collect();
         self.inner
             .apply_root_pair_priors(&pair_actions, logits, pair_mix)
-            .map_err(PyValueError::new_err)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
 
     fn apply_root_pair_first_priors<'py>(
@@ -1068,7 +1069,7 @@ impl PyMCTSEngine {
         })?;
         self.inner
             .apply_root_pair_first_priors(logits, pair_mix)
-            .map_err(PyValueError::new_err)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
 
     fn apply_root_pair_second_priors<'py>(
@@ -1097,7 +1098,7 @@ impl PyMCTSEngine {
             .collect();
         self.inner
             .apply_root_pair_second_priors(&pair_actions, logits, pair_mix)
-            .map_err(PyValueError::new_err)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
 
     #[pyo3(signature = (noise, noise_fraction))]
@@ -1133,7 +1134,7 @@ impl PyMCTSEngine {
     ) -> PyResult<(Bound<'py, PyArray4<f32>>, u32, u64)> {
         let (count, batch_generation, tensor_vec) = py
             .allow_threads(|| {
-                self.inner.select_leaves_tokenized(batch_size).map(|batch| {
+                self.inner.select_leaves(batch_size).map(|batch| {
                     (
                         batch.non_terminal_count,
                         batch.batch_generation,
@@ -1221,7 +1222,7 @@ impl PyMCTSEngine {
                 self.last_batch_generation
             )));
         }
-        py.allow_threads(|| self.inner.try_expand_and_backprop(batch_generation, &p, &v))
+        py.allow_threads(|| self.inner.expand_and_backprop(batch_generation, &p, &v))
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.last_non_terminal_count = 0;
         self.last_batch_generation = None;
@@ -1305,7 +1306,7 @@ impl PyMCTSEngine {
             )));
         }
         py.allow_threads(|| {
-            self.inner.try_expand_and_backprop_with_sparse(
+            self.inner.expand_and_backprop_with_sparse(
                 batch_generation,
                 &p,
                 &v,
@@ -1409,7 +1410,7 @@ impl PyMCTSEngine {
             )));
         }
         py.allow_threads(|| {
-            self.inner.try_expand_and_backprop_with_sparse_sources(
+            self.inner.expand_and_backprop_with_sparse_sources(
                 batch_generation,
                 &p,
                 &v,
@@ -1520,7 +1521,9 @@ impl PyMCTSEngine {
             ));
         }
         let mut state = rng_state.unwrap_or(0);
-        Ok(self.inner.sample_action(temperature, &mut state))
+        self.inner
+            .sample_action(temperature, &mut state)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
 
     /// Returns true if the root Q-value is below the resign threshold.
