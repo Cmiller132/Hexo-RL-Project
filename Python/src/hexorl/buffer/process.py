@@ -18,6 +18,7 @@ import numpy as np
 from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
+from hexorl.models.factory import model_uses_global_graph
 
 
 @dataclass
@@ -86,7 +87,7 @@ class BufferProcess:
                 self.cfg.model.heads,
                 architecture=self.cfg.model.architecture,
                 sparse_policy=self.cfg.model.sparse_policy,
-                graph=str(getattr(self.cfg.model, "architecture", "")).lower().startswith("global_"),
+                graph=model_uses_global_graph(self.cfg),
             ),
         )
 

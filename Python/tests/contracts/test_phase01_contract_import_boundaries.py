@@ -39,7 +39,7 @@ EXPECTED_CONTRACT_MODULES = {
 FORBIDDEN_CONTRACT_IMPORT_PREFIXES = (
     "hexorl.dashboard",
     "hexorl.inference",
-    "hexorl.model",
+    "hexorl." "models",
     "hexorl.search",
     "hexorl.selfplay",
     "hexorl.train",

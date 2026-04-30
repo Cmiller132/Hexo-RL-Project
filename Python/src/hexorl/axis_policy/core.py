@@ -79,7 +79,7 @@ class AxisPolicyResult:
                 if axis_count >= 6:
                     own_axes = axis_values[:3]
                     opp_axes = axis_values[3:6]
-                    net_axes = [own - opp for own, opp in zip(own_axes, opp_axes, strict=False)]
+                    net_axes = [own - opp for own, opp in zip(own_axes, opp_axes)]
                     own_score = max(own_axes) if own_axes else 0.0
                     opp_score = max(opp_axes) if opp_axes else 0.0
                     score = own_score if own_score >= opp_score else opp_score

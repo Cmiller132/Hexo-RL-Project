@@ -15,7 +15,7 @@ import torch
 
 from hexorl.engine.legal import decode_legal_bytes
 from hexorl.engine.rust import engine_available, hex_game_class
-from hexorl.model.network import HexNet
+from hexorl.models.network import HexNet
 from hexorl.selfplay.records import BOARD_SIZE
 
 HAS_ENGINE = engine_available()

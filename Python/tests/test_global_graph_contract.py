@@ -20,8 +20,8 @@ from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.graph.tensorize import graph_batch_with_pair_table, graph_capacity_report, validate_graph_ipc_capacity
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
-from hexorl.model.global_graph import GlobalHexGraphNet
-from hexorl.model.network import build_model_from_config
+from hexorl.models.factory import build_model
+from hexorl.models.global_graph import GlobalHexGraphNet
 from hexorl.selfplay.worker import _align_global_logits_to_rust_legal, _graph_batch_with_pair_rows
 from hexorl.train.trainer import Trainer
 
@@ -386,7 +386,7 @@ def test_global_graph_pair_chunks_remove_ipc_pair_cap_as_semantic_limit():
         np.asarray(pair_first, dtype=np.int64),
         np.asarray(pair_second, dtype=np.int64),
     )
-    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, architecture="global_pair_twostage_0")
+    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, family_kind="pair_two_stage")
 
     out = model(
         token_features=torch.from_numpy(chunk.token_features).unsqueeze(0),
@@ -451,7 +451,7 @@ def test_global_graph_model_forward_with_padded_batch():
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     tensors = {
         "token_features": torch.from_numpy(batch.token_features),
         "token_type": torch.from_numpy(batch.token_type),
@@ -503,7 +503,7 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     aux = {
         "token_features": torch.from_numpy(graph.token_features),
         "token_type": torch.from_numpy(graph.token_type),
@@ -546,7 +546,7 @@ def test_global_graph_pair_logits_mask_invalid_rows_even_without_pair_token_indi
         build_graph_batch_from_history(_hist((0, 0, 0)), radius=2),
     ]
     batch = collate_graph_batches(graphs)
-    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, architecture="global_xattn_0")
+    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, family_kind="context_cross_attention")
     tensors = {
         "token_features": torch.from_numpy(batch.token_features),
         "token_type": torch.from_numpy(batch.token_type),
@@ -566,7 +566,7 @@ def test_global_graph_pair_logits_mask_invalid_rows_even_without_pair_token_indi
 
 def test_global_graph_full_requires_relation_bias_contract():
     graph = build_graph_batch_from_history(_hist((0, 0, 0)), radius=2)
-    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, architecture="global_graph_full_0")
+    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, family_kind="full_relation_graph")
 
     with pytest.raises(ValueError, match="relation_type and relation_bias"):
         model(
@@ -581,7 +581,7 @@ def test_global_graph_full_requires_relation_bias_contract():
 
 def test_global_graph_relation_tensor_shapes_are_validated():
     graph = build_graph_batch_from_history(_hist((0, 0, 0)), radius=2)
-    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, architecture="global_xattn_0")
+    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, family_kind="context_cross_attention")
     tensors = {
         "token_features": torch.from_numpy(graph.token_features).unsqueeze(0),
         "token_type": torch.from_numpy(graph.token_type).unsqueeze(0),
@@ -607,7 +607,15 @@ def test_global_graph_relation_tensor_shapes_are_validated():
         model(**tensors)
 
 
-@pytest.mark.parametrize("architecture", sorted(GlobalHexGraphNet.ARCHITECTURES))
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "global_xattn_0",
+        "global_line_window_0",
+        "global_pair_twostage_0",
+        "global_graph_full_0",
+    ],
+)
 def test_global_graph_alternatives_share_targets_and_masks(architecture):
     graph = build_graph_batch_from_history(_hist((0, 0, 0)), radius=1)
     cfg = Config.model_validate(
@@ -621,7 +629,7 @@ def test_global_graph_alternatives_share_targets_and_masks(architecture):
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     tensors = {
         "token_features": torch.from_numpy(graph.token_features).unsqueeze(0),
         "token_type": torch.from_numpy(graph.token_type).unsqueeze(0),
@@ -650,7 +658,7 @@ def test_global_graph_pair_heads_are_distinct_first_second_and_joint_contracts()
         max_pair_rows=8,
         allow_pair_truncation=True,
     )
-    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, architecture="global_pair_twostage_0")
+    model = GlobalHexGraphNet(channels=16, heads=4, layers=1, family_kind="pair_two_stage")
 
     out = model(
         token_features=torch.from_numpy(graph.token_features).unsqueeze(0),
@@ -672,14 +680,14 @@ def test_global_graph_pair_heads_are_distinct_first_second_and_joint_contracts()
 
 def test_global_graph_alternatives_have_distinct_model_families():
     families = {
-        arch: GlobalHexGraphNet(channels=16, heads=4, layers=1, architecture=arch).architecture_family
-        for arch in GlobalHexGraphNet.ARCHITECTURES
+        kind: GlobalHexGraphNet(channels=16, heads=4, layers=1, family_kind=kind).architecture_family
+        for kind in GlobalHexGraphNet.FAMILY_KINDS
     }
 
-    assert families["global_xattn_0"] == "context_cross_attention"
-    assert families["global_line_window_0"] == "line_window_cover"
-    assert families["global_pair_twostage_0"] == "pair_two_stage"
-    assert families["global_graph_full_0"] == "full_relation_graph"
+    assert families["context_cross_attention"] == "context_cross_attention"
+    assert families["line_window_cover"] == "line_window_cover"
+    assert families["pair_two_stage"] == "pair_two_stage"
+    assert families["full_relation_graph"] == "full_relation_graph"
     assert len(set(families.values())) == len(families)
 
 

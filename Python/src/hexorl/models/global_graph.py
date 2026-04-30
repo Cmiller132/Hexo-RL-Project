@@ -129,20 +129,20 @@ class GlobalHexGraphNet(nn.Module):
     crop policy is intentionally absent from this model.
     """
 
-    ARCHITECTURES = {
-        "global_graph_option1",
-        "global_xattn_0",
-        "global_line_window_0",
-        "global_pair_twostage_0",
-        "global_graph_full_0",
-        "global_hybrid_action_0",
-        "global_graph768_champion",
+    FAMILY_KINDS = {
+        "relation_graph",
+        "context_cross_attention",
+        "line_window_cover",
+        "pair_two_stage",
+        "full_relation_graph",
+        "crop_diagnostic_global_action",
+        "scaled_relation_graph",
     }
-    RELATION_REQUIRED_ARCHITECTURES = {
-        "global_graph_option1",
-        "global_line_window_0",
-        "global_graph_full_0",
-        "global_graph768_champion",
+    RELATION_REQUIRED_FAMILY_KINDS = {
+        "relation_graph",
+        "line_window_cover",
+        "full_relation_graph",
+        "scaled_relation_graph",
     }
 
     def __init__(
@@ -151,15 +151,15 @@ class GlobalHexGraphNet(nn.Module):
         layers: int = 4,
         heads: int = 8,
         n_bins: int = 65,
-        architecture: str = "global_graph_option1",
+        family_kind: str = "relation_graph",
         dropout: float = 0.0,
         output_heads: Optional[list[str]] = None,
     ):
         super().__init__()
-        architecture = architecture.lower()
-        if architecture not in self.ARCHITECTURES:
-            raise ValueError(f"unknown global graph architecture {architecture}")
-        self.architecture = architecture
+        family_kind = family_kind.lower()
+        if family_kind not in self.FAMILY_KINDS:
+            raise ValueError(f"unknown global graph family kind {family_kind}")
+        self.family_kind = family_kind
         self.channels = channels
         self.n_bins = n_bins
         self.head_names = set(output_heads or [])
@@ -167,19 +167,11 @@ class GlobalHexGraphNet(nn.Module):
         self.input = nn.Linear(GRAPH_FEATURE_DIM, channels)
         self.type_embedding = nn.Embedding(max(int(t) for t in GraphTokenType) + 1, channels)
         self.coord = nn.Sequential(nn.Linear(3, channels), nn.SiLU(), nn.Linear(channels, channels))
-        self.architecture_family = {
-            "global_graph_option1": "relation_graph",
-            "global_xattn_0": "context_cross_attention",
-            "global_line_window_0": "line_window_cover",
-            "global_pair_twostage_0": "pair_two_stage",
-            "global_graph_full_0": "full_relation_graph",
-            "global_hybrid_action_0": "crop_diagnostic_global_action",
-            "global_graph768_champion": "scaled_relation_graph",
-        }[architecture]
+        self.architecture_family = family_kind
         block_count = max(1, int(layers))
-        if architecture == "global_xattn_0":
+        if family_kind == "context_cross_attention":
             block_count = max(1, min(block_count, 2))
-        elif architecture == "global_graph768_champion":
+        elif family_kind == "scaled_relation_graph":
             block_count = max(block_count, 6)
         self.blocks = nn.ModuleList([GraphBlock(channels, heads, dropout=dropout) for _ in range(block_count)])
         self.legal_cross_attention = LegalContextCrossAttention(channels, heads, dropout=dropout)
@@ -236,10 +228,10 @@ class GlobalHexGraphNet(nn.Module):
         crop_tensor: Optional[torch.Tensor] = None,
         **_unused,
     ) -> Dict[str, torch.Tensor]:
-        if self.architecture in self.RELATION_REQUIRED_ARCHITECTURES and (
+        if self.family_kind in self.RELATION_REQUIRED_FAMILY_KINDS and (
             relation_type is None or relation_bias is None
         ):
-            raise ValueError(f"{self.architecture} requires relation_type and relation_bias tensors")
+            raise ValueError(f"{self.family_kind} requires relation_type and relation_bias tensors")
         qr = token_qr.to(device=token_features.device, dtype=token_features.dtype)
         coord = torch.stack([qr[..., 0], qr[..., 1], qr[..., 0] + qr[..., 1]], dim=-1) / 64.0
         x = self.input(token_features)
@@ -261,11 +253,11 @@ class GlobalHexGraphNet(nn.Module):
 
         legal_idx = legal_idx_raw.clamp(0, max(x.shape[1] - 1, 0))
         legal_vec = x.gather(1, legal_idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
-        if self.architecture == "global_xattn_0":
+        if self.family_kind == "context_cross_attention":
             context_type = token_type.to(device=x.device)
             context_mask = mask & (context_type != int(GraphTokenType.LEGAL))
             legal_vec = legal_vec + self.legal_cross_attention(legal_vec, x, context_mask)
-        elif self.architecture == "global_line_window_0":
+        elif self.family_kind == "line_window_cover":
             tactical_types = torch.tensor(
                 [int(GraphTokenType.WINDOW6), int(GraphTokenType.LINE), int(GraphTokenType.COVER_SET)],
                 device=x.device,
@@ -276,7 +268,7 @@ class GlobalHexGraphNet(nn.Module):
             legal_vec = legal_vec + self.line_window_gate(
                 torch.cat([legal_vec, tactical_context.unsqueeze(1).expand_as(legal_vec)], dim=-1)
             )
-        elif self.architecture == "global_hybrid_action_0":
+        elif self.family_kind == "crop_diagnostic_global_action":
             legal_features = token_features.gather(
                 1,
                 legal_idx.unsqueeze(-1).expand(-1, -1, token_features.shape[-1]),

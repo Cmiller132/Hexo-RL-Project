@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 from torch.utils.data import DataLoader
 
 from hexorl.contracts.candidates import CANDIDATE_FEATURE_VERSION
@@ -10,7 +10,7 @@ from hexorl.dashboard.recorder import RunRecorder
 from hexorl.dashboard.replay import replay_game
 from hexorl.epoch.pipeline import _make_bootstrap_game_records
 from hexorl.eval.scorecard import compute_phase3_scorecard
-from hexorl.model.network import build_model_from_config
+from hexorl.models.factory import build_model
 from hexorl.train.losses import compute_losses
 
 
@@ -73,7 +73,7 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
     batch = next(iter(DataLoader(dataset, batch_size=None, num_workers=0)))
     tensors, policies, values, _lookahead, aux_targets = batch
     targets = {"policy": policies, "value": values, **aux_targets}
-    model = build_model_from_config(cfg, device=torch.device("cpu"), inference=False)
+    model = build_model(cfg, device=torch.device("cpu"), inference=False)
     model.train()
     predictions = model(
         tensors,

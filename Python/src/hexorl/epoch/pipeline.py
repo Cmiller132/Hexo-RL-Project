@@ -25,7 +25,8 @@ from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 from hexorl.engine.rust import hex_game_class
-from hexorl.model.network import HexNet, build_model_from_config
+from hexorl.models.factory import build_model, model_uses_global_graph
+from hexorl.models.network import HexNet
 from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import (
@@ -134,7 +135,7 @@ def run_epoch(
     if trainer is not None:
         model = trainer.model
     elif model is None:
-        model = build_model_from_config(cfg, device=device, inference=False)
+        model = build_model(cfg, device=device, inference=False)
 
     if use_selfplay:
         selfplay_epoch = int(getattr(trainer, "epoch", 0)) + 1 if trainer is not None else 1
@@ -182,7 +183,7 @@ def run_epoch(
                 or "pair_policy" in cfg.model.heads
             ),
             include_pair_policy=_uses_pair_policy_targets(cfg),
-            include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
+            include_graph_policy=model_uses_global_graph(cfg),
             candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
             max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
         )
@@ -321,7 +322,7 @@ def run_tiny_training_smoke(
             or "pair_policy" in cfg.model.heads
         ),
         include_pair_policy=_uses_pair_policy_targets(cfg),
-        include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
+        include_graph_policy=model_uses_global_graph(cfg),
         candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
     )
     num_workers = dataloader_worker_count(cfg)
@@ -332,7 +333,7 @@ def run_tiny_training_smoke(
         pin_memory=False,
         persistent_workers=num_workers > 0,
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"), inference=False)
+    model = build_model(cfg, device=torch.device("cpu"), inference=False)
     trainer = Trainer(model, cfg, dataloader, device=torch.device("cpu"))
 
     results = []
@@ -605,5 +606,4 @@ def _pack_moves(moves: Iterable[tuple[int, int, int]]) -> bytes:
 
 
 def _model_state_for_inference(model: torch.nn.Module) -> dict:
-    original = getattr(model, "_orig_mod", model)
-    return original.state_dict()
+    return model.state_dict()

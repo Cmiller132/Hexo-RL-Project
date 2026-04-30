@@ -1,4 +1,4 @@
-﻿"""Self-play worker â€” plays games using MCTSEngine + InferenceClient.
+"""Self-play worker â€” plays games using MCTSEngine + InferenceClient.
 
 Each worker is a separate multiprocessing.Process. It:
   1. Connects to the inference server via SharedMemory.
@@ -27,6 +27,7 @@ from hexorl.engine.legal import decode_legal_bytes
 from hexorl.engine.rust import engine_available, hex_game_class, mcts_engine_class
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
+from hexorl.models.specs import model_spec_from_config
 from hexorl.graph.semantic_builder import GraphTokenType
 from hexorl.graph.tensorize import GraphBatch, build_graph_batch_from_history
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
@@ -1200,7 +1201,7 @@ class SelfPlayWorker:
         self.sparse_prior_stage = int(getattr(cfg.model, "sparse_prior_stage", 0))
         self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
         self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
-        self.global_graph_enabled = str(getattr(cfg.model, "architecture", "")).lower().startswith("global_")
+        self.global_graph_enabled = model_spec_from_config(cfg).is_global_graph
         if self.global_graph_enabled:
             self.near_radius = 8
             self.constrain_threats = False
@@ -1238,7 +1239,7 @@ class SelfPlayWorker:
         return {
             "event": "pair_strategy_summary",
             "worker_id": int(self.worker_id),
-            "model_family": str(getattr(self.cfg.model, "architecture", "")),
+            "model_family": model_spec_from_config(self.cfg).kind,
             "pair_strategy": self.pair_strategy,
             "pair_prior_mix": float(self.pair_prior_mix),
             "pair_rows_possible": int(pair_rows_possible),

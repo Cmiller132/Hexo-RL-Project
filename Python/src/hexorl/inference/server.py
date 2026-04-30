@@ -1,10 +1,10 @@
-"""GPU inference server — the central process for neural network evaluation.
+"""GPU inference server â€” the central process for neural network evaluation.
 
 One server process owns the GPU + model weights. N self-play workers
 write leaf-batch tensors into shared-memory request slots; the server
 batches across workers, runs one forward pass, and writes results back.
 
-Architecture: §5 of SYSTEM_DESIGN.md — KataGo-style NNEvaluator pattern.
+Architecture: Â§5 of SYSTEM_DESIGN.md â€” KataGo-style NNEvaluator pattern.
 """
 
 import asyncio
@@ -16,7 +16,9 @@ import torch
 from typing import List, Optional, Tuple
 
 from hexorl.config import Config
-from hexorl.model.network import from_config, HexNet, load_model_state
+from hexorl.models.checkpoint import CheckpointManager
+from hexorl.models.factory import build_inference_model, model_uses_global_graph
+from hexorl.models.network import HexNet
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
@@ -60,8 +62,7 @@ class InferenceServer:
         initial_state_dict: Optional[dict] = None,
     ):
         self.cfg = cfg
-        architecture = str(getattr(cfg.model, "architecture", "")).lower()
-        self._global_graph_mode = architecture.startswith("global_")
+        self._global_graph_mode = model_uses_global_graph(cfg)
         required_heads = {"value"} if self._global_graph_mode else {"policy", "value"}
         missing_heads = sorted(required_heads - set(cfg.model.heads))
         if missing_heads:
@@ -101,11 +102,6 @@ class InferenceServer:
     def _state_to_cpu(state_dict: Optional[dict]) -> Optional[dict]:
         if state_dict is None:
             return None
-        if state_dict and all(str(k).startswith("_orig_mod.") for k in state_dict):
-            state_dict = {
-                str(k).removeprefix("_orig_mod."): v
-                for k, v in state_dict.items()
-            }
         return {
             k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
             for k, v in state_dict.items()
@@ -118,19 +114,19 @@ class InferenceServer:
             state.pop(key, None)
         return state
 
-    # ── Process management ────────────────────────────────────────────────
+    # â”€â”€ Process management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def start(self):
         """Launch the inference server in a background process.
 
         Creates shared-memory queue in the main process (owns lifecycle),
         then spawns the child. The child reconnects to the same queue
-        via named shared memory — safe in both fork and spawn modes.
+        via named shared memory â€” safe in both fork and spawn modes.
         """
         if self._process is not None:
             raise RuntimeError("Server already running")
 
-        # Create queue in main process — this allocates named SharedMemory
+        # Create queue in main process â€” this allocates named SharedMemory
         # segments and SharedEvent bytes that persist until unlinked.
         _queue = create_inference_queue(self.num_workers, self.max_batch)
         self._owned_queue = _queue
@@ -188,10 +184,10 @@ class InferenceServer:
     def is_running(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
-    # ── Main loop (runs in the child process) ─────────────────────────────
+    # â”€â”€ Main loop (runs in the child process) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _run(self):
-        """Server entry point — called in the spawned process."""
+        """Server entry point â€” called in the spawned process."""
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         configure_torch_runtime(self.cfg)
 
@@ -202,7 +198,7 @@ class InferenceServer:
         else:
             self._device = torch.device("cpu")
 
-        self._model = from_config(self.cfg, device=self._device)
+        self._model = build_inference_model(self.cfg, device=self._device)
         if self._device.type == "cuda" and getattr(self.cfg.runtime, "channels_last", True):
             self._model = self._model.to(memory_format=torch.channels_last)
         compile_inference = getattr(self.cfg.runtime, "compile_inference", None)
@@ -221,7 +217,7 @@ class InferenceServer:
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
                 for k, v in self._initial_state_dict.items()
             }
-            load_model_state(self._model, initial, allow_partial=False)
+            CheckpointManager().load_state_into_model(self._model, initial)
             self._model.eval()
         if self._device.type == "cuda":
             self._forward_stream = torch.cuda.Stream(priority=-1)
@@ -241,16 +237,16 @@ class InferenceServer:
             if self._queue is not None:
                 self._queue.close()
 
-    # ── Adaptive batching event loop ──────────────────────────────────────
+    # â”€â”€ Adaptive batching event loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _event_loop(self):
-        """Main asyncio loop — adaptive batching across workers.
+        """Main asyncio loop â€” adaptive batching across workers.
 
-        Algorithm (§5.3 of SYSTEM_DESIGN.md):
+        Algorithm (Â§5.3 of SYSTEM_DESIGN.md):
           while running:
               drain ready requests (up to max_batch total)
               if batch_size > 0:
-                  upload → forward → download (with stream pipelining)
+                  upload â†’ forward â†’ download (with stream pipelining)
                   signal res_ready for drained workers
               else:
                   await any-doorbell with short timeout
@@ -268,7 +264,7 @@ class InferenceServer:
                 await asyncio.sleep(wait_s)
                 continue
 
-            # At least one worker ready — wait max_wait_us for more to arrive.
+            # At least one worker ready â€” wait max_wait_us for more to arrive.
             await asyncio.sleep(wait_s)
 
             ready_workers = self._drain_ready_workers(max_total=self.max_batch)
@@ -365,7 +361,7 @@ class InferenceServer:
             flush=True,
         )
 
-    # ── Worker drain ──────────────────────────────────────────────────────
+    # â”€â”€ Worker drain â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _drain_ready_workers(self, max_total: Optional[int] = None) -> List[int]:
         """Collect worker IDs whose req_ready event is set.
@@ -415,7 +411,7 @@ class InferenceServer:
             if int(mode) == int(target)
         ]
 
-    # ── Batch building ────────────────────────────────────────────────────
+    # â”€â”€ Batch building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_batch(
         self, ready_workers: List[int]
@@ -602,7 +598,7 @@ class InferenceServer:
             )
         return out
 
-    # ── Forward pass ──────────────────────────────────────────────────────
+    # â”€â”€ Forward pass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _forward(
         self,
@@ -766,7 +762,7 @@ class InferenceServer:
             self._host_batch_np = np.empty((self.max_batch, 13, 33, 33), dtype=np.float32)
             self._host_batch_tensor = torch.from_numpy(self._host_batch_np)
 
-    # ── Result scattering ─────────────────────────────────────────────────
+    # â”€â”€ Result scattering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _scatter_results(
         self,
@@ -850,7 +846,7 @@ class InferenceServer:
                 slot.res_graph_pair_second_logits[:pair_count] = pair_second_logits[row, :pair_count]
             slot.req_mode[0] = 0
 
-    # ── Stats ─────────────────────────────────────────────────────────────
+    # â”€â”€ Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _any_worker_ready(self) -> bool:
         """Return True if at least one worker slot has req_ready set."""
@@ -872,7 +868,7 @@ class InferenceServer:
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
                 for k, v in latest.items()
             }
-            load_model_state(self._model, latest, allow_partial=False)
+            CheckpointManager().load_state_into_model(self._model, latest)
             self._model.eval()
 
     @property

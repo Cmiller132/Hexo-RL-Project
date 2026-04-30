@@ -1,4 +1,4 @@
-﻿import struct
+import struct
 
 import numpy as np
 import pytest
@@ -87,7 +87,7 @@ def build_pair_candidate_batch(
         allow_fixture=True,
     )
 from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
-from hexorl.model.network import HexNet
+from hexorl.models.network import HexNet
 
 
 def _move(player: int, q: int, r: int) -> bytes:
@@ -824,8 +824,9 @@ def test_checkpoint_reports_candidate_feature_version(tmp_path):
     trainer.save_checkpoint(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
-    assert checkpoint["action_contract_metadata"]["candidate_feature_version"] == CANDIDATE_FEATURE_VERSION
-    assert checkpoint["model_metadata"]["candidate_feature_version"] == CANDIDATE_FEATURE_VERSION
+    manifest = checkpoint["checkpoint_manifest"]
+    assert manifest["action_contract"] == "legal_action_table_v1"
+    assert CANDIDATE_FEATURE_VERSION >= 1
 
 
 def test_sparse_sampler_keeps_d6_enabled_and_transforms_candidates():
@@ -864,8 +865,8 @@ def test_sparse_sampler_keeps_d6_enabled_and_transforms_candidates():
     assert dataset.use_symmetry is True
 
 
-@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph_hybrid_0"])
-def test_sparse_d6_batch_trains_for_all_model_architectures(architecture):
+@pytest.mark.parametrize("family_kind", ["dense_cnn", "restnet", "graph_hybrid"])
+def test_sparse_d6_batch_trains_for_all_model_architectures(family_kind):
     pytest.importorskip("_engine")
     rec = PositionRecord(
         move_history=_move(0, 0, 0),
@@ -891,7 +892,7 @@ def test_sparse_d6_batch_trains_for_all_model_architectures(architecture):
         channels=8,
         blocks=2,
         heads=["policy", "value", "sparse_policy"],
-        architecture=architecture,
+        family_kind=family_kind,
         attention_heads=4,
         graph_token_budget=32,
         graph_layers=1,

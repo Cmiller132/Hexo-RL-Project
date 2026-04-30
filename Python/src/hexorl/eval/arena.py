@@ -1,4 +1,4 @@
-"""Arena — head-to-head evaluation between models or vs classical opponent.
+"""Arena â€” head-to-head evaluation between models or vs classical opponent.
 
 Runs N games between two sides (A and B), switching colours halfway.
 Each side uses its own inference server or classical engine.
@@ -16,7 +16,9 @@ from hexorl.config import Config
 from hexorl.engine.history import game_from_history
 from hexorl.engine.legal import decode_legal_bytes
 from hexorl.engine.rust import engine_available, hex_game_class
-from hexorl.model.network import HexNet, from_config, load_model_state
+from hexorl.models.checkpoint import CheckpointManager
+from hexorl.models.factory import build_model
+from hexorl.models.network import HexNet
 from hexorl.eval.players import model_input_dtype, noisy_model_player
 
 logger = logging.getLogger(__name__)
@@ -84,7 +86,7 @@ def run_arena(
     """Run N games between side A and side B.
 
     Games alternate colours: even games A=P0(black), odd games A=P1(white).
-    Each side_fn is called as fn(move_history, time_ms, player) → (q, r).
+    Each side_fn is called as fn(move_history, time_ms, player) â†’ (q, r).
     """
     stats = ArenaStats()
     t_start = time.monotonic()
@@ -204,14 +206,17 @@ def load_checkpoint_model(
 ) -> HexNet:
     """Load a HexNet checkpoint for arena evaluation."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    loaded = CheckpointManager().load(checkpoint_path, purpose="eval", device=device)
+    checkpoint = loaded.payload
     ckpt_cfg = checkpoint.get("cfg")
     if not isinstance(ckpt_cfg, Config) and checkpoint.get("cfg_json") is not None:
         ckpt_cfg = Config.model_validate(checkpoint["cfg_json"])
     model_cfg = ckpt_cfg if isinstance(ckpt_cfg, Config) else cfg
-    model = from_config(model_cfg, device=device)
+    if allow_partial:
+        raise ValueError("partial checkpoint loading is not allowed in Phase 03 runtime")
+    model = build_model(model_cfg, device=device, inference=True)
     state = checkpoint.get("model_state_dict", checkpoint)
-    load_model_state(model, state, allow_partial=allow_partial)
+    CheckpointManager().load_state_into_model(model, state)
     model.eval()
     return model
 

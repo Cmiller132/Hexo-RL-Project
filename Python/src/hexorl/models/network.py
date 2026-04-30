@@ -1,7 +1,7 @@
 """KataGo-style CNN for Hexo with binned value heads and configurable multi-head architecture.
 
 Input: (B, 13, 33, 33) f32 tensor
-Output: dict of head_name → tensor
+Output: dict of head_name â†’ tensor
 
 Supports heads: policy, value (binned), lookahead_* (binned), opp_policy,
 axis (3-class), axis_delta_norm (6-plane map), regret_rank (scalar),
@@ -15,9 +15,6 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional
 
 from hexorl.contracts.candidates import CANDIDATE_FEATURES
-from hexorl.model.global_graph import GlobalHexGraphNet
-
-
 BOARD_SIZE = 33
 BOARD_AREA = BOARD_SIZE * BOARD_SIZE
 DEFAULT_CANDIDATE_FEATURES = CANDIDATE_FEATURES
@@ -344,7 +341,7 @@ class AuxPolicyHead(nn.Module):
 
 
 class AxisHead(nn.Module):
-    """Axis classification head: global avg pool → (B, 3) logits."""
+    """Axis classification head: global avg pool â†’ (B, 3) logits."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -369,7 +366,7 @@ class AxisMapHead(nn.Module):
 
 
 class RegretRankHead(nn.Module):
-    """Regret ranking head: global avg pool → Linear → ReLU → Linear → scalar φ(s)."""
+    """Regret ranking head: global avg pool â†’ Linear â†’ ReLU â†’ Linear â†’ scalar Ï†(s)."""
 
     def __init__(self, channels: int, hidden: int = 64):
         super().__init__()
@@ -383,7 +380,7 @@ class RegretRankHead(nn.Module):
 
 
 class MovesLeftHead(nn.Module):
-    """Moves-left head: global avg pool → Linear → ReLU → Linear → softplus."""
+    """Moves-left head: global avg pool â†’ Linear â†’ ReLU â†’ Linear â†’ softplus."""
 
     def __init__(self, channels: int, hidden: int = 64):
         super().__init__()
@@ -527,18 +524,18 @@ class HexNet(nn.Module):
     """KataGo-style network for Hex with configurable multi-head architecture.
 
     Input:  (B, 13, 33, 33)
-    Output: dict of head_name → tensor
+    Output: dict of head_name â†’ tensor
 
     Heads:
-        policy      — (B, 1089) policy logits
-        value       — (B, N_BINS) binned value logits
-        lookahead_* — (B, N_BINS) binned lookahead value logits
-        opp_policy  — (B, 1089) opponent policy logits
-        axis        — (B, 3) hex axis classification logits
-        axis_delta_norm — (B, 6, 33, 33) delta-norm axis-map regression
-        regret_rank — (B, 1) ranking score scalar
-        regret_value— (B, N_BINS) binned regret value logits
-        moves_left  — (B, 1) moves-left scalar (softplus)
+        policy      â€” (B, 1089) policy logits
+        value       â€” (B, N_BINS) binned value logits
+        lookahead_* â€” (B, N_BINS) binned lookahead value logits
+        opp_policy  â€” (B, 1089) opponent policy logits
+        axis        â€” (B, 3) hex axis classification logits
+        axis_delta_norm â€” (B, 6, 33, 33) delta-norm axis-map regression
+        regret_rank â€” (B, 1) ranking score scalar
+        regret_valueâ€” (B, N_BINS) binned regret value logits
+        moves_left  â€” (B, 1) moves-left scalar (softplus)
     """
 
     def __init__(
@@ -547,7 +544,7 @@ class HexNet(nn.Module):
         blocks: int = 16,
         heads: Optional[List[str]] = None,
         n_bins: int = 65,
-        architecture: str = "cnn",
+        family_kind: str = "dense_cnn",
         attention_positions: Optional[List[int]] = None,
         attention_heads: int = 8,
         attention_mlp_ratio: float = 2.0,
@@ -564,7 +561,7 @@ class HexNet(nn.Module):
         self.channels = channels
         self.blocks = blocks
         self.n_bins = n_bins
-        self.architecture = architecture.lower()
+        self.family_kind = family_kind.lower()
         self.attention_positions = sorted(set(attention_positions or []))
         self.sparse_policy_enabled = bool(sparse_policy)
         self.candidate_feature_dim = candidate_feature_dim
@@ -581,9 +578,7 @@ class HexNet(nn.Module):
         self.res_blocks = nn.ModuleList()
         self.graph_encoder: Optional[SparseHexGraphHybrid0Encoder] = None
         attention_set = set(self.attention_positions)
-        if self.architecture == "graph":
-            self.architecture = "graph_hybrid_0"
-        if self.architecture == "graph_hybrid_0":
+        if self.family_kind == "graph_hybrid":
             local_blocks = max(1, min(blocks, max(2, blocks // 4)))
             for _ in range(local_blocks):
                 self.res_blocks.append(GatedResBlock(channels, dropout=dropout))
@@ -599,7 +594,7 @@ class HexNet(nn.Module):
             )
         else:
             for idx in range(1, blocks + 1):
-                if self.architecture == "restnet" and idx in attention_set:
+                if self.family_kind == "restnet" and idx in attention_set:
                     self.res_blocks.append(
                         SpatialTransformerBlock(
                             channels,
@@ -754,7 +749,7 @@ class HexNet(nn.Module):
     def value_to_bins(t: torch.Tensor, n_bins: int = 65) -> torch.Tensor:
         """Convert continuous value in [-1, 1] to binned soft target.
 
-        Uses linear interpolation between the two nearest bins —
+        Uses linear interpolation between the two nearest bins â€”
         mirrors KataGo's value head target projection exactly.
 
         Args:
@@ -828,114 +823,3 @@ class HexNet(nn.Module):
             out = {k: v for k, v in out.items() if k in requested_heads}
 
         return out
-
-
-def from_config(cfg, device: Optional[torch.device] = None) -> nn.Module:
-    """Create a HexNet from a Config object.
-
-    Args:
-        cfg: hexorl.config.Config instance.
-        device: Target device (cpu, cuda, mps). Defaults to best available.
-
-    Returns:
-        HexNet instance on the requested device, optionally in FP16.
-    """
-    model = build_model_from_config(cfg, device=device, inference=True)
-    model.eval()
-    return model
-
-
-def build_model_from_config(
-    cfg,
-    device: Optional[torch.device] = None,
-    inference: bool = False,
-) -> nn.Module:
-    """Create a HexNet from config while preserving default CNN compatibility."""
-    model_cfg = cfg.model
-    inference_cfg = cfg.inference
-    arch = getattr(model_cfg, "architecture", "cnn").lower()
-    global_architectures = GlobalHexGraphNet.ARCHITECTURES
-    if arch in global_architectures:
-        graph_heads = set(getattr(model_cfg, "heads", []))
-        graph_heads.update(f"lookahead_{h}" for h in getattr(getattr(cfg, "buffer", object()), "lookahead_horizons", []))
-        model = GlobalHexGraphNet(
-            channels=model_cfg.channels,
-            layers=getattr(model_cfg, "graph_layers", 3),
-            heads=getattr(model_cfg, "attention_heads", 8),
-            architecture=arch,
-            dropout=getattr(model_cfg, "dropout", 0.0),
-            output_heads=sorted(graph_heads),
-        )
-        if device is None:
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                device = torch.device("mps")
-            else:
-                device = torch.device("cpu")
-        model = model.to(device)
-        if inference and inference_cfg.fp16 and device.type == "cuda":
-            model = model.half()
-        if inference:
-            model.eval()
-        return model
-
-    heads = list(model_cfg.heads)
-    if getattr(model_cfg, "sparse_policy", False) and "sparse_policy" not in heads:
-        heads.append("sparse_policy")
-
-    model = HexNet(
-        channels=model_cfg.channels,
-        blocks=model_cfg.blocks,
-        heads=heads,
-        architecture=getattr(model_cfg, "architecture", "cnn"),
-        attention_positions=list(getattr(model_cfg, "attention_positions", [])),
-        attention_heads=getattr(model_cfg, "attention_heads", 8),
-        attention_mlp_ratio=getattr(model_cfg, "attention_mlp_ratio", 2.0),
-        attention_dropout=getattr(model_cfg, "attention_dropout", 0.0),
-        dropout=getattr(model_cfg, "dropout", 0.0),
-        relative_bias=getattr(model_cfg, "relative_bias", False),
-        graph_token_set=getattr(model_cfg, "graph_token_set", "graph512_turn_pair_prior"),
-        graph_token_budget=getattr(model_cfg, "graph_token_budget", 512),
-        graph_layers=getattr(model_cfg, "graph_layers", 3),
-        sparse_policy=getattr(model_cfg, "sparse_policy", False),
-    )
-
-    if device is None:
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-
-    model = model.to(device)
-
-    if inference and inference_cfg.fp16 and device.type == "cuda":
-        model = model.half()
-
-    if inference:
-        model.eval()
-    return model
-
-
-def strip_compiled_prefix(state_dict: dict) -> dict:
-    """Remove torch.compile's _orig_mod prefix when present."""
-    if state_dict and all(str(k).startswith("_orig_mod.") for k in state_dict):
-        return {str(k).removeprefix("_orig_mod."): v for k, v in state_dict.items()}
-    return state_dict
-
-
-def load_model_state(model: nn.Module, state_dict: dict, *, allow_partial: bool = False):
-    target = getattr(model, "_orig_mod", None)
-    if target is not None:
-        state_dict = strip_compiled_prefix(state_dict)
-        result = target.load_state_dict(state_dict, strict=not allow_partial)
-        if hasattr(target, "apply_hex_masks_"):
-            target.apply_hex_masks_()
-        return result
-    state_dict = strip_compiled_prefix(state_dict)
-    result = model.load_state_dict(state_dict, strict=not allow_partial)
-    if hasattr(model, "apply_hex_masks_"):
-        model.apply_hex_masks_()
-    return result

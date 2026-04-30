@@ -1,4 +1,4 @@
-﻿"""Small in-process model cache for dashboard inference/debug routes."""
+"""Small in-process model cache for dashboard inference/debug routes."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
 from hexorl.engine.legal import decode_legal_bytes
-from hexorl.model.network import HexNet
+from hexorl.models.network import HexNet
 
 
 @dataclass

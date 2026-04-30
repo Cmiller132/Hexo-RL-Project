@@ -10,7 +10,9 @@ from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
 from hexorl.selfplay.worker import SelfPlayWorker, _score_graph_pair_chunks
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
-from hexorl.model.network import HexConv2d, GatedResBlock, build_model_from_config, load_model_state
+from hexorl.models.checkpoint import CheckpointManager
+from hexorl.models.factory import build_model
+from hexorl.models.network import HexConv2d, GatedResBlock
 
 
 def test_config_rejects_lookahead_head_without_matching_horizon():
@@ -180,7 +182,7 @@ def test_restnet_config_validation_and_forward_shapes():
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     out = model(torch.zeros(2, 13, 33, 33))
     assert out["policy"].shape == (2, 1089)
     assert out["value"].shape == (2, 65)
@@ -205,7 +207,7 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
         }
     )
     assert cfg.model.architecture == "graph_hybrid_0"
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     x = torch.zeros(2, 13, 33, 33)
     x[:, 2] = 1.0
     x[:, 3, 16, 16] = 1.0
@@ -240,7 +242,7 @@ def test_hex_conv_invalid_axial_corners_stay_zero_after_optimizer_step():
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     hex_convs = [m for m in model.modules() if isinstance(m, HexConv2d)]
     assert hex_convs
     for conv in hex_convs:
@@ -276,14 +278,14 @@ def test_hex_conv_masks_are_reapplied_after_loading_state_dict():
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     state = {key: value.clone() for key, value in model.state_dict().items()}
     for key, value in state.items():
         if value.ndim == 4 and value.shape[-2:] == (3, 3):
             value[:, :, 0, 0].fill_(1.0)
             value[:, :, 2, 2].fill_(1.0)
 
-    load_model_state(model, state)
+    CheckpointManager().load_state_into_model(model, state)
 
     for conv in [m for m in model.modules() if isinstance(m, HexConv2d)]:
         assert torch.count_nonzero(conv.weight[:, :, 0, 0]) == 0
@@ -308,7 +310,7 @@ def test_trunks_use_hex_conv_for_architecture_names(architecture):
             "inference": {"fp16": False},
         }
     )
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
 
     assert isinstance(model.conv_in, HexConv2d)
     gated_blocks = [m for m in model.res_blocks if isinstance(m, GatedResBlock)]
@@ -342,7 +344,7 @@ def test_pair_policy_head_forward_and_default_weight():
     )
     assert cfg.model.sparse_policy is True
     assert cfg.train.loss_weights["pair_policy"] == pytest.approx(0.05)
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     x = torch.zeros(2, 13, 33, 33)
     candidate_indices = torch.tensor([[544, 545, -1], [544, 545, 546]], dtype=torch.long)
     candidate_features = torch.zeros(2, 3, 12)
@@ -503,7 +505,7 @@ def test_sparse_policy_head_enables_sparse_data_contract():
 
 def test_cnn_config_does_not_require_attention_head_divisibility():
     cfg = Config.model_validate({"model": {"channels": 10, "blocks": 1}})
-    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    model = build_model(cfg, device=torch.device("cpu"))
     out = model(torch.zeros(1, 13, 33, 33))
     assert out["policy"].shape == (1, 1089)
 

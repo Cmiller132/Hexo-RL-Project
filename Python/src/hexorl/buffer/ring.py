@@ -14,18 +14,12 @@ from typing import Iterable, List, Optional
 import numpy as np
 
 from hexorl.selfplay.records import PositionRecord
+from hexorl.models.specs import normalize_model_kind
 
 
 HISTORY_STRIDE = 12
 REPLAY_POLICY_WIDTH_CAP = 512
 PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
-GLOBAL_GRAPH_ARCHITECTURES = {
-    "global_graph_option1",
-    "global_xattn_0",
-    "global_line_window_0",
-    "global_pair_twostage_0",
-    "global_graph_full_0",
-}
 
 _POLICY_BLOB_DTYPE = np.dtype([("action", "<u2"), ("prob", "<f2")])
 _V2_BLOB_DTYPE = np.dtype([("q", "<i2"), ("r", "<i2"), ("prob", "<f2")])
@@ -81,14 +75,14 @@ def replay_feature_flags(
 ) -> dict[str, bool]:
     """Return compact replay feature groups needed by a model/trial."""
     head_set = {str(head) for head in heads}
-    arch = str(architecture).lower()
+    model_kind = normalize_model_kind(str(architecture))
     store_pair = bool(head_set & PAIR_POLICY_HEADS)
     sparse_diagnostics = bool(
         sparse_policy
         or "sparse_policy" in head_set
         or store_pair
         or graph
-        or arch in {"graph", "graph_hybrid_0", *GLOBAL_GRAPH_ARCHITECTURES}
+        or model_kind in {"graph_hybrid", "global_xattn", "global_line_window", "global_relation_graph"}
     )
     return {
         "store_opp_policy": "opp_policy" in head_set,

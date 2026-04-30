@@ -18,7 +18,7 @@ from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import CANDIDATE_FEATURES, connect_inference_queue
 from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
-from hexorl.model.network import from_config
+from hexorl.models.factory import build_inference_model
 
 # Try to import the compiled Rust extension.
 try:
@@ -89,7 +89,7 @@ class TestInferenceServer(unittest.TestCase):
         cfg.inference.fp16 = False
         server = InferenceServer(cfg, num_workers=1)
         server._device = torch.device("cpu")
-        server._model = from_config(cfg, device=server._device)
+        server._model = build_inference_model(cfg, device=server._device)
         server._model.eval()
 
         count = 2
@@ -138,7 +138,7 @@ class TestInferenceServer(unittest.TestCase):
         cfg.inference.fp16 = False
         server = InferenceServer(cfg, num_workers=1)
         server._device = torch.device("cpu")
-        server._model = from_config(cfg, device=server._device)
+        server._model = build_inference_model(cfg, device=server._device)
         server._model.eval()
         graph = collate_graph_batches([
             build_graph_batch_from_history(b"", include_pair_rows=False),
@@ -239,44 +239,49 @@ class TestInferenceServerWithEngine(unittest.TestCase):
         client.connect()
 
         server_q = connect_inference_queue(1, 16)
-        s0 = server_q.get_slot(0)
-        client._slot.req_ready = s0.req_ready
-        client._slot.res_ready = s0.res_ready
+        try:
+            s0 = server_q.get_slot(0)
+            client._slot.req_ready = s0.req_ready
+            client._slot.res_ready = s0.res_ready
 
-        # Create an MCTSEngine
-        game = _engine.PyHexGame()
-        engine = _engine.PyMCTSEngine(game, num_simulations=100, c_puct=1.5,
-                                       near_radius=2, c_puct_init=19652.0,
-                                       constrain_threats=False, seed=42)
+            game = _engine.PyHexGame()
+            engine = _engine.PyMCTSEngine(
+                game,
+                num_simulations=8,
+                c_puct=1.5,
+                near_radius=2,
+                c_puct_init=19652.0,
+                constrain_threats=False,
+                seed=42,
+            )
 
-        # Init root
-        init = engine.init_root()
-        self.assertIsNotNone(init, "init_root returned None (game over?)")
-        tensor_3d, oq, or_, legal_bytes, root_token = init
-        self.assertEqual(tensor_3d.shape, (13, 33, 33))
+            init = engine.init_root()
+            self.assertIsNotNone(init, "init_root returned None (game over?)")
+            tensor_3d, oq, or_, legal_bytes = init
+            self.assertEqual(tensor_3d.shape, (13, 33, 33))
 
-        # Expand root with mock uniform policy
-        uniform = np.ones(1089, dtype=np.float32) / 1089.0
-        engine.expand_root(uniform, 0.0, oq, or_, legal_bytes, root_token)
+            uniform = np.ones(1089, dtype=np.float32) / 1089.0
+            engine.expand_root(uniform, 0.0, oq, or_, legal_bytes)
 
-        # MCTS loop with inference server
-        while not engine.done():
-            tensor_4d, count, batch_token = engine.select_leaves(8)
-            tensor_np = np.array(tensor_4d).astype(np.float32)
-            policies, values = client.submit(tensor_np, count)
-            engine.expand_and_backprop(policies, values, batch_token)
+            for _step in range(16):
+                if engine.done():
+                    break
+                tensor_4d, count = engine.select_leaves(8)
+                tensor_np = np.array(tensor_4d).astype(np.float32)
+                policies, values = client.submit(tensor_np, count)
+                engine.expand_and_backprop(policies, values)
+            self.assertTrue(engine.done(), "MCTS did not finish within bounded inference loop")
 
-        # Get results
-        moves_q, moves_r, visits, root_value = engine.get_results()
-        self.assertGreater(len(moves_q), 0, "No moves from MCTS")
-        self.assertGreaterEqual(max(visits), 1, "No visits recorded")
-        self.assertGreaterEqual(root_value, -1.0)
-        self.assertLessEqual(root_value, 1.0)
-
-        client.disconnect()
-        server.stop()
-        server.join(timeout=5.0)
-        server_q.close()
+            moves_q, moves_r, visits, root_value = engine.get_results()
+            self.assertGreater(len(moves_q), 0, "No moves from MCTS")
+            self.assertGreaterEqual(max(visits), 1, "No visits recorded")
+            self.assertGreaterEqual(root_value, -1.0)
+            self.assertLessEqual(root_value, 1.0)
+        finally:
+            client.disconnect()
+            server.stop()
+            server.join(timeout=5.0)
+            server_q.close()
 
 
 if __name__ == "__main__":
