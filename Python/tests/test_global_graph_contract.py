@@ -22,6 +22,7 @@ from hexorl.graph.tensorize import GraphBatch, graph_batch_with_pair_table, grap
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.models.factory import build_model
 from hexorl.models.global_graph import GlobalHexGraphNet
+from hexorl.replay.projector import ProjectedReplayBatch
 from hexorl.train.trainer import Trainer
 
 
@@ -85,7 +86,7 @@ def build_graph_batch_from_history(history, **kwargs):
     return _build_graph_batch_from_history(history, **kwargs)
 
 
-def graph_batch_with_reference_pair_rows(graph, pair_policy_target):
+def graph_batch_with_test_pair_rows(graph, pair_policy_target):
     legal_rows = [(int(q), int(r)) for q, r in graph.legal_qr.tolist()]
     known_first = None
     if int(graph.placements_remaining) == 1:
@@ -268,7 +269,7 @@ def test_global_graph_capacity_report_fails_without_dropping_rows():
     )
     assert "graph_token_capacity" in huge.failures()
 
-    graph = graph_batch_with_reference_pair_rows(graph, [])
+    graph = graph_batch_with_test_pair_rows(graph, [])
     validate_graph_ipc_capacity(
         build_graph_batch_from_history(_hist(), include_pair_rows=False)
     )
@@ -451,7 +452,7 @@ def test_global_graph_reference_pair_rows_cover_full_first_placement_table():
     first = tuple(graph.legal_qr[0].tolist())
     second = tuple(graph.legal_qr[1].tolist())
 
-    graph = graph_batch_with_reference_pair_rows(
+    graph = graph_batch_with_test_pair_rows(
         graph,
         [(first, second, 1.0)],
     )
@@ -558,6 +559,11 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
         "pair_token_indices": torch.from_numpy(graph.pair_token_indices),
         "pair_first_indices": torch.from_numpy(graph.pair_first_indices),
         "pair_second_indices": torch.from_numpy(graph.pair_second_indices),
+        "pair_rows": torch.from_numpy(graph.pair_rows),
+        "pair_table_mask": torch.from_numpy(graph.pair_table_mask),
+        "pair_phase": torch.from_numpy(graph.pair_phase),
+        "pair_known_first": torch.from_numpy(graph.pair_known_first),
+        "pair_known_first_mask": torch.from_numpy(graph.pair_known_first_mask),
         "pair_policy_target": torch.from_numpy(graph.pair_policy_target),
         "relation_type": torch.from_numpy(graph.relation_type),
         "relation_bias": torch.from_numpy(graph.relation_bias),
@@ -565,12 +571,13 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
         "policy_weight": torch.ones(1),
         "opp_policy_weight": torch.ones(1),
     }
-    batch = (
-        torch.zeros(1, 13, 33, 33),
-        torch.zeros(1, 1089),
-        torch.zeros(1),
-        [],
-        aux,
+    batch = ProjectedReplayBatch(
+        tensors=np.zeros((1, 13, 33, 33), dtype=np.float32),
+        policies=np.zeros((1, 1089), dtype=np.float32),
+        values=np.zeros(1, dtype=np.float32),
+        lookahead=[],
+        aux_targets=aux,
+        record_hashes=("test-global-graph",),
     )
     trainer = Trainer(model, cfg, dataloader=[], device=torch.device("cpu"))
 

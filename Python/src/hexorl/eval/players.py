@@ -9,15 +9,10 @@ from typing import Callable
 import numpy as np
 import torch
 
-from hexorl.engine.tactical import scan_tactical_oracle_from_history
 from hexorl.config import Config
-from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.history import encode_move_history
-from hexorl.contracts.identity import stable_digest
-from hexorl.contracts.legal import LegalActionTable
-from hexorl.engine.encoding import encode_board_and_legal
 from hexorl.engine.rust import engine_available
-from hexorl.graph.tensorize import build_graph_batch_from_history
+from hexorl.eval.position_services import build_search_context
 from hexorl.models.specs import ModelSpec, model_spec_from_config
 from hexorl.search.context import SearchContext
 from hexorl.search.policy_provider import PolicyProvider, create_policy_provider
@@ -201,61 +196,14 @@ class PolicyPlayer:
 
     def _context(self, moves: list[tuple[int, int, int]]) -> SearchContext:
         history = encode_move_history(moves)
-        tensor, offset_q, offset_r, legal_rows, _legal_bytes = encode_board_and_legal(
+        return build_search_context(
             history,
-            self.config.near_radius,
-            self.config.constrain_threats,
-        )
-        legal_table = LegalActionTable.from_rows(
-            [(int(q), int(r)) for q, r in legal_rows.tolist()],
-            source="rust:legal",
-            history_hash=stable_digest(("eval-history", history)),
-            current_player=len(moves) % 2,
-            placements_remaining=1,
-        )
-        candidate_table = None
-        graph_batch = None
-        if self.model_spec.is_global_graph:
-            graph_batch = build_graph_batch_from_history(
-                history,
-                radius=self.config.near_radius,
-                max_pair_rows=0,
-                include_pair_rows=False,
-            )
-        elif self.model_spec.kind == "graph_hybrid":
-            oracle = scan_tactical_oracle_from_history(
-                history,
-                [(int(q), int(r)) for q, r in legal_rows.tolist()],
-                offset_q=int(offset_q),
-                offset_r=int(offset_r),
-            )
-            candidate_table = CandidateContractBuilder().build(
-                [(int(q), int(r)) for q, r in legal_rows.tolist()],
-                [],
-                offset_q=int(offset_q),
-                offset_r=int(offset_r),
-                budget=self.candidate_budget,
-                storage_width=self.candidate_budget,
-                winning_moves=oracle.win_now_cells,
-                forced_block_moves=oracle.forced_block_cells,
-                cover_cells=oracle.cover_cells,
-                open_four_cells=oracle.open_four_cells,
-                open_five_cells=oracle.open_five_cells,
-            )
-        return SearchContext.create(
-            phase="root",
-            legal_table=legal_table,
-            model_family=self.model_spec.kind,
-            model_spec_version=str(self.model_spec.version),
+            model_spec=self.model_spec,
             recipe_id=self.recipe_id,
-            search_id="arena",
-            pair_strategy_id="none",
-            tensor=tensor.reshape(1, 13, 33, 33).astype(np.float32, copy=False),
-            history_bytes=history,
-            candidate_table=candidate_table,
-            graph_batch=graph_batch,
+            candidate_budget=self.candidate_budget,
+            near_radius=self.config.near_radius,
+            constrain_threats=self.config.constrain_threats,
             inference_protocol="local_model_eval_v1",
-            extra={"offset_q": int(offset_q), "offset_r": int(offset_r)},
         )
 
 

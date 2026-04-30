@@ -21,7 +21,7 @@ from hexorl.replay.fixtures import corrupt_replay_bytes, golden_replay_game
 from hexorl.replay.sampler import ReplayDataset
 from hexorl.replay.storage import ReplayStorage
 from hexorl.tuning.family_spaces import family_space
-from hexorl.tuning.recipes import ModelRecipe, RecipeTransform
+from hexorl.tuning.recipes import ConfigSectionTransform, ModelRecipe, RecipeTransform, config_from_recipe
 from hexorl.tuning.reporting import trial_lifecycle_report
 from hexorl.tuning.runtime_sweep import HostProfile, default_runtime_spec, simulate_no_progress
 from hexorl.tuning.validation import dry_run_validate_recipe
@@ -49,29 +49,34 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def _cfg() -> Config:
-    cfg = Config()
-    cfg.run.seed = 20260430
-    cfg.model.architecture = "graph_hybrid_0"
-    cfg.model.channels = 4
-    cfg.model.blocks = 1
-    cfg.model.graph_layers = 1
-    cfg.model.attention_heads = 1
-    cfg.model.heads = ["policy", "value", "sparse_policy", "pair_policy"]
-    cfg.model.sparse_policy = True
-    cfg.model.candidate_budget = 8
-    cfg.model.pair_strategy = "none"
-    cfg.buffer.capacity = 32
-    cfg.buffer.lookahead_horizons = []
-    cfg.buffer.lookahead_lambdas = []
-    cfg.selfplay.max_game_moves = 8
-    cfg.selfplay.policy_target_top_k = 4
-    cfg.train.batch_size = 2
-    cfg.train.batches_per_epoch = 1
-    cfg.train.lr_schedule = "constant"
-    cfg.train.loss_weights = {"policy": 1.0, "value": 1.0, "sparse_policy": 0.1, "pair_policy": 0.05}
-    cfg.runtime.dataloader_workers = 0
-    cfg.inference.fp16 = False
-    return cfg
+    recipe = ModelRecipe(
+        recipe_id="phase09-smoke-graph-hybrid",
+        model_family="graph_hybrid",
+        channels=4,
+        blocks=1,
+        graph_layers=1,
+        attention_heads=1,
+        heads=("policy", "value", "sparse_policy", "pair_policy"),
+        sparse_policy=True,
+        candidate_budget=8,
+        pair_strategy="none",
+        seed=20260430,
+    )
+    sections = ConfigSectionTransform(
+        name="phase09-smoke-runtime",
+        run={"seed": 20260430},
+        buffer={"capacity": 32, "lookahead_horizons": [], "lookahead_lambdas": []},
+        selfplay={"max_game_moves": 8, "policy_target_top_k": 4},
+        train={
+            "batch_size": 2,
+            "batches_per_epoch": 1,
+            "lr_schedule": "constant",
+            "loss_weights": {"policy": 1.0, "value": 1.0, "sparse_policy": 0.1, "pair_policy": 0.05},
+        },
+        runtime={"dataloader_workers": 0},
+        inference={"fp16": False},
+    )
+    return config_from_recipe(Config(), recipe, section_transform=sections)
 
 
 def _one_train_step(cfg: Config, storage: ReplayStorage) -> dict[str, object]:
@@ -107,7 +112,9 @@ def _tuning_probe() -> dict[str, object]:
         model_family="graph_hybrid",
         channels=4,
         blocks=1,
+        attention_heads=1,
         heads=("policy", "value", "sparse_policy"),
+        sparse_policy=True,
         candidate_budget=8,
     )
     valid = tuple(dry_run_validate_recipe(recipe, runtime, host))

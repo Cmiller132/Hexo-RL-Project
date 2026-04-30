@@ -31,6 +31,9 @@ This does not make Rust a trusted oracle. It makes Rust the production rules bou
   - Universal and phase-level completion checklist used at signoff.
 - `PHASED_IMPLEMENTATION_PLAN.md`
   - Master program overview, sequencing, and promotion rules.
+- `new_project_structure.md`
+  - Current post-refactor repository map, runtime dependency flow, phase review,
+    and conservative care/completeness assessment.
 - `ORCHESTRATION_AGENT_BOOTSTRAP.md`
   - Exact initial prompt, document packet, process loop, and subagent assignment template for the orchestration agent.
 - `EXECUTION_QUALITY_GUARDRAILS.md`

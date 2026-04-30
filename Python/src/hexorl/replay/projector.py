@@ -54,9 +54,6 @@ class ProjectedReplayBatch:
     projection_id: str = ""
     throughput: dict[str, float] = field(default_factory=dict)
 
-    def as_legacy_tuple(self):
-        return self.tensors, self.policies, self.values, self.lookahead, self.aux_targets
-
 
 class ReplayProjector:
     """Single runtime path from canonical replay records to trainable batches."""
@@ -183,6 +180,11 @@ class ReplayProjector:
                     "pair_token_indices": graph.pair_token_indices,
                     "pair_first_indices": graph.pair_first_indices,
                     "pair_second_indices": graph.pair_second_indices,
+                    "pair_rows": graph.pair_rows,
+                    "pair_table_mask": graph.pair_table_mask,
+                    "pair_phase": graph.pair_phase,
+                    "pair_known_first": graph.pair_known_first,
+                    "pair_known_first_mask": graph.pair_known_first_mask,
                     "relation_type": graph.relation_type,
                     "relation_bias": graph.relation_bias,
                     "policy_target": graph.policy_target,

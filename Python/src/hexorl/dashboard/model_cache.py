@@ -7,14 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from hexorl.config import Config
-from hexorl.dashboard.contract_inspector import build_dashboard_model_inputs, contract_catalog
-from hexorl.eval.arena import load_checkpoint_model
-from hexorl.eval.players import model_input_dtype
-from hexorl.dashboard.replay import policy_debug
+from hexorl.dashboard.model_inference import DashboardModelInferenceService
+from hexorl.models.checkpoint import CheckpointManager
+from hexorl.models.factory import build_model
+from hexorl.models.specs import ModelSpec, model_spec_from_config
 
 
 @dataclass
@@ -23,6 +22,9 @@ class CachedModel:
     path: Path
     model: torch.nn.Module
     device: torch.device
+    cfg: Config
+    model_spec: ModelSpec
+    inference_service: DashboardModelInferenceService
 
 
 class ModelCache:
@@ -35,9 +37,32 @@ class ModelCache:
         path = Path(path)
         cfg = cfg or Config()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = load_checkpoint_model(path, cfg, device=device)
+        manager = CheckpointManager()
+        loaded = manager.load(path, purpose="eval", device=device)
+        checkpoint = loaded.payload
+        ckpt_cfg = checkpoint.get("cfg")
+        if not isinstance(ckpt_cfg, Config) and checkpoint.get("cfg_json") is not None:
+            ckpt_cfg = Config.model_validate(checkpoint["cfg_json"])
+        model_cfg = ckpt_cfg if isinstance(ckpt_cfg, Config) else cfg
+        model = build_model(model_cfg, device=device, inference=True)
+        manager.load_state_into_model(model, checkpoint["model_state_dict"])
+        model.eval()
+        model_spec = model_spec_from_config(model_cfg)
         model_id = uuid.uuid4().hex[:12]
-        cached = CachedModel(model_id, path, model, device)
+        cached = CachedModel(
+            model_id,
+            path,
+            model,
+            device,
+            model_cfg,
+            model_spec,
+            DashboardModelInferenceService(
+                model=model,
+                device=device,
+                cfg=model_cfg,
+                model_spec=model_spec,
+            ),
+        )
         self._models[model_id] = cached
         self._order.append(model_id)
         while len(self._order) > self.max_models:
@@ -51,6 +76,7 @@ class ModelCache:
                 "model_id": cached.model_id,
                 "path": str(cached.path),
                 "device": str(cached.device),
+                "model_family": cached.model_spec.kind,
             }
             for cached in self._models.values()
         ]
@@ -61,108 +87,4 @@ class ModelCache:
 
     def infer_history(self, model_id: str, history: bytes) -> dict[str, Any]:
         cached = self._models[model_id]
-        inputs = build_dashboard_model_inputs(history, include_pair_rows=True)
-        tensor = inputs.tensor.reshape(13, 33, 33)
-        arr = inputs.legal_table.rows
-        offset_q = inputs.offset_q
-        offset_r = inputs.offset_r
-        legal_mask = []
-        outside_legal = []
-        for q, r in arr:
-            gi = int(q) - int(offset_q)
-            gj = int(r) - int(offset_r)
-            if 0 <= gi < 33 and 0 <= gj < 33:
-                legal_mask.append(gi * 33 + gj)
-            else:
-                outside_legal.append({"q": int(q), "r": int(r)})
-        x = (
-            torch.from_numpy(tensor)
-            .unsqueeze(0)
-            .to(device=cached.device, dtype=model_input_dtype(cached.model))
-        )
-        model_sparse = bool(getattr(cached.model, "sparse_policy_enabled", False))
-        model_pair = getattr(cached.model, "pair_policy_head", None) is not None
-        candidate_payload: dict[str, Any] | None = None
-        forward_kwargs: dict[str, torch.Tensor] = {}
-        if (model_sparse or model_pair) and len(arr) > 0 and inputs.candidate_table is not None:
-            cand = inputs.candidate_table
-            candidate_payload = {
-                "qr": cand.qr,
-                "mask": cand.mask,
-            }
-            forward_kwargs = {
-                "candidate_indices": torch.from_numpy(cand.indices.reshape(1, -1).copy()).to(cached.device),
-                "candidate_features": torch.from_numpy(cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1]).copy()).to(cached.device),
-                "candidate_mask": torch.from_numpy(cand.mask.reshape(1, -1).copy()).to(cached.device),
-            }
-            if model_pair and inputs.pair_table is not None:
-                pair = inputs.pair_table
-                candidate_payload["pair_indices"] = pair.pair_indices
-                candidate_payload["pair_mask"] = pair.mask
-                forward_kwargs["pair_candidate_indices"] = torch.from_numpy(
-                    pair.pair_indices.reshape(1, pair.pair_indices.shape[0], 2).copy()
-                ).to(cached.device)
-                forward_kwargs["pair_candidate_mask"] = torch.from_numpy(
-                    pair.mask.reshape(1, -1).copy()
-                ).to(cached.device)
-        with torch.no_grad():
-            out = cached.model(x, **forward_kwargs) if forward_kwargs else cached.model(x)
-        result: dict[str, Any] = {
-            "model_id": model_id,
-            "legal_moves": [{"q": int(q), "r": int(r)} for q, r in arr],
-            "outside_window_legal_count": len(outside_legal),
-            "outside_window_legal_moves": outside_legal[:32],
-            "candidate_contract": contract_catalog()["candidate"],
-            "heads": {},
-        }
-        if "policy" in out:
-            logits = out["policy"][0].detach().cpu().numpy()
-            result["heads"]["policy"] = policy_debug(logits, legal_mask)
-        if "sparse_policy" in out and candidate_payload is not None:
-            sparse_logits = out["sparse_policy"][0].detach().float().cpu().numpy()
-            mask = candidate_payload["mask"]
-            qr = candidate_payload["qr"]
-            valid_rows = np.where(mask)[0]
-            if valid_rows.size:
-                top_rows = valid_rows[np.argsort(-sparse_logits[valid_rows])[:16]]
-                result["heads"]["sparse_policy"] = [
-                    {
-                        "q": int(qr[row, 0]),
-                        "r": int(qr[row, 1]),
-                        "logit": float(sparse_logits[row]),
-                    }
-                    for row in top_rows
-                ]
-        if "pair_policy" in out and candidate_payload is not None:
-            pair_logits = out["pair_policy"][0].detach().float().cpu().numpy()
-            pair_mask = candidate_payload.get("pair_mask")
-            pair_indices = candidate_payload.get("pair_indices")
-            qr = candidate_payload["qr"]
-            if pair_mask is not None and pair_indices is not None:
-                valid_rows = np.where(pair_mask)[0]
-                if valid_rows.size:
-                    top_rows = valid_rows[np.argsort(-pair_logits[valid_rows])[:16]]
-                    result["heads"]["pair_policy"] = [
-                        {
-                            "first": {
-                                "q": int(qr[int(pair_indices[row, 0]), 0]),
-                                "r": int(qr[int(pair_indices[row, 0]), 1]),
-                            },
-                            "second": {
-                                "q": int(qr[int(pair_indices[row, 1]), 0]),
-                                "r": int(qr[int(pair_indices[row, 1]), 1]),
-                            },
-                            "logit": float(pair_logits[row]),
-                        }
-                        for row in top_rows
-                    ]
-        if "value" in out:
-            value_logits = out["value"].detach().cpu()
-            result["heads"]["value"] = float(cached.model.bins_to_value(value_logits)[0])
-        if "axis" in out:
-            probs = torch.softmax(out["axis"][0], dim=-1).detach().cpu().numpy()
-            result["heads"]["axis"] = [float(v) for v in probs]
-        for name, tensor_out in out.items():
-            if name.startswith("lookahead_"):
-                result["heads"][name] = float(cached.model.bins_to_value(tensor_out.detach().cpu())[0])
-        return result
+        return cached.inference_service.infer_history(model_id, history)

@@ -18,13 +18,18 @@ from typing import List, Optional, Tuple
 from hexorl.config import Config
 from hexorl.models.checkpoint import CheckpointManager
 from hexorl.models.factory import build_inference_model, model_uses_global_graph
+from hexorl.models.specs import model_spec_from_config
 from hexorl.models.network import HexNet
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.protocol import (
     InferenceOutputValidationError,
     InferenceRequestKind,
     REQUEST_CODE_TO_KIND,
+    default_protocol_manifest,
+    publish_server_manifest,
+    remove_server_manifest,
 )
+from hexorl.inference.batching import BatchingPolicy, ReadyRequest
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
     GRAPH_SCHEMA_VERSION,
@@ -68,6 +73,7 @@ class InferenceServer:
     ):
         self.cfg = cfg
         self._global_graph_kind = model_uses_global_graph(cfg)
+        model_spec = model_spec_from_config(cfg)
         required_heads = {"value"} if self._global_graph_kind else {"policy", "value"}
         missing_heads = sorted(required_heads - set(cfg.model.heads))
         if missing_heads:
@@ -79,6 +85,19 @@ class InferenceServer:
         self.max_batch = cfg.inference.max_batch_size
         self.max_wait_us = cfg.inference.max_wait_us
         self.fp16 = cfg.inference.fp16
+        self.manifest = default_protocol_manifest(
+            max_batch_size=self.max_batch,
+            timeout_ms=float(getattr(cfg.inference, "timeout_ms", 30000.0)),
+            heads=tuple(str(head) for head in cfg.model.heads),
+            adapter_name="hexorl-shm-server",
+            model_family=model_spec.kind,
+            model_spec_version=str(model_spec.version),
+            config_hash=str(getattr(cfg.run, "name", "server")),
+        )
+        self._batching_policy = BatchingPolicy(
+            max_batch_size=self.max_batch,
+            max_wait_us=int(self.max_wait_us),
+        )
 
         self._mp_ctx = mp.get_context("spawn")
         self._process: Optional[mp.Process] = None
@@ -135,6 +154,11 @@ class InferenceServer:
         # segments and SharedEvent bytes that persist until unlinked.
         _queue = create_inference_queue(self.num_workers, self.max_batch)
         self._owned_queue = _queue
+        publish_server_manifest(
+            self.manifest,
+            num_workers=self.num_workers,
+            max_batch_size=self.max_batch,
+        )
 
         self._process = self._mp_ctx.Process(
             target=self._run,
@@ -169,6 +193,7 @@ class InferenceServer:
         if hasattr(self, "_owned_queue") and self._owned_queue is not None:
             self._owned_queue.close()
             self._owned_queue = None
+        remove_server_manifest(num_workers=self.num_workers, max_batch_size=self.max_batch)
 
     def update_weights(self, state_dict: dict):
         """Queue a model state update for hot-swap in the inference process.
@@ -276,10 +301,6 @@ class InferenceServer:
             if not ready_workers:
                 continue
 
-            homogeneous_workers = self._ready_workers_same_request_kind(ready_workers)
-            if homogeneous_workers is not None:
-                ready_workers = homogeneous_workers
-
             build_t0 = time.monotonic()
             if self._is_graph_request(ready_workers):
                 graph_inputs, per_worker_counts, total_count = self._build_graph_inputs(ready_workers)
@@ -377,23 +398,17 @@ class InferenceServer:
         if max_total is None:
             max_total = self.max_batch
 
-        ready = []
-        total = 0
+        ready: list[ReadyRequest] = []
         for i in range(self.num_workers):
-            if total >= max_total:
-                break
             slot = self._queue.get_slot(i)
             if slot.req_ready.is_set():
                 count = int(slot.req_count[0])
                 if count > 0:
-                    if total + count > max_total and ready:
-                        continue
-                    ready.append(i)
-                    total += count
+                    kind_code = int(getattr(slot, "req_kind", np.array([0], dtype=np.uint8))[0])
+                    ready.append(ReadyRequest(worker_id=i, count=count, request_kind_code=kind_code))
                 else:
                     slot.req_ready.clear()
-
-        return ready
+        return self._batching_policy.select_batch(ready, max_total=max_total).worker_ids
 
     def _is_graph_request(self, ready_workers: List[int]) -> bool:
         if not ready_workers:
@@ -407,18 +422,18 @@ class InferenceServer:
 
     def _ready_workers_same_request_kind(self, ready_workers: List[int]) -> Optional[List[int]]:
         """Keep a drained batch homogeneous by typed request kind."""
-        modes = [
-            int(getattr(self._queue.get_slot(worker_id), "req_kind", np.array([0], dtype=np.uint8))[0])
+        requests = [
+            ReadyRequest(
+                worker_id=worker_id,
+                count=int(self._queue.get_slot(worker_id).req_count[0]),
+                request_kind_code=int(getattr(self._queue.get_slot(worker_id), "req_kind", np.array([0], dtype=np.uint8))[0]),
+            )
             for worker_id in ready_workers
         ]
-        if not modes or all(mode == modes[0] for mode in modes):
+        selected = self._batching_policy.select_batch(requests).worker_ids
+        if selected == ready_workers:
             return None
-        target = modes[0]
-        return [
-            worker_id
-            for worker_id, mode in zip(ready_workers, modes)
-            if int(mode) == int(target)
-        ]
+        return selected
 
     # â”€â”€ Batch building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

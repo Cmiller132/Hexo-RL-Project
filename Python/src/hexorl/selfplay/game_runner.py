@@ -16,18 +16,23 @@ from hexorl.config import Config
 from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.identity import stable_digest
 from hexorl.contracts.legal import LegalActionTable
+from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy as PairTableStrategy
 from hexorl.engine.tactical import (
     scan_tactical_oracle_from_game,
     scan_tactical_oracle_from_history,
 )
 from hexorl.engine.legal import decode_legal_bytes
-from hexorl.engine.rust import engine_available, hex_game_class
 from hexorl.inference.shm_queue import MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
 from hexorl.models.specs import model_spec_from_config
 from hexorl.graph.tensorize import GraphBatch, build_graph_batch_from_history
 from hexorl.search.context import SearchContext
-from hexorl.search.engine_adapter import create_engine_adapter
-from hexorl.search.pair_strategy import PairEvaluation, PairStrategySpec, create_pair_strategy
+from hexorl.search.engine_adapter import create_engine_adapter, create_hex_game_factory
+from hexorl.search.pair_strategy import (
+    InferencePairScoringProvider,
+    PairEvaluation,
+    PairStrategySpec,
+    create_pair_strategy,
+)
 from hexorl.search.policy_provider import PolicyProvider, create_policy_provider
 from hexorl.search.priors import PRIOR_SOURCE_DEFAULT, SearchEvaluation
 from hexorl.search.mcts_runner import choose_leaf_batch, commit_leaf_batch, commit_root, start_root
@@ -50,8 +55,6 @@ from hexorl.selfplay.telemetry import (
 )
 
 logger = logging.getLogger(__name__)
-
-ENGINE_AVAILABLE = engine_available()
 
 PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
@@ -125,6 +128,7 @@ class GameRunResult:
 @dataclass(frozen=True)
 class SelfPlayContractBuilders:
     candidate_builder_factory: Callable[[], CandidateContractBuilder] = CandidateContractBuilder
+    pair_table_builder_factory: Callable[[], PairActionTableBuilder] = PairActionTableBuilder
     graph_batch_builder: Callable[..., GraphBatch] = build_graph_batch_from_history
     tactical_from_game: Callable[..., object] = scan_tactical_oracle_from_game
     tactical_from_history: Callable[..., object] = scan_tactical_oracle_from_history
@@ -142,7 +146,6 @@ class EngineAdapterFactory(Protocol):
         c_puct_init: float = 19652.0,
         constrain_threats: bool = True,
         subtree_reuse: bool = False,
-        force_mock: bool | None = None,
     ):
         ...
 
@@ -338,6 +341,7 @@ class GameRunner:
         runtime_spec: RuntimeResourceSpec,
         runner_config: GameRunnerConfig,
         model_spec,
+        game_factory: Callable[[], object] | None = None,
         rgsc_service: RGSCRestartService | None = None,
     ):
         self.policy_provider = policy_provider
@@ -349,6 +353,7 @@ class GameRunner:
         self.runtime_spec = runtime_spec
         self.runner_config = runner_config
         self.model_spec = model_spec
+        self.game_factory = game_factory
         self.rgsc = rgsc_service or RGSCRestartService(enabled=False)
         self.worker_id = runner_config.worker_id
         self.num_simulations = runner_config.num_simulations
@@ -513,6 +518,31 @@ class GameRunner:
             open_five_cells=oracle.open_five_cells,
         )
 
+    def _pair_table_for_search(self, candidate_table, legal: np.ndarray):
+        if not self.pair_policy_enabled:
+            return None
+        if candidate_table is None:
+            raise ValueError("pair scoring requires candidate_table construction before PairStrategy")
+        if self.pair_strategy in {"two_stage_root_only", "two_stage_root", "tactical_only", "tactical"}:
+            table_strategy = PairTableStrategy(
+                mode="capped_fill",
+                max_pairs=self.pair_strategy_max_pairs,
+            )
+        elif self.pair_strategy in {PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR, "diagnostic_full_root"}:
+            table_strategy = PairTableStrategy(
+                mode="full_capped",
+                max_pairs=self.pair_strategy_max_pairs,
+                allow_full=True,
+            )
+        else:
+            raise ValueError(f"unsupported explicit pair strategy {self.pair_strategy!r}")
+        return self.contract_builders.pair_table_builder_factory().build(
+            candidate_table,
+            [],
+            strategy=table_strategy,
+            legal_moves=[(int(q), int(r)) for q, r in legal.tolist()],
+        )
+
     def _root_context(
         self,
         *,
@@ -533,12 +563,13 @@ class GameRunner:
         candidate_table = None
         graph_batch = None
         candidate_ms = 0.0
+        pair_table = None
         if self.uses_global_policy:
             graph_batch = self.contract_builders.graph_batch_builder(
                 bytes(move_history),
                 radius=8,
-                max_pair_rows=0,
-                include_pair_rows=False,
+                max_pair_rows=self.pair_strategy_max_pairs if self.pair_policy_enabled else 0,
+                include_pair_rows=self.pair_policy_enabled,
             )
         elif self.sparse_policy_enabled and self.sparse_prior_stage > 0:
             t0 = time.monotonic()
@@ -551,6 +582,19 @@ class GameRunner:
                 engine=engine,
             )
             candidate_ms = (time.monotonic() - t0) * 1000.0
+        if self.pair_policy_enabled and candidate_table is None and not self.uses_global_policy:
+            t0 = time.monotonic()
+            candidate_table = self._candidate_table_for_search(
+                tensor_3d=tensor_3d,
+                legal=legal,
+                offset_q=int(offset_q),
+                offset_r=int(offset_r),
+                history_bytes=bytes(move_history),
+                engine=engine,
+            )
+            candidate_ms += (time.monotonic() - t0) * 1000.0
+        if self.pair_policy_enabled and not self.uses_global_policy:
+            pair_table = self._pair_table_for_search(candidate_table, legal)
         context = SearchContext.create(
             phase="root",
             legal_table=legal_table,
@@ -559,6 +603,7 @@ class GameRunner:
             history_bytes=bytes(move_history),
             root_generation=int(root_generation),
             candidate_table=candidate_table,
+            pair_table=pair_table,
             graph_batch=graph_batch,
             pair_strategy_id=self.pair_strategy,
             extra={
@@ -837,8 +882,8 @@ class GameRunner:
         game_seed = int(request.seed)
         game_id = int(request.game_id)
         rgsc_restart = None
-        if ENGINE_AVAILABLE:
-            game_cls = hex_game_class(required=True)
+        if self.game_factory is not None:
+            game_cls = self.game_factory
             rgsc_restart = self.rgsc.maybe_restart(
                 game_cls,
                 max_game_moves=self.max_game_moves,
@@ -855,13 +900,13 @@ class GameRunner:
                 subtree_reuse=self.runner_config.subtree_reuse,
             )
         else:
+            game = None
             engine = self.engine_adapter_factory(
                 game=None,
                 num_simulations=sims,
                 c_puct=self.c_puct,
                 near_radius=self.near_radius,
                 seed=game_seed,
-                force_mock=True,
             )
 
         positions: List[PositionRecord] = []
@@ -966,11 +1011,7 @@ class GameRunner:
                 else []
             )
             legal_root = decode_legal_bytes(legal_bytes)
-            root_placements_remaining_for_targets = (
-                int(getattr(engine._game, "placements_remaining", 1))
-                if ENGINE_AVAILABLE and hasattr(engine, "_game")
-                else (1 if move_idx == 0 else 2 if move_idx % 2 == 1 else 1)
-            )
+            root_placements_remaining_for_targets = int(getattr(getattr(engine, "_game", None), "placements_remaining", 1))
             pair_policy_complete = _pair_policy_target_is_complete(
                 pair_policy_v2,
                 legal_root,
@@ -1041,10 +1082,7 @@ class GameRunner:
             except Exception:
                 selected_action_value = None
 
-            if ENGINE_AVAILABLE:
-                player = engine._game.current_player
-            else:
-                player = move_idx % 2
+            player = int(getattr(getattr(engine, "_game", None), "current_player", move_idx % 2))
 
             record_history = bytes(move_history)
 
@@ -1207,22 +1245,15 @@ class GameRunner:
                 terminal_reason = "win"
                 break
 
-        if ENGINE_AVAILABLE:
-            outcome = (
-                1.0
-                if engine.winner == 0
-                else -1.0
-                if engine.winner == 1
-                else 0.0
-            )
+        winner = engine.winner
+        if winner is None:
+            outcome = 0.0
+        elif winner == 0:
+            outcome = 1.0
+        elif winner == 1:
+            outcome = -1.0
         else:
-            winner = engine.winner
-            if winner is None:
-                outcome = 0.0
-            elif winner == 0:
-                outcome = 1.0
-            else:
-                outcome = -1.0
+            outcome = 0.0
 
         full_history = bytes(move_history)
         truncated = terminal_reason != "win"
@@ -1302,7 +1333,7 @@ def create_default_game_runner(
         ema_alpha=float(getattr(sp, "rgsc_prb_ema_alpha", 0.5)),
         sampling_temperature=float(getattr(sp, "rgsc_prb_temperature", 0.1)),
         seed=int(cfg.run.seed + worker_id * 10000),
-        enabled=ENGINE_AVAILABLE,
+        enabled=True,
     )
     writer = QueueSelfPlayRecordWriter(
         output_queue,
@@ -1311,8 +1342,10 @@ def create_default_game_runner(
         telemetry_sink=telemetry,
         rgsc_service=rgsc,
     )
-    pair_strategy = create_pair_strategy(_pair_strategy_spec_from_config(runner_config))
+    pair_scorer = InferencePairScoringProvider(client) if client is not None else None
+    pair_strategy = create_pair_strategy(_pair_strategy_spec_from_config(runner_config), pair_scorer=pair_scorer)
     policy_provider = create_policy_provider(model_spec=model_spec, client=client)
+    game_factory = create_hex_game_factory()
     return GameRunner(
         policy_provider=policy_provider,
         pair_strategy=pair_strategy,
@@ -1323,6 +1356,7 @@ def create_default_game_runner(
         runtime_spec=runtime_spec,
         runner_config=runner_config,
         model_spec=model_spec,
+        game_factory=game_factory,
         rgsc_service=rgsc,
     )
 

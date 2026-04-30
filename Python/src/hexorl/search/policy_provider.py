@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import time
-from typing import Protocol
+from typing import Callable, Protocol
 
 import numpy as np
 
 from hexorl.contracts.validation import ContractValidationError
 from hexorl.inference.client import InferenceClient
+from hexorl.models.capabilities import (
+    CROP_INPUT,
+    DENSE_PLACE_POLICY,
+    GLOBAL_GRAPH_INPUT,
+    GLOBAL_PLACE_POLICY,
+    SPARSE_PLACE_POLICY,
+)
+from hexorl.models.factory import get_model_registry
 from hexorl.models.specs import ModelSpec
 from hexorl.search.context import SearchContext
 from hexorl.search.priors import (
@@ -26,6 +34,24 @@ class PolicyProvider(Protocol):
     def evaluate_root(self, context: SearchContext) -> SearchEvaluation: ...
 
     def evaluate_leaves(self, contexts: list[SearchContext]) -> list[SearchEvaluation]: ...
+
+
+PolicyProviderFactory = Callable[..., PolicyProvider]
+
+_POLICY_PROVIDER_FACTORIES: dict[frozenset[str], type["_BasePolicyProvider"]] = {}
+_MODEL_FAMILY_PROVIDER_FACTORIES: dict[str, type["_BasePolicyProvider"]] = {}
+
+
+def register_policy_provider(required_capabilities: set[str], provider_cls: type["_BasePolicyProvider"]) -> None:
+    if not required_capabilities:
+        raise ValueError("policy provider registration requires at least one capability")
+    _POLICY_PROVIDER_FACTORIES[frozenset(required_capabilities)] = provider_cls
+
+
+def register_model_family_policy_provider(model_family: str, provider_cls: type["_BasePolicyProvider"]) -> None:
+    if not model_family:
+        raise ValueError("model-family policy provider registration requires a family name")
+    _MODEL_FAMILY_PROVIDER_FACTORIES[str(model_family)] = provider_cls
 
 
 class _BasePolicyProvider:
@@ -134,8 +160,10 @@ class GraphHybridPolicyProvider(_BasePolicyProvider):
     source_label = PRIOR_SOURCE_SPARSE
 
     def _evaluate_one(self, context: SearchContext) -> SearchEvaluation:
-        if context.tensor is None or context.candidate_table is None:
-            return DensePolicyProvider(client=self.client, model_spec=self.model_spec)._evaluate_one(context)
+        if context.tensor is None:
+            raise ContractValidationError("graph hybrid provider requires tensor in SearchContext", owner=self.name)
+        if context.candidate_table is None:
+            raise ContractValidationError("graph hybrid provider requires canonical candidate_table in SearchContext", owner=self.name)
         active = np.flatnonzero(context.candidate_table.mask)
         if active.shape[0] == 0:
             raise ContractValidationError("graph hybrid provider requires active candidate rows", owner=self.name)
@@ -213,16 +241,25 @@ class GlobalGraphPolicyProvider(_BasePolicyProvider):
 
 
 def create_policy_provider(*, model_spec: ModelSpec, client: InferenceClient | None) -> PolicyProvider:
-    providers = {
-        "dense_cnn": DensePolicyProvider,
-        "restnet": RestNetPolicyProvider,
-        "graph_hybrid": GraphHybridPolicyProvider,
-        "global_xattn": GlobalGraphPolicyProvider,
-        "global_line_window": GlobalGraphPolicyProvider,
-        "global_relation_graph": GlobalGraphPolicyProvider,
-    }
-    try:
-        cls = providers[model_spec.kind]
-    except KeyError as exc:
-        raise ValueError(f"no PolicyProvider registered for model kind {model_spec.kind!r}") from exc
+    descriptor = get_model_registry().resolve(model_spec)
+    family_cls = _MODEL_FAMILY_PROVIDER_FACTORIES.get(descriptor.name)
+    if family_cls is not None:
+        return family_cls(client=client, model_spec=model_spec)
+    capabilities = set(descriptor.capabilities.to_manifest())
+    matches: list[tuple[int, type[_BasePolicyProvider]]] = []
+    for required, provider_cls in _POLICY_PROVIDER_FACTORIES.items():
+        if required.issubset(capabilities):
+            matches.append((len(required), provider_cls))
+    if not matches:
+        raise ValueError(
+            "no PolicyProvider registered for model family "
+            f"{descriptor.name!r} with capabilities {sorted(capabilities)}"
+        )
+    _score, cls = max(matches, key=lambda item: item[0])
     return cls(client=client, model_spec=model_spec)
+
+
+register_policy_provider({GLOBAL_GRAPH_INPUT, GLOBAL_PLACE_POLICY}, GlobalGraphPolicyProvider)
+register_policy_provider({CROP_INPUT, SPARSE_PLACE_POLICY}, GraphHybridPolicyProvider)
+register_policy_provider({CROP_INPUT, DENSE_PLACE_POLICY}, DensePolicyProvider)
+register_model_family_policy_provider("restnet", RestNetPolicyProvider)

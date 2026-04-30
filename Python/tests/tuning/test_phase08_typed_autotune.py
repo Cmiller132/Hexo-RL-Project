@@ -92,3 +92,19 @@ def test_tuning_import_audit_rejects_legacy_raw_config_modules():
     text = "\n".join(path.read_text(encoding="utf-8") for path in root.glob("*.py"))
     assert "SearchSpace" not in text
     assert "raw config" not in text.lower()
+
+
+def test_runtime_scripts_use_typed_recipe_transforms():
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parents[3]
+    script_paths = [
+        repo / "scripts" / "run_restnet_sparse_epoch10.py",
+        repo / "scripts" / "run_ablation_suite.py",
+    ]
+    text = "\n".join(path.read_text(encoding="utf-8") for path in script_paths)
+    assert "cfg.model.architecture =" not in text
+    assert "setattr(" not in text
+    assert ".split(\".\")" not in text
+    assert "RecipeTransform" in text
+    assert "ConfigSectionTransform" in text

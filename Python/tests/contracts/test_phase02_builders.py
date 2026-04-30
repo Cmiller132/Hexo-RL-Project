@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from hexorl.contracts.candidates import CANDIDATE_FEATURES, CandidateContractBuilder
-from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
+from hexorl.contracts.pairs import PairActionTable, PairActionTableBuilder, PairStrategy
 from hexorl.contracts.symmetry import compose_symmetries, inverse_symmetry, transform_pair_policy_target, transform_policy_target
 from hexorl.graph.collate import collate_graph_batches
 from hexorl.graph.semantic_builder import GraphSemanticBuilder, GraphSemanticContract, GraphTokenType
@@ -108,6 +108,8 @@ def test_second_placement_pair_table_validates_known_first():
 def test_graph_semantic_builder_tensorizer_and_collator_are_split_and_mutation_safe():
     semantic = GraphSemanticBuilder().build(b"", include_pair_rows=False)
     assert isinstance(semantic, GraphSemanticContract)
+    with pytest.raises(ValueError, match="read-only"):
+        semantic.token_type[0] = 99
     batch = GraphTensorizer().tensorize(semantic)
     batch.token_type[0] = 99
     assert int(semantic.token_type[0]) == int(GraphTokenType.STATE)
@@ -140,6 +142,48 @@ def test_graph_pair_projection_derives_from_pair_action_table():
     assert projected.pair_first_indices.shape[0] == pair_table.selected_pair_count
     assert projected.pair_policy_target.sum() == pytest.approx(1.0)
     assert projected.pair_first_policy_target[1] == pytest.approx(1.0)
+
+
+def test_graph_pair_projection_rejects_stale_pair_table_references():
+    history = struct.pack("<iii", 0, 0, 0)
+    graph = GraphTensorizer().tensorize(GraphSemanticBuilder().build(history, include_pair_rows=False))
+    legal_rows = [(int(q), int(r)) for q, r in graph.legal_qr[:3].tolist()]
+    candidates = CandidateContractBuilder().build(
+        legal_rows,
+        [],
+        offset_q=0,
+        offset_r=0,
+        budget=3,
+        storage_width=3,
+        critical_actions=legal_rows,
+    )
+    good = PairActionTableBuilder().build(
+        candidates,
+        [(legal_rows[0], legal_rows[1], 1.0)],
+        strategy=PairStrategy(mode="full_capped", max_pairs=3, allow_full=True),
+        legal_moves=legal_rows,
+    )
+    bad_refs = np.asarray(good.first_candidate_rows, dtype=np.int64).copy()
+    bad_refs[0] = 2
+    stale = PairActionTable(
+        rows=good.rows,
+        first_candidate_rows=bad_refs,
+        second_candidate_rows=good.second_candidate_rows,
+        mask=good.mask,
+        target=good.target,
+        first_policy_target=good.first_policy_target,
+        phase=good.phase,
+        source=good.source,
+        known_first=good.known_first,
+        generation_mode=good.generation_mode,
+        possible_pair_count=good.possible_pair_count,
+        selected_pair_count=good.selected_pair_count,
+        missing_mass=good.missing_mass,
+        candidate_table_hash=good.candidate_table_hash,
+    )
+
+    with pytest.raises(ValueError, match="references do not match PairActionTable rows"):
+        graph_batch_with_pair_table(graph, stale)
 
 
 def test_candidate_pair_d6_inverse_composition_preserves_target_mass():

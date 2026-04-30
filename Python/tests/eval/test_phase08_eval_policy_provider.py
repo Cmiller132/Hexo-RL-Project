@@ -2,9 +2,11 @@ import numpy as np
 import pytest
 
 from hexorl.config import Config
+from hexorl.eval.position_services import build_search_context
 from hexorl.eval.players import PolicyPlayer
 from hexorl.models.factory import get_model_registry
 from hexorl.models.specs import ModelSpec
+from hexorl.search.policy_provider import create_policy_provider
 from hexorl.search.priors import SearchEvaluation
 
 
@@ -36,6 +38,31 @@ class _Provider:
         return [self.evaluate_root(ctx) for ctx in contexts]
 
 
+class _Manifest:
+    transport = "unit-registry"
+
+
+class _InferenceClient:
+    manifest = _Manifest()
+
+    def evaluate_dense(self, tensor, count):
+        return np.ones((count, 1089), dtype=np.float32), np.zeros((count,), dtype=np.float32)
+
+    def evaluate_sparse(self, tensor, count, candidate_indices, candidate_features, candidate_mask):
+        dense = np.ones((count, 1089), dtype=np.float32)
+        sparse = np.ones(np.asarray(candidate_indices).shape, dtype=np.float32)
+        return dense, np.zeros((count,), dtype=np.float32), sparse
+
+    def evaluate_global_graph(self, graph_batch):
+        legal_qr = np.asarray(graph_batch.legal_qr, dtype=np.int32)
+        return {
+            "metadata": {"legal_qr": legal_qr},
+            "policy_place": np.ones((legal_qr.shape[0],), dtype=np.float32),
+            "value": np.zeros((1,), dtype=np.float32),
+            "policy_pair_first": np.zeros((0,), dtype=np.float32),
+        }
+
+
 def test_arena_policy_player_covers_every_registered_family_through_provider():
     pytest.importorskip("_engine")
     for family in get_model_registry().names():
@@ -46,6 +73,25 @@ def test_arena_policy_player_covers_every_registered_family_through_provider():
         assert provider.seen[0].model_family == family
         assert player.telemetry[-1].provider_type == "UnitPolicyProvider"
         assert player.telemetry[-1].pair_rows_scored == 0
+
+
+def test_eval_uses_real_policy_provider_registry_for_every_registered_family():
+    pytest.importorskip("_engine")
+    client = _InferenceClient()
+    for family in get_model_registry().names():
+        spec = ModelSpec(kind=family, source_name="test")
+        provider = create_policy_provider(model_spec=spec, client=client)
+        context = build_search_context(
+            b"",
+            model_spec=spec,
+            recipe_id=f"registry:{family}",
+            candidate_budget=32,
+        )
+        evaluation = provider.evaluate_root(context)
+        assert evaluation.model_family == family
+        assert evaluation.policy_provider.endswith("PolicyProvider")
+        assert evaluation.legal_row_ids.shape[0] == context.legal_table.rows.shape[0]
+        assert np.isclose(float(evaluation.row_priors.sum()), 1.0)
 
 
 def test_eval_import_boundary_has_no_model_class_or_architecture_dispatch():

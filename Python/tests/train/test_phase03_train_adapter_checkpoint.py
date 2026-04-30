@@ -1,9 +1,12 @@
+import numpy as np
 import torch
+import zipfile
 
 from hexorl.config import Config
 from hexorl.graph import build_graph_batch_from_history, collate_graph_batches
 from hexorl.models.checkpoint import CheckpointBundle, CheckpointManager
 from hexorl.models.factory import build_model, train_adapter_for
+from hexorl.replay.projector import ProjectedReplayBatch
 from hexorl.train.trainer import Trainer
 
 
@@ -27,9 +30,16 @@ def _cfg(architecture: str) -> Config:
 
 
 def _crop_batch():
-    policy = torch.zeros(1, 1089)
+    policy = np.zeros((1, 1089), dtype=np.float32)
     policy[0, 544] = 1.0
-    return (torch.zeros(1, 13, 33, 33), policy, torch.zeros(1))
+    return ProjectedReplayBatch(
+        tensors=np.zeros((1, 13, 33, 33), dtype=np.float32),
+        policies=policy,
+        values=np.zeros(1, dtype=np.float32),
+        lookahead=[],
+        aux_targets={},
+        record_hashes=("test-crop",),
+    )
 
 
 def _graph_batch():
@@ -44,20 +54,34 @@ def _graph_batch():
         ]
     )
     aux = {
-        "token_features": torch.from_numpy(graph.token_features),
-        "token_type": torch.from_numpy(graph.token_type),
-        "token_qr": torch.from_numpy(graph.token_qr),
-        "token_mask": torch.from_numpy(graph.token_mask),
-        "legal_token_indices": torch.from_numpy(graph.legal_token_indices),
-        "legal_qr": torch.from_numpy(graph.legal_qr),
-        "legal_mask": torch.from_numpy(graph.legal_mask),
-        "policy_target": torch.from_numpy(graph.policy_target),
-        "pair_token_indices": torch.from_numpy(graph.pair_token_indices),
-        "relation_type": torch.from_numpy(graph.relation_type),
-        "relation_bias": torch.from_numpy(graph.relation_bias),
-        "policy_weight": torch.ones(1),
+        "token_features": graph.token_features,
+        "token_type": graph.token_type,
+        "token_qr": graph.token_qr,
+        "token_mask": graph.token_mask,
+        "legal_token_indices": graph.legal_token_indices,
+        "legal_qr": graph.legal_qr,
+        "legal_mask": graph.legal_mask,
+        "policy_target": graph.policy_target,
+        "pair_token_indices": graph.pair_token_indices,
+        "pair_first_indices": graph.pair_first_indices,
+        "pair_second_indices": graph.pair_second_indices,
+        "pair_rows": graph.pair_rows,
+        "pair_table_mask": graph.pair_table_mask,
+        "pair_phase": graph.pair_phase,
+        "pair_known_first": graph.pair_known_first,
+        "pair_known_first_mask": graph.pair_known_first_mask,
+        "relation_type": graph.relation_type,
+        "relation_bias": graph.relation_bias,
+        "policy_weight": np.ones(1, dtype=np.float32),
     }
-    return (torch.zeros(1, 13, 33, 33), torch.zeros(1, 1089), torch.zeros(1), [], aux)
+    return ProjectedReplayBatch(
+        tensors=np.zeros((1, 13, 33, 33), dtype=np.float32),
+        policies=np.zeros((1, 1089), dtype=np.float32),
+        values=np.zeros(1, dtype=np.float32),
+        lookahead=[],
+        aux_targets=aux,
+        record_hashes=("test-graph",),
+    )
 
 
 def test_trainer_runs_one_batch_for_every_registered_family():
@@ -87,6 +111,20 @@ def test_trainer_contains_no_architecture_or_model_class_branches():
         assert pattern not in source
 
 
+def test_train_adapter_rejects_legacy_raw_tuple_batches():
+    cfg = _cfg("cnn")
+    model = build_model(cfg, device=torch.device("cpu"), inference=False)
+    adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
+    legacy = (np.zeros((1, 13, 33, 33), dtype=np.float32), np.zeros((1, 1089), dtype=np.float32), np.zeros(1, dtype=np.float32))
+
+    try:
+        adapter.project_batch(legacy)
+    except TypeError as exc:
+        assert "ProjectedReplayBatch" in str(exc)
+    else:
+        raise AssertionError("legacy raw tuple batch was accepted")
+
+
 def test_pair_target_validation_rejects_opening_pair_loss():
     cfg = _cfg("global_xattn_0")
     cfg.model.pair_strategy = "diagnostic_full_pair"
@@ -94,7 +132,7 @@ def test_pair_target_validation_rejects_opening_pair_loss():
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
     batch = _graph_batch()
-    batch[-1]["pair_policy_target"] = torch.zeros_like(batch[-1]["pair_token_indices"], dtype=torch.float32)
+    batch.aux_targets["pair_policy_target"] = np.zeros_like(batch.aux_targets["pair_token_indices"], dtype=np.float32)
 
     try:
         adapter.project_batch(batch)
@@ -109,8 +147,8 @@ def test_pair_target_validation_rejects_missing_known_first():
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
     batch = _graph_batch()
-    batch[-1]["pair_policy_target"] = torch.zeros(1, 1)
-    batch[-1].pop("pair_token_indices")
+    batch.aux_targets["pair_policy_target"] = np.zeros((1, 1), dtype=np.float32)
+    batch.aux_targets.pop("pair_token_indices")
 
     try:
         adapter.project_batch(batch)
@@ -125,7 +163,7 @@ def test_pair_target_validation_rejects_stale_post_first_legal_table():
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
     batch = _graph_batch()
-    batch[-1]["pair_policy_target"] = torch.zeros(1, 2)
+    batch.aux_targets["pair_policy_target"] = np.zeros((1, 2), dtype=np.float32)
 
     try:
         adapter.project_batch(batch)
@@ -137,8 +175,8 @@ def test_pair_target_validation_rejects_stale_post_first_legal_table():
 
 def test_pair_target_mass_preserved_under_d6():
     batch = _graph_batch()
-    target = batch[-1]["policy_target"]
-    assert torch.isclose(target.sum(), torch.tensor(1.0, dtype=target.dtype))
+    target = batch.aux_targets["policy_target"]
+    assert np.isclose(target.sum(), 1.0)
 
 
 def test_train_adapter_debug_bundle_reconstructs_replay_to_loss_inputs():
@@ -161,7 +199,7 @@ def test_train_adapter_rejects_mutated_contract_after_projection():
     adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
     batch = _crop_batch()
     projected = adapter.project_batch(batch)
-    batch[1][0, 0] = float("nan")
+    batch.policies[0, 0] = float("nan")
     assert torch.isfinite(projected.targets["policy"]).all()
 
 
@@ -170,7 +208,7 @@ def test_train_adapter_rejects_stale_legal_row_identity():
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
     batch = _graph_batch()
-    batch[-1]["policy_target"] = torch.zeros(1, 3)
+    batch.aux_targets["policy_target"] = np.zeros((1, 3), dtype=np.float32)
 
     try:
         adapter.project_batch(batch)
@@ -185,7 +223,7 @@ def test_train_adapter_rejects_corrupt_masks_or_nonfinite_targets():
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     adapter = train_adapter_for(model, cfg, device=torch.device("cpu"))
     batch = _crop_batch()
-    batch[1][0, 0] = float("nan")
+    batch.policies[0, 0] = float("nan")
 
     try:
         adapter.project_batch(batch)
@@ -228,12 +266,19 @@ def test_checkpoint_manifest_round_trips(tmp_path):
     assert loaded.manifest.model_family == "dense_cnn"
 
 
-def test_checkpoint_inspect_does_not_load_weights(tmp_path):
+def test_checkpoint_inspect_does_not_load_weights(tmp_path, monkeypatch):
     cfg = _cfg("cnn")
     model = build_model(cfg, device=torch.device("cpu"), inference=False)
     path = tmp_path / "phase03.pt"
     manager = CheckpointManager()
     manager.save(CheckpointBundle(cfg=cfg, model=model), path)
+    with zipfile.ZipFile(path) as archive:
+        assert any(name.endswith("/checkpoint_manifest.json") for name in archive.namelist())
+
+    def _fail_torch_load(*args, **kwargs):
+        raise AssertionError("inspect must not torch.load or unpickle the checkpoint payload")
+
+    monkeypatch.setattr(torch, "load", _fail_torch_load)
     manifest = manager.inspect(path)
     assert manifest.model_family == "dense_cnn"
 

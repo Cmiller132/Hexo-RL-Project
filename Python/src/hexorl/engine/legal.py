@@ -35,14 +35,16 @@ class LegalTableProvider:
         return self.from_game(game, history=contract)
 
     def from_game(self, game: object, *, history: MoveHistory | None = None) -> LegalActionTable:
-        if hasattr(game, "encode_board_and_legal"):
-            _tensor, _offset_q, _offset_r, legal_bytes = game.encode_board_and_legal(
-                int(self.near_radius),
-                bool(self.constrain_threats),
+        if not hasattr(game, "encode_board_and_legal"):
+            raise RuntimeError(
+                "LegalTableProvider requires the Rust/PyO3 encode_board_and_legal legal-byte protocol; "
+                "arbitrary legal-move objects are not accepted as rust legal rows"
             )
-            rows = decode_legal_bytes(legal_bytes)
-        else:
-            rows = np.asarray(game.legal_moves(), dtype=np.int32).reshape(-1, 2)
+        _tensor, _offset_q, _offset_r, legal_bytes = game.encode_board_and_legal(
+            int(self.near_radius),
+            bool(self.constrain_threats),
+        )
+        rows = decode_legal_bytes(legal_bytes)
         current_player = _attr_int(game, "current_player", history.current_player if history else 0)
         placements_remaining = _attr_int(game, "placements_remaining", history.placements_remaining if history else 1)
         terminal = bool(_attr_value(game, "is_over", False))

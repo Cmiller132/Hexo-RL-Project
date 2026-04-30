@@ -26,3 +26,20 @@ def test_runner_uses_explicit_dependencies_not_worker_runtime(runner_factory):
     assert result.ok is True
     assert writer.records[0].game_id == 3
     assert result.record_write.record_hash == writer.records[0].game_hash
+
+
+def test_runner_pair_strategy_consumes_pair_scoring_provider(runner_factory, fake_pair_scorer):
+    runner, telemetry, writer = runner_factory(
+        pair_strategy_name="two_stage_root_only",
+        pair_strategy_max_pairs=1,
+        pair_scorer=fake_pair_scorer,
+    )
+    result = runner.run_game(GameRunRequest(run_id="r", game_id=5, game_index=0, seed=5))
+
+    assert result.ok is True
+    assert fake_pair_scorer.calls == 1
+    assert result.game_record.positions[0].pair_prior_candidate_count == 1
+    assert any(
+        event["event"] == "pair_strategy_summary" and event["scored_rows"] == 1
+        for event in telemetry.events
+    )

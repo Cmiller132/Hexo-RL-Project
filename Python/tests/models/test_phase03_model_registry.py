@@ -2,6 +2,7 @@ import torch
 
 from hexorl.config import Config
 from hexorl.models.capabilities import CROP_INPUT, DENSE_PLACE_POLICY, CapabilitySet
+from hexorl.models.families import builtin_descriptors
 from hexorl.models.factory import REGISTRY, build_model
 from hexorl.models.registry import FamilyComponents, ModelFamilyDescriptor, ModelFamilyRegistry
 from hexorl.models.specs import REQUIRED_MODEL_KINDS, ModelSpec
@@ -25,6 +26,39 @@ def _cfg(architecture: str) -> Config:
 
 def test_registry_lists_all_required_families():
     assert set(REQUIRED_MODEL_KINDS) <= set(REGISTRY.names())
+
+
+def test_builtin_family_modules_own_descriptor_construction():
+    descriptors = builtin_descriptors()
+    assert {descriptor.name for descriptor in descriptors} == set(REQUIRED_MODEL_KINDS)
+    for descriptor in descriptors:
+        assert descriptor.components.trunk
+        assert descriptor.components.heads
+        assert descriptor.model_builder.__module__.startswith("hexorl.models.trunks.")
+        assert descriptor.checkpoint_manifest_provider(ModelSpec(kind=descriptor.name), _cfg("cnn"))["model_family"] == descriptor.name
+
+
+def test_head_and_trunk_modules_expose_used_components():
+    from hexorl.models.heads import GLOBAL_GRAPH_OUTPUT_HEADS, GRAPH_HYBRID_POLICY_HEADS
+    from hexorl.models.trunks import (
+        build_dense_cnn_model,
+        build_global_relation_graph_model,
+        build_graph_hybrid_model,
+        build_restnet_model,
+    )
+
+    assert GRAPH_HYBRID_POLICY_HEADS == ("policy", "sparse_policy")
+    assert GLOBAL_GRAPH_OUTPUT_HEADS == (
+        "policy_place",
+        "policy_pair_first",
+        "policy_pair_second",
+        "policy_pair_joint",
+        "value",
+    )
+    assert build_dense_cnn_model.__module__ == "hexorl.models.trunks.dense_cnn"
+    assert build_restnet_model.__module__ == "hexorl.models.trunks.restnet"
+    assert build_graph_hybrid_model.__module__ == "hexorl.models.trunks.graph_hybrid"
+    assert build_global_relation_graph_model.__module__ == "hexorl.models.trunks.global_graph"
 
 
 def test_every_registered_family_validates_default_recipe():

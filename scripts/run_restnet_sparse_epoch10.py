@@ -20,6 +20,7 @@ from hexorl.dashboard.recorder import RunRecorder
 from hexorl.epoch import run_epoch
 from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
+from hexorl.tuning import ConfigSectionTransform, ModelRecipe, config_from_recipe
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,33 +40,40 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_experiment(cfg: Config, args: argparse.Namespace) -> Config:
-    cfg.run.output_dir = str(args.output_dir)
-    cfg.run.log_level = "INFO"
-
-    cfg.model.architecture = "restnet"
-    cfg.model.attention_positions = [
-        int(part.strip()) for part in args.attention.split(",") if part.strip()
-    ]
-    cfg.model.attention_heads = 8
-    cfg.model.attention_mlp_ratio = 2.0
-    cfg.model.sparse_policy = True
-    cfg.model.sparse_prior_stage = int(args.sparse_stage)
-    cfg.model.sparse_prior_mix = 0.25
-    cfg.model.candidate_budget = int(args.candidate_budget)
-    if "sparse_policy" not in cfg.train.loss_weights:
-        cfg.train.loss_weights["sparse_policy"] = 0.25
-
-    cfg.selfplay.games_per_epoch = int(args.games_per_epoch)
-    cfg.selfplay.states_per_epoch = int(args.states_per_epoch)
-    cfg.selfplay.mcts_simulations = int(args.mcts_sims)
-    cfg.selfplay.train_on_truncated_games = True
-
-    cfg.train.batches_per_epoch = int(args.train_batches)
-    cfg.train.peak_lr = float(args.peak_lr)
-    cfg.runtime.compile_model = False
-    cfg.runtime.compile_inference = False
-
-    return Config.model_validate(cfg.model_dump())
+    loss_weights = dict(cfg.train.loss_weights)
+    loss_weights.setdefault("sparse_policy", 0.25)
+    recipe = ModelRecipe(
+        recipe_id="restnet_sparse_stage0_epoch10",
+        model_family="restnet",
+        channels=cfg.model.channels,
+        blocks=cfg.model.blocks,
+        heads=tuple(cfg.model.heads),
+        attention_positions=tuple(int(part.strip()) for part in args.attention.split(",") if part.strip()),
+        attention_heads=8,
+        attention_mlp_ratio=2.0,
+        candidate_budget=int(args.candidate_budget),
+        sparse_policy=True,
+        sparse_prior_stage=int(args.sparse_stage),
+        sparse_prior_mix=0.25,
+        seed=cfg.run.seed,
+    )
+    transform = ConfigSectionTransform(
+        name="restnet_sparse_epoch10_runtime",
+        run={"output_dir": str(args.output_dir), "log_level": "INFO"},
+        selfplay={
+            "games_per_epoch": int(args.games_per_epoch),
+            "states_per_epoch": int(args.states_per_epoch),
+            "mcts_simulations": int(args.mcts_sims),
+            "train_on_truncated_games": True,
+        },
+        train={
+            "batches_per_epoch": int(args.train_batches),
+            "peak_lr": float(args.peak_lr),
+            "loss_weights": loss_weights,
+        },
+        runtime={"compile_model": False, "compile_inference": False},
+    )
+    return config_from_recipe(cfg, recipe, section_transform=transform)
 
 
 def main() -> None:

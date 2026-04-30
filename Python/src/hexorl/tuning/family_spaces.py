@@ -33,6 +33,7 @@ class FamilySpace:
             graph_layers=self.graph_layer_choices[0],
             graph_token_budget=self.graph_token_budget_choices[0],
             candidate_budget=self.candidate_budget_choices[0],
+            sparse_policy=self.family == "graph_hybrid",
             pair_strategy="none",
             pair_strategy_max_pairs=0,
             seed=seed,

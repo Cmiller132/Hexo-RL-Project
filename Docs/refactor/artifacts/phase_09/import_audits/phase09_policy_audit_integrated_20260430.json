@@ -1,0 +1,34 @@
+{
+  "checks": {
+    "absent_runtime_paths": [
+      "Python/src/hexorl/model",
+      "Python/src/hexorl/buffer",
+      "Python/src/hexorl/action_contract"
+    ],
+    "architecture_gate_allowlist": [
+      "Python/src/hexorl/config/schema.py",
+      "Python/src/hexorl/models/factory.py",
+      "Python/src/hexorl/models/specs.py"
+    ],
+    "mcts_allowlist": [
+      "Python/src/hexorl/engine/rust.py",
+      "Python/src/hexorl/search/engine_adapter.py"
+    ],
+    "raw_config_script_paths": [
+      "scripts/run_restnet_sparse_epoch10.py",
+      "scripts/run_ablation_suite.py",
+      "tools/refactor/phase09_final_smoke.py"
+    ],
+    "scan_roots": [
+      "Python/src/hexorl",
+      "Python/scripts",
+      "scripts",
+      "benches",
+      ".github/workflows"
+    ]
+  },
+  "cwd": "/Users/coltonmiller/Documents/GitHub/Hexo-RL-Project",
+  "findings": [],
+  "ok": true,
+  "schema_version": 1
+}

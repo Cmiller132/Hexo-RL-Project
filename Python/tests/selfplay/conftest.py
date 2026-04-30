@@ -52,7 +52,8 @@ class FakeEngineAdapter:
         self.is_over = False
         self.winner = 0
         self._game = SimpleNamespace(current_player=0, placements_remaining=1)
-        self._legal = np.asarray([[0, 0]], dtype=np.int32)
+        self._legal = np.asarray([[0, 0], [1, 0]], dtype=np.int32)
+        self.pair_priors_applied = 0
 
     def init_root(self):
         tensor = np.zeros((13, 33, 33), dtype=np.float32)
@@ -67,6 +68,10 @@ class FakeEngineAdapter:
     def expand_root_with_global_priors(self, *args):
         return None
 
+    def apply_root_pair_priors(self, pair_eval):
+        self.pair_priors_applied += int(pair_eval.scored_pair_rows)
+        return None
+
     def done(self):
         return True
 
@@ -77,7 +82,7 @@ class FakeEngineAdapter:
         return []
 
     def prior_source_summary(self):
-        return {"root_total_count": 2, "root_dense_count": 2, "leaf_total_count": 0}
+        return {"root_total_count": 2, "root_dense_count": 2, "leaf_total_count": 0, "root_pair_candidate_count": self.pair_priors_applied}
 
     def root_child_prior_sources(self):
         return [PRIOR_SOURCE_DENSE, PRIOR_SOURCE_DENSE]
@@ -100,9 +105,42 @@ class FakeGraphBatch:
     graph_semantic_hash = "fake-graph"
 
 
+def _fake_oracle(*args, **kwargs):
+    return SimpleNamespace(
+        win_now_cells=(),
+        forced_block_cells=(),
+        cover_cells=(),
+        open_four_cells=(),
+        open_five_cells=(),
+    )
+
+
+class FakePairScorer:
+    name = "fake_pair_adapter"
+
+    def __init__(self):
+        self.calls = 0
+
+    def score_pairs(self, context, table, active_rows):
+        self.calls += 1
+        return np.asarray([2.0] * len(active_rows), dtype=np.float32)
+
+
+@pytest.fixture
+def fake_pair_scorer():
+    return FakePairScorer()
+
+
 @pytest.fixture
 def runner_factory():
-    def _make(*, model_family: str = "dense_cnn", is_global_graph: bool = False):
+    def _make(
+        *,
+        model_family: str = "dense_cnn",
+        is_global_graph: bool = False,
+        pair_strategy_name: str = "none",
+        pair_strategy_max_pairs: int = 0,
+        pair_scorer=None,
+    ):
         telemetry = InMemorySelfPlayTelemetrySink()
         writer = InMemorySelfPlayRecordWriter(telemetry_sink=telemetry)
         config = GameRunnerConfig(
@@ -126,8 +164,8 @@ def runner_factory():
             sparse_policy_enabled=False,
             candidate_budget=4,
             subtree_reuse=False,
-            pair_strategy_name="none",
-            pair_strategy_max_pairs=0,
+            pair_strategy_name=pair_strategy_name,
+            pair_strategy_max_pairs=pair_strategy_max_pairs,
         )
         runtime = RuntimeResourceSpec(
             worker_processes=1,
@@ -140,10 +178,23 @@ def runner_factory():
             shutdown_timeout_s=1.0,
         )
         model_spec = SimpleNamespace(kind=model_family, version="v2", is_global_graph=is_global_graph)
-        builders = SelfPlayContractBuilders(graph_batch_builder=lambda *args, **kwargs: FakeGraphBatch())
+        builders = SelfPlayContractBuilders(
+            graph_batch_builder=lambda *args, **kwargs: FakeGraphBatch(),
+            tactical_from_game=_fake_oracle,
+            tactical_from_history=_fake_oracle,
+        )
         runner = GameRunner(
             policy_provider=FakePolicyProvider(model_family),
-            pair_strategy=create_pair_strategy(PairStrategySpec()),
+            pair_strategy=create_pair_strategy(
+                PairStrategySpec()
+                if pair_strategy_name == "none"
+                else PairStrategySpec(
+                    name="two_stage_root_only",
+                    root_enabled=True,
+                    max_root_pair_rows=pair_strategy_max_pairs,
+                ),
+                pair_scorer=pair_scorer,
+            ),
             engine_adapter_factory=lambda **kwargs: FakeEngineAdapter(),
             record_writer=writer,
             telemetry_sink=telemetry,

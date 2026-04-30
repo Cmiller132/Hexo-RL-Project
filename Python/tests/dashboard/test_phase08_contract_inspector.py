@@ -3,7 +3,6 @@ import struct
 
 import pytest
 
-from hexorl.dashboard.app import create_app
 from hexorl.dashboard.contract_inspector import ContractInspector, required_view_names
 
 
@@ -31,6 +30,7 @@ def test_dashboard_routes_use_contract_inspector_and_render_required_views(tmp_p
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+    from hexorl.dashboard.app import create_app
 
     client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing"))
     views = client.get("/api/inspect/views").json()
@@ -66,14 +66,24 @@ def test_dashboard_import_audit_rejects_private_reconstruction_imports():
         "CandidateContractBuilder",
         "PairActionTableBuilder",
         "build_graph_batch_from_history",
+        "build_dashboard_model_inputs",
         "transform_history",
     )
     offenders = []
     for path in root.glob("*.py"):
-        if path.name == "contract_inspector.py":
-            continue
         text = path.read_text(encoding="utf-8")
         for needle in banned:
             if needle in text:
                 offenders.append(f"{path.name}:{needle}")
     assert offenders == []
+
+
+def test_contract_inspector_dispatcher_does_not_embed_view_services():
+    import inspect
+
+    import hexorl.dashboard.contract_inspector as module
+
+    source = inspect.getsource(module.ContractInspector)
+    assert "HistoryInspector" not in source
+    assert "LegalTableInspector" not in source
+    assert "CandidateContractBuilder" not in source

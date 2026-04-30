@@ -412,30 +412,46 @@ def test_dashboard_debug_contract_and_graph_endpoints(tmp_path):
     assert "graph_targets" in first
 
 
-def test_dashboard_pair_policy_inference_returns_pair_logits(tmp_path):
+def test_dashboard_model_inference_uses_provider_contracts_not_pair_head(tmp_path):
     pytest.importorskip("_engine")
+    from hexorl.config import Config
     from hexorl.dashboard.model_cache import CachedModel, ModelCache
+    from hexorl.dashboard.model_inference import DashboardModelInferenceService
+    from hexorl.models.specs import model_spec_from_config
 
+    cfg = Config()
+    cfg.model.channels = 4
+    cfg.model.blocks = 1
+    cfg.model.heads = ["policy", "value", "pair_policy"]
     model = HexNet(
         channels=4,
         blocks=1,
         heads=["policy", "value", "pair_policy"],
     )
+    model_spec = model_spec_from_config(cfg)
     cache = ModelCache()
     cache._models["pair-unit"] = CachedModel(
         "pair-unit",
         tmp_path / "in-memory.pt",
         model,
         torch.device("cpu"),
+        cfg,
+        model_spec,
+        DashboardModelInferenceService(
+            model=model,
+            device=torch.device("cpu"),
+            cfg=cfg,
+            model_spec=model_spec,
+        ),
     )
     cache._order.append("pair-unit")
 
     result = cache.infer_history("pair-unit", _move(0, 0, 0))
 
-    assert result["heads"]["pair_policy"]
-    top = result["heads"]["pair_policy"][0]
-    assert {"first", "second", "logit"} <= set(top)
-    assert top["first"] != top["second"]
+    assert result["provider_type"] == "DensePolicyProvider"
+    assert "policy_provider_rows" in result["heads"]
+    assert "pair_policy" not in result["heads"]
+    assert result["contracts"]["model_family"] == "dense_cnn"
 
 
 def test_noisy_model_player_reproducible_without_engine():

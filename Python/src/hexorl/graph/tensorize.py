@@ -48,6 +48,11 @@ class GraphBatch:
     schema_version: int = GRAPH_SCHEMA_VERSION
     relation_schema_version: int = RELATION_SCHEMA_VERSION
     graph_semantic_hash: str = ""
+    pair_rows: np.ndarray | None = None
+    pair_table_mask: np.ndarray | None = None
+    pair_phase: np.ndarray | None = None
+    pair_known_first: np.ndarray | None = None
+    pair_known_first_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +118,11 @@ class GraphTensorizer:
             schema_version=int(semantic.schema_version),
             relation_schema_version=int(semantic.relation_schema_version),
             graph_semantic_hash=graph_semantic_hash(semantic),
+            pair_rows=np.zeros((0, 4), dtype=np.int32),
+            pair_table_mask=np.zeros(0, dtype=np.bool_),
+            pair_phase=np.asarray(0, dtype=np.int64),
+            pair_known_first=np.zeros(2, dtype=np.int32),
+            pair_known_first_mask=np.asarray(False, dtype=np.bool_),
         )
 
 
@@ -144,6 +154,7 @@ def build_graph_batch_from_history(
 
 def graph_batch_with_pair_table(graph_batch: GraphBatch, pair_table: PairActionTable) -> GraphBatch:
     """Project canonical pair rows onto an existing graph tensor batch."""
+    _validate_pair_table_for_graph(graph_batch, pair_table)
     legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
     first_refs = np.asarray(pair_table.first_candidate_rows, dtype=np.int64)
     second_refs = np.asarray(pair_table.second_candidate_rows, dtype=np.int64)
@@ -162,8 +173,18 @@ def graph_batch_with_pair_table(graph_batch: GraphBatch, pair_table: PairActionT
         pair_first = np.full(active.shape[0], first_token, dtype=np.int64)
         pair_second = np.asarray([legal_tokens[int(second_refs[idx]) - 1] for idx in active], dtype=np.int64)
     else:
-        pair_first = np.asarray([legal_tokens[int(first_refs[idx])] for idx in active], dtype=np.int64)
-        pair_second = np.asarray([legal_tokens[int(second_refs[idx])] for idx in active], dtype=np.int64)
+        legal_row_to_token = {
+            (int(q), int(r)): int(tok)
+            for (q, r), tok in zip(np.asarray(graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2).tolist(), legal_tokens.tolist())
+        }
+        pair_first = np.asarray(
+            [legal_row_to_token[(int(pair_table.rows[idx, 0]), int(pair_table.rows[idx, 1]))] for idx in active],
+            dtype=np.int64,
+        )
+        pair_second = np.asarray(
+            [legal_row_to_token[(int(pair_table.rows[idx, 2]), int(pair_table.rows[idx, 3]))] for idx in active],
+            dtype=np.int64,
+        )
     pair_target = np.asarray(pair_table.target[active], dtype=np.float32)
     pair_first_target = np.zeros(graph_batch.legal_qr.shape[0], dtype=np.float32)
     if pair_table.phase == "first_placement":
@@ -194,7 +215,76 @@ def graph_batch_with_pair_table(graph_batch: GraphBatch, pair_table: PairActionT
         schema_version=graph_batch.schema_version,
         relation_schema_version=graph_batch.relation_schema_version,
         graph_semantic_hash=graph_batch.graph_semantic_hash,
+        pair_rows=np.asarray(pair_table.rows[active], dtype=np.int32),
+        pair_table_mask=np.ones(active.shape[0], dtype=np.bool_),
+        pair_phase=np.asarray(_pair_phase_code(pair_table.phase), dtype=np.int64),
+        pair_known_first=np.asarray(pair_table.known_first or (0, 0), dtype=np.int32),
+        pair_known_first_mask=np.asarray(pair_table.known_first is not None, dtype=np.bool_),
     )
+
+
+def _validate_pair_table_for_graph(graph_batch: GraphBatch, pair_table: PairActionTable) -> None:
+    legal_rows = [(int(q), int(r)) for q, r in np.asarray(graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2).tolist()]
+    legal_set = set(legal_rows)
+    legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64).reshape(-1)
+    token_type = np.asarray(graph_batch.token_type, dtype=np.int64).reshape(-1)
+    token_qr = np.asarray(graph_batch.token_qr, dtype=np.int32).reshape(-1, 2)
+    first_refs = np.asarray(pair_table.first_candidate_rows, dtype=np.int64).reshape(-1)
+    second_refs = np.asarray(pair_table.second_candidate_rows, dtype=np.int64).reshape(-1)
+    rows = np.asarray(pair_table.rows, dtype=np.int32).reshape(-1, 4)
+    active = np.flatnonzero(np.asarray(pair_table.mask, dtype=np.bool_).reshape(-1))
+    if pair_table.phase == "empty":
+        if active.size:
+            raise ValueError("graph pair projection received active rows for empty PairActionTable")
+        return
+    if pair_table.phase == "first_placement" and int(graph_batch.placements_remaining) < 2:
+        raise ValueError("first-placement PairActionTable does not match graph placement phase")
+    if pair_table.phase == "second_placement_known_first" and int(graph_batch.placements_remaining) != 1:
+        raise ValueError("second-placement PairActionTable does not match graph placement phase")
+    for idx in active:
+        first = (int(rows[idx, 0]), int(rows[idx, 1]))
+        second = (int(rows[idx, 2]), int(rows[idx, 3]))
+        if first == second:
+            raise ValueError(f"graph pair projection rejects duplicate pair row: {first}")
+        if pair_table.phase == "first_placement":
+            if first > second:
+                raise ValueError(f"graph pair projection rejects non-canonical unordered row: {(first, second)}")
+            if first not in legal_set or second not in legal_set:
+                raise ValueError(f"graph pair projection row is outside graph legal rows: {(first, second)}")
+            first_ref = int(first_refs[idx])
+            second_ref = int(second_refs[idx])
+            if not (0 <= first_ref < len(legal_tokens) and 0 <= second_ref < len(legal_tokens)):
+                raise ValueError("graph pair projection has legal reference outside graph legal table")
+            ref_pair = {legal_rows[first_ref], legal_rows[second_ref]}
+            if ref_pair != {first, second}:
+                raise ValueError("graph pair projection references do not match PairActionTable rows")
+        else:
+            if pair_table.known_first is None or first != pair_table.known_first:
+                raise ValueError("graph pair projection row does not preserve known_first")
+            if second not in legal_set:
+                raise ValueError(f"graph pair projection second action is outside graph legal rows: {second}")
+            stone_tokens = [
+                token_idx
+                for token_idx, (tt, qr) in enumerate(zip(token_type.tolist(), token_qr.tolist()))
+                if int(tt) == int(GraphTokenType.STONE) and (int(qr[0]), int(qr[1])) == pair_table.known_first
+            ]
+            if not stone_tokens:
+                raise ValueError("graph pair projection known_first is not present as a graph stone token")
+            second_ref = int(second_refs[idx]) - 1
+            if not (0 <= second_ref < len(legal_tokens)):
+                raise ValueError("graph pair projection known-first second reference is outside graph legal table")
+            if legal_rows[second_ref] != second:
+                raise ValueError("graph pair projection known-first second reference does not match row")
+
+
+def _pair_phase_code(phase: str) -> int:
+    if phase == "empty":
+        return 0
+    if phase == "first_placement":
+        return 1
+    if phase == "second_placement_known_first":
+        return 2
+    raise ValueError(f"unsupported pair phase: {phase}")
 
 
 def graph_capacity_report(graph_batch: GraphBatch) -> GraphCapacityReport:

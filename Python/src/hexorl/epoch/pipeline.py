@@ -32,7 +32,6 @@ from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
-    action_to_board_index,
     dense_policy_from_v2,
 )
 from hexorl.train.trainer import Trainer
@@ -426,15 +425,11 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
             else:
                 outcome = 1.0 if score > 0.0 else -1.0
         terminal_reason = "win" if game.is_over else "bootstrap_cap"
-    except Exception:
-        outcome, terminal_reason = _make_fallback_bootstrap_game(
-            cfg,
-            game_id,
-            rng,
-            max_moves,
-            moves,
-            positions,
-        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Rust bootstrap generation failed for game_id={game_id}; "
+            "epoch bootstrap requires Rust legal rows"
+        ) from exc
 
     game = GameRecord(
         positions=positions,
@@ -448,72 +443,6 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
     return game
 
 
-def _make_fallback_bootstrap_game(
-    cfg: Config,
-    game_id: int,
-    rng: np.random.Generator,
-    max_moves: int,
-    moves: List[tuple[int, int, int]],
-    positions: List[PositionRecord],
-) -> tuple[float, str]:
-    occupied: set[tuple[int, int]] = set()
-    current_player = 0
-    placements_remaining = 1
-
-    for move_idx in range(max_moves):
-        legal = _fallback_bootstrap_legal_moves(occupied, cfg.selfplay.near_radius)
-        if not legal:
-            break
-        q, r = _sample_bootstrap_move(legal, rng)
-        policy_v2 = _bootstrap_policy_v2_for_move(q, r, legal, rng, cfg.selfplay.policy_target_top_k)
-        policy, outside_mass = dense_policy_from_v2(
-            policy_v2,
-            -16,
-            -16,
-            top_k=cfg.selfplay.policy_target_top_k,
-        )
-        positions.append(
-            PositionRecord(
-                move_history=_pack_moves(moves),
-                policy_target=policy,
-                policy_target_v2=policy_v2,
-                target_policy_mass_outside_window=outside_mass,
-                root_value=float(rng.uniform(-0.25, 0.25)),
-                player=current_player,
-                game_id=game_id,
-                is_full_search=(game_id % 3 != 0),
-                turn_index=move_idx,
-            )
-        )
-        occupied.add((q, r))
-        moves.append((current_player, q, r))
-        if placements_remaining > 1:
-            placements_remaining -= 1
-        else:
-            current_player = 1 - current_player
-            placements_remaining = 2
-
-    return (1.0 if game_id % 2 == 0 else -1.0), "bootstrap_cap"
-
-
-def _fallback_bootstrap_legal_moves(
-    occupied: set[tuple[int, int]],
-    near_radius: int,
-) -> List[tuple[int, int]]:
-    if not occupied:
-        return [(0, 0)]
-    radius = max(1, min(int(near_radius), 8))
-    legal: set[tuple[int, int]] = set()
-    for q, r in occupied:
-        for dq in range(-radius, radius + 1):
-            for dr in range(-radius, radius + 1):
-                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
-                    candidate = (q + dq, r + dr)
-                    if candidate not in occupied and action_to_board_index(*candidate) >= 0:
-                        legal.add(candidate)
-    return sorted(legal)
-
-
 def _sample_bootstrap_move(
     legal: List[tuple[int, int]],
     rng: np.random.Generator,
@@ -525,34 +454,6 @@ def _sample_bootstrap_move(
     weights /= weights.sum()
     idx = int(rng.choice(len(legal), p=weights))
     return legal[idx]
-
-
-def _bootstrap_policy_for_move(
-    q: int,
-    r: int,
-    legal: List[tuple[int, int]],
-    rng: np.random.Generator,
-    top_k: int,
-) -> dict[int, float]:
-    dense = np.zeros(33 * 33, dtype=np.float32)
-    chosen_idx = action_to_board_index(q, r)
-    if chosen_idx >= 0:
-        dense[chosen_idx] = 1.0
-    if len(legal) > 1:
-        alt_count = min(max(1, top_k - 1), len(legal) - 1, 7)
-        alt_indices = rng.choice(len(legal), size=alt_count, replace=False)
-        for legal_idx in alt_indices:
-            aq, ar = legal[int(legal_idx)]
-            if (aq, ar) == (q, r):
-                continue
-            flat = action_to_board_index(aq, ar)
-            if flat >= 0:
-                dense[flat] += float(rng.uniform(0.02, 0.12))
-    total = dense.sum()
-    if total > 0:
-        dense /= total
-    nonzero = np.flatnonzero(dense)
-    return {int(idx): float(dense[idx]) for idx in nonzero}
 
 
 def _bootstrap_policy_v2_for_move(

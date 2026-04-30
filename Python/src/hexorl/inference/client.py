@@ -17,6 +17,7 @@ from hexorl.inference.protocol import (
     InferenceProtocolManifest,
     InferenceRequestKind,
     default_protocol_manifest,
+    load_server_manifest,
     make_request,
     negotiate_protocol,
 )
@@ -38,20 +39,30 @@ class InferenceClient:
         max_batch_size: int,
         timeout_ms: float = 1000.0,
         manifest: InferenceProtocolManifest | None = None,
+        server_manifest: InferenceProtocolManifest | None = None,
     ):
         self.worker_id = worker_id
         self.num_workers = num_workers
         self.max_batch = max_batch_size
         self.timeout_ms = timeout_ms
+        self._manifest_explicit = manifest is not None
         self.manifest = manifest or default_protocol_manifest(
             max_batch_size=max_batch_size,
             timeout_ms=timeout_ms,
         )
+        self.server_manifest = server_manifest
         self._queue: Optional[InferenceQueue] = None
         self._slot = None
         self._transport: ShmTransport | None = None
         self._connected = False
-        self._adapters = {
+        self._adapters = self._build_adapters()
+
+        self.n_submits = 0
+        self.total_wait_ms = 0.0
+        self.handshake = None
+
+    def _build_adapters(self):
+        return {
             InferenceRequestKind.DENSE_POLICY_VALUE: DensePolicyValueAdapter(self.manifest),
             InferenceRequestKind.REGRET_RANK_POLICY_VALUE: DensePolicyValueAdapter(self.manifest),
             InferenceRequestKind.SPARSE_POLICY_VALUE: SparsePolicyValueAdapter(self.manifest),
@@ -60,10 +71,6 @@ class InferenceClient:
             InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE: GlobalGraphPolicyValueAdapter(self.manifest),
             InferenceRequestKind.GRAPH_PAIR_POLICY_VALUE: GlobalGraphPolicyValueAdapter(self.manifest),
         }
-
-        self.n_submits = 0
-        self.total_wait_ms = 0.0
-        self.handshake = None
 
     def connect(self):
         if self._connected:
@@ -76,13 +83,33 @@ class InferenceClient:
             timeout_ms=self.timeout_ms,
         )
         self._transport.state = TransportState.HANDSHAKING
+        server_manifest = self.server_manifest or load_server_manifest(
+            num_workers=self.num_workers,
+            max_batch_size=self.max_batch,
+        )
+        if not self._manifest_explicit:
+            self.manifest = server_manifest
+            self._adapters = self._build_adapters()
+        selected_kind = self._select_request_kind(server_manifest)
         self.handshake = negotiate_protocol(
             client_manifest=self.manifest,
-            server_manifest=self.manifest,
-            request_kind=InferenceRequestKind.DENSE_POLICY_VALUE,
+            server_manifest=server_manifest,
+            request_kind=selected_kind,
+            required_heads=tuple(self.manifest.heads),
         )
         self._transport.mark_ready()
         self._connected = True
+
+    def _select_request_kind(self, server_manifest: InferenceProtocolManifest) -> InferenceRequestKind:
+        client_kinds = [InferenceRequestKind(kind) for kind in self.manifest.request_kind]
+        server_kinds = set(server_manifest.request_kind)
+        for kind in client_kinds:
+            if kind.value in server_kinds:
+                return kind
+        raise RuntimeError(
+            "no compatible inference request kind between client and server: "
+            f"client={list(self.manifest.request_kind)} server={list(server_manifest.request_kind)}"
+        )
 
     def disconnect(self):
         if self._transport is not None:

@@ -110,6 +110,37 @@ class GraphSemanticContract:
     schema_version: int = GRAPH_SCHEMA_VERSION
     relation_schema_version: int = RELATION_SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        array_fields = {
+            "token_features": (np.float32, None),
+            "token_type": (np.int64, None),
+            "token_qr": (np.int32, None),
+            "token_mask": (np.bool_, None),
+            "legal_token_indices": (np.int64, None),
+            "legal_qr": (np.int32, None),
+            "legal_mask": (np.bool_, None),
+            "pair_token_indices": (np.int64, None),
+            "pair_first_indices": (np.int64, None),
+            "pair_second_indices": (np.int64, None),
+            "relation_bias": (np.float32, None),
+            "relation_type": (np.int64, None),
+            "policy_target": (np.float32, None),
+            "opp_legal_qr": (np.int32, None),
+            "opp_legal_mask": (np.bool_, None),
+            "opp_policy_target": (np.float32, None),
+            "pair_first_policy_target": (np.float32, None),
+            "pair_policy_target": (np.float32, None),
+            "tactical_target": (np.float32, None),
+        }
+        for name, (dtype, _shape) in array_fields.items():
+            arr = np.array(getattr(self, name), dtype=dtype, copy=True)
+            arr.setflags(write=False)
+            object.__setattr__(self, name, arr)
+        object.__setattr__(self, "placements_remaining", int(self.placements_remaining))
+        object.__setattr__(self, "current_player", int(self.current_player))
+        object.__setattr__(self, "schema_version", int(self.schema_version))
+        object.__setattr__(self, "relation_schema_version", int(self.relation_schema_version))
+
 
 @dataclass(frozen=True)
 class GraphCapacityReport:
@@ -879,89 +910,6 @@ def _pair_first_target_for_legal(
     return out
 
 
-def graph_batch_with_reference_pair_rows(
-    graph_batch: GraphSemanticContract,
-    pair_policy_target: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
-) -> GraphSemanticContract:
-    """Attach full legal pair rows without materializing pair tokens.
-
-    The transformer context keeps all legal action tokens but pair scoring can
-    be O(A^2).  For replay training, represent pair rows by references to the
-    relevant LEGAL/STONE token indices so the pair heads can train over the
-    complete table without adding tens of thousands of PAIR_ACTION tokens.
-    """
-
-    legal = [(int(q), int(r)) for q, r in np.asarray(graph_batch.legal_qr, dtype=np.int32).tolist()]
-    legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
-    if graph_batch.placements_remaining >= 2:
-        first_rows: list[int] = []
-        second_rows: list[int] = []
-        for a_idx in range(len(legal)):
-            for b_idx in range(a_idx + 1, len(legal)):
-                first_rows.append(int(legal_tokens[a_idx]))
-                second_rows.append(int(legal_tokens[b_idx]))
-        pair_first = np.asarray(first_rows, dtype=np.int64)
-        pair_second = np.asarray(second_rows, dtype=np.int64)
-        pair_context_first = None
-    elif graph_batch.placements_remaining == 1:
-        stone_tokens = np.flatnonzero(graph_batch.token_type == int(GraphTokenType.STONE))
-        if stone_tokens.size == 0:
-            pair_first = np.zeros(0, dtype=np.int64)
-            pair_second = np.zeros(0, dtype=np.int64)
-            pair_context_first = None
-        else:
-            first_token = int(stone_tokens[-1])
-            first_qr = tuple(int(x) for x in graph_batch.token_qr[first_token].tolist())
-            pair_first = np.full(len(legal), first_token, dtype=np.int64)
-            pair_second = legal_tokens.astype(np.int64, copy=True)
-            pair_context_first = first_qr
-    else:
-        pair_first = np.zeros(0, dtype=np.int64)
-        pair_second = np.zeros(0, dtype=np.int64)
-        pair_context_first = None
-
-    pair_target = _target_for_pairs(
-        pair_first,
-        pair_second,
-        legal_tokens,
-        legal,
-        pair_policy_target,
-        placements_remaining=int(graph_batch.placements_remaining),
-        pair_context_first=pair_context_first,
-    )
-    pair_first_target = _pair_first_target_for_legal(
-        legal,
-        pair_policy_target,
-        placements_remaining=int(graph_batch.placements_remaining),
-    )
-    pair_count = int(pair_first.shape[0])
-    return GraphSemanticContract(
-        token_features=graph_batch.token_features,
-        token_type=graph_batch.token_type,
-        token_qr=graph_batch.token_qr,
-        token_mask=graph_batch.token_mask,
-        legal_token_indices=graph_batch.legal_token_indices,
-        legal_qr=graph_batch.legal_qr,
-        legal_mask=graph_batch.legal_mask,
-        pair_token_indices=np.zeros(pair_count, dtype=np.int64),
-        pair_first_indices=pair_first,
-        pair_second_indices=pair_second,
-        relation_bias=graph_batch.relation_bias,
-        relation_type=graph_batch.relation_type,
-        policy_target=graph_batch.policy_target,
-        opp_legal_qr=graph_batch.opp_legal_qr,
-        opp_legal_mask=graph_batch.opp_legal_mask,
-        opp_policy_target=graph_batch.opp_policy_target,
-        pair_first_policy_target=pair_first_target,
-        pair_policy_target=pair_target,
-        tactical_target=graph_batch.tactical_target,
-        placements_remaining=graph_batch.placements_remaining,
-        current_player=graph_batch.current_player,
-        schema_version=graph_batch.schema_version,
-        relation_schema_version=graph_batch.relation_schema_version,
-    )
-
-
 def _opponent_legal_after_passive_turn(
     stones: dict[tuple[int, int], int],
     legal: Sequence[tuple[int, int]],
@@ -1209,4 +1157,3 @@ def collate_graph_batches(batches: Sequence[GraphSemanticContract]) -> GraphSema
         placements_remaining=-1,
         current_player=-1,
     )
-

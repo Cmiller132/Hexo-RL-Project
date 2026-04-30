@@ -11,8 +11,9 @@ import numpy as np
 
 from hexorl.contracts.pairs import PairActionTable
 from hexorl.contracts.validation import ContractValidationError
+from hexorl.inference.client import InferenceClient
 from hexorl.search.context import SearchContext
-from hexorl.search.priors import SearchEvaluation, priors_from_logits
+from hexorl.search.priors import PRIOR_SOURCE_PAIR, SearchEvaluation, priors_from_logits
 
 PairStrategyName = Literal["none", "two_stage_root_only", "tactical_only", "diagnostic_full_root"]
 
@@ -125,6 +126,44 @@ class PairStrategy(Protocol):
     def score_leaves(self, contexts: list[SearchContext], base_evals: list[SearchEvaluation]) -> list[PairEvaluation]: ...
 
 
+class PairScoringProvider(Protocol):
+    name: str
+
+    def score_pairs(self, context: SearchContext, table: PairActionTable, active_rows: np.ndarray) -> np.ndarray: ...
+
+
+class InferencePairScoringProvider:
+    name = "inference_pair_scoring"
+
+    def __init__(self, client: InferenceClient):
+        self.client = client
+
+    def score_pairs(self, context: SearchContext, table: PairActionTable, active_rows: np.ndarray) -> np.ndarray:
+        if context.tensor is None:
+            raise ContractValidationError("pair scoring requires tensor in SearchContext", owner=self.name)
+        if context.candidate_table is None:
+            raise ContractValidationError("pair scoring requires canonical candidate_table in SearchContext", owner=self.name)
+        active = np.asarray(active_rows, dtype=np.int64).reshape(-1)
+        if active.shape[0] == 0:
+            return np.zeros(0, dtype=np.float32)
+        candidate_table = context.candidate_table
+        _policy, _value, _sparse, pair_logits = self.client.evaluate_pair_scoring(
+            context.tensor.reshape(1, 13, 33, 33),
+            1,
+            candidate_table.dense_indices.reshape(1, -1),
+            candidate_table.features.reshape(1, candidate_table.features.shape[0], candidate_table.features.shape[1]),
+            candidate_table.mask.reshape(1, -1),
+            table.pair_indices[active].reshape(1, active.shape[0], 2),
+            table.mask[active].reshape(1, -1),
+        )
+        logits = np.asarray(pair_logits, dtype=np.float32).reshape(1, -1)[0, : active.shape[0]]
+        if logits.shape[0] != active.shape[0]:
+            raise ContractValidationError("pair-scoring output length does not match selected pair rows", owner=self.name)
+        if not np.isfinite(logits).all():
+            raise ContractValidationError("pair-scoring output contains non-finite logits", owner=self.name)
+        return logits
+
+
 class NoPairStrategy:
     name = "none"
 
@@ -136,9 +175,10 @@ class NoPairStrategy:
 
 
 class ExplicitPairStrategy:
-    def __init__(self, spec: PairStrategySpec):
+    def __init__(self, spec: PairStrategySpec, *, pair_scorer: PairScoringProvider | None = None):
         self.spec = spec
         self.name = spec.name
+        self.pair_scorer = pair_scorer
 
     def score_root(self, context: SearchContext, base_eval: SearchEvaluation) -> PairEvaluation:
         if not self.spec.root_enabled:
@@ -164,9 +204,12 @@ class ExplicitPairStrategy:
         rows = table.rows[active]
         if rows.shape[0] == 0:
             return PairEvaluation.empty(strategy_name=self.name, context=context, total_possible_pairs=table.possible_pair_count)
-        logits = table.target[active]
-        if float(np.sum(logits)) <= 0.0:
-            logits = np.ones(rows.shape[0], dtype=np.float32)
+        if self.pair_scorer is None:
+            raise ContractValidationError(
+                f"pair strategy {self.name!r} requires an inference pair-scoring provider",
+                owner="ExplicitPairStrategy",
+            )
+        logits = self.pair_scorer.score_pairs(context, table, active)
         priors, _fallback = priors_from_logits(logits)
         return PairEvaluation(
             strategy_name=self.name,
@@ -175,22 +218,26 @@ class ExplicitPairStrategy:
             pair_table_identity=table.table_hash,
             pair_rows=rows,
             pair_priors=priors,
-            pair_prior_source=np.ones(rows.shape[0], dtype=np.uint8),
+            pair_prior_source=np.full(rows.shape[0], PRIOR_SOURCE_PAIR, dtype=np.uint8),
             known_first=table.known_first,
             total_possible_pairs=table.possible_pair_count,
             selected_pair_rows=int(rows.shape[0]),
             scored_pair_rows=int(rows.shape[0]),
             caps_applied={"cap": int(cap)},
-            timings={"pair_strategy_ms": (time.monotonic() - t0) * 1000.0},
-            influence=str(self.name),
+            timings={
+                "pair_strategy_ms": (time.monotonic() - t0) * 1000.0,
+                "pair_chunk_count": 1,
+                "pair_chunk_forward_ms": (time.monotonic() - t0) * 1000.0,
+            },
+            influence=f"{self.name}:{self.pair_scorer.name}",
         )
 
 
-def create_pair_strategy(spec: PairStrategySpec | None = None) -> PairStrategy:
+def create_pair_strategy(spec: PairStrategySpec | None = None, *, pair_scorer: PairScoringProvider | None = None) -> PairStrategy:
     spec = spec or PairStrategySpec()
     if spec.name == "none":
         return NoPairStrategy()
-    return ExplicitPairStrategy(spec)
+    return ExplicitPairStrategy(spec, pair_scorer=pair_scorer)
 
 
 def _possible_pairs(table: PairActionTable | None) -> int:

@@ -50,3 +50,15 @@ def test_engine_encoding_returns_validated_legal_rows_and_bytes_identity():
 def test_decode_legal_bytes_rejects_malformed_protocol_width():
     with pytest.raises(ValueError, match="multiple of 8"):
         decode_legal_bytes(b"\x00\x00\x00\x00")
+
+
+def test_legal_provider_rejects_non_protocol_legal_moves_object():
+    class FakeGame:
+        current_player = 0
+        placements_remaining = 1
+
+        def legal_moves(self):
+            return [(0, 0)]
+
+    with pytest.raises(RuntimeError, match="encode_board_and_legal legal-byte protocol"):
+        LegalTableProvider().from_game(FakeGame())

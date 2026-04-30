@@ -61,6 +61,18 @@ def test_graph_hybrid_policy_provider_uses_candidate_legal_rows(legal_table, fak
     assert ev.raw_metadata["candidate_table_hash"] == cand.table_hash
 
 
+def test_graph_hybrid_policy_provider_fails_without_candidate_contract(legal_table, fake_client):
+    spec = ModelSpec(kind="graph_hybrid", source_name="fixture")
+    ctx = SearchContext.create(
+        phase="root",
+        legal_table=legal_table,
+        model_family="graph_hybrid",
+        tensor=_tensor(),
+    )
+    with pytest.raises(ContractValidationError, match="candidate_table"):
+        GraphHybridPolicyProvider(client=fake_client, model_spec=spec).evaluate_root(ctx)
+
+
 def test_global_graph_policy_provider_maps_legal_logits_to_legal_rows(legal_table, fake_client):
     spec = ModelSpec(kind="global_xattn", source_name="fixture")
     graph = build_graph_batch_from_history(b"", include_pair_rows=False)

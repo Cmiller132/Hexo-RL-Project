@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any, Literal
+import zipfile
 
 import torch
 import torch.nn as nn
@@ -14,6 +16,7 @@ from hexorl.models.specs import model_spec_from_config
 
 
 LoadPurpose = Literal["train", "inference", "eval"]
+_INSPECTION_MANIFEST_NAME = "checkpoint_manifest.json"
 
 
 @dataclass
@@ -99,12 +102,10 @@ class CheckpointManager:
             "cfg_json": bundle.cfg.model_dump(mode="json") if hasattr(bundle.cfg, "model_dump") else None,
         }
         torch.save(payload, path)
+        _write_inspection_manifest(path, manifest)
 
     def inspect(self, path: Path) -> CheckpointManifest:
-        checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
-        raw = checkpoint.get("checkpoint_manifest")
-        if raw is None:
-            raise ValueError("checkpoint is missing strict checkpoint_manifest")
+        raw = _read_inspection_manifest(Path(path))
         return CheckpointManifest.from_dict(raw)
 
     def load(self, path: Path, *, purpose: LoadPurpose, device: str | torch.device) -> LoadedCheckpoint:
@@ -166,3 +167,39 @@ def _manifest_from_cfg(cfg: Any, created_by: dict[str, Any]) -> CheckpointManife
             "config_hash": str(created_by.get("config_hash", "unknown")),
         },
     )
+
+
+def _write_inspection_manifest(path: Path, manifest: CheckpointManifest) -> None:
+    member = _inspection_manifest_member(path)
+    with zipfile.ZipFile(path, mode="a", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(member, json.dumps(manifest.to_dict(), sort_keys=True, separators=(",", ":")))
+
+
+def _read_inspection_manifest(path: Path) -> dict[str, Any]:
+    if not zipfile.is_zipfile(path):
+        raise ValueError("checkpoint is not a PyTorch zip archive with inspectable manifest metadata")
+    with zipfile.ZipFile(path, mode="r") as archive:
+        candidates = [name for name in archive.namelist() if name.endswith(f"/{_INSPECTION_MANIFEST_NAME}")]
+        if not candidates:
+            raise ValueError(
+                "checkpoint is missing inspectable checkpoint_manifest metadata; "
+                "resave or convert it with the strict CheckpointManager format"
+            )
+        if len(candidates) != 1:
+            raise ValueError(f"checkpoint contains ambiguous inspectable manifests: {sorted(candidates)}")
+        raw = json.loads(archive.read(candidates[0]).decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("checkpoint inspectable manifest must be a JSON object")
+    return raw
+
+
+def _inspection_manifest_member(path: Path) -> str:
+    with zipfile.ZipFile(path, mode="r") as archive:
+        prefixes = {
+            name.split("/", 1)[0]
+            for name in archive.namelist()
+            if "/" in name and name.endswith("data.pkl")
+        }
+    if len(prefixes) != 1:
+        raise ValueError(f"checkpoint archive has ambiguous PyTorch prefixes: {sorted(prefixes)}")
+    return f"{next(iter(prefixes))}/{_INSPECTION_MANIFEST_NAME}"

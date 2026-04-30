@@ -1,1 +1,44 @@
-"""Global relation graph family marker."""
+"""Global relation graph model family descriptor."""
+
+from hexorl.models.capabilities import (
+    GLOBAL_GRAPH_INPUT,
+    GLOBAL_PLACE_POLICY,
+    JOINT_PAIR_POLICY,
+    PAIR_FIRST_POLICY,
+    PAIR_SECOND_POLICY,
+    REGRET_HEAD,
+    CapabilitySet,
+)
+from hexorl.models.facets import make_descriptor
+from hexorl.models.heads.tactical import GLOBAL_GRAPH_OUTPUT_HEADS
+from hexorl.models.registry import FamilyComponents, ModelFamilyDescriptor
+from hexorl.models.trunks.global_graph import GLOBAL_GRAPH_TRUNK, build_global_relation_graph_model
+
+FAMILY_NAME = "global_relation_graph"
+ALIASES = (
+    "global_graph_option1",
+    "global_pair_twostage_0",
+    "global_graph_full_0",
+    "global_hybrid_action_0",
+    "global_graph768_champion",
+)
+CAPABILITIES = CapabilitySet.of(
+    (GLOBAL_GRAPH_INPUT, GLOBAL_PLACE_POLICY, PAIR_FIRST_POLICY, PAIR_SECOND_POLICY, JOINT_PAIR_POLICY, REGRET_HEAD)
+)
+COMPONENTS = FamilyComponents(trunk=GLOBAL_GRAPH_TRUNK, heads=GLOBAL_GRAPH_OUTPUT_HEADS)
+REQUIRED_HEADS = ("value", "policy_place")
+
+
+def descriptor() -> ModelFamilyDescriptor:
+    return make_descriptor(
+        name=FAMILY_NAME,
+        aliases=ALIASES,
+        capabilities=CAPABILITIES,
+        builder=build_global_relation_graph_model,
+        components=COMPONENTS,
+        required_heads=REQUIRED_HEADS,
+        graph=True,
+    )
+
+
+__all__ = ["ALIASES", "CAPABILITIES", "COMPONENTS", "FAMILY_NAME", "REQUIRED_HEADS", "descriptor"]

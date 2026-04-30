@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -107,6 +108,13 @@ class InferenceProtocolManifest:
     def supports(self, kind: InferenceRequestKind) -> bool:
         return kind.value in self.request_kind
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "InferenceProtocolManifest":
+        data = dict(payload)
+        for key in ("request_kind", "heads"):
+            data[key] = tuple(str(value) for value in data.get(key, ()))
+        return cls(**data)
+
 
 def stable_json_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -178,6 +186,11 @@ class InferenceHandshake:
     client_manifest_hash: str
     server_manifest_hash: str
     request_kind: InferenceRequestKind
+    selected_request_kind: str
+    selected_request_schema_version: int
+    selected_response_schema_version: int
+    selected_capacity: int
+    selected_heads: tuple[str, ...]
     accepted: bool
 
 
@@ -186,6 +199,7 @@ def negotiate_protocol(
     client_manifest: InferenceProtocolManifest,
     server_manifest: InferenceProtocolManifest,
     request_kind: InferenceRequestKind,
+    required_heads: tuple[str, ...] = (),
 ) -> InferenceHandshake:
     if client_manifest.protocol_version != server_manifest.protocol_version:
         raise InferenceProtocolMismatch(
@@ -204,19 +218,95 @@ def negotiate_protocol(
         )
     if not client_manifest.supports(request_kind) or not server_manifest.supports(request_kind):
         raise InferenceProtocolMismatch(f"inference request kind is unsupported: {request_kind.value}")
+    missing_heads = sorted(set(required_heads) - set(server_manifest.heads))
+    if missing_heads:
+        raise InferenceProtocolMismatch(
+            "inference server omitted required heads: "
+            f"{missing_heads} kind={request_kind.value}"
+        )
+    if client_manifest.input_contract != server_manifest.input_contract:
+        raise InferenceProtocolMismatch(
+            "inference input contract mismatch: "
+            f"client={client_manifest.input_contract} server={server_manifest.input_contract}"
+        )
+    if client_manifest.output_contract != server_manifest.output_contract:
+        raise InferenceProtocolMismatch(
+            "inference output contract mismatch: "
+            f"client={client_manifest.output_contract} server={server_manifest.output_contract}"
+        )
+    if client_manifest.action_contract != server_manifest.action_contract:
+        raise InferenceProtocolMismatch(
+            "inference action contract mismatch: "
+            f"client={client_manifest.action_contract} server={server_manifest.action_contract}"
+        )
+    if client_manifest.max_batch_size <= 0 or server_manifest.max_batch_size <= 0:
+        raise InferenceProtocolMismatch(
+            "inference capacity mismatch: "
+            f"client={client_manifest.max_batch_size} server={server_manifest.max_batch_size}"
+        )
+    if client_manifest.max_candidate_rows > server_manifest.max_candidate_rows:
+        raise InferenceProtocolMismatch(
+            "inference candidate capacity mismatch: "
+            f"client={client_manifest.max_candidate_rows} server={server_manifest.max_candidate_rows}"
+        )
+    if client_manifest.max_pair_rows > server_manifest.max_pair_rows:
+        raise InferenceProtocolMismatch(
+            "inference pair capacity mismatch: "
+            f"client={client_manifest.max_pair_rows} server={server_manifest.max_pair_rows}"
+        )
+    if client_manifest.max_graph_tokens > server_manifest.max_graph_tokens:
+        raise InferenceProtocolMismatch(
+            "inference graph-token capacity mismatch: "
+            f"client={client_manifest.max_graph_tokens} server={server_manifest.max_graph_tokens}"
+        )
     client_hash = client_manifest.hash()
     server_hash = server_manifest.hash()
-    if client_hash != server_hash:
-        raise InferenceProtocolMismatch(
-            "inference manifest hash mismatch: "
-            f"client={client_hash[:12]} server={server_hash[:12]} kind={request_kind.value}"
-        )
+    selected_heads = tuple(head for head in required_heads if head in server_manifest.heads)
     return InferenceHandshake(
         client_manifest_hash=client_hash,
         server_manifest_hash=server_hash,
         request_kind=request_kind,
+        selected_request_kind=request_kind.value,
+        selected_request_schema_version=client_manifest.request_schema_version,
+        selected_response_schema_version=client_manifest.response_schema_version,
+        selected_capacity=min(int(client_manifest.max_batch_size), int(server_manifest.max_batch_size)),
+        selected_heads=selected_heads,
         accepted=True,
     )
+
+
+def server_manifest_path(*, num_workers: int, max_batch_size: int) -> str:
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"hexorl_inference_manifest_w{int(num_workers)}_b{int(max_batch_size)}.json",
+    )
+
+
+def publish_server_manifest(manifest: InferenceProtocolManifest, *, num_workers: int, max_batch_size: int) -> str:
+    path = server_manifest_path(num_workers=num_workers, max_batch_size=max_batch_size)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest.canonical_dict(), handle, sort_keys=True)
+    os.replace(tmp_path, path)
+    return path
+
+
+def load_server_manifest(*, num_workers: int, max_batch_size: int) -> InferenceProtocolManifest:
+    path = server_manifest_path(num_workers=num_workers, max_batch_size=max_batch_size)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError as exc:
+        raise InferenceProtocolMismatch(f"inference server manifest was not published: {path}") from exc
+    return InferenceProtocolManifest.from_dict(payload)
+
+
+def remove_server_manifest(*, num_workers: int, max_batch_size: int) -> None:
+    path = server_manifest_path(num_workers=num_workers, max_batch_size=max_batch_size)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
 
 
 @dataclass(frozen=True)

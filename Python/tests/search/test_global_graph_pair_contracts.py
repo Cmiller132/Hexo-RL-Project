@@ -94,7 +94,22 @@ def test_policy_pair_second_uses_post_first_legal_table():
 def test_policy_pair_joint_one_logit_per_pair_action_row():
     table = _pair_table(mode="full_capped", max_pairs=3)
     base = build_graph_batch_from_history(b"", include_pair_rows=False)
-    base = base.__class__(**{**base.__dict__, "legal_token_indices": np.arange(3, dtype=np.int64)})
+    legal_rows = np.asarray(_candidate_table().rows, dtype=np.int32)
+    token_type = np.array(base.token_type, copy=True)
+    token_qr = np.array(base.token_qr, copy=True)
+    token_type[:3] = 4
+    token_qr[:3] = legal_rows
+    base = base.__class__(
+        **{
+            **base.__dict__,
+            "token_type": token_type,
+            "token_qr": token_qr,
+            "legal_qr": legal_rows,
+            "legal_mask": np.ones(3, dtype=np.bool_),
+            "legal_token_indices": np.arange(3, dtype=np.int64),
+            "placements_remaining": 2,
+        }
+    )
     graph = graph_batch_with_pair_table(base, table)
     assert graph.pair_policy_target.shape == (table.selected_pair_count,)
     assert graph.pair_first_indices.shape == graph.pair_second_indices.shape == (table.selected_pair_count,)

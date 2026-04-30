@@ -7,6 +7,17 @@ from hexorl.search.pair_strategy import PairStrategySpec, create_pair_strategy
 from hexorl.search.priors import PRIOR_SOURCE_DENSE, SearchEvaluation
 
 
+class FakePairScorer:
+    name = "fake_pair_adapter"
+
+    def __init__(self):
+        self.calls = 0
+
+    def score_pairs(self, context, table, active_rows):
+        self.calls += 1
+        return np.linspace(1.0, 2.0, num=len(active_rows), dtype=np.float32)
+
+
 def _evaluation(legal_table, pair_table=None):
     context = SearchContext.create(
         phase="root",
@@ -57,14 +68,17 @@ def test_pair_scoring_occurs_only_through_explicit_strategy(legal_table):
         allow_fixture=True,
     )
     context, evaluation = _evaluation(legal_table, pair_table=table)
+    scorer = FakePairScorer()
     pair_eval = create_pair_strategy(
         PairStrategySpec(
             name="diagnostic_full_root",
             diagnostic=True,
             root_enabled=True,
             max_full_pair_rows=1,
-        )
+        ),
+        pair_scorer=scorer,
     ).score_root(context, evaluation)
 
     assert pair_eval.scored_pair_rows == 1
     assert pair_eval.caps_applied["cap"] == 1
+    assert scorer.calls == 1

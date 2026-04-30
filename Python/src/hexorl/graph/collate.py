@@ -39,6 +39,11 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
     pair_token_indices = pad((bsz, max_p), np.int64, -1)
     pair_first_indices = pad((bsz, max_p), np.int64, -1)
     pair_second_indices = pad((bsz, max_p), np.int64, -1)
+    pair_rows = pad((bsz, max_p, 4), np.int32)
+    pair_table_mask = pad((bsz, max_p), np.bool_)
+    pair_phase = pad((bsz,), np.int64)
+    pair_known_first = pad((bsz, 2), np.int32)
+    pair_known_first_mask = pad((bsz,), np.bool_)
     pair_policy_target = pad((bsz, max_p), np.float32)
     tactical_target = pad((bsz, 4), np.float32)
 
@@ -64,6 +69,16 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
         pair_token_indices[row, :p] = batch.pair_token_indices
         pair_first_indices[row, :p] = batch.pair_first_indices
         pair_second_indices[row, :p] = batch.pair_second_indices
+        if batch.pair_rows is not None:
+            pair_rows[row, :p] = np.asarray(batch.pair_rows, dtype=np.int32).reshape(-1, 4)[:p]
+        if batch.pair_table_mask is not None:
+            pair_table_mask[row, :p] = np.asarray(batch.pair_table_mask, dtype=np.bool_).reshape(-1)[:p]
+        if batch.pair_phase is not None:
+            pair_phase[row] = int(np.asarray(batch.pair_phase).reshape(()))
+        if batch.pair_known_first is not None:
+            pair_known_first[row] = np.asarray(batch.pair_known_first, dtype=np.int32).reshape(2)
+        if batch.pair_known_first_mask is not None:
+            pair_known_first_mask[row] = bool(np.asarray(batch.pair_known_first_mask).reshape(()))
         pair_policy_target[row, :p] = batch.pair_policy_target
         tactical_target[row] = batch.tactical_target
 
@@ -89,5 +104,9 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
         tactical_target=tactical_target,
         placements_remaining=-1,
         current_player=-1,
+        pair_rows=pair_rows,
+        pair_table_mask=pair_table_mask,
+        pair_phase=pair_phase,
+        pair_known_first=pair_known_first,
+        pair_known_first_mask=pair_known_first_mask,
     )
-

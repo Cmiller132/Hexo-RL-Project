@@ -6,7 +6,7 @@ from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.contracts.validation import ContractValidationError
 from hexorl.search.context import SearchContext
 from hexorl.search.pair_strategy import PairStrategySpec, create_pair_strategy
-from hexorl.search.priors import SearchEvaluation
+from hexorl.search.priors import PRIOR_SOURCE_PAIR, SearchEvaluation
 
 
 def _base_eval(ctx):
@@ -49,7 +49,19 @@ def _pair_context(legal_table, *, strategy):
         model_family="dense_cnn",
         candidate_table=cand,
         pair_table=pair_table,
+        tensor=np.zeros((1, 13, 33, 33), dtype=np.float32),
     )
+
+
+class FakePairScorer:
+    name = "fake_pair_head"
+
+    def __init__(self):
+        self.calls = []
+
+    def score_pairs(self, context, table, active_rows):
+        self.calls.append((context, table, np.asarray(active_rows, dtype=np.int64).copy()))
+        return np.asarray([4.0, 1.0, -2.0], dtype=np.float32)[: len(active_rows)]
 
 
 def test_pair_strategy_none_generates_zero_pair_rows(legal_table):
@@ -110,14 +122,14 @@ def test_full_pair_strategy_requires_diagnostic_root_only_and_cap():
 def test_capped_pair_strategy_enforces_root_cap(legal_table):
     ctx = _pair_context(legal_table, strategy=PairStrategy(mode="capped_fill", max_pairs=3))
     spec = PairStrategySpec(name="two_stage_root_only", root_enabled=True, max_root_pair_rows=1)
-    ev = create_pair_strategy(spec).score_root(ctx, _base_eval(ctx))
+    ev = create_pair_strategy(spec, pair_scorer=FakePairScorer()).score_root(ctx, _base_eval(ctx))
     assert ev.scored_pair_rows <= 1
 
 
 def test_capped_pair_strategy_enforces_leaf_cap(legal_table):
     ctx = _pair_context(legal_table, strategy=PairStrategy(mode="capped_fill", max_pairs=3))
     spec = PairStrategySpec(name="tactical_only", root_enabled=False, leaf_enabled=True, max_leaf_pair_rows=1)
-    ev = create_pair_strategy(spec).score_leaves([ctx], [_base_eval(ctx)])[0]
+    ev = create_pair_strategy(spec, pair_scorer=FakePairScorer()).score_leaves([ctx], [_base_eval(ctx)])[0]
     assert ev.scored_pair_rows <= 1
 
 
@@ -126,3 +138,22 @@ def test_diagnostic_full_root_strategy_never_scores_leaves(legal_table):
     spec = PairStrategySpec(name="diagnostic_full_root", diagnostic=True, root_enabled=True, leaf_enabled=False, max_full_pair_rows=3)
     ev = create_pair_strategy(spec).score_leaves([ctx], [_base_eval(ctx)])[0]
     assert ev.scored_pair_rows == 0
+
+
+def test_explicit_pair_strategy_consumes_pair_scorer_not_pair_targets(legal_table):
+    ctx = _pair_context(legal_table, strategy=PairStrategy(mode="capped_fill", max_pairs=3))
+    scorer = FakePairScorer()
+    spec = PairStrategySpec(name="two_stage_root_only", root_enabled=True, max_root_pair_rows=2)
+    ev = create_pair_strategy(spec, pair_scorer=scorer).score_root(ctx, _base_eval(ctx))
+
+    assert len(scorer.calls) == 1
+    assert ev.scored_pair_rows == 2
+    assert np.all(ev.pair_prior_source == PRIOR_SOURCE_PAIR)
+    assert "fake_pair_head" in ev.influence
+
+
+def test_explicit_pair_strategy_fails_without_pair_scorer(legal_table):
+    ctx = _pair_context(legal_table, strategy=PairStrategy(mode="capped_fill", max_pairs=3))
+    spec = PairStrategySpec(name="two_stage_root_only", root_enabled=True, max_root_pair_rows=1)
+    with pytest.raises(ContractValidationError, match="pair-scoring provider"):
+        create_pair_strategy(spec).score_root(ctx, _base_eval(ctx))

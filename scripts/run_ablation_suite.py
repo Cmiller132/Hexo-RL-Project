@@ -27,13 +27,15 @@ from hexorl.eval.arena import load_checkpoint_model, model_move_fn, run_arena
 from hexorl.eval.classical import classical_opponent_fn
 from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import autotune_config, configure_torch_runtime
+from hexorl.tuning import ConfigSectionTransform, RecipeTransform, config_from_recipe, recipe_from_config
 
 
 @dataclass(frozen=True)
 class Ablation:
     name: str
     description: str
-    overrides: dict[str, Any]
+    recipe_transform: RecipeTransform | None = None
+    section_transform: ConfigSectionTransform | None = None
 
 
 HEADS_FULL = ["policy", "value", "lookahead_4", "lookahead_12", "lookahead_36", "axis"]
@@ -48,72 +50,90 @@ ABLATIONS: list[Ablation] = [
     Ablation(
         "model_64x8",
         "Compact model to measure throughput/learning tradeoff.",
-        {"model.channels": 64, "model.blocks": 8},
+        RecipeTransform("model_64x8", {"channels": 64, "blocks": 8}),
     ),
     Ablation(
         "model_96x12",
         "Mid-size model between compact and baseline.",
-        {"model.channels": 96, "model.blocks": 12},
+        RecipeTransform("model_96x12", {"channels": 96, "blocks": 12}),
     ),
     Ablation(
         "model_160x20",
         "Larger model to test whether extra capacity is worth slower search/inference.",
-        {"model.channels": 160, "model.blocks": 20},
+        RecipeTransform("model_160x20", {"channels": 160, "blocks": 20}),
     ),
     Ablation(
         "noise_low_a015_f015",
         "Lower root Dirichlet noise.",
-        {"selfplay.dirichlet_alpha": 0.15, "selfplay.dirichlet_fraction": 0.15},
+        section_transform=ConfigSectionTransform(
+            "noise_low_a015_f015",
+            selfplay={"dirichlet_alpha": 0.15, "dirichlet_fraction": 0.15},
+        ),
     ),
     Ablation(
         "noise_high_a050_f035",
         "Higher root Dirichlet noise.",
-        {"selfplay.dirichlet_alpha": 0.50, "selfplay.dirichlet_fraction": 0.35},
+        section_transform=ConfigSectionTransform(
+            "noise_high_a050_f035",
+            selfplay={"dirichlet_alpha": 0.50, "dirichlet_fraction": 0.35},
+        ),
     ),
     Ablation(
         "search_96sims",
         "Lower MCTS budget for faster but noisier targets.",
-        {"selfplay.mcts_simulations": 96, "selfplay.pcr_low_sims": 48},
+        section_transform=ConfigSectionTransform(
+            "search_96sims",
+            selfplay={"mcts_simulations": 96, "pcr_low_sims": 48},
+        ),
     ),
     Ablation(
         "search_192sims",
         "Higher MCTS budget for stronger targets.",
-        {"selfplay.mcts_simulations": 192, "selfplay.pcr_low_sims": 96},
+        section_transform=ConfigSectionTransform(
+            "search_192sims",
+            selfplay={"mcts_simulations": 192, "pcr_low_sims": 96},
+        ),
     ),
     Ablation(
         "pcr_low_more",
         "More frequent low-simulation PCR games.",
-        {"selfplay.pcr_low_sim_prob": 0.75, "selfplay.pcr_low_sims": 64},
+        section_transform=ConfigSectionTransform(
+            "pcr_low_more",
+            selfplay={"pcr_low_sim_prob": 0.75, "pcr_low_sims": 64},
+        ),
     ),
     Ablation(
         "pcr_low_less",
         "Less frequent low-simulation PCR games.",
-        {"selfplay.pcr_low_sim_prob": 0.25, "selfplay.pcr_low_sims": 64},
+        section_transform=ConfigSectionTransform(
+            "pcr_low_less",
+            selfplay={"pcr_low_sim_prob": 0.25, "pcr_low_sims": 64},
+        ),
     ),
     Ablation(
         "cpuct_100",
         "Lower exploration constant.",
-        {"selfplay.c_puct": 1.0},
+        section_transform=ConfigSectionTransform("cpuct_100", selfplay={"c_puct": 1.0}),
     ),
     Ablation(
         "cpuct_200",
         "Higher exploration constant.",
-        {"selfplay.c_puct": 2.0},
+        section_transform=ConfigSectionTransform("cpuct_200", selfplay={"c_puct": 2.0}),
     ),
     Ablation(
         "lr_0015",
         "Lower peak learning rate.",
-        {"train.peak_lr": 0.0015},
+        section_transform=ConfigSectionTransform("lr_0015", train={"peak_lr": 0.0015}),
     ),
     Ablation(
         "lr_0050",
         "Higher peak learning rate.",
-        {"train.peak_lr": 0.0050},
+        section_transform=ConfigSectionTransform("lr_0050", train={"peak_lr": 0.0050}),
     ),
     Ablation(
         "train_compile",
         "Torch compile for multi-epoch training.",
-        {"runtime.compile_model": True},
+        section_transform=ConfigSectionTransform("train_compile", runtime={"compile_model": True}),
     ),
 ]
 
@@ -174,7 +194,16 @@ def main() -> None:
             "seed": args.seed,
             "suite": args.suite,
             "ablations": [
-                {"name": item.name, "description": item.description, "overrides": item.overrides}
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "recipe_transform": None
+                    if item.recipe_transform is None
+                    else {"name": item.recipe_transform.name, "updates": item.recipe_transform.updates},
+                    "section_transform": None
+                    if item.section_transform is None
+                    else _section_transform_manifest(item.section_transform),
+                }
                 for item in suite
             ],
         },
@@ -198,7 +227,12 @@ def main() -> None:
         _write_json(run_dir / "variant.json", {
             "name": ablation.name,
             "description": ablation.description,
-            "overrides": ablation.overrides,
+            "recipe_transform": None
+            if ablation.recipe_transform is None
+            else {"name": ablation.recipe_transform.name, "updates": ablation.recipe_transform.updates},
+            "section_transform": None
+            if ablation.section_transform is None
+            else _section_transform_manifest(ablation.section_transform),
             "runtime": runtime,
         })
         _write_json(run_dir / "config.resolved.json", cfg.model_dump(mode="json"))
@@ -225,20 +259,24 @@ def _select_ablations(suite_name: str, only: str) -> list[Ablation]:
 
 
 def _make_config(base_cfg: Config, ablation: Ablation, run_dir: Path, seed: int) -> Config:
-    cfg = base_cfg.model_copy(deep=True)
-    cfg.run.output_dir = str(run_dir)
-    cfg.run.seed = seed
-    cfg.model.heads = list(HEADS_FULL)
-    cfg.buffer.lookahead_horizons = [4, 12, 36]
-    cfg.buffer.lookahead_lambdas = [0.75, 0.90, 0.97]
-    cfg.selfplay.num_workers = 0
-    cfg.selfplay.batch_size_per_worker = 0
-    cfg.inference.max_batch_size = 0
-    cfg.train.batch_size = 0
-    cfg.runtime.compile_inference = False
-    for path, value in ablation.overrides.items():
-        _set_path(cfg, path, value)
-    return cfg
+    recipe = recipe_from_config(base_cfg, recipe_id=ablation.name)
+    recipe = recipe.transform(RecipeTransform("full_heads", {"heads": tuple(HEADS_FULL)}))
+    if ablation.recipe_transform is not None:
+        recipe = recipe.transform(ablation.recipe_transform)
+    base_transform = ConfigSectionTransform(
+        name="ablation_runtime_base",
+        run={"output_dir": str(run_dir), "seed": seed},
+        buffer={"lookahead_horizons": [4, 12, 36], "lookahead_lambdas": [0.75, 0.90, 0.97]},
+        selfplay={"num_workers": 0, "batch_size_per_worker": 0},
+        inference={"max_batch_size": 0},
+        train={"batch_size": 0},
+        runtime={"compile_inference": False},
+    )
+    return config_from_recipe(
+        base_cfg,
+        recipe,
+        section_transform=_merge_section_transforms(base_transform, ablation.section_transform),
+    )
 
 
 def _run_ablation(
@@ -320,12 +358,33 @@ def _run_eval(cfg: Config, checkpoint: Path, args: argparse.Namespace) -> dict[s
     }
 
 
-def _set_path(cfg: Config, dotted_path: str, value: Any) -> None:
-    obj: Any = cfg
-    parts = dotted_path.split(".")
-    for part in parts[:-1]:
-        obj = getattr(obj, part)
-    setattr(obj, parts[-1], value)
+def _merge_section_transforms(
+    base: ConfigSectionTransform,
+    extra: ConfigSectionTransform | None,
+) -> ConfigSectionTransform:
+    if extra is None:
+        return base
+    return ConfigSectionTransform(
+        name=f"{base.name}+{extra.name}",
+        run={**dict(base.run), **dict(extra.run)},
+        selfplay={**dict(base.selfplay), **dict(extra.selfplay)},
+        inference={**dict(base.inference), **dict(extra.inference)},
+        buffer={**dict(base.buffer), **dict(extra.buffer)},
+        train={**dict(base.train), **dict(extra.train)},
+        runtime={**dict(base.runtime), **dict(extra.runtime)},
+    )
+
+
+def _section_transform_manifest(transform: ConfigSectionTransform) -> dict[str, Any]:
+    return {
+        "name": transform.name,
+        "run": dict(transform.run),
+        "selfplay": dict(transform.selfplay),
+        "inference": dict(transform.inference),
+        "buffer": dict(transform.buffer),
+        "train": dict(transform.train),
+        "runtime": dict(transform.runtime),
+    }
 
 
 def _seed_everything(seed: int) -> None:

@@ -11,7 +11,7 @@ import numpy as np
 
 from hexorl.contracts.validation import ContractValidationError
 from hexorl.engine.legal import decode_legal_bytes
-from hexorl.engine.rust import engine_available, mcts_engine_class
+from hexorl.engine.rust import hex_game_class, mcts_engine_class
 from hexorl.search.pair_strategy import PairEvaluation
 from hexorl.search.priors import PRIOR_SOURCE_DENSE, SearchEvaluation
 
@@ -572,8 +572,7 @@ def create_engine_adapter(
     subtree_reuse: bool = False,
     force_mock: bool | None = None,
 ) -> EngineAdapter:
-    use_mock = (not engine_available()) if force_mock is None else bool(force_mock)
-    if use_mock:
+    if bool(force_mock):
         return EngineAdapter(_MockBackend(num_simulations=num_simulations, c_puct=c_puct, near_radius=near_radius, seed=seed), is_mock=True)
     engine_cls = mcts_engine_class(required=True)
     args = {
@@ -587,3 +586,8 @@ def create_engine_adapter(
     }
     backend = engine_cls(**args)
     return EngineAdapter(backend, game=game, subtree_reuse=subtree_reuse, engine_factory_args=args)
+
+
+def create_hex_game_factory():
+    game_cls = hex_game_class(required=True)
+    return game_cls

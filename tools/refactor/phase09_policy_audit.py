@@ -51,9 +51,11 @@ MCTS_ALLOWLIST = {
     Path("Python/src/hexorl/search/engine_adapter.py"),
 }
 
-DASHBOARD_PRIVATE_ALLOWLIST = {
-    Path("Python/src/hexorl/dashboard/contract_inspector.py"),
-}
+RAW_CONFIG_SCRIPT_PATHS = (
+    Path("scripts/run_restnet_sparse_epoch10.py"),
+    Path("scripts/run_ablation_suite.py"),
+    Path("tools/refactor/phase09_final_smoke.py"),
+)
 
 BANNED_IMPORT_RE = re.compile(
     r"(?m)^\s*(?:from\s+hexorl\.(?:model|buffer|action_contract)(?:\.|\s+import)"
@@ -64,6 +66,7 @@ DASHBOARD_PRIVATE_PATTERNS = (
     "CandidateContractBuilder",
     "PairActionTableBuilder",
     "build_graph_batch_from_history",
+    "build_dashboard_model_inputs",
     "transform_history",
 )
 
@@ -161,12 +164,78 @@ def _check_dashboard_private_rebuilds(findings: list[Finding]) -> None:
         return
     for path in root.glob("*.py"):
         rel = _rel(path)
-        if rel in DASHBOARD_PRIVATE_ALLOWLIST:
-            continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for pattern in DASHBOARD_PRIVATE_PATTERNS:
             if pattern in text:
                 findings.append(Finding("dashboard-private-reconstruction", rel.as_posix(), _line_number(text, pattern), pattern))
+
+
+def _attribute_path(node: ast.AST) -> list[str]:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return list(reversed(parts))
+
+
+def _check_raw_config_script_mutation(findings: list[Finding]) -> None:
+    for rel in RAW_CONFIG_SCRIPT_PATHS:
+        path = ROOT / rel
+        if not path.exists():
+            findings.append(Finding("missing-typed-runtime-script", rel.as_posix(), 1, "script missing"))
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError as exc:
+            findings.append(Finding("script-parse-error", rel.as_posix(), exc.lineno or 1, str(exc)))
+            continue
+        for node in ast.walk(tree):
+            targets: list[ast.AST] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            elif isinstance(node, ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                if _attribute_path(target) == ["cfg", "model", "architecture"]:
+                    findings.append(
+                        Finding(
+                            "autotune-raw-config-mutation",
+                            rel.as_posix(),
+                            getattr(target, "lineno", 1),
+                            "cfg.model.architecture assignment",
+                        )
+                    )
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id == "setattr":
+                    findings.append(
+                        Finding(
+                            "autotune-generic-setattr-mutation",
+                            rel.as_posix(),
+                            getattr(node, "lineno", 1),
+                            "setattr",
+                        )
+                    )
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "split"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "."
+                ):
+                    findings.append(
+                        Finding(
+                            "autotune-dotted-path-mutation",
+                            rel.as_posix(),
+                            getattr(node, "lineno", 1),
+                            '.split(".")',
+                        )
+                    )
 
 
 def _check_duplicate_protocol_decoders(findings: list[Finding]) -> None:
@@ -196,6 +265,7 @@ def run_audit() -> dict[str, object]:
     _check_architecture_gates(findings)
     _check_direct_mcts(findings)
     _check_dashboard_private_rebuilds(findings)
+    _check_raw_config_script_mutation(findings)
     _check_duplicate_protocol_decoders(findings)
     _check_skipped_phase09_tests(findings)
     return {
@@ -207,7 +277,7 @@ def run_audit() -> dict[str, object]:
             "scan_roots": [p.as_posix() for p in SCAN_ROOTS],
             "architecture_gate_allowlist": [p.as_posix() for p in sorted(ARCHITECTURE_GATE_ALLOWLIST)],
             "mcts_allowlist": [p.as_posix() for p in sorted(MCTS_ALLOWLIST)],
-            "dashboard_private_allowlist": [p.as_posix() for p in sorted(DASHBOARD_PRIVATE_ALLOWLIST)],
+            "raw_config_script_paths": [p.as_posix() for p in RAW_CONFIG_SCRIPT_PATHS],
         },
         "findings": [asdict(item) for item in findings],
     }
