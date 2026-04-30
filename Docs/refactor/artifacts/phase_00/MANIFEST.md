@@ -1,0 +1,81 @@
+# Phase 00 Artifact Manifest
+
+- Created: `2026-04-30T03:31:49Z`
+- Git SHA: `9d7a24ca196e2c3343d34cbd6721ec96bb195d96`
+- Owner: Orchestrator, with S1-S5 subagent artifacts reconciled.
+- Creation command: `.venv/Scripts/python scripts/phase00_finalize_artifacts.py` for final control-plane files; individual command transcripts list their own command lines.
+
+| Artifact path | Type | Owner | Creation command | Timestamp | Git SHA | Config hash |
+|---|---|---|---|---|---|---|
+| `Docs/refactor/artifacts/phase_00/agent_completion_packet.md` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/baseline/baseline_freeze.md` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/checks/adversarial_review.md` | checks | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/checks/phase_00_scope_and_ci.md` | checks | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/checks/verification_inventory.md` | checks | S1 | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_bench_encode_short.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_bench_mcts_short.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_bench_threats_short.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_clippy_workspace_release.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_fmt_check.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_test_workspace.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/cargo_test_workspace_release.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/COMMAND_INDEX.md` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/dashboard_frontend_build.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/maturin_develop_hexgame_py.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/maturin_develop_hexgame_py_venv.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/phase00_autotune_runtime_dry_run.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/commands/phase00_inference_smoke.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/commands/phase00_selfplay_smoke.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/commands/phase00_training_smoke.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/commands/phase00_watchdog_smoke_expected_abort.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/commands/pytest_engine_smoke_invariants_inference.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/pytest_engine_smoke_invariants_inference_rerun.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/pytest_full_python_tests.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/commands/python_hexorl_cli_help.txt` | command transcript | S5/Orchestrator | see transcript header | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/config_hashes/CONFIG_HASH_INDEX.md` | config_hashes | S5/Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `self` |
+| `Docs/refactor/artifacts/phase_00/config_hashes/config_hashes.json` | config_hashes | S5/Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `self` |
+| `Docs/refactor/artifacts/phase_00/contract_examples/pair_strategy_config_examples.md` | contract_examples | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/deletion_manifest/deletion_manifest.md` | deletion_manifest | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/evidence_reconciliation.md` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/exit_gate_report.md` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/exit_gates/PHASE_00_EXIT_REPORT.md` | exit_gates | S5/Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/fixtures_or_references/fixture_reference_inventory.md` | fixtures_or_references | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/git/archive_manifest.md` | git | S4 | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/git/git_state.txt` | git | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/git/tag.txt` | git | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/import_audits/architecture_string_audit.txt` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/import_audits/legacy_runtime_path_audit.txt` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/import_audits/pair_policy_audit.txt` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/import_audits/rust_boundary_direct_engine_audit.txt` | control-plane | Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/inventory/architecture_string_inventory.md` | inventory | S1 | subagent inventory review | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/inventory/deletion_legacy_inventory.md` | inventory | S4 | subagent inventory review | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/inventory/pair_policy_inventory.md` | inventory | S3 | subagent inventory review | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/inventory/rust_python_boundary_inventory.md` | inventory | S2 | subagent inventory review | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/logs/structured_events.jsonl` | logs | Orchestrator | `scripts/phase00_capture_baseline.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/MANIFEST.md` | control-plane | S5/Orchestrator | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/performance/autotune_runtime_baseline.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/baseline_probe.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/baseline_probe.md` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/dashboard_autotune_timing.md` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/host_profile.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/inference_baseline.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/mcts_baseline.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/performance_summary.md` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/replay_projection_baseline.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/selfplay_phase_profile.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/tactical_baseline.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/training_smoke_run/epoch_0001.pt` | control-plane | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/performance/training_step_baseline.json` | performance | Orchestrator | `scripts/phase00_capture_baseline.py`, runtime smokes, or cargo bench | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `inline_phase00_tiny_cfg or none; see CONFIG_HASH_INDEX.md` |
+| `Docs/refactor/artifacts/phase_00/traces/contract_trace_sample.json` | traces | Orchestrator | `scripts/phase00_capture_baseline.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/watchdog/no_progress_event.json` | watchdog | S2 | `scripts/phase00_capture_baseline.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/watchdog/no_progress_smoke.md` | watchdog | S2 | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+| `Docs/refactor/artifacts/phase_00/watchdog/no_progress_smoke_event.json` | watchdog | S2 | `scripts/phase00_finalize_artifacts.py` | `2026-04-30T03:31:49Z` | `9d7a24ca196e2c3343d34cbd6721ec96bb195d96` | `none` |
+
+## Supersession Log
+
+| Superseded artifact | Superseding artifact | Reason |
+|---|---|---|
+| `commands/maturin_develop_hexgame_py.txt` | `commands/maturin_develop_hexgame_py_venv.txt` | Initial run lacked active venv; rerun installed `_engine` successfully. |
+| `commands/pytest_engine_smoke_invariants_inference.txt` | `commands/pytest_engine_smoke_invariants_inference_rerun.txt` | Initial run hit stale local shared-memory state; rerun passed after cleanup. |
+
+No artifact used for Phase 00 closure is missing from this manifest.

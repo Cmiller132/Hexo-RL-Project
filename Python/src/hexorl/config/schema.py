@@ -35,6 +35,8 @@ class ModelConfig(BaseModel):
     sparse_prior_stage: int = 0
     sparse_prior_mix: float = 0.25
     pair_prior_mix: float = 0.35
+    pair_strategy: str = "none"
+    pair_strategy_max_pairs: int = 0
 
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
@@ -103,6 +105,29 @@ class ModelConfig(BaseModel):
             raise ValueError("model.sparse_prior_mix must be in [0, 1]")
         if not 0.0 <= self.pair_prior_mix <= 1.0:
             raise ValueError("model.pair_prior_mix must be in [0, 1]")
+        self.pair_strategy = self.pair_strategy.lower()
+        valid_pair_strategies = {"none", "diagnostic_full_pair"}
+        if self.pair_strategy not in valid_pair_strategies:
+            raise ValueError(
+                "model.pair_strategy must be one of "
+                f"{sorted(valid_pair_strategies)}"
+            )
+        if self.pair_strategy == "none":
+            if self.pair_strategy_max_pairs != 0:
+                raise ValueError(
+                    "model.pair_strategy_max_pairs must be 0 when "
+                    "model.pair_strategy='none'"
+                )
+        else:
+            if self.pair_prior_mix <= 0.0:
+                raise ValueError(
+                    "non-none model.pair_strategy requires model.pair_prior_mix > 0"
+                )
+            if self.pair_strategy_max_pairs <= 0:
+                raise ValueError(
+                    "non-none model.pair_strategy requires "
+                    "model.pair_strategy_max_pairs > 0"
+                )
         invalid_positions = [
             pos for pos in self.attention_positions if pos < 1 or pos > self.blocks
         ]
@@ -225,8 +250,16 @@ class Config(BaseModel):
                 "model heads sparse_policy/pair_policy require explicit model.sparse_policy = true; "
                 "the config is not auto-mutated"
             )
-        if "pair_policy" in self.model.heads and self.model.pair_prior_mix <= 0.0:
-            raise ValueError("pair_policy head requires model.pair_prior_mix > 0 so MCTS consumes pair priors")
+        if (
+            self.model.pair_strategy != "none"
+            and not (
+                {"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+                & set(self.model.heads)
+            )
+        ):
+            raise ValueError(
+                "non-none model.pair_strategy requires an explicit pair policy head"
+            )
         if self.model.sparse_policy and max(
             self.model.candidate_budget,
             self.selfplay.policy_target_top_k,

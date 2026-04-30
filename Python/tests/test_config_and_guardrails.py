@@ -1,4 +1,5 @@
 import multiprocessing as mp
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -6,7 +7,7 @@ import torch
 from hexorl.buffer import RingBuffer
 from hexorl.config import Config
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
-from hexorl.selfplay.worker import SelfPlayWorker
+from hexorl.selfplay.worker import SelfPlayWorker, _score_graph_pair_chunks
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
 from hexorl.model.network import HexConv2d, GatedResBlock, build_model_from_config, load_model_state
@@ -362,11 +363,11 @@ def test_pair_policy_head_forward_and_default_weight():
     assert torch.isfinite(out["pair_policy"][pair_candidate_mask]).all()
 
 
-def test_global_graph_selfplay_consumes_pair_priors_by_default():
+def test_global_xattn_pair_strategy_defaults_to_none():
     cfg = Config.model_validate(
         {
             "model": {
-                "architecture": "global_graph_option1",
+                "architecture": "global_xattn_0",
                 "channels": 16,
                 "attention_heads": 4,
                 "graph_layers": 1,
@@ -378,9 +379,84 @@ def test_global_graph_selfplay_consumes_pair_priors_by_default():
     try:
         worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
         assert worker.global_graph_enabled is True
-        assert worker.pair_policy_enabled is True
+        assert worker.pair_strategy == "none"
+        assert worker.pair_policy_enabled is False
+        assert worker.pair_strategy_summary()["pair_rows_scored"] == 0
     finally:
         queue.close()
+
+
+def test_global_xattn_pair_heads_do_not_enable_pair_scoring_without_strategy():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_xattn_0",
+                "channels": 16,
+                "attention_heads": 4,
+                "graph_layers": 1,
+                "heads": ["value", "policy_place", "policy_pair_first", "policy_pair_joint"],
+                "pair_prior_mix": 0.75,
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    queue = mp.Queue()
+    try:
+        worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
+        assert worker.pair_policy_enabled is False
+        assert worker.pair_strategy_summary(pair_rows_possible=100)["pair_rows_scored"] == 0
+    finally:
+        queue.close()
+
+
+def test_pair_scoring_requires_explicit_diagnostic_strategy_and_cap():
+    with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
+        Config.model_validate(
+            {
+                "model": {
+                    "architecture": "global_xattn_0",
+                    "channels": 16,
+                    "attention_heads": 4,
+                    "graph_layers": 1,
+                    "heads": ["value", "policy_place", "policy_pair_joint"],
+                    "pair_strategy": "diagnostic_full_pair",
+                },
+                "inference": {"fp16": False},
+            }
+        )
+
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_xattn_0",
+                "channels": 16,
+                "attention_heads": 4,
+                "graph_layers": 1,
+                "heads": ["value", "policy_place", "policy_pair_joint"],
+                "pair_strategy": "diagnostic_full_pair",
+                "pair_strategy_max_pairs": 32,
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    queue = mp.Queue()
+    try:
+        worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
+        assert worker.pair_policy_enabled is True
+        assert worker.pair_strategy_max_pairs == 32
+    finally:
+        queue.close()
+
+    with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
+        _score_graph_pair_chunks(
+            client=object(),  # type: ignore[arg-type]
+            graph_batch=SimpleNamespace(
+                legal_qr=torch.zeros(2, 2, dtype=torch.int32).numpy(),
+                legal_token_indices=torch.arange(2).numpy(),
+            ),
+            second_placement=False,
+            max_pair_rows=0,
+        )
 
 
 def test_restnet_config_rejects_invalid_attention_position():

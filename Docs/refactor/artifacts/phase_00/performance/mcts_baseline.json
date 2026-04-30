@@ -1,0 +1,27 @@
+{
+  "accepted_regressions": [],
+  "command": "cargo bench -p hexgame-bench --bench mcts -- --warm-up-time 1 --measurement-time 2",
+  "config_hash": "none",
+  "created_at": "2026-04-30T03:31:49Z",
+  "git_sha": "9d7a24ca196e2c3343d34cbd6721ec96bb195d96",
+  "host_profile": {
+    "cuda_available": true,
+    "cuda_memory_gb": 11.99365234375,
+    "cuda_name": "NVIDIA GeForce RTX 4070 Ti",
+    "logical_cpus": 32,
+    "physical_cpus": 16,
+    "system": "windows",
+    "system_memory_gb": 31.159404754638672
+  },
+  "latency_metrics": {
+    "single_mcts_full_sim": "[294.87 us, 305.15 us, 317.69 us]"
+  },
+  "queue_backpressure_metrics": {
+    "not_applicable": "Rust microbench"
+  },
+  "source_transcript": "Docs/refactor/artifacts/phase_00/commands/cargo_bench_mcts_short.txt",
+  "throughput_metrics": {
+    "single_mcts_full_sim": "305.15 us median"
+  },
+  "workload": "single MCTS full simulation short bench"
+}

@@ -1,0 +1,6 @@
+created_at: 2026-04-30T03:31:49Z
+tag: v2-phase-00-pre-python-foundation
+tag_sha: 9d7a24ca196e2c3343d34cbd6721ec96bb195d96
+head_sha_at_finalize: 9d7a24ca196e2c3343d34cbd6721ec96bb195d96
+tag_maps_to_baseline: true
+completed_rust_refactor_sha_contained: 9d7a24ca196e2c3343d34cbd6721ec96bb195d96

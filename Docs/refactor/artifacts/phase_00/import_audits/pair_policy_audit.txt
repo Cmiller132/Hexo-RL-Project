@@ -1,0 +1,143 @@
+﻿command: git grep -n -E 'pair_prior_mix|pair_policy_enabled|pair_strategy|pair_strategy_max_pairs|policy_pair_first|policy_pair_second|policy_pair_joint|_score_graph_pair_chunks|_score_crop_pair_chunks|apply_root_pair' -- Python/src/hexorl Python/tests scripts Configs configs exit_code: 0 
+Python/src/hexorl/buffer/ring.py:21:PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+Python/src/hexorl/config/schema.py:37:    pair_prior_mix: float = 0.35
+Python/src/hexorl/config/schema.py:38:    pair_strategy: str = "none"
+Python/src/hexorl/config/schema.py:39:    pair_strategy_max_pairs: int = 0
+Python/src/hexorl/config/schema.py:106:        if not 0.0 <= self.pair_prior_mix <= 1.0:
+Python/src/hexorl/config/schema.py:107:            raise ValueError("model.pair_prior_mix must be in [0, 1]")
+Python/src/hexorl/config/schema.py:108:        self.pair_strategy = self.pair_strategy.lower()
+Python/src/hexorl/config/schema.py:110:        if self.pair_strategy not in valid_pair_strategies:
+Python/src/hexorl/config/schema.py:112:                "model.pair_strategy must be one of "
+Python/src/hexorl/config/schema.py:115:        if self.pair_strategy == "none":
+Python/src/hexorl/config/schema.py:116:            if self.pair_strategy_max_pairs != 0:
+Python/src/hexorl/config/schema.py:118:                    "model.pair_strategy_max_pairs must be 0 when "
+Python/src/hexorl/config/schema.py:119:                    "model.pair_strategy='none'"
+Python/src/hexorl/config/schema.py:122:            if self.pair_prior_mix <= 0.0:
+Python/src/hexorl/config/schema.py:124:                    "non-none model.pair_strategy requires model.pair_prior_mix > 0"
+Python/src/hexorl/config/schema.py:126:            if self.pair_strategy_max_pairs <= 0:
+Python/src/hexorl/config/schema.py:128:                    "non-none model.pair_strategy requires "
+Python/src/hexorl/config/schema.py:129:                    "model.pair_strategy_max_pairs > 0"
+Python/src/hexorl/config/schema.py:254:            self.model.pair_strategy != "none"
+Python/src/hexorl/config/schema.py:256:                {"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+Python/src/hexorl/config/schema.py:261:                "non-none model.pair_strategy requires an explicit pair policy head"
+Python/src/hexorl/config/schema.py:283:            "policy_pair_first",
+Python/src/hexorl/config/schema.py:284:            "policy_pair_second",
+Python/src/hexorl/config/schema.py:285:            "policy_pair_joint",
+Python/src/hexorl/config/schema.py:301:                "policy_pair_first": self.train.loss_weights.get("pair_policy", 0.05),
+Python/src/hexorl/config/schema.py:302:                "policy_pair_second": self.train.loss_weights.get("pair_policy", 0.05),
+Python/src/hexorl/config/schema.py:303:                "policy_pair_joint": self.train.loss_weights.get("pair_policy", 0.05),
+Python/src/hexorl/epoch/pipeline.py:41:GRAPH_PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+Python/src/hexorl/inference/client.py:375:            "policy_pair_first": np.array(self._slot.res_graph_pair_first_logits[:legal_count], copy=True),
+Python/src/hexorl/inference/client.py:376:            "policy_pair_joint": np.array(self._slot.res_graph_pair_logits[:pair_count], copy=True),
+Python/src/hexorl/inference/client.py:377:            "policy_pair_second": np.array(self._slot.res_graph_pair_second_logits[:pair_count], copy=True),
+Python/src/hexorl/inference/server.py:708:        pair_first = self._sanitize_policy_logits(out["policy_pair_first"]) if "policy_pair_first" in out else None
+Python/src/hexorl/inference/server.py:711:        if "policy_pair_joint" in out:
+Python/src/hexorl/inference/server.py:712:            pair_joint = self._sanitize_policy_logits(out["policy_pair_joint"])
+Python/src/hexorl/inference/server.py:713:        if "policy_pair_second" in out:
+Python/src/hexorl/inference/server.py:714:            pair_second = self._sanitize_policy_logits(out["policy_pair_second"])
+Python/src/hexorl/inference/server.py:817:                raise ValueError("graph model did not return policy_pair_first for legal rows")
+Python/src/hexorl/model/global_graph.py:192:        self.policy_pair_first = nn.Linear(channels, 1)
+Python/src/hexorl/model/global_graph.py:294:            "policy_pair_first": self.policy_pair_first(legal_vec).squeeze(-1).masked_fill(
+Python/src/hexorl/model/global_graph.py:360:            out["policy_pair_joint"] = joint
+Python/src/hexorl/model/global_graph.py:361:            out["policy_pair_second"] = second_logits
+Python/src/hexorl/selfplay/worker.py:126:def _score_graph_pair_chunks(
+Python/src/hexorl/selfplay/worker.py:137:        raise ValueError("pair scoring requires explicit nonzero pair_strategy_max_pairs")
+Python/src/hexorl/selfplay/worker.py:163:            logits = np.asarray(out.get("policy_pair_second", out.get("policy_pair_joint", [])), dtype=np.float32)[:width]
+Python/src/hexorl/selfplay/worker.py:200:                    logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
+Python/src/hexorl/selfplay/worker.py:212:            logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
+Python/src/hexorl/selfplay/worker.py:238:def _score_crop_pair_chunks(
+Python/src/hexorl/selfplay/worker.py:252:        raise ValueError("pair scoring requires explicit nonzero pair_strategy_max_pairs")
+Python/src/hexorl/selfplay/worker.py:684:    def apply_root_pair_first_priors(self, pair_first_logits: np.ndarray, pair_mix: float):
+Python/src/hexorl/selfplay/worker.py:695:    def apply_root_pair_priors(
+Python/src/hexorl/selfplay/worker.py:704:    def apply_root_pair_second_priors(
+Python/src/hexorl/selfplay/worker.py:974:    def apply_root_pair_priors(self, pair_qr, pair_logits, pair_mix):
+Python/src/hexorl/selfplay/worker.py:975:        self._engine.apply_root_pair_priors(
+Python/src/hexorl/selfplay/worker.py:981:    def apply_root_pair_first_priors(self, pair_first_logits, pair_mix):
+Python/src/hexorl/selfplay/worker.py:982:        self._engine.apply_root_pair_first_priors(
+Python/src/hexorl/selfplay/worker.py:987:    def apply_root_pair_second_priors(self, pair_qr, pair_logits, pair_mix):
+Python/src/hexorl/selfplay/worker.py:988:        self._engine.apply_root_pair_second_priors(
+Python/src/hexorl/selfplay/worker.py:1178:        self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
+Python/src/hexorl/selfplay/worker.py:1179:        self.pair_strategy = str(
+Python/src/hexorl/selfplay/worker.py:1180:            getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)
+Python/src/hexorl/selfplay/worker.py:1182:        self.pair_strategy_max_pairs = int(
+Python/src/hexorl/selfplay/worker.py:1183:            getattr(cfg.model, "pair_strategy_max_pairs", 0)
+Python/src/hexorl/selfplay/worker.py:1185:        self.pair_policy_enabled = self.pair_strategy != PAIR_STRATEGY_NONE
+Python/src/hexorl/selfplay/worker.py:1203:    def pair_strategy_summary(
+Python/src/hexorl/selfplay/worker.py:1210:            "event": "pair_strategy_summary",
+Python/src/hexorl/selfplay/worker.py:1213:            "pair_strategy": self.pair_strategy,
+Python/src/hexorl/selfplay/worker.py:1214:            "pair_prior_mix": float(self.pair_prior_mix),
+Python/src/hexorl/selfplay/worker.py:1226:        logger.info("pair_strategy_summary %s", self.pair_strategy_summary())
+Python/src/hexorl/selfplay/worker.py:1392:                        if self.pair_policy_enabled:
+Python/src/hexorl/selfplay/worker.py:1394:                            pair_qr, pair_logits = _score_graph_pair_chunks(
+Python/src/hexorl/selfplay/worker.py:1399:                                max_pair_rows=self.pair_strategy_max_pairs,
+Python/src/hexorl/selfplay/worker.py:1418:                            self.pair_policy_enabled
+Python/src/hexorl/selfplay/worker.py:1420:                            and "policy_pair_first" in graph_out
+Python/src/hexorl/selfplay/worker.py:1422:                            engine.apply_root_pair_first_priors(
+Python/src/hexorl/selfplay/worker.py:1423:                                np.asarray(graph_out["policy_pair_first"], dtype=np.float32),
+Python/src/hexorl/selfplay/worker.py:1424:                                self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1426:                        if self.pair_policy_enabled and pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
+Python/src/hexorl/selfplay/worker.py:1428:                                engine.apply_root_pair_second_priors(
+Python/src/hexorl/selfplay/worker.py:1431:                                    self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1434:                                engine.apply_root_pair_priors(
+Python/src/hexorl/selfplay/worker.py:1437:                                    self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1442:                            or self.pair_policy_enabled
+Python/src/hexorl/selfplay/worker.py:1533:                                if self.pair_policy_enabled:
+Python/src/hexorl/selfplay/worker.py:1536:                                    pair_qr, pair_logits = _score_crop_pair_chunks(
+Python/src/hexorl/selfplay/worker.py:1544:                                        max_pair_rows=self.pair_strategy_max_pairs,
+Python/src/hexorl/selfplay/worker.py:1551:                                        engine.apply_root_pair_second_priors(
+Python/src/hexorl/selfplay/worker.py:1554:                                            self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1557:                                        engine.apply_root_pair_priors(
+Python/src/hexorl/selfplay/worker.py:1560:                                            self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1662:                                    self.pair_policy_enabled
+Python/src/hexorl/selfplay/worker.py:1668:                                            pair_qr, pair_logits = _score_graph_pair_chunks(
+Python/src/hexorl/selfplay/worker.py:1673:                                                max_pair_rows=self.pair_strategy_max_pairs,
+Python/src/hexorl/selfplay/worker.py:1679:                                                    self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1684:                                        if "policy_pair_first" in graph_out:
+Python/src/hexorl/selfplay/worker.py:1687:                                                np.asarray(graph_out["policy_pair_first"], dtype=np.float32)[: graph_legal.shape[0]],
+Python/src/hexorl/selfplay/worker.py:1688:                                                self.pair_prior_mix,
+Python/src/hexorl/selfplay/worker.py:1691:                                        pair_qr, pair_logits = _score_graph_pair_chunks(
+Python/src/hexorl/selfplay/worker.py:1695:                                            max_pair_rows=self.pair_strategy_max_pairs,
+Python/src/hexorl/selfplay/worker.py:1702:                                                self.pair_prior_mix,
+Python/src/hexorl/train/losses.py:430:        elif head_name == "policy_pair_first":
+Python/src/hexorl/train/losses.py:440:        elif head_name in {"policy_pair_second", "policy_pair_joint"}:
+Python/src/hexorl/train/trainer.py:86:                "policy_pair_first": self._loss_weights.get("pair_policy", 0.05),
+Python/src/hexorl/train/trainer.py:87:                "policy_pair_second": self._loss_weights.get("pair_policy", 0.05),
+Python/src/hexorl/train/trainer.py:88:                "policy_pair_joint": self._loss_weights.get("pair_policy", 0.05),
+Python/tests/test_config_and_guardrails.py:10:from hexorl.selfplay.worker import SelfPlayWorker, _score_graph_pair_chunks
+Python/tests/test_config_and_guardrails.py:366:def test_global_xattn_pair_strategy_defaults_to_none():
+Python/tests/test_config_and_guardrails.py:382:        assert worker.pair_strategy == "none"
+Python/tests/test_config_and_guardrails.py:383:        assert worker.pair_policy_enabled is False
+Python/tests/test_config_and_guardrails.py:384:        assert worker.pair_strategy_summary()["pair_rows_scored"] == 0
+Python/tests/test_config_and_guardrails.py:397:                "heads": ["value", "policy_place", "policy_pair_first", "policy_pair_joint"],
+Python/tests/test_config_and_guardrails.py:398:                "pair_prior_mix": 0.75,
+Python/tests/test_config_and_guardrails.py:406:        assert worker.pair_policy_enabled is False
+Python/tests/test_config_and_guardrails.py:407:        assert worker.pair_strategy_summary(pair_rows_possible=100)["pair_rows_scored"] == 0
+Python/tests/test_config_and_guardrails.py:413:    with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
+Python/tests/test_config_and_guardrails.py:421:                    "heads": ["value", "policy_place", "policy_pair_joint"],
+Python/tests/test_config_and_guardrails.py:422:                    "pair_strategy": "diagnostic_full_pair",
+Python/tests/test_config_and_guardrails.py:435:                "heads": ["value", "policy_place", "policy_pair_joint"],
+Python/tests/test_config_and_guardrails.py:436:                "pair_strategy": "diagnostic_full_pair",
+Python/tests/test_config_and_guardrails.py:437:                "pair_strategy_max_pairs": 32,
+Python/tests/test_config_and_guardrails.py:445:        assert worker.pair_policy_enabled is True
+Python/tests/test_config_and_guardrails.py:446:        assert worker.pair_strategy_max_pairs == 32
+Python/tests/test_config_and_guardrails.py:450:    with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
+Python/tests/test_config_and_guardrails.py:451:        _score_graph_pair_chunks(
+Python/tests/test_engine_smoke.py:121:@pytest.mark.parametrize("method", ["apply_root_pair_priors", "apply_root_pair_second_priors"])
+Python/tests/test_global_graph_contract.py:372:    assert out["policy_pair_joint"].shape == (1, 4096)
+Python/tests/test_global_graph_contract.py:373:    assert out["policy_pair_second"].shape == (1, 4096)
+Python/tests/test_global_graph_contract.py:441:    assert out["policy_pair_first"].shape == batch.legal_mask.shape
+Python/tests/test_global_graph_contract.py:443:    assert "policy_pair_joint" in out
+Python/tests/test_global_graph_contract.py:532:    assert torch.all(out["policy_pair_joint"][0] == -80.0)
+Python/tests/test_global_graph_contract.py:533:    assert torch.isfinite(out["policy_pair_joint"][1][batch.pair_token_indices[1] >= 0]).all()
+Python/tests/test_global_graph_contract.py:612:    assert out["policy_pair_first"].shape == (1, graph.legal_mask.shape[0])
+Python/tests/test_global_graph_contract.py:637:    assert out["policy_pair_first"].shape == (1, graph.legal_qr.shape[0])
+Python/tests/test_global_graph_contract.py:638:    assert out["policy_pair_second"].shape == out["policy_pair_joint"].shape
+Python/tests/test_global_graph_contract.py:639:    assert not torch.allclose(out["policy_pair_second"], out["policy_pair_joint"])
+Python/tests/test_inference_server.py:136:        cfg.model.heads = ["value", "policy_place", "policy_pair_joint", "opp_policy"]
+Python/tests/test_production_smoke.py:26:    cfg.model.pair_prior_mix = 0.25
+scripts/run_phase3_48h_autotune.py:76:GLOBAL_GRAPH_PAIR_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+scripts/run_phase3_48h_autotune.py:842:            heads.extend(["policy_pair_first", "policy_pair_second", "policy_pair_joint", "tactical"])
+scripts/run_phase3_48h_autotune.py:873:            cfg.model.pair_prior_mix = 0.0
+scripts/run_phase3_48h_autotune.py:982:            weights["policy_pair_first"] = dynamic.pair_policy_loss
+scripts/run_phase3_48h_autotune.py:983:            weights["policy_pair_second"] = dynamic.pair_policy_loss
+scripts/run_phase3_48h_autotune.py:984:            weights["policy_pair_joint"] = dynamic.pair_policy_loss

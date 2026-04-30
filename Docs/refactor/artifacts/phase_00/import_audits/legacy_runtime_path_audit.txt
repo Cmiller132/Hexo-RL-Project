@@ -1,0 +1,116 @@
+﻿command: git grep -n -E 'hexorl\.buffer|from hexorl\.buffer|hexorl\.model|from hexorl\.model|action_contract|PairCandidateBatch|build_pair_candidate_batch|_py_decode_compact_record|_py_apply_d6_symmetry|_fallback_legal_moves|strip_compiled_prefix|load_model_state' -- Python/src/hexorl Python/tests scripts exit_code: 0 
+Python/src/hexorl/action_contract/__init__.py:3:from hexorl.action_contract.candidates import (
+Python/src/hexorl/action_contract/__init__.py:8:    PairCandidateBatch,
+Python/src/hexorl/action_contract/__init__.py:11:    build_pair_candidate_batch,
+Python/src/hexorl/action_contract/__init__.py:19:    "PairCandidateBatch",
+Python/src/hexorl/action_contract/__init__.py:22:    "build_pair_candidate_batch",
+Python/src/hexorl/action_contract/candidates.py:68:class PairCandidateBatch:
+Python/src/hexorl/action_contract/candidates.py:305:def build_pair_candidate_batch(
+Python/src/hexorl/action_contract/candidates.py:313:) -> PairCandidateBatch:
+Python/src/hexorl/action_contract/candidates.py:407:    return PairCandidateBatch(pair_indices=pair_indices, mask=mask, target=target, missing_mass=missing_mass)
+Python/src/hexorl/buffer/process.py:18:from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+Python/src/hexorl/buffer/process.py:19:from hexorl.buffer.targets import process_game_record
+Python/src/hexorl/buffer/sampler.py:18:from hexorl.buffer.ring import RingBuffer
+Python/src/hexorl/buffer/sampler.py:27:from hexorl.action_contract.candidates import (
+Python/src/hexorl/buffer/sampler.py:30:    build_pair_candidate_batch,
+Python/src/hexorl/buffer/sampler.py:32:from hexorl.action_contract.tactical_oracle import (
+Python/src/hexorl/buffer/sampler.py:160:    for q, r in _fallback_legal_moves(stones, near_radius):
+Python/src/hexorl/buffer/sampler.py:189:def _fallback_legal_moves(
+Python/src/hexorl/buffer/sampler.py:249:def _py_decode_compact_record(
+Python/src/hexorl/buffer/sampler.py:364:def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
+Python/src/hexorl/buffer/sampler.py:446:    spatial = _py_apply_d6_symmetry(axis_maps, sym_idx)
+Python/src/hexorl/buffer/sampler.py:841:                        pair = build_pair_candidate_batch(
+Python/src/hexorl/buffer/sampler.py:938:            decoded = _py_decode_compact_record(history, self.near_radius)
+Python/src/hexorl/buffer/sampler.py:941:            legal = _fallback_legal_moves(_history_stones(history), self.near_radius)
+Python/src/hexorl/dashboard/app.py:19:from hexorl.action_contract.candidates import (
+Python/src/hexorl/dashboard/app.py:23:    build_pair_candidate_batch,
+Python/src/hexorl/dashboard/app.py:25:from hexorl.buffer.sampler import _transform_history_bytes
+Python/src/hexorl/dashboard/app.py:1092:        "action_contract_metadata": checkpoint.get("action_contract_metadata", {}),
+Python/src/hexorl/dashboard/app.py:1381:        pair = build_pair_candidate_batch(
+Python/src/hexorl/dashboard/app.py:1419:            pair = build_pair_candidate_batch(
+Python/src/hexorl/dashboard/checkpoints.py:114:        if checkpoint.get("action_contract_metadata") is not None:
+Python/src/hexorl/dashboard/checkpoints.py:115:            metadata["action_contract_metadata"] = checkpoint["action_contract_metadata"]
+Python/src/hexorl/dashboard/model_cache.py:14:from hexorl.action_contract.candidates import (
+Python/src/hexorl/dashboard/model_cache.py:18:    build_pair_candidate_batch,
+Python/src/hexorl/dashboard/model_cache.py:23:from hexorl.model.network import HexNet
+Python/src/hexorl/dashboard/model_cache.py:109:                pair = build_pair_candidate_batch(
+Python/src/hexorl/dashboard/replay.py:12:from hexorl.action_contract.candidates import (
+Python/src/hexorl/dashboard/replay.py:17:from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+Python/src/hexorl/dashboard/replay.py:160:        legal_moves = _fallback_legal_moves(moves)
+Python/src/hexorl/dashboard/replay.py:305:def _fallback_legal_moves(moves: list[Move]) -> list[dict[str, int]]:
+Python/src/hexorl/epoch/pipeline.py:23:from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+Python/src/hexorl/epoch/pipeline.py:24:from hexorl.buffer.sampler import ReplayDataset
+Python/src/hexorl/epoch/pipeline.py:25:from hexorl.buffer.targets import process_game_record
+Python/src/hexorl/epoch/pipeline.py:27:from hexorl.model.network import HexNet, build_model_from_config
+Python/src/hexorl/eval/arena.py:16:from hexorl.model.network import HexNet, from_config, load_model_state
+Python/src/hexorl/eval/arena.py:213:    load_model_state(model, state, allow_partial=allow_partial)
+Python/src/hexorl/eval/players.py:16:from hexorl.model.network import HexNet
+Python/src/hexorl/eval/tactical_suite.py:9:from hexorl.action_contract.tactical_oracle import (
+Python/src/hexorl/graph/batch.py:18:from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+Python/src/hexorl/inference/server.py:19:from hexorl.model.network import from_config, HexNet, load_model_state
+Python/src/hexorl/inference/server.py:224:            load_model_state(self._model, initial, allow_partial=False)
+Python/src/hexorl/inference/server.py:875:            load_model_state(self._model, latest, allow_partial=False)
+Python/src/hexorl/inference/shm_queue.py:21:from hexorl.action_contract.candidates import CANDIDATE_FEATURES
+Python/src/hexorl/model/network.py:17:from hexorl.action_contract.candidates import CANDIDATE_FEATURES
+Python/src/hexorl/model/network.py:18:from hexorl.model.global_graph import GlobalHexGraphNet
+Python/src/hexorl/model/network.py:922:def strip_compiled_prefix(state_dict: dict) -> dict:
+Python/src/hexorl/model/network.py:929:def load_model_state(model: nn.Module, state_dict: dict, *, allow_partial: bool = False):
+Python/src/hexorl/model/network.py:932:        state_dict = strip_compiled_prefix(state_dict)
+Python/src/hexorl/model/network.py:937:    state_dict = strip_compiled_prefix(state_dict)
+Python/src/hexorl/selfplay/orchestrator.py:20:from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+Python/src/hexorl/selfplay/records.py:746:    ``hexorl.buffer.targets``. This helper is retained for legacy tests and
+Python/src/hexorl/selfplay/rgsc.py:18:from hexorl.buffer.regret_buffer import PrioritizedRegretBuffer
+Python/src/hexorl/selfplay/worker.py:28:from hexorl.action_contract.candidates import build_candidate_batch, build_pair_candidate_batch
+Python/src/hexorl/selfplay/worker.py:29:from hexorl.action_contract.tactical_oracle import (
+Python/src/hexorl/selfplay/worker.py:44:from hexorl.buffer.targets import process_game_record
+Python/src/hexorl/train/trainer.py:17:from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
+Python/src/hexorl/train/trainer.py:19:from hexorl.model.global_graph import GlobalHexGraphNet
+Python/src/hexorl/train/trainer.py:20:from hexorl.model.network import HexNet, load_model_state
+Python/src/hexorl/train/trainer.py:451:            "action_contract_metadata": candidate_contract,
+Python/src/hexorl/train/trainer.py:462:        load_model_state(self.model, checkpoint["model_state_dict"], allow_partial=False)
+Python/tests/test_config_and_guardrails.py:7:from hexorl.buffer import RingBuffer
+Python/tests/test_config_and_guardrails.py:13:from hexorl.model.network import HexConv2d, GatedResBlock, build_model_from_config, load_model_state
+Python/tests/test_config_and_guardrails.py:286:    load_model_state(model, state)
+Python/tests/test_dashboard_foundation.py:9:from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
+Python/tests/test_dashboard_foundation.py:20:from hexorl.model.network import HexNet
+Python/tests/test_engine_invariants.py:11:from hexorl.action_contract.tactical_oracle import (
+Python/tests/test_global_graph_contract.py:22:from hexorl.model.global_graph import GlobalHexGraphNet
+Python/tests/test_global_graph_contract.py:23:from hexorl.model.network import build_model_from_config
+Python/tests/test_inference_server.py:21:from hexorl.model.network import from_config
+Python/tests/test_production_smoke.py:4:from hexorl.action_contract.candidates import CANDIDATE_FEATURE_VERSION
+Python/tests/test_production_smoke.py:5:from hexorl.buffer.ring import RingBuffer
+Python/tests/test_production_smoke.py:6:from hexorl.buffer.sampler import ReplayDataset
+Python/tests/test_production_smoke.py:13:from hexorl.model.network import build_model_from_config
+Python/tests/test_rgsc_restart_service.py:7:from hexorl.buffer.regret_buffer import PrioritizedRegretBuffer
+Python/tests/test_tactical_oracle.py:3:from hexorl.action_contract.candidates import build_candidate_batch
+Python/tests/test_tactical_oracle.py:4:from hexorl.action_contract.tactical_oracle import (
+Python/tests/test_tactical_oracle.py:106:    import hexorl.action_contract.tactical_oracle as oracle_mod
+Python/tests/test_training_data_pipeline.py:7:from hexorl.buffer.ring import RingBuffer
+Python/tests/test_training_data_pipeline.py:8:from hexorl.buffer.regret_buffer import compute_regret
+Python/tests/test_training_data_pipeline.py:9:from hexorl.buffer.sampler import (
+Python/tests/test_training_data_pipeline.py:10:    _py_apply_d6_symmetry,
+Python/tests/test_training_data_pipeline.py:11:    _py_decode_compact_record,
+Python/tests/test_training_data_pipeline.py:19:from hexorl.buffer.targets import (
+Python/tests/test_training_data_pipeline.py:40:from hexorl.model.network import HexNet
+Python/tests/test_training_data_pipeline.py:60:    decoded = _py_decode_compact_record(history)
+Python/tests/test_training_data_pipeline.py:94:        transformed_tensor = _py_apply_d6_symmetry(tensor, sym_idx)
+Python/tests/test_training_data_pipeline.py:755:    from hexorl.action_contract.candidates import (
+Python/tests/test_training_data_pipeline.py:767:    from hexorl.action_contract.candidates import CANDIDATE_FEATURE_VERSION
+Python/tests/test_training_data_pipeline.py:784:    assert checkpoint["action_contract_metadata"]["candidate_feature_version"] == CANDIDATE_FEATURE_VERSION
+Python/tests/test_training_data_pipeline.py:993:    from hexorl.action_contract.candidates import build_pair_candidate_batch
+Python/tests/test_training_data_pipeline.py:1001:        pair = build_pair_candidate_batch(
+Python/tests/test_training_data_pipeline.py:1016:    from hexorl.action_contract.candidates import build_pair_candidate_batch
+Python/tests/test_training_data_pipeline.py:1019:        build_pair_candidate_batch(
+Python/tests/test_training_data_pipeline.py:1027:        build_pair_candidate_batch(
+Python/tests/test_training_data_pipeline.py:1035:        build_pair_candidate_batch(
+Python/tests/test_training_data_pipeline.py:1045:    from hexorl.action_contract.candidates import build_pair_candidate_batch
+Python/tests/test_training_data_pipeline.py:1047:    pair = build_pair_candidate_batch(
+Python/tests/test_training_data_pipeline.py:1059:    from hexorl.action_contract.candidates import build_candidate_batch
+Python/tests/test_training_data_pipeline.py:1074:    from hexorl.action_contract.candidates import build_candidate_batch
+Python/tests/test_training_data_pipeline.py:1095:    from hexorl.action_contract.candidates import build_candidate_batch
+Python/tests/test_training_data_pipeline.py:1111:    from hexorl.action_contract.candidates import build_candidate_batch
+Python/tests/test_training_data_pipeline.py:1126:    from hexorl.action_contract.candidates import build_candidate_batch
+Python/tests/test_training_data_pipeline.py:1143:    from hexorl.action_contract.candidates import build_candidate_batch
+scripts/run_ablation_suite.py:23:from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+scripts/run_phase3_48h_autotune.py:38:from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+scripts/run_restnet_sparse_epoch10.py:18:from hexorl.buffer.ring import RingBuffer, replay_feature_flags

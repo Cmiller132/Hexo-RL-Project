@@ -1,0 +1,15 @@
+created_at: 2026-04-30T03:31:49Z
+branch: main
+git_sha: 9d7a24ca196e2c3343d34cbd6721ec96bb195d96
+dirty_status:
+M Docs/refactor/V2_REQUIREMENTS_MATRIX.md
+ M Python/src/hexorl/config/schema.py
+ M Python/src/hexorl/selfplay/worker.py
+ M Python/tests/test_config_and_guardrails.py
+?? Docs/refactor/artifacts/
+?? scripts/phase00_capture_baseline.py
+?? scripts/phase00_finalize_artifacts.py
+?? scripts/phase00_runtime_smoke.py
+submodule_status:
+(no submodules)
+baseline_note: post-Rust Phase 2, pre-Python-foundation cutover state.

@@ -1,0 +1,9 @@
+{
+  "cuda_available": true,
+  "cuda_memory_gb": 11.99365234375,
+  "cuda_name": "NVIDIA GeForce RTX 4070 Ti",
+  "logical_cpus": 32,
+  "physical_cpus": 16,
+  "system": "windows",
+  "system_memory_gb": 31.159404754638672
+}

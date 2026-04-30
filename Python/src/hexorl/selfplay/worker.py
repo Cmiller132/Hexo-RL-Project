@@ -49,6 +49,8 @@ PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
 PRIOR_SOURCE_DEFAULT = 3
 PRIOR_SOURCE_PAIR = 4
+PAIR_STRATEGY_NONE = "none"
+PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR = "diagnostic_full_pair"
 
 
 def _align_global_logits_to_rust_legal(
@@ -127,8 +129,12 @@ def _score_graph_pair_chunks(
     *,
     second_placement: bool,
     first_qr: tuple[int, int] | None = None,
+    max_pair_rows: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Score every legal pair row while using the IPC pair table as a chunk."""
+    max_pair_rows = int(max_pair_rows)
+    if max_pair_rows <= 0:
+        raise ValueError("pair scoring requires explicit nonzero pair_strategy_max_pairs")
     legal = np.asarray(graph_batch.legal_qr, dtype=np.int32)
     legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
     if legal.shape[0] == 0:
@@ -142,9 +148,14 @@ def _score_graph_pair_chunks(
             raise ValueError("second-placement pair scoring requires first_qr")
         first_token = _graph_stone_token_for_qr(graph_batch, first_qr)
         first = np.asarray(first_qr, dtype=np.int32)
+        scored = 0
         for start in range(0, legal.shape[0], MAX_GRAPH_PAIRS):
-            stop = min(start + MAX_GRAPH_PAIRS, legal.shape[0])
+            if scored >= max_pair_rows:
+                break
+            stop = min(start + MAX_GRAPH_PAIRS, legal.shape[0], start + (max_pair_rows - scored))
             width = stop - start
+            if width <= 0:
+                break
             pair_first = np.full(width, first_token, dtype=np.int64)
             pair_second = legal_tokens[start:stop]
             chunk = _graph_batch_with_pair_rows(graph_batch, pair_first, pair_second)
@@ -158,12 +169,18 @@ def _score_graph_pair_chunks(
             ])
             pair_qr_chunks.append(pair_qr)
             logit_chunks.append(logits)
+            scored += width
     else:
         first_rows: list[int] = []
         second_rows: list[int] = []
         qr_rows: list[tuple[int, int, int, int]] = []
+        scored = 0
         for a_idx in range(legal.shape[0]):
+            if scored >= max_pair_rows:
+                break
             for b_idx in range(a_idx + 1, legal.shape[0]):
+                if scored >= max_pair_rows:
+                    break
                 first_rows.append(int(legal_tokens[a_idx]))
                 second_rows.append(int(legal_tokens[b_idx]))
                 qr_rows.append((
@@ -172,6 +189,7 @@ def _score_graph_pair_chunks(
                     int(legal[b_idx, 0]),
                     int(legal[b_idx, 1]),
                 ))
+                scored += 1
                 if len(first_rows) == MAX_GRAPH_PAIRS:
                     chunk = _graph_batch_with_pair_rows(
                         graph_batch,
@@ -226,8 +244,12 @@ def _score_crop_pair_chunks(
     offset_r: int,
     second_placement: bool,
     first_qr: tuple[int, int] | None = None,
+    max_pair_rows: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Score all crop-model pair rows through bounded IPC chunks."""
+    max_pair_rows = int(max_pair_rows)
+    if max_pair_rows <= 0:
+        raise ValueError("pair scoring requires explicit nonzero pair_strategy_max_pairs")
     legal = np.asarray(legal, dtype=np.int32).reshape(-1, 2)
     if legal.shape[0] == 0:
         return np.zeros((0, 4), dtype=np.int32), np.zeros(0, dtype=np.float32)
@@ -239,9 +261,14 @@ def _score_crop_pair_chunks(
         if first_qr is None:
             raise ValueError("second-placement crop pair scoring requires first_qr")
         first = (int(first_qr[0]), int(first_qr[1]))
+        scored = 0
         for start in range(0, legal.shape[0], rows_per_chunk):
-            stop = min(start + rows_per_chunk, legal.shape[0])
+            if scored >= max_pair_rows:
+                break
+            stop = min(start + rows_per_chunk, legal.shape[0], start + (max_pair_rows - scored))
             seconds = [(int(q), int(r)) for q, r in legal[start:stop].tolist()]
+            if not seconds:
+                break
             candidate_rows = [first] + seconds
             indices, features, mask = _candidate_forward_rows(
                 candidate_rows,
@@ -266,12 +293,20 @@ def _score_crop_pair_chunks(
                 )
             )
             logit_chunks.append(np.asarray(pair_logits[0, : pair_indices.shape[0]], dtype=np.float32))
+            scored += len(seconds)
     else:
+        scored = 0
         for anchor_idx in range(max(0, legal.shape[0] - 1)):
+            if scored >= max_pair_rows:
+                break
             first = (int(legal[anchor_idx, 0]), int(legal[anchor_idx, 1]))
             for start in range(anchor_idx + 1, legal.shape[0], rows_per_chunk):
-                stop = min(start + rows_per_chunk, legal.shape[0])
+                if scored >= max_pair_rows:
+                    break
+                stop = min(start + rows_per_chunk, legal.shape[0], start + (max_pair_rows - scored))
                 seconds = [(int(q), int(r)) for q, r in legal[start:stop].tolist()]
+                if not seconds:
+                    break
                 candidate_rows = [first] + seconds
                 indices, features, mask = _candidate_forward_rows(
                     candidate_rows,
@@ -296,6 +331,7 @@ def _score_crop_pair_chunks(
                     )
                 )
                 logit_chunks.append(np.asarray(pair_logits[0, : pair_indices.shape[0]], dtype=np.float32))
+                scored += len(seconds)
 
     if not pair_qr_chunks:
         return np.zeros((0, 4), dtype=np.int32), np.zeros(0, dtype=np.float32)
@@ -1140,11 +1176,13 @@ class SelfPlayWorker:
             self.near_radius = 8
             self.constrain_threats = False
         self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
-        configured_heads = set(getattr(cfg.model, "heads", []))
-        self.pair_policy_enabled = bool(
-            (self.global_graph_enabled and self.pair_prior_mix > 0.0)
-            or ({"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"} & configured_heads)
+        self.pair_strategy = str(
+            getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)
+        ).lower()
+        self.pair_strategy_max_pairs = int(
+            getattr(cfg.model, "pair_strategy_max_pairs", 0)
         )
+        self.pair_policy_enabled = self.pair_strategy != PAIR_STRATEGY_NONE
         self.candidate_budget = max(
             int(getattr(cfg.model, "candidate_budget", 256)),
             int(sp.policy_target_top_k),
@@ -1162,6 +1200,22 @@ class SelfPlayWorker:
         self._game_counter = 0
         self._crash_count = 0
 
+    def pair_strategy_summary(
+        self,
+        *,
+        pair_rows_possible: int = 0,
+        pair_rows_scored: int = 0,
+    ) -> dict[str, int | float | str]:
+        return {
+            "event": "pair_strategy_summary",
+            "worker_id": int(self.worker_id),
+            "model_family": str(getattr(self.cfg.model, "architecture", "")),
+            "pair_strategy": self.pair_strategy,
+            "pair_prior_mix": float(self.pair_prior_mix),
+            "pair_rows_possible": int(pair_rows_possible),
+            "pair_rows_scored": int(pair_rows_scored),
+        }
+
     def run(self):
         """Main worker loop — runs in a separate multiprocessing.Process."""
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -1169,6 +1223,7 @@ class SelfPlayWorker:
         logger.info(
             f"Worker {self.worker_id} starting (engine={'rust' if HAS_ENGINE else 'mock'})"
         )
+        logger.info("pair_strategy_summary %s", self.pair_strategy_summary())
 
         client = InferenceClient(
             worker_id=self.worker_id,
@@ -1341,6 +1396,7 @@ class SelfPlayWorker:
                                 graph_batch,
                                 second_placement=root_placements_remaining == 1,
                                 first_qr=first_qr,
+                                max_pair_rows=self.pair_strategy_max_pairs,
                             )
                         else:
                             pair_qr = np.zeros((0, 4), dtype=np.int32)
@@ -1485,6 +1541,7 @@ class SelfPlayWorker:
                                         offset_r=int(offset_r),
                                         second_placement=root_placements_remaining == 1,
                                         first_qr=first_qr,
+                                        max_pair_rows=self.pair_strategy_max_pairs,
                                     )
                                     sparse_prior_forward_ms += (time.monotonic() - pair_t0) * 1000.0
                                     if (
@@ -1613,6 +1670,7 @@ class SelfPlayWorker:
                                                 graph_batch,
                                                 second_placement=True,
                                                 first_qr=first_qr,
+                                                max_pair_rows=self.pair_strategy_max_pairs,
                                             )
                                             if pair_qr.shape[0] == graph_legal.shape[0] and pair_logits.shape[0] >= graph_legal.shape[0]:
                                                 logits = _blend_action_logits(
@@ -1634,6 +1692,7 @@ class SelfPlayWorker:
                                             client,
                                             graph_batch,
                                             second_placement=False,
+                                            max_pair_rows=self.pair_strategy_max_pairs,
                                         )
                                         if pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
                                             pair_action_logits = _pair_logits_to_action_logits(pair_qr, pair_logits, graph_legal)

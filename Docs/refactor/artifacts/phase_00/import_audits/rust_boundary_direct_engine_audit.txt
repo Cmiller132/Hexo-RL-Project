@@ -1,0 +1,157 @@
+﻿command: git grep -n '_engine' -- Python/src/hexorl Python/tests crates Docs/RUST_API.md Docs/refactor/rust_review exit_code: 0 
+Docs/refactor/rust_review/CI_AND_PERFORMANCE_BUDGET_PLAN.md:19:| Python extension smoke/invariants/inference | Build `_engine` with `maturin develop`, then run `pytest` for `test_engine_smoke.py`, `test_engine_invariants.py`, and `test_inference_server.py` |
+Docs/refactor/rust_review/PHASE_2_VERIFICATION_REPORT.md:114:- `pytest Python/tests/test_engine_smoke.py -v` passed: 8 passed.
+Docs/refactor/rust_review/PHASE_2_VERIFICATION_REPORT.md:115:- `pytest Python/tests/test_engine_invariants.py -v` passed: 13 passed.
+Docs/refactor/rust_review/PHASE_2_VERIFICATION_REPORT.md:133:  - `pytest Python/tests/test_engine_smoke.py -v`
+Docs/refactor/rust_review/PHASE_2_VERIFICATION_REPORT.md:208:- Rebuild `_engine` before local Python smoke verification; stale local
+Docs/refactor/rust_review/evidence/public_api_inventory.md:45:- library name: `_engine`
+Docs/refactor/rust_review/evidence/public_api_inventory.md:69:- `pytest Python/tests/test_engine_smoke.py -v`
+Python/src/hexorl/action_contract/tactical_oracle.py:75:    engine_cls = _engine_game_class()
+Python/src/hexorl/action_contract/tactical_oracle.py:164:        result = _result_from_engine_payload(payload, offset_q=offset_q, offset_r=offset_r)
+Python/src/hexorl/action_contract/tactical_oracle.py:379:def _result_from_engine_payload(
+Python/src/hexorl/action_contract/tactical_oracle.py:420:def _engine_game_class():
+Python/src/hexorl/action_contract/tactical_oracle.py:422:        import _engine  # type: ignore
+Python/src/hexorl/action_contract/tactical_oracle.py:425:    return getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
+Python/src/hexorl/buffer/sampler.py:58:    import _engine
+Python/src/hexorl/dashboard/arena_service.py:16:    import _engine
+Python/src/hexorl/dashboard/arena_service.py:20:    _engine = None
+Python/src/hexorl/dashboard/arena_service.py:163:    cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+Python/src/hexorl/dashboard/fixtures.py:60:    if importlib.util.find_spec("_engine") is None:  # pragma: no cover - depends on local build artifacts.
+Python/src/hexorl/dashboard/fixtures.py:61:        raise RuntimeError("Rust _engine extension is required for classical fixtures")
+Python/src/hexorl/dashboard/fixtures.py:93:    import _engine  # type: ignore
+Python/src/hexorl/dashboard/fixtures.py:97:    game = _engine.HexGame()
+Python/src/hexorl/dashboard/fixtures.py:101:    while len(moves) < target_moves and not bool(_engine_value(game, "is_over")):
+Python/src/hexorl/dashboard/fixtures.py:102:        player = int(_engine_value(game, "current_player"))
+Python/src/hexorl/dashboard/fixtures.py:126:        "winner": _optional_int(_engine_value(game, "winner")),
+Python/src/hexorl/dashboard/fixtures.py:127:        "is_over": bool(_engine_value(game, "is_over")),
+Python/src/hexorl/dashboard/fixtures.py:197:def _engine_value(game: Any, name: str) -> Any:
+Python/src/hexorl/dashboard/replay.py:22:    import _engine
+Python/src/hexorl/dashboard/replay.py:26:    _engine = None
+Python/src/hexorl/dashboard/replay.py:111:        raise RuntimeError("Rust _engine extension is required for tensor encoding")
+Python/src/hexorl/dashboard/replay.py:148:        stones = _engine_stones(game)
+Python/src/hexorl/dashboard/replay.py:149:        legal_moves, tensor, offsets, legal_mask = _engine_encoding(
+Python/src/hexorl/dashboard/replay.py:152:        threat_moves = _engine_threat_moves(game, near_radius)
+Python/src/hexorl/dashboard/replay.py:198:    cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+Python/src/hexorl/dashboard/replay.py:205:def _engine_stones(game: Any) -> list[dict[str, int]]:
+Python/src/hexorl/dashboard/replay.py:217:def _engine_encoding(
+Python/src/hexorl/dashboard/replay.py:239:def _engine_threat_moves(game: Any, near_radius: int) -> list[dict[str, int]]:
+Python/src/hexorl/epoch/pipeline.py:391:        import _engine
+Python/src/hexorl/epoch/pipeline.py:393:        game = _engine.HexGame()
+Python/src/hexorl/eval/arena.py:22:    import _engine
+Python/src/hexorl/eval/arena.py:97:        result = _play_engine_match(
+Python/src/hexorl/eval/arena.py:164:            game = _engine.HexGame()
+Python/src/hexorl/eval/arena.py:187:        # Fallback for environments without _engine: choose the strongest centered action.
+Python/src/hexorl/eval/arena.py:218:def _play_engine_match(
+Python/src/hexorl/eval/arena.py:225:    game = _engine.HexGame()
+Python/src/hexorl/eval/classical.py:14:    import _engine
+Python/src/hexorl/eval/classical.py:42:            self._game = _engine.HexGame()
+Python/src/hexorl/eval/players.py:20:    import _engine
+Python/src/hexorl/eval/players.py:24:    _engine = None
+Python/src/hexorl/eval/players.py:182:    cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+Python/src/hexorl/graph/batch.py:505:    engine_state = _engine_state_from_history(history)
+Python/src/hexorl/graph/batch.py:1040:def _engine_state_from_history(history: bytes) -> tuple[list[tuple[int, int]], int, int] | None:
+Python/src/hexorl/graph/batch.py:1042:        import _engine  # type: ignore
+Python/src/hexorl/graph/batch.py:1045:    engine_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
+Python/src/hexorl/selfplay/worker.py:21:    import _engine
+Python/src/hexorl/selfplay/worker.py:912:        self._engine = _engine.MCTSEngine(
+Python/src/hexorl/selfplay/worker.py:924:        init = self._engine.init_root()
+Python/src/hexorl/selfplay/worker.py:937:        self._engine.expand_root(policy, value, oq, or_, legal_bytes, root_generation)
+Python/src/hexorl/selfplay/worker.py:952:        self._engine.expand_root_with_sparse_priors(
+Python/src/hexorl/selfplay/worker.py:966:        self._engine.expand_root_with_global_priors(
+Python/src/hexorl/selfplay/worker.py:975:        self._engine.apply_root_pair_priors(
+Python/src/hexorl/selfplay/worker.py:982:        self._engine.apply_root_pair_first_priors(
+Python/src/hexorl/selfplay/worker.py:988:        self._engine.apply_root_pair_second_priors(
+Python/src/hexorl/selfplay/worker.py:995:        self._engine.add_dirichlet_noise(noise, fraction)
+Python/src/hexorl/selfplay/worker.py:998:        return self._engine.done()
+Python/src/hexorl/selfplay/worker.py:1001:        tensor_4d, count, batch_generation = self._engine.select_leaves(batch_size)
+Python/src/hexorl/selfplay/worker.py:1005:        return self._engine.pending_leaf_metadata()
+Python/src/hexorl/selfplay/worker.py:1008:        self._engine.expand_and_backprop(policies, values, batch_generation)
+Python/src/hexorl/selfplay/worker.py:1021:        self._engine.expand_and_backprop_with_sparse(
+Python/src/hexorl/selfplay/worker.py:1044:        self._engine.expand_and_backprop_with_sparse_sources(
+Python/src/hexorl/selfplay/worker.py:1057:        return self._engine.get_results()
+Python/src/hexorl/selfplay/worker.py:1060:        return self._engine.sample_action(temperature, rng_state)
+Python/src/hexorl/selfplay/worker.py:1064:            self._engine.re_root(q, r, new_sims)
+Python/src/hexorl/selfplay/worker.py:1069:        self._engine = _engine.MCTSEngine(
+Python/src/hexorl/selfplay/worker.py:1081:        return self._engine.root_child_priors()
+Python/src/hexorl/selfplay/worker.py:1084:        if hasattr(self._engine, "root_child_prior_sources"):
+Python/src/hexorl/selfplay/worker.py:1085:            return self._engine.root_child_prior_sources()
+Python/src/hexorl/selfplay/worker.py:1090:        if hasattr(self._engine, "prior_source_summary"):
+Python/src/hexorl/selfplay/worker.py:1091:            return dict(self._engine.prior_source_summary())
+Python/src/hexorl/selfplay/worker.py:1111:        return self._engine.root_child_q_values()
+Python/src/hexorl/selfplay/worker.py:1114:        if hasattr(self._engine, "root_pair_visit_targets"):
+Python/src/hexorl/selfplay/worker.py:1115:            return self._engine.root_pair_visit_targets()
+Python/src/hexorl/selfplay/worker.py:1119:        if hasattr(self._engine, "extract_tree_node_states"):
+Python/src/hexorl/selfplay/worker.py:1120:            _tensors, histories, _count = self._engine.extract_tree_node_states(int(min_visits))
+Python/src/hexorl/selfplay/worker.py:1199:        self._engine_factory = MockMCTSEngine if not HAS_ENGINE else RealMCTSEngine
+Python/src/hexorl/selfplay/worker.py:1329:                _engine.HexGame,
+Python/src/hexorl/selfplay/worker.py:1332:            game = rgsc_restart.game if rgsc_restart.used else _engine.HexGame()
+Python/tests/test_dashboard_foundation.py:138:    pytest.importorskip("_engine")
+Python/tests/test_dashboard_foundation.py:416:    pytest.importorskip("_engine")
+Python/tests/test_dashboard_foundation.py:441:def test_noisy_model_player_reproducible_without_engine():
+Python/tests/test_dashboard_foundation.py:448:def test_noisy_model_player_chooses_legal_origin_when_engine_available():
+Python/tests/test_dashboard_foundation.py:449:    pytest.importorskip("_engine")
+Python/tests/test_dashboard_replay_debug.py:14:    pytest.importorskip("_engine")
+Python/tests/test_engine_invariants.py:17:_engine = pytest.importorskip("_engine")
+Python/tests/test_engine_invariants.py:39:def test_engine_opening_and_two_placement_turn_order():
+Python/tests/test_engine_invariants.py:40:    game = _engine.PyHexGame()
+Python/tests/test_engine_invariants.py:69:def test_engine_legal_moves_match_radius_rule():
+Python/tests/test_engine_invariants.py:84:def test_engine_winner_matches_reference_axis_scan():
+Python/tests/test_engine_invariants.py:91:        game = _engine.PyHexGame()
+Python/tests/test_engine_invariants.py:102:def test_engine_rejects_post_terminal_moves():
+Python/tests/test_engine_invariants.py:112:    loaded = _engine.PyHexGame()
+Python/tests/test_engine_invariants.py:159:        game = _engine.PyHexGame()
+Python/tests/test_engine_invariants.py:170:def test_d6_all_12_preserve_engine_state():
+Python/tests/test_engine_invariants.py:272:    game = _engine.PyHexGame()
+Python/tests/test_engine_invariants.py:288:        game = _engine.PyHexGame()
+Python/tests/test_engine_smoke.py:5:_engine = pytest.importorskip("_engine")
+Python/tests/test_engine_smoke.py:9:    assert hasattr(_engine, "BOARD_SIZE")
+Python/tests/test_engine_smoke.py:10:    assert hasattr(_engine, "NUM_CHANNELS")
+Python/tests/test_engine_smoke.py:11:    assert _engine.NUM_CHANNELS == 13
+Python/tests/test_engine_smoke.py:12:    assert _engine.BOARD_SIZE == 33
+Python/tests/test_engine_smoke.py:16:    g = _engine.PyHexGame()
+Python/tests/test_engine_smoke.py:25:    g = _engine.PyHexGame()
+Python/tests/test_engine_smoke.py:39:    g = _engine.PyHexGame()
+Python/tests/test_engine_smoke.py:42:    assert tensor.shape == (_engine.NUM_CHANNELS, _engine.BOARD_SIZE, _engine.BOARD_SIZE)
+Python/tests/test_engine_smoke.py:47:    g = _engine.PyHexGame()
+Python/tests/test_engine_smoke.py:49:    engine = _engine.PyMCTSEngine(g, num_simulations=20, c_puct=1.5,
+Python/tests/test_engine_smoke.py:55:    policy = np.ones(_engine.BOARD_SIZE ** 2, dtype=np.float32)
+Python/tests/test_engine_smoke.py:61:        policies = np.ones((count, _engine.BOARD_SIZE ** 2), dtype=np.float32)
+Python/tests/test_engine_smoke.py:73:    g = _engine.PyHexGame()
+Python/tests/test_engine_smoke.py:75:    engine = _engine.PyMCTSEngine(g, num_simulations=4, c_puct=1.5,
+Python/tests/test_engine_smoke.py:79:    policy = np.ones(_engine.BOARD_SIZE ** 2, dtype=np.float32)
+Python/tests/test_engine_smoke.py:114:    policies = np.ones((count, _engine.BOARD_SIZE ** 2), dtype=np.float32).reshape(-1)
+Python/tests/test_engine_smoke.py:141:        _engine.encode_compact_record(b"\x00", 2)
+Python/tests/test_inference_server.py:25:    import _engine
+Python/tests/test_inference_server.py:221:@unittest.skipUnless(HAS_ENGINE, "Rust _engine extension not available")
+Python/tests/test_inference_server.py:247:        game = _engine.PyHexGame()
+Python/tests/test_inference_server.py:248:        engine = _engine.PyMCTSEngine(game, num_simulations=100, c_puct=1.5,
+Python/tests/test_phase3_scorecard.py:176:def test_tactical_suite_positions_replay_in_engine_when_available():
+Python/tests/test_phase3_scorecard.py:177:    engine = pytest.importorskip("_engine")
+Python/tests/test_tactical_oracle.py:64:def test_engine_backed_oracle_uses_hot_window_cells_with_radius_three():
+Python/tests/test_tactical_oracle.py:65:    _engine = pytest.importorskip("_engine")
+Python/tests/test_tactical_oracle.py:66:    game_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+Python/tests/test_tactical_oracle.py:78:def test_engine_backed_oracle_stays_engine_backed_with_explicit_legal_rows():
+Python/tests/test_tactical_oracle.py:79:    _engine = pytest.importorskip("_engine")
+Python/tests/test_tactical_oracle.py:80:    game_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+Python/tests/test_tactical_oracle.py:95:def test_history_oracle_rejects_illegal_origin_via_engine_replay():
+Python/tests/test_tactical_oracle.py:96:    pytest.importorskip("_engine")
+Python/tests/test_tactical_oracle.py:105:def test_history_oracle_requires_engine_oracle_for_production(monkeypatch):
+Python/tests/test_tactical_oracle.py:108:    monkeypatch.setattr(oracle_mod, "_engine_game_class", lambda: None)
+Python/tests/test_training_data_pipeline.py:789:    pytest.importorskip("_engine")
+Python/tests/test_training_data_pipeline.py:826:    pytest.importorskip("_engine")
+Python/tests/test_training_data_pipeline.py:1643:    pytest.importorskip("_engine")
+crates/hexgame-core/src/tests/mcts.rs:463:        let mut dense_engine =
+crates/hexgame-core/src/tests/mcts.rs:465:        let mut sparse_engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+crates/hexgame-core/src/tests/mcts.rs:470:        let (_, _, _, dense_root_generation) = init_root_parts(&mut dense_engine);
+crates/hexgame-core/src/tests/mcts.rs:471:        let (_, _, _, sparse_root_generation) = init_root_parts(&mut sparse_engine);
+crates/hexgame-core/src/tests/mcts.rs:473:            &mut dense_engine,
+crates/hexgame-core/src/tests/mcts.rs:480:        sparse_engine
+crates/hexgame-core/src/tests/mcts.rs:496:            sparse_engine.root_child_priors(),
+crates/hexgame-core/src/tests/mcts.rs:497:            dense_engine.root_child_priors()
+crates/hexgame-core/src/tests/mcts.rs:587:        let mut default_engine =
+crates/hexgame-core/src/tests/mcts.rs:589:        let (_, _, _, root_generation) = init_root_parts(&mut default_engine);
+crates/hexgame-core/src/tests/mcts.rs:591:            &mut default_engine,
+crates/hexgame-core/src/tests/mcts.rs:598:        let default_telemetry = default_engine.prior_source_telemetry();
+crates/hexgame-py/Cargo.toml:9:name = "_engine"
+crates/hexgame-py/src/lib.rs:7:/// Python module `_engine` — the compiled Rust extension for Hexo.
+crates/hexgame-py/src/lib.rs:9:#[pyo3(name = "_engine")]
