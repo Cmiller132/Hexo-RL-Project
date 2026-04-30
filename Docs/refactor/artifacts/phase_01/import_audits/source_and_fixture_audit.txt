@@ -1,0 +1,3 @@
+COMMAND: source fallback and fixture provider audit
+SOURCE_FALLBACK_RUNTIME_ONLY: no output
+FALLBACK_NAME_EXIT_CODE: 1

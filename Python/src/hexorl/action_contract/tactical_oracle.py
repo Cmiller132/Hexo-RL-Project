@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Iterable, Mapping, Sequence
 
+from hexorl.contracts.history import MoveHistory
 from hexorl.selfplay.records import action_to_board_index
+from hexorl.engine.history import game_from_history
+from hexorl.engine.legal import legal_rows_from_stones
+from hexorl.engine.rust import hex_game_class
 
 
 AXES: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
@@ -45,70 +49,26 @@ class TacticalOracleResult:
 
 def parse_history_state(history_bytes: bytes) -> tuple[dict[tuple[int, int], int], int, int]:
     """Return stones, current player, and placements remaining for compact history."""
-    if len(history_bytes) % 12 != 0:
-        raise ValueError(f"history_bytes length {len(history_bytes)} is not a multiple of 12")
-    stones: dict[tuple[int, int], int] = {}
-    current_player = 0
-    placements_remaining = 1
-    for offset in range(0, len(history_bytes), 12):
-        player = int.from_bytes(history_bytes[offset : offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4 : offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8 : offset + 12], "little", signed=True)
-        if player != current_player:
-            raise ValueError(
-                f"Invalid compact history: move {offset // 12} stores player {player}, "
-                f"expected {current_player}"
-            )
-        if (q, r) in stones:
-            raise ValueError(f"Invalid compact history: duplicate cell ({q}, {r})")
-        stones[(q, r)] = player
-        if placements_remaining > 1:
-            placements_remaining -= 1
-        else:
-            current_player = 1 - current_player
-            placements_remaining = 2
-    return stones, current_player, placements_remaining
+    history = MoveHistory.decode(history_bytes, source="rust")
+    return history.stones, history.current_player, history.placements_remaining
 
 
 def engine_game_from_history(history_bytes: bytes):
     """Replay compact history through the Rust engine when available."""
-    engine_cls = _engine_game_class()
-    if engine_cls is None:
+    if _engine_game_class() is None:
         return None
-    if len(history_bytes) % 12 != 0:
-        raise ValueError(f"history_bytes length {len(history_bytes)} is not a multiple of 12")
-    game = engine_cls()
-    for offset in range(0, len(history_bytes), 12):
-        player = int.from_bytes(history_bytes[offset : offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4 : offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8 : offset + 12], "little", signed=True)
-        current_player = int(_attr_value(game, "current_player", player))
-        if player != current_player:
-            raise ValueError(
-                f"Invalid compact history: move {offset // 12} stores player {player}, "
-                f"expected {current_player}"
-            )
-        game.place(q, r)
-    return game
+    return game_from_history(history_bytes)
 
 
 def legal_moves_from_stones(
     stones: Mapping[tuple[int, int], int],
     near_radius: int = TACTICAL_SCAN_RADIUS,
 ) -> list[tuple[int, int]]:
-    if not stones:
-        return [(0, 0)]
-    radius = max(0, int(near_radius))
-    occupied = set(stones)
-    legal: set[tuple[int, int]] = set()
-    for q, r in occupied:
-        for dq in range(-radius, radius + 1):
-            for dr in range(-radius, radius + 1):
-                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
-                    candidate = (q + dq, r + dr)
-                    if candidate not in occupied:
-                        legal.add(candidate)
-    return sorted(legal, key=_cell_sort_key)
+    return legal_rows_from_stones(
+        {(int(q), int(r)): int(player) for (q, r), player in stones.items()},
+        radius=near_radius,
+        current_player=0,
+    )
 
 
 def scan_tactical_oracle_from_history(
@@ -118,7 +78,7 @@ def scan_tactical_oracle_from_history(
     offset_q: int = -16,
     offset_r: int = -16,
     near_radius: int = TACTICAL_SCAN_RADIUS,
-    allow_python_fallback: bool = False,
+    allow_fixture_scan: bool = False,
 ) -> TacticalOracleResult:
     game = engine_game_from_history(history_bytes)
     if game is not None and hasattr(game, "tactical_oracle"):
@@ -129,7 +89,7 @@ def scan_tactical_oracle_from_history(
             offset_r=offset_r,
             near_radius=near_radius,
         )
-    if not allow_python_fallback:
+    if not allow_fixture_scan:
         if game is None:
             raise RuntimeError("engine tactical oracle is required but the Rust engine is unavailable")
         raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
@@ -151,7 +111,7 @@ def scan_tactical_oracle_from_game(
     offset_q: int = -16,
     offset_r: int = -16,
     near_radius: int = TACTICAL_SCAN_RADIUS,
-    allow_python_fallback: bool = False,
+    allow_fixture_scan: bool = False,
 ) -> TacticalOracleResult:
     """Return the engine-backed tactical oracle for an already-restored game."""
     pieces = getattr(game, "board_pieces", lambda: [])()
@@ -166,7 +126,7 @@ def scan_tactical_oracle_from_game(
             return result
         return _filter_result_to_legal(result, legal_moves)
 
-    if not allow_python_fallback:
+    if not allow_fixture_scan:
         raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
 
     if legal_moves is None:
@@ -258,7 +218,7 @@ def scan_tactical_oracle(
     outside = tuple(cell for cell in tactical if action_to_board_index(cell[0], cell[1], offset_q, offset_r) < 0)
 
     return TacticalOracleResult(
-        status=_fallback_status(bool(win_now), bool(forced_unique), bool(cover_pairs), int(placements_remaining)),
+        status=_tactical_status_from_scan(bool(win_now), bool(forced_unique), bool(cover_pairs), int(placements_remaining)),
         current_player=player,
         placements_remaining=int(placements_remaining),
         win_now_cells=tuple(_unique_qr(win_now)),
@@ -366,7 +326,7 @@ def _unique_qr(items: Iterable[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(out, key=_cell_sort_key))
 
 
-def _fallback_status(has_win: bool, has_forced: bool, has_pairs: bool, placements_remaining: int) -> str:
+def _tactical_status_from_scan(has_win: bool, has_forced: bool, has_pairs: bool, placements_remaining: int) -> str:
     if has_win:
         return "winning_turn"
     if not has_forced:
@@ -418,11 +378,7 @@ def _coerce_pairs(raw: object) -> tuple[tuple[tuple[int, int], tuple[int, int]],
 
 
 def _engine_game_class():
-    try:
-        import _engine  # type: ignore
-    except Exception:
-        return None
-    return getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
+    return hex_game_class(required=False)
 
 
 def _attr_value(obj: object, name: str, default: int | bool | None = None):

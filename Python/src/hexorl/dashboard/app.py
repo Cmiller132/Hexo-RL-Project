@@ -22,7 +22,12 @@ from hexorl.action_contract.candidates import (
     build_candidate_batch,
     build_pair_candidate_batch,
 )
-from hexorl.buffer.sampler import _transform_history_bytes
+from hexorl.contracts.history import MoveHistory
+from hexorl.contracts.symmetry import (
+    transform_history,
+    transform_pair_policy_target,
+    transform_policy_target,
+)
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
 from hexorl.dashboard.checkpoints import scan_checkpoints
@@ -45,8 +50,6 @@ from hexorl.graph.batch import (
     RelationType,
     build_graph_batch_from_history,
     graph_capacity_report,
-    transform_pair_policy_target,
-    transform_policy_target,
 )
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -492,7 +495,7 @@ def create_app(
         base_pair_target = _parse_pair_policy_target_v2(req.pair_policy_target_v2)
         transforms = []
         for sym_idx in range(12):
-            transformed = _transform_history_bytes(history, sym_idx)
+            transformed = transform_history(history, sym_idx)
             policy_target = transform_policy_target(base_policy_target, sym_idx)
             pair_target = transform_pair_policy_target(base_pair_target, sym_idx)
             graph = _graph_debug_payload(
@@ -1270,8 +1273,10 @@ def _d6_target_checks(transforms: list[dict[str, Any]]) -> dict[str, Any]:
 def _last_history_qr(history: bytes) -> tuple[int, int] | None:
     if len(history) < 12:
         return None
-    q = int.from_bytes(history[-8:-4], "little", signed=True)
-    r = int.from_bytes(history[-4:], "little", signed=True)
+    moves = MoveHistory.decode(history, source="rust").rows
+    if not moves:
+        return None
+    _player, q, r = moves[-1]
     return q, r
 
 

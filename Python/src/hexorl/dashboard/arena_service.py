@@ -11,14 +11,9 @@ from typing import Any, Callable
 
 from hexorl.dashboard.db import DashboardStore
 from hexorl.eval.classical import classical_opponent_fn
+from hexorl.engine.rust import engine_available, hex_game_class
 
-try:
-    import _engine
-
-    HAS_ENGINE = True
-except ImportError:  # pragma: no cover - depends on local extension build
-    _engine = None
-    HAS_ENGINE = False
+HAS_ENGINE = engine_available()
 
 
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -160,7 +155,7 @@ def _random_player(seed: int):
 
 
 def _new_game():
-    cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+    cls = hex_game_class(required=True)
     return cls()
 
 

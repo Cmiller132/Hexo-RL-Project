@@ -17,19 +17,14 @@ import numpy as np
 from dataclasses import replace
 from typing import Optional, List, Tuple
 
-try:
-    import _engine
-
-    HAS_ENGINE = True
-except ImportError:
-    HAS_ENGINE = False
-
 from hexorl.config import Config
 from hexorl.action_contract.candidates import build_candidate_batch, build_pair_candidate_batch
 from hexorl.action_contract.tactical_oracle import (
     scan_tactical_oracle_from_game,
     scan_tactical_oracle_from_history,
 )
+from hexorl.engine.legal import decode_legal_bytes
+from hexorl.engine.rust import engine_available, hex_game_class, mcts_engine_class
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
 from hexorl.graph.batch import GraphBatch, GraphTokenType, build_graph_batch_from_history
@@ -44,6 +39,8 @@ from hexorl.selfplay.records import (
 from hexorl.buffer.targets import process_game_record
 
 logger = logging.getLogger(__name__)
+
+HAS_ENGINE = engine_available()
 
 PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
@@ -645,7 +642,7 @@ class MockMCTSEngine:
         root_generation: int,
     ):
         """Mock root expansion with random priors."""
-        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+        legal = decode_legal_bytes(legal_bytes)
         n = len(legal)
         self._num_children = n
         self._priors = np.random.dirichlet([0.3] * n).astype(np.float32)
@@ -670,7 +667,7 @@ class MockMCTSEngine:
 
     def expand_root_with_global_priors(self, legal_bytes: bytes, root_generation: int, global_qr: np.ndarray, global_logits: np.ndarray, value: float):
         """Mock graph root expansion from keyed global priors."""
-        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+        legal = decode_legal_bytes(legal_bytes)
         if legal.shape != np.asarray(global_qr).shape or not np.array_equal(legal, np.asarray(global_qr, dtype=np.int32)):
             raise ValueError("mock global priors legal_qr does not match legal_bytes")
         self._num_children = int(legal.shape[0])
@@ -909,7 +906,10 @@ class RealMCTSEngine:
         self._constrain_threats = constrain_threats
         self._seed = seed
         self._subtree_reuse = subtree_reuse
-        self._engine = _engine.MCTSEngine(
+        self._root_offset: tuple[int, int] | None = None
+        self._root_legal_bytes: bytes | None = None
+        engine_cls = mcts_engine_class(required=True)
+        self._engine = engine_cls(
             game=game,
             num_simulations=num_simulations,
             c_puct=c_puct,
@@ -924,7 +924,13 @@ class RealMCTSEngine:
         init = self._engine.init_root()
         if init is None:
             return None
-        tensor_3d, oq, or_, legal_bytes, root_generation = init
+        if len(init) == 5:
+            tensor_3d, oq, or_, legal_bytes, root_generation = init
+        else:
+            tensor_3d, oq, or_, legal_bytes = init
+            root_generation = 0
+        self._root_offset = (int(oq), int(or_))
+        self._root_legal_bytes = bytes(legal_bytes)
         return (
             np.asarray(tensor_3d, dtype=np.float32),
             oq,
@@ -934,7 +940,20 @@ class RealMCTSEngine:
         )
 
     def expand_root(self, policy, value, oq, or_, legal_bytes, root_generation):
-        self._engine.expand_root(policy, value, oq, or_, legal_bytes, root_generation)
+        policy_arr = np.asarray(policy, dtype=np.float32)
+        if not np.isfinite(policy_arr).all():
+            raise ValueError("root policy contains non-finite values")
+        if self._root_offset is not None and (int(oq), int(or_)) != self._root_offset:
+            raise ValueError("root offset mismatch")
+        if self._root_legal_bytes is not None:
+            expected = decode_legal_bytes(self._root_legal_bytes)
+            received = decode_legal_bytes(bytes(legal_bytes))
+            if expected.shape != received.shape or not np.array_equal(expected, received):
+                raise ValueError("root legal row mismatch")
+        try:
+            self._engine.expand_root(policy_arr, value, oq, or_, legal_bytes, root_generation)
+        except TypeError:
+            self._engine.expand_root(policy_arr, value, oq, or_, legal_bytes)
 
     def expand_root_with_sparse_priors(
         self,
@@ -998,14 +1017,22 @@ class RealMCTSEngine:
         return self._engine.done()
 
     def select_leaves(self, batch_size):
-        tensor_4d, count, batch_generation = self._engine.select_leaves(batch_size)
+        selected = self._engine.select_leaves(batch_size)
+        if len(selected) == 3:
+            tensor_4d, count, batch_generation = selected
+        else:
+            tensor_4d, count = selected
+            batch_generation = 0
         return np.asarray(tensor_4d, dtype=np.float32), count, batch_generation
 
     def pending_leaf_metadata(self):
         return self._engine.pending_leaf_metadata()
 
     def expand_and_backprop(self, policies, values, batch_generation):
-        self._engine.expand_and_backprop(policies, values, batch_generation)
+        try:
+            self._engine.expand_and_backprop(policies, values, batch_generation)
+        except TypeError:
+            self._engine.expand_and_backprop(policies, values)
 
     def expand_and_backprop_with_sparse(
         self,
@@ -1066,7 +1093,8 @@ class RealMCTSEngine:
             return True
         self._game.place(q, r)
         self._num_simulations = new_sims
-        self._engine = _engine.MCTSEngine(
+        engine_cls = mcts_engine_class(required=True)
+        self._engine = engine_cls(
             game=self._game,
             num_simulations=new_sims,
             c_puct=self._c_puct,
@@ -1325,11 +1353,12 @@ class SelfPlayWorker:
         game_id = self._game_id()
         rgsc_restart = None
         if HAS_ENGINE:
+            game_cls = hex_game_class(required=True)
             rgsc_restart = self.rgsc.maybe_restart(
-                _engine.HexGame,
+                game_cls,
                 max_game_moves=self.max_game_moves,
             )
-            game = rgsc_restart.game if rgsc_restart.used else _engine.HexGame()
+            game = rgsc_restart.game if rgsc_restart.used else game_cls()
             engine = RealMCTSEngine(
                 game,
                 sims,
@@ -1381,7 +1410,7 @@ class SelfPlayWorker:
                         )
                         graph_out = client.submit_graph(graph_batch)
                         graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
-                        rust_legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                        rust_legal = decode_legal_bytes(legal_bytes)
                         policy_place = np.asarray(graph_out["policy_place"], dtype=np.float32)
                         graph_value = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
                         root_placements_remaining = (
@@ -1442,7 +1471,7 @@ class SelfPlayWorker:
                             or self.pair_policy_enabled
                         )
                         if use_action_keyed_root:
-                            legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                            legal = decode_legal_bytes(legal_bytes)
                             winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
                                 tensor_3d,
                                 legal,
@@ -1646,7 +1675,7 @@ class SelfPlayWorker:
                             max_width = 0
                             t_forward = time.monotonic()
                             for row, (_leaf_oq, _leaf_or, leaf_legal_bytes, leaf_history_bytes) in enumerate(meta):
-                                legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
+                                legal = decode_legal_bytes(bytes(leaf_legal_bytes))
                                 graph_batch = build_graph_batch_from_history(
                                     bytes(leaf_history_bytes),
                                     opp_legal_moves=[(int(q), int(r)) for q, r in legal],
@@ -1747,7 +1776,7 @@ class SelfPlayWorker:
                                 cand_counts = np.zeros(count, dtype=np.uint16)
                                 t_build = time.monotonic()
                                 for row, (leaf_oq, leaf_or, leaf_legal_bytes, leaf_history_bytes) in enumerate(meta):
-                                    legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
+                                    legal = decode_legal_bytes(bytes(leaf_legal_bytes))
                                     leaf_winning, leaf_forced, leaf_cover = _critical_actions_from_root_tensor(
                                         batch_4d[row],
                                         legal,
@@ -1839,7 +1868,7 @@ class SelfPlayWorker:
                 if hasattr(engine, "root_pair_visit_targets")
                 else []
             )
-            legal_root = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+            legal_root = decode_legal_bytes(legal_bytes)
             root_placements_remaining_for_targets = (
                 int(getattr(engine._game, "placements_remaining", 1))
                 if HAS_ENGINE and hasattr(engine, "_game")

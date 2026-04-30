@@ -38,6 +38,18 @@ from hexorl.graph.batch import (
     collate_graph_batches,
     graph_batch_with_reference_pair_rows,
 )
+from hexorl.contracts.symmetry import (
+    apply_tensor_symmetry,
+    transform_axis_label,
+    transform_axis_maps,
+    transform_dense_policy,
+    transform_history,
+    transform_pair_policy_target,
+    transform_policy_target,
+    transform_qr,
+)
+from hexorl.engine.legal import decode_legal_bytes
+from hexorl.engine.rust import engine_available
 
 logger = logging.getLogger(__name__)
 
@@ -54,166 +66,7 @@ try:
 except ImportError:  # pragma: no cover - optional dashboard/axis lab dependency path
     HAS_AXIS_POLICY = False
 
-try:
-    import _engine
-    HAS_ENGINE = True
-except ImportError:
-    HAS_ENGINE = False
-
-
-def _py_encode_from_coords(
-    history_bytes: bytes,
-    stride: int,
-    num_moves: int,
-    near_radius: int,
-) -> np.ndarray:
-    """Encode a sequence of positions from coordinate history.
-
-    Sets channel 0/1 (stones), channel 2 (empty mask), channel 6 (player colour),
-    and channel 11 (distance from centre) based on coordinates.
-    """
-    half = BOARD_SIZE // 2
-    positions = np.zeros(
-        (num_moves + 1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE),
-        dtype=np.float32,
-    )
-    moves: List[Tuple[int, int, int]] = []
-    stones: dict[Tuple[int, int], int] = {}
-    current_player = 0
-    placements_remaining = 1
-
-    qi_grid = np.arange(BOARD_SIZE)[:, None] - half
-    rj_grid = np.arange(BOARD_SIZE)[None, :] - half
-    dist = np.maximum(
-        np.maximum(np.abs(qi_grid), np.abs(rj_grid)),
-        np.abs(qi_grid + rj_grid),
-    ).astype(np.float32)
-
-    for i in range(num_moves + 1):
-        _encode_position_fallback(
-            positions[i],
-            stones,
-            moves,
-            current_player,
-            placements_remaining,
-            dist / half,
-            near_radius=near_radius,
-        )
-        if i >= num_moves:
-            break
-
-        offset = i * stride
-        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
-        if player != current_player:
-            raise ValueError(
-                f"Invalid compact history: move {i} stores player {player}, "
-                f"expected {current_player}"
-            )
-        if (q, r) in stones:
-            raise ValueError(f"Invalid compact history: duplicate cell ({q}, {r})")
-
-        stones[(q, r)] = player
-        moves.append((player, q, r))
-        if placements_remaining > 1:
-            placements_remaining -= 1
-        else:
-            current_player = 1 - current_player
-            placements_remaining = 2
-
-    return positions
-
-
-def _encode_position_fallback(
-    out: np.ndarray,
-    stones: dict[Tuple[int, int], int],
-    moves: List[Tuple[int, int, int]],
-    current_player: int,
-    placements_remaining: int,
-    distance: np.ndarray,
-    near_radius: int,
-) -> None:
-    """Encode the non-tactical feature planes used by Python fallback tests."""
-    half = BOARD_SIZE // 2
-
-    for (gqi, grj), player in stones.items():
-            gi2, gj2 = gqi + half, grj + half
-            if 0 <= gi2 < BOARD_SIZE and 0 <= gj2 < BOARD_SIZE:
-                if player == current_player:
-                    out[0, gi2, gj2] = 1.0
-                else:
-                    out[1, gi2, gj2] = 1.0
-
-    out[2] = 1.0 - out[0] - out[1]
-    out[11] = distance
-    if current_player == 0:
-        out[6].fill(1.0)
-
-    if placements_remaining == 1 and moves:
-        out[4].fill(1.0)
-        _, q, r = moves[-1]
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            out[5, gi, gj] = 1.0
-
-    for q, r in _fallback_legal_moves(stones, near_radius):
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            out[3, gi, gj] = 1.0
-
-    opp = 1 - current_player
-    recent_opp: List[Tuple[int, int]] = []
-    for player, q, r in reversed(moves):
-        if player == current_player:
-            if recent_opp:
-                break
-            continue
-        if player == opp:
-            recent_opp.append((q, r))
-            if len(recent_opp) == 2:
-                break
-    for q, r in recent_opp:
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            out[12, gi, gj] = 1.0
-
-    move_count = len(moves)
-    for ply_idx, (player, q, r) in enumerate(moves):
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            recency = 1.0 / (1.0 + move_count - ply_idx)
-            out[7 if player == current_player else 8, gi, gj] = recency
-
-
-def _fallback_legal_moves(
-    stones: dict[Tuple[int, int], int],
-    near_radius: int,
-) -> List[Tuple[int, int]]:
-    if not stones:
-        return [(0, 0)]
-    radius = max(0, min(int(near_radius), 8))
-    legal: set[Tuple[int, int]] = set()
-    for q, r in stones:
-        for dq in range(-radius, radius + 1):
-            for dr in range(-radius, radius + 1):
-                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
-                    candidate = (q + dq, r + dr)
-                    if candidate not in stones:
-                        legal.add(candidate)
-    return sorted(legal)
-
-
-def _history_stones(history_bytes: bytes) -> dict[Tuple[int, int], int]:
-    stones: dict[Tuple[int, int], int] = {}
-    if len(history_bytes) % 12 != 0:
-        return stones
-    for offset in range(0, len(history_bytes), 12):
-        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
-        stones[(q, r)] = player
-    return stones
+HAS_ENGINE = engine_available()
 
 
 def _critical_actions_from_tensor(
@@ -246,112 +99,6 @@ def _critical_actions_from_tensor(
     return winning, forced, cover
 
 
-def _py_decode_compact_record(
-    history_bytes: bytes,
-    near_radius: int = 8,
-) -> np.ndarray:
-    """Pure Python fallback for encode_compact_record.
-
-    Replays the move history on a fresh board and encodes each position.
-    Returns (N + 1, 13, 33, 33) float32 array.
-    """
-    if len(history_bytes) % 12 != 0:
-        raise ValueError(
-            f"history_bytes length {len(history_bytes)} is not a multiple of 12"
-        )
-    stride = 12
-    num_moves = len(history_bytes) // stride
-    positions = _py_encode_from_coords(
-        history_bytes[:num_moves * stride],
-        stride,
-        num_moves,
-        near_radius,
-    )
-    return positions
-
-
-def _hex_transform(qi: int, rj: int, sym: int) -> Tuple[int, int]:
-    """Apply one of 12 hex-grid D6 symmetry transforms."""
-    if sym == 0:
-        return (qi, rj)
-    elif sym == 1:
-        return (-rj, qi + rj)
-    elif sym == 2:
-        return (-qi - rj, qi)
-    elif sym == 3:
-        return (-qi, -rj)
-    elif sym == 4:
-        return (rj, -qi - rj)
-    elif sym == 5:
-        return (qi + rj, -qi)
-    elif sym == 6:
-        return (rj, qi)
-    elif sym == 7:
-        return (-qi, qi + rj)
-    elif sym == 8:
-        return (-qi - rj, rj)
-    elif sym == 9:
-        return (-rj, -qi)
-    elif sym == 10:
-        return (qi, -qi - rj)
-    else:
-        return (qi + rj, -rj)
-
-
-def _transform_policy_v2(policy: PolicyTargetV2, sym_idx: int) -> PolicyTargetV2:
-    """Transform global action-keyed policy entries under D6."""
-    transformed: dict[tuple[int, int], float] = {}
-    for q, r, prob in policy:
-        tq, tr = _hex_transform(int(q), int(r), sym_idx % 12)
-        transformed[(int(tq), int(tr))] = transformed.get((int(tq), int(tr)), 0.0) + float(prob)
-    return [(q, r, prob) for (q, r), prob in transformed.items()]
-
-
-def _transform_policy_keys(keys: List[Tuple[int, int]], sym_idx: int) -> List[Tuple[int, int]]:
-    """Transform global action-key table entries under D6."""
-    transformed: List[Tuple[int, int]] = []
-    seen: set[Tuple[int, int]] = set()
-    for q, r in keys:
-        tq, tr = _hex_transform(int(q), int(r), sym_idx % 12)
-        qr = (int(tq), int(tr))
-        if qr in seen:
-            continue
-        seen.add(qr)
-        transformed.append(qr)
-    return transformed
-
-
-def _transform_pair_policy_v2(
-    pairs: List[Tuple[Tuple[int, int], Tuple[int, int], float]],
-    sym_idx: int,
-) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
-    """Transform pair-action policy entries under D6."""
-    transformed = []
-    for first, second, prob in pairs:
-        q1, r1 = _hex_transform(int(first[0]), int(first[1]), sym_idx % 12)
-        q2, r2 = _hex_transform(int(second[0]), int(second[1]), sym_idx % 12)
-        transformed.append(((int(q1), int(r1)), (int(q2), int(r2)), float(prob)))
-    return transformed
-
-
-def _transform_history_bytes(history_bytes: bytes, sym_idx: int) -> bytes:
-    """Transform compact move-history coordinates under D6, preserving players."""
-    if sym_idx % 12 == 0:
-        return history_bytes
-    if len(history_bytes) % 12 != 0:
-        raise ValueError(f"history_bytes length {len(history_bytes)} is not a multiple of 12")
-    out = bytearray(len(history_bytes))
-    for offset in range(0, len(history_bytes), 12):
-        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
-        tq, tr = _hex_transform(q, r, sym_idx % 12)
-        out[offset:offset + 4] = int(player).to_bytes(4, "little", signed=True)
-        out[offset + 4:offset + 8] = int(tq).to_bytes(4, "little", signed=True)
-        out[offset + 8:offset + 12] = int(tr).to_bytes(4, "little", signed=True)
-    return bytes(out)
-
-
 def _last_move_qr(history_bytes: bytes) -> tuple[int, int] | None:
     if len(history_bytes) < 12:
         return None
@@ -359,71 +106,6 @@ def _last_move_qr(history_bytes: bytes) -> tuple[int, int] | None:
     q = int.from_bytes(tail[4:8], "little", signed=True)
     r = int.from_bytes(tail[8:12], "little", signed=True)
     return (q, r)
-
-
-def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
-    """Pure Python fallback for apply_d6_symmetry.
-
-    Applies one of 12 hex-grid transforms to a (C, 33, 33) tensor.
-    Uses numpy vectorisation for speed.
-    """
-    sym = sym_idx % 12
-    half = BOARD_SIZE // 2
-
-    yi, xi = np.mgrid[0:BOARD_SIZE, 0:BOARD_SIZE]
-    qi = yi - half
-    rj = xi - half
-
-    qi_t, rj_t = _hex_transform(qi, rj, sym)
-
-    ti = qi_t + half
-    tj = rj_t + half
-
-    valid = (ti >= 0) & (ti < BOARD_SIZE) & (tj >= 0) & (tj < BOARD_SIZE)
-
-    result = np.zeros_like(tensor)
-    for c in range(tensor.shape[0]):
-        result[c, ti[valid], tj[valid]] = tensor[c, yi[valid], xi[valid]]
-
-    return result
-
-
-def _transform_axis_label(axis_label: int, sym_idx: int) -> int:
-    """Transform an unoriented axis label under a D6 symmetry."""
-    if axis_label < 0:
-        return axis_label
-    axes = [(1, 0), (0, 1), (1, -1)]
-    q, r = axes[axis_label % 3]
-    tq, tr = _hex_transform(q, r, sym_idx % 12)
-    for i, (aq, ar) in enumerate(axes):
-        if (tq, tr) == (aq, ar) or (tq, tr) == (-aq, -ar):
-            return i
-    return axis_label
-
-
-def _transform_dense_policy(policy: np.ndarray, sym_idx: int) -> np.ndarray:
-    """Apply the same D6 transform to a dense (33*33,) policy target."""
-    sym = sym_idx % 12
-    half = BOARD_SIZE // 2
-    result = np.zeros_like(policy)
-
-    for i in range(BOARD_SIZE):
-        for j in range(BOARD_SIZE):
-            value = policy[i * BOARD_SIZE + j]
-            if value == 0.0:
-                continue
-            qi = i - half
-            rj = j - half
-            qi_t, rj_t = _hex_transform(qi, rj, sym)
-            ti = qi_t + half
-            tj = rj_t + half
-            if 0 <= ti < BOARD_SIZE and 0 <= tj < BOARD_SIZE:
-                result[ti * BOARD_SIZE + tj] += value
-
-    total = result.sum()
-    if total > 0:
-        result /= total
-    return result
 
 
 def _dense_from_sparse_policy(policy: Dict[int, float]) -> np.ndarray:
@@ -434,22 +116,16 @@ def _dense_from_sparse_policy(policy: Dict[int, float]) -> np.ndarray:
     return dense
 
 
-def _transform_axis_maps(axis_maps: np.ndarray, sym_idx: int) -> np.ndarray:
-    """Apply D6 spatial transform and axis-plane permutation to 6 axis maps.
-
-    Planes 0..2 are own strength by unoriented axis; planes 3..5 are opponent
-    strength by the same axes. A board symmetry moves both coordinates and the
-    meaning of each axis plane.
-    """
-    if axis_maps.shape != (6, BOARD_SIZE, BOARD_SIZE):
-        raise ValueError(f"Expected axis maps shape (6,{BOARD_SIZE},{BOARD_SIZE}), got {axis_maps.shape}")
-    spatial = _py_apply_d6_symmetry(axis_maps, sym_idx)
-    result = np.zeros_like(spatial)
-    for src_axis in range(3):
-        dst_axis = _transform_axis_label(src_axis, sym_idx)
-        result[dst_axis] += spatial[src_axis]
-        result[dst_axis + 3] += spatial[src_axis + 3]
-    return result
+def _unique_transformed_keys(keys: List[Tuple[int, int]], sym_idx: int) -> List[Tuple[int, int]]:
+    transformed: List[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    for q, r in keys:
+        qr = transform_qr((int(q), int(r)), sym_idx)
+        if qr in seen:
+            continue
+        seen.add(qr)
+        transformed.append(qr)
+    return transformed
 
 
 class ReplayDataset(_IterableDataset):
@@ -642,12 +318,12 @@ class ReplayDataset(_IterableDataset):
             pair_policy_v2 = list(rec.pair_policy_target_v2)
             if self.use_symmetry:
                 sym_idx = self._rng.randint(0, 12)
-                sample_history = _transform_history_bytes(rec.move_history, sym_idx)
-                policy_v2 = _transform_policy_v2(policy_v2, sym_idx)
-                opp_policy_v2 = _transform_policy_v2(opp_policy_v2, sym_idx)
-                pair_policy_v2 = _transform_pair_policy_v2(pair_policy_v2, sym_idx)
-                opp_legal_v2 = _transform_policy_keys(getattr(rec, "opp_policy_legal_v2", []), sym_idx)
-                axis_label = _transform_axis_label(rec.axis_label, sym_idx)
+                sample_history = transform_history(rec.move_history, sym_idx)
+                policy_v2 = transform_policy_target(policy_v2, sym_idx)
+                opp_policy_v2 = transform_policy_target(opp_policy_v2, sym_idx)
+                pair_policy_v2 = transform_pair_policy_target(pair_policy_v2, sym_idx)
+                opp_legal_v2 = _unique_transformed_keys(getattr(rec, "opp_policy_legal_v2", []), sym_idx)
+                axis_label = transform_axis_label(rec.axis_label, sym_idx)
             else:
                 axis_label = rec.axis_label
                 opp_legal_v2 = list(getattr(rec, "opp_policy_legal_v2", []))
@@ -666,7 +342,7 @@ class ReplayDataset(_IterableDataset):
             else:
                 policy = rec.to_dense_policy()
                 if self.use_symmetry:
-                    policy = _transform_dense_policy(policy, sym_idx)
+                    policy = transform_dense_policy(policy, sym_idx)
 
             if opp_policy_v2:
                 opp_policy_dict, _outside = dense_policy_from_v2(
@@ -679,7 +355,7 @@ class ReplayDataset(_IterableDataset):
             else:
                 opp_policy = rec.to_dense_opp_policy()
                 if self.use_symmetry:
-                    opp_policy = _transform_dense_policy(opp_policy, sym_idx)
+                    opp_policy = transform_dense_policy(opp_policy, sym_idx)
 
             policies[i] = policy
             values[i] = rec.to_value_target()
@@ -705,7 +381,7 @@ class ReplayDataset(_IterableDataset):
                 aux_targets["opp_policy_weight"][i] = 0.0
             if self.include_sparse_policy:
                 legal = (
-                    np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                    decode_legal_bytes(legal_bytes)
                     if legal_bytes
                     else np.empty((0, 2), dtype=np.int32)
                 )
@@ -935,15 +611,7 @@ class ReplayDataset(_IterableDataset):
                 constrain_threats=False,
             )
         else:
-            decoded = _py_decode_compact_record(history, self.near_radius)
-            tensor = decoded[-1] if decoded.ndim == 4 else decoded
-            offset_q, offset_r = -16, -16
-            legal = _fallback_legal_moves(_history_stones(history), self.near_radius)
-            buf = bytearray()
-            for q, r in legal:
-                buf.extend(int(q).to_bytes(4, "little", signed=True))
-                buf.extend(int(r).to_bytes(4, "little", signed=True))
-            legal_bytes = bytes(buf)
+            raise RuntimeError("Rust engine is required for replay tensor encoding")
         tensor = np.asarray(tensor, dtype=np.float32)
         self._tensor_cache[history] = tensor
         if len(self._tensor_cache) > self._tensor_cache_max:

@@ -15,16 +15,15 @@ from hexorl.action_contract.candidates import (
     build_candidate_batch,
 )
 from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.contracts.history import MoveHistory, encode_move_history as contract_encode_move_history
+from hexorl.engine.encoding import encode_board_and_legal
+from hexorl.engine.history import game_from_history
+from hexorl.engine.legal import decode_legal_bytes
+from hexorl.engine.rust import engine_available
 from hexorl.dashboard.db import DashboardStore
 from hexorl.selfplay.records import BOARD_SIZE
 
-try:
-    import _engine
-
-    HAS_ENGINE = True
-except ImportError:  # pragma: no cover - depends on local extension build
-    _engine = None
-    HAS_ENGINE = False
+HAS_ENGINE = engine_available()
 
 
 Move = tuple[int, int, int]
@@ -46,18 +45,11 @@ class ReplayPosition:
 
 
 def decode_move_history(history: bytes) -> list[Move]:
-    moves: list[Move] = []
-    stride = 12
-    for offset in range(0, len(history) - stride + 1, stride):
-        moves.append(struct.unpack_from("<iii", history, offset))
-    return moves
+    return list(MoveHistory.decode(history, source="rust").rows)
 
 
 def encode_move_history(moves: Iterable[Move]) -> bytes:
-    out = bytearray()
-    for player, q, r in moves:
-        out.extend(struct.pack("<iii", int(player), int(q), int(r)))
-    return bytes(out)
+    return contract_encode_move_history(list(moves))
 
 
 def replay_game(store: DashboardStore, game_id: int) -> dict[str, Any]:
@@ -105,11 +97,10 @@ def encode_tensor_for_history(
     constrain_threats: bool = True,
 ) -> tuple[np.ndarray, int, int, bytes]:
     """Return the canonical Rust encoder tensor for a compact history."""
-    moves = decode_move_history(history)
-    game = _game_from_moves(moves)
-    if not HAS_ENGINE or game is None:
+    if not HAS_ENGINE:
         raise RuntimeError("Rust _engine extension is required for tensor encoding")
-    tensor_3d, offset_q, offset_r, legal_bytes = game.encode_board_and_legal(
+    tensor_3d, offset_q, offset_r, _legal_rows, legal_bytes = encode_board_and_legal(
+        history,
         near_radius,
         constrain_threats,
     )
@@ -152,20 +143,7 @@ def _position_from_game(
         threat_moves = _engine_threat_moves(game, near_radius)
         encoding = _encoding_summary(tensor, offsets, legal_mask)
     else:
-        current_player = len(moves) % 2
-        placements_remaining = _fallback_placements_remaining(moves)
-        winner = None
-        is_over = False
-        stones = [_move_dict(m) for m in moves]
-        legal_moves = _fallback_legal_moves(moves)
-        threat_moves = legal_moves
-        encoding = {
-            "available": False,
-            "channels": [],
-            "offset_q": -16,
-            "offset_r": -16,
-            "legal_mask": _dense_mask(legal_moves),
-        }
+        raise RuntimeError("Rust engine is required for dashboard replay positions")
 
     return ReplayPosition(
         turn_index=len(moves),
@@ -195,11 +173,7 @@ def _fallback_placements_remaining(moves: list[Move]) -> int:
 def _game_from_moves(moves: list[Move]) -> Any:
     if not HAS_ENGINE:
         return None
-    cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
-    game = cls()
-    for _player, q, r in moves:
-        game.place(int(q), int(r))
-    return game
+    return game_from_history(encode_move_history(moves))
 
 
 def _engine_stones(game: Any) -> list[dict[str, int]]:
@@ -249,12 +223,7 @@ def _engine_threat_moves(game: Any, near_radius: int) -> list[dict[str, int]]:
 
 
 def _moves_from_bytes(data: bytes) -> list[tuple[int, int]]:
-    if not data:
-        return []
-    arr = np.frombuffer(data, dtype=np.int32)
-    if arr.size % 2 != 0:
-        return []
-    return [(int(q), int(r)) for q, r in arr.reshape(-1, 2)]
+    return [(int(q), int(r)) for q, r in decode_legal_bytes(data).tolist()]
 
 
 def _encoding_summary(
@@ -300,24 +269,6 @@ def _encoding_summary(
         "channels": channels,
         "legal_mask": legal_mask,
     }
-
-
-def _fallback_legal_moves(moves: list[Move]) -> list[dict[str, int]]:
-    occupied = {(q, r) for _p, q, r in moves}
-    if not occupied:
-        return [{"q": 0, "r": 0}]
-    result = []
-    radius = 2
-    for q0, r0 in occupied:
-        for dq in range(-radius, radius + 1):
-            for dr in range(-radius, radius + 1):
-                q, r = q0 + dq, r0 + dr
-                if (q, r) in occupied:
-                    continue
-                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
-                    result.append({"q": q, "r": r})
-    result.sort(key=lambda x: (abs(x["q"]) + abs(x["r"]), x["q"], x["r"]))
-    return result[:96]
 
 
 def _dense_mask(moves: list[dict[str, int]]) -> list[int]:

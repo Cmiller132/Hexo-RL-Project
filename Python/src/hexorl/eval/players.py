@@ -13,16 +13,12 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
+from hexorl.engine.legal import decode_legal_bytes
+from hexorl.engine.rust import engine_available, hex_game_class
 from hexorl.model.network import HexNet
 from hexorl.selfplay.records import BOARD_SIZE
 
-try:
-    import _engine
-
-    HAS_ENGINE = True
-except ImportError:  # pragma: no cover - depends on local extension build
-    _engine = None
-    HAS_ENGINE = False
+HAS_ENGINE = engine_available()
 
 
 PlayerFn = Callable[[list[tuple[int, int, int]], int, int], tuple[int | None, int | None]]
@@ -70,7 +66,7 @@ class NoisyModelPlayer:
             self.config.near_radius,
             self.config.constrain_threats,
         )
-        legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+        legal = decode_legal_bytes(legal_bytes)
         if len(legal) == 0:
             return None, None
         tensor = (
@@ -179,5 +175,5 @@ def _flat_index(q: int, r: int, offset_q: int, offset_r: int) -> int:
 
 
 def _new_game():
-    cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame")
+    cls = hex_game_class(required=True)
     return cls()

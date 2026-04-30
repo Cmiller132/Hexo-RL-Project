@@ -1,0 +1,33 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 5000,
+      "label": "MoveHistory.decode",
+      "per_iter_us": 2.3036799975670874,
+      "total_ms": 11.518399987835437
+    },
+    {
+      "iterations": 5000,
+      "label": "decode_legal_bytes",
+      "per_iter_us": 1.1087400023825467,
+      "total_ms": 5.543700011912733
+    },
+    {
+      "iterations": 5000,
+      "label": "transform_history_d6",
+      "per_iter_us": 3.519540000706911,
+      "total_ms": 17.597700003534555
+    },
+    {
+      "iterations": 200,
+      "label": "LegalTableProvider.from_history",
+      "per_iter_us": 187.79150006594136,
+      "total_ms": 37.55830001318827
+    }
+  ],
+  "commit": "4055227a880a3f6995bc2d18e30f61a11b4a7ef4",
+  "kind": "phase01_local_hot_path_timing",
+  "note": "Local timing smoke; stable performance comparison remains scheduled/deep CI per CI_STRATEGY.md.",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python": "3.14.0"
+}

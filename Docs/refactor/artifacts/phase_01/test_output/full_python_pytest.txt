@@ -1,0 +1,3 @@
+COMMAND: python -m pytest Python/tests -q
+EXIT_CODE: 124 from orchestration tool timeout
+RESULT: non-closing deep-suite attempt. The run exceeded the local tool timeout and left inference-server shared-memory child processes. The stale pytest processes were terminated. Phase 01 closure uses focused deterministic suite in focused_phase01_pytest.txt; Phase 04/05 own long-running inference/MCTS server checks.

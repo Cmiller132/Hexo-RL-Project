@@ -13,16 +13,15 @@ from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
 from hexorl.config import Config
+from hexorl.engine.history import game_from_history
+from hexorl.engine.legal import decode_legal_bytes
+from hexorl.engine.rust import engine_available, hex_game_class
 from hexorl.model.network import HexNet, from_config, load_model_state
 from hexorl.eval.players import model_input_dtype, noisy_model_player
 
 logger = logging.getLogger(__name__)
 
-try:
-    import _engine
-    HAS_ENGINE = True
-except ImportError:
-    HAS_ENGINE = False
+HAS_ENGINE = engine_available()
 
 
 @dataclass
@@ -161,12 +160,14 @@ def model_move_fn(
 
     def _fn(move_history, time_ms_override, player):
         if HAS_ENGINE:
-            game = _engine.HexGame()
-            for _p, q, r in move_history:
-                game.place(int(q), int(r))
+            game = game_from_history(bytes().join(
+                int(v).to_bytes(4, "little", signed=True)
+                for row in move_history
+                for v in row
+            ))
             encoded = game.encode_board_and_legal(near_radius, constrain_threats)
             tensor_3d, offset_q, offset_r, legal_bytes = encoded
-            legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+            legal = decode_legal_bytes(legal_bytes)
             if len(legal) == 0:
                 return None, None
             tensor = (
@@ -222,7 +223,8 @@ def _play_engine_match(
     if not HAS_ENGINE:
         return _play_fallback_match(side_a_fn, side_b_fn, game_idx, a_is_black, sims, max_moves)
 
-    game = _engine.HexGame()
+    cls = hex_game_class(required=True)
+    game = cls()
     move_history: List[Tuple[int, int, int]] = []
     moves_played = 0
     winner = -1

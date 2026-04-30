@@ -10,12 +10,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import itertools
-import struct
 from typing import Iterable, Sequence
 
 import numpy as np
 
 from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.contracts.history import MoveHistory, turn_state_after
+from hexorl.contracts.symmetry import (
+    transform_history,
+    transform_pair_policy_target,
+    transform_policy_target,
+    transform_qr,
+)
+from hexorl.engine.history import game_from_history
+from hexorl.engine.legal import legal_rows_from_history
 
 
 GRAPH_SCHEMA_VERSION = 2
@@ -170,87 +178,8 @@ def hex_distance(a: tuple[int, int], b: tuple[int, int] = (0, 0)) -> int:
     return max(abs(dq), abs(dr), abs(dq + dr))
 
 
-def transform_qr(qr: tuple[int, int], sym_idx: int) -> tuple[int, int]:
-    """Apply one of the 12 D6 symmetries to an axial coordinate."""
-    q, r = int(qr[0]), int(qr[1])
-    sym = int(sym_idx) % 12
-    if sym == 0:
-        return (q, r)
-    if sym == 1:
-        return (-r, q + r)
-    if sym == 2:
-        return (-q - r, q)
-    if sym == 3:
-        return (-q, -r)
-    if sym == 4:
-        return (r, -q - r)
-    if sym == 5:
-        return (q + r, -q)
-    if sym == 6:
-        return (r, q)
-    if sym == 7:
-        return (-q, q + r)
-    if sym == 8:
-        return (-q - r, r)
-    if sym == 9:
-        return (-r, -q)
-    if sym == 10:
-        return (q, -q - r)
-    return (q + r, -r)
-
-
-def transform_history(history: bytes, sym_idx: int) -> bytes:
-    """Transform compact move-history coordinates while preserving players."""
-    if len(history) % 12 != 0:
-        raise ValueError("compact move history length must be a multiple of 12")
-    if int(sym_idx) % 12 == 0:
-        return history
-    out = bytearray(len(history))
-    for off in range(0, len(history), 12):
-        player, q, r = struct.unpack_from("<iii", history, off)
-        tq, tr = transform_qr((q, r), sym_idx)
-        struct.pack_into("<iii", out, off, int(player), int(tq), int(tr))
-    return bytes(out)
-
-
-def transform_policy_target(
-    target: Sequence[tuple[int, int, float]],
-    sym_idx: int,
-) -> list[tuple[int, int, float]]:
-    """Transform global action-keyed policy entries under D6."""
-    merged: dict[tuple[int, int], float] = {}
-    for q, r, prob in target:
-        if float(prob) <= 0.0:
-            continue
-        qr = transform_qr((int(q), int(r)), sym_idx)
-        merged[qr] = merged.get(qr, 0.0) + float(prob)
-    return [(q, r, prob) for (q, r), prob in merged.items()]
-
-
-def transform_pair_policy_target(
-    target: Sequence[tuple[tuple[int, int], tuple[int, int], float]],
-    sym_idx: int,
-) -> list[tuple[tuple[int, int], tuple[int, int], float]]:
-    """Transform pair-action policy entries under D6."""
-    transformed = []
-    for first, second, prob in target:
-        if float(prob) <= 0.0:
-            continue
-        transformed.append((
-            transform_qr(first, sym_idx),
-            transform_qr(second, sym_idx),
-            float(prob),
-        ))
-    return transformed
-
-
 def parse_history(history: bytes) -> list[tuple[int, int, int]]:
-    if len(history) % 12 != 0:
-        raise ValueError("compact move history length must be a multiple of 12")
-    moves: list[tuple[int, int, int]] = []
-    for off in range(0, len(history), 12):
-        moves.append(struct.unpack_from("<iii", history, off))
-    return moves
+    return list(MoveHistory.decode(history, source="rust").rows)
 
 
 def _unique_qr(items: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -266,36 +195,22 @@ def _unique_qr(items: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def current_turn_state(moves: Sequence[tuple[int, int, int]]) -> tuple[int, int]:
-    if not moves:
-        return 0, 1
-    last_player = moves[-1][0]
-    run_len = 0
-    for player, _q, _r in reversed(moves):
-        if player != last_player:
-            break
-        run_len += 1
-    if len(moves) == 1:
-        return 1, 2
-    if run_len == 1:
-        return last_player, 1
-    return 1 - last_player, 2
+    return turn_state_after(moves)
 
 
 def legal_moves_for_stones(stones: dict[tuple[int, int], int], radius: int = 8) -> list[tuple[int, int]]:
     if int(radius) != 8:
         raise ValueError("global graph legal rows must use the Rust placement radius 8")
-    if not stones:
-        return [(0, 0)]
-    legal: set[tuple[int, int]] = set()
-    radius = 8
-    for q, r in stones:
-        for dq in range(-radius, radius + 1):
-            for dr in range(-radius, radius + 1):
-                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
-                    cell = (q + dq, r + dr)
-                    if cell not in stones:
-                        legal.add(cell)
-    return sorted(legal, key=lambda qr: (hex_distance(qr), qr[0], qr[1]))
+    rows = legal_rows_from_history(
+        MoveHistory.from_rows(
+            [(player, q, r) for (q, r), player in stones.items()],
+            source="fixture",
+            allow_fixture=True,
+        ),
+        near_radius=radius,
+        constrain_threats=False,
+    )
+    return [(int(q), int(r)) for q, r in rows.tolist()]
 
 
 def _line_id(qr: tuple[int, int], axis: int) -> int:
@@ -1038,20 +953,7 @@ def _opponent_legal_after_passive_turn(
 
 
 def _engine_state_from_history(history: bytes) -> tuple[list[tuple[int, int]], int, int] | None:
-    try:
-        import _engine  # type: ignore
-    except Exception:
-        return None
-    engine_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
-    if engine_cls is None:
-        return None
-    game = engine_cls()
-    for player, q, r in parse_history(history):
-        current = getattr(game, "current_player", player)
-        current = current() if callable(current) else current
-        if int(player) != int(current):
-            raise ValueError(f"invalid graph history: player {player} does not match engine current player {current}")
-        game.place(int(q), int(r))
+    game = game_from_history(history)
     legal = getattr(game, "legal_moves", lambda: [])()
     current_player = getattr(game, "current_player", 0)
     placements_remaining = getattr(game, "placements_remaining", 1)

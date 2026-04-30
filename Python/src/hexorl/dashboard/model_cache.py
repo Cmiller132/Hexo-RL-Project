@@ -20,6 +20,7 @@ from hexorl.action_contract.candidates import (
 from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
+from hexorl.engine.legal import decode_legal_bytes
 from hexorl.model.network import HexNet
 
 
@@ -68,7 +69,7 @@ class ModelCache:
     def infer_history(self, model_id: str, history: bytes) -> dict[str, Any]:
         cached = self._models[model_id]
         tensor, offset_q, offset_r, legal_bytes = encode_tensor_for_history(history)
-        arr = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+        arr = decode_legal_bytes(legal_bytes)
         legal_mask = []
         outside_legal = []
         for q, r in arr:

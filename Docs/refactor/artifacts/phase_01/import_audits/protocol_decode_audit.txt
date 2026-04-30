@@ -1,0 +1,4 @@
+COMMAND: legal_bytes / compact-history byte decode audit
+LEGAL_BYTES_EXIT_CODE: 0
+HISTORY_BYTES_EXIT_CODE: 0
+RESULT: no runtime legal_bytes/leaf_legal_bytes np.frombuffer hits and no compact-history int.from_bytes hits.

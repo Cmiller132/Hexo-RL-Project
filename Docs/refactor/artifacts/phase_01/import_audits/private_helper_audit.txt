@@ -1,0 +1,2 @@
+COMMAND: git grep private fallback/history/D6 helper names
+EXIT_CODE: 1

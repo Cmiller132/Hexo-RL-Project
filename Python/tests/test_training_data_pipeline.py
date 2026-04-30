@@ -7,14 +7,16 @@ import torch
 from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.regret_buffer import compute_regret
 from hexorl.buffer.sampler import (
-    _py_apply_d6_symmetry,
-    _py_decode_compact_record,
-    _hex_transform,
-    _transform_pair_policy_v2,
-    _transform_axis_maps,
-    _transform_axis_label,
-    _transform_dense_policy,
     ReplayDataset,
+)
+from hexorl.contracts.history import MoveHistory
+from hexorl.contracts.symmetry import (
+    apply_tensor_symmetry,
+    transform_axis_label,
+    transform_axis_maps,
+    transform_dense_policy,
+    transform_pair_policy_target,
+    transform_qr,
 )
 from hexorl.buffer.targets import (
     _turn_boundary_indices,
@@ -55,17 +57,14 @@ class _FixedSymmetryRng:
         return None
 
 
-def test_python_decoder_returns_final_position_for_history():
+def test_move_history_contract_decodes_turn_state():
     history = _move(0, 0, 0)
-    decoded = _py_decode_compact_record(history)
+    contract = MoveHistory.decode(history, source="rust")
 
-    assert decoded.shape == (2, 13, BOARD_SIZE, BOARD_SIZE)
-    assert decoded[0, 0].sum() == 0.0
-    assert decoded[0, 2].sum() == BOARD_SIZE * BOARD_SIZE
-    assert decoded[0, 3, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
-    assert decoded[0, 6].sum() == BOARD_SIZE * BOARD_SIZE
-    assert decoded[-1, 1, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
-    assert decoded[-1, 6].sum() == 0.0
+    assert contract.rows == ((0, 0, 0),)
+    assert contract.current_player == 1
+    assert contract.placements_remaining == 2
+    assert contract.encode() == history
 
 
 def test_policy_symmetry_transform_tracks_dense_target():
@@ -74,7 +73,7 @@ def test_policy_symmetry_transform_tracks_dense_target():
     src_j = BOARD_SIZE // 2
     policy[src_i * BOARD_SIZE + src_j] = 1.0
 
-    transformed = _transform_dense_policy(policy, sym_idx=3)
+    transformed = transform_dense_policy(policy, sym_idx=3)
 
     dst_i = BOARD_SIZE // 2 - 1
     dst_j = BOARD_SIZE // 2
@@ -91,8 +90,8 @@ def test_tensor_and_policy_symmetry_match_for_all_transforms():
     policy[src_i * BOARD_SIZE + src_j] = 1.0
 
     for sym_idx in range(12):
-        transformed_tensor = _py_apply_d6_symmetry(tensor, sym_idx)
-        transformed_policy = _transform_dense_policy(policy, sym_idx)
+        transformed_tensor = apply_tensor_symmetry(tensor, sym_idx)
+        transformed_policy = transform_dense_policy(policy, sym_idx)
         tensor_idx = int(transformed_tensor[0].argmax())
         policy_idx = int(transformed_policy.argmax())
         assert tensor_idx == policy_idx
@@ -101,12 +100,12 @@ def test_tensor_and_policy_symmetry_match_for_all_transforms():
 def test_axis_label_symmetry_transform_remains_valid():
     for axis in range(3):
         for sym_idx in range(12):
-            assert _transform_axis_label(axis, sym_idx) in {0, 1, 2}
+            assert transform_axis_label(axis, sym_idx) in {0, 1, 2}
 
 
 def test_each_symmetry_permutates_axes_one_to_one():
     for sym_idx in range(12):
-        mapped = [_transform_axis_label(axis, sym_idx) for axis in range(3)]
+        mapped = [transform_axis_label(axis, sym_idx) for axis in range(3)]
         assert sorted(mapped) == [0, 1, 2]
 
 
@@ -117,9 +116,9 @@ def test_axis_delta_maps_symmetry_transforms_space_and_axis_planes():
     maps[0, src_i, src_j] = 2.0
     maps[3, src_i, src_j] = 3.0
 
-    transformed = _transform_axis_maps(maps, sym_idx=1)
+    transformed = transform_axis_maps(maps, sym_idx=1)
 
-    dst_axis = _transform_axis_label(0, 1)
+    dst_axis = transform_axis_label(0, 1)
     dst_i = BOARD_SIZE // 2
     dst_j = BOARD_SIZE // 2 + 1
     assert transformed[dst_axis, dst_i, dst_j] == 2.0
@@ -789,7 +788,7 @@ def test_sparse_sampler_keeps_d6_enabled_and_transforms_candidates():
     pytest.importorskip("_engine")
     history = _move(0, 0, 0)
     target = (1, 0)
-    target_t = _hex_transform(*target, 1)
+    target_t = transform_qr(target, 1)
     rec = PositionRecord(
         move_history=history,
         policy_target={action_to_board_index(*target): 1.0},
@@ -996,8 +995,8 @@ def test_pair_policy_d6_bijection_preserves_pair_identity():
     base_pair = [((1, 0), (0, 1), 1.0)]
 
     for sym_idx in range(12):
-        candidates = [_hex_transform(q, r, sym_idx) for q, r in base_candidates]
-        target = _transform_pair_policy_v2(base_pair, sym_idx)
+        candidates = [transform_qr((q, r), sym_idx) for q, r in base_candidates]
+        target = transform_pair_policy_target(base_pair, sym_idx)
         pair = build_pair_candidate_batch(
             candidates,
             target,

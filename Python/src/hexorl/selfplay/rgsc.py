@@ -16,6 +16,11 @@ from typing import Callable, Optional
 import numpy as np
 
 from hexorl.buffer.regret_buffer import PrioritizedRegretBuffer
+from hexorl.contracts.history import (
+    MoveHistory,
+    encode_move_history as contract_encode_move_history,
+)
+from hexorl.contracts.validation import ContractValidationError
 from hexorl.selfplay.records import GameRecord, PositionRecord
 
 
@@ -49,25 +54,12 @@ class RGSCRestartDecision:
 
 def decode_move_history(move_history: bytes) -> list[tuple[int, int, int]]:
     """Decode compact `(player, q, r)` little-endian i32 move history."""
-    if len(move_history) % HISTORY_STRIDE != 0:
-        raise ValueError("move history length must be a multiple of 12 bytes")
-    moves: list[tuple[int, int, int]] = []
-    for offset in range(0, len(move_history), HISTORY_STRIDE):
-        player = int.from_bytes(move_history[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(move_history[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(move_history[offset + 8:offset + 12], "little", signed=True)
-        moves.append((player, q, r))
-    return moves
+    return list(MoveHistory.decode(move_history, source="rust").rows)
 
 
 def encode_move_history(moves: list[tuple[int, int, int]] | tuple[tuple[int, int, int], ...]) -> bytes:
     """Encode `(player, q, r)` triples into compact little-endian i32 history."""
-    out = bytearray()
-    for player, q, r in moves:
-        out.extend(int(player).to_bytes(4, "little", signed=True))
-        out.extend(int(q).to_bytes(4, "little", signed=True))
-        out.extend(int(r).to_bytes(4, "little", signed=True))
-    return bytes(out)
+    return contract_encode_move_history(moves)
 
 
 def _attr_value(obj: object, name: str, default: int | bool | None = None):
@@ -84,8 +76,11 @@ def restore_game_from_history(
     """Replay a compact history into a fresh game and validate turn phase."""
     try:
         moves = decode_move_history(move_history)
-    except ValueError as exc:
-        return RestoreResult(ok=False, reason=str(exc))
+    except (ValueError, ContractValidationError) as exc:
+        reason = str(exc)
+        if "invalid player order" in reason:
+            reason = f"player_mismatch: {reason}"
+        return RestoreResult(ok=False, reason=reason)
     if max_game_moves is not None and len(moves) >= max_game_moves:
         return RestoreResult(ok=False, reason="history_at_or_past_move_cap")
 

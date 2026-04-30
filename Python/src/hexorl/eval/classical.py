@@ -8,13 +8,11 @@ import logging
 import random
 from typing import Optional, Tuple, List
 
+from hexorl.engine.rust import engine_available, hex_game_class
+
 logger = logging.getLogger(__name__)
 
-try:
-    import _engine
-    HAS_ENGINE = True
-except ImportError:
-    HAS_ENGINE = False
+HAS_ENGINE = engine_available()
 
 
 class ClassicalOpponent:
@@ -39,7 +37,8 @@ class ClassicalOpponent:
 
     def reset(self):
         if HAS_ENGINE:
-            self._game = _engine.HexGame()
+            cls = hex_game_class(required=True)
+            self._game = cls()
         else:
             self._game = None
         self._moves_played = 0

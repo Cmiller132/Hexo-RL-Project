@@ -24,6 +24,7 @@ from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
+from hexorl.engine.rust import hex_game_class
 from hexorl.model.network import HexNet, build_model_from_config
 from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
@@ -388,9 +389,8 @@ def _make_synthetic_game(cfg: Config, game_id: int) -> GameRecord:
     positions: List[PositionRecord] = []
 
     try:
-        import _engine
-
-        game = _engine.HexGame()
+        game_cls = hex_game_class(required=True)
+        game = game_cls()
         for move_idx in range(max_moves):
             player = int(game.current_player)
             legal = game.threat_constrained_moves(cfg.selfplay.near_radius)

@@ -11,7 +11,8 @@ Runs CPU-side on completed game records. Computes:
 from bisect import bisect_right
 import numpy as np
 from typing import List, Tuple, Optional
-from hexorl.graph.batch import legal_moves_for_stones, parse_history
+from hexorl.contracts.history import MoveHistory
+from hexorl.engine.legal import legal_rows_from_history
 from hexorl.selfplay.records import GameRecord, PositionRecord
 
 
@@ -250,14 +251,14 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
 
 
 def _legal_qr_from_history(history: bytes) -> List[Tuple[int, int]]:
-    stones = {(q, r): player for player, q, r in parse_history(history)}
-    return legal_moves_for_stones(stones, radius=8)
+    rows = legal_rows_from_history(history, near_radius=8, constrain_threats=False)
+    return [(int(q), int(r)) for q, r in rows.tolist()]
 
 
 def _last_move_qr(history: bytes) -> Tuple[int, int] | None:
     if len(history) < 12:
         return None
-    moves = parse_history(history)
+    moves = MoveHistory.decode(history, source="rust").rows
     if not moves:
         return None
     _player, q, r = moves[-1]
@@ -324,11 +325,7 @@ def _dominant_axis_label(history_bytes: bytes, winner: int | None) -> int:
         return -1
 
     stones = set()
-    stride = 12
-    for offset in range(0, len(history_bytes) - stride + 1, stride):
-        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
+    for player, q, r in MoveHistory.decode(history_bytes, source="rust").rows:
         if player == winner:
             stones.add((q, r))
 

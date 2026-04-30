@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import random
-import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +10,7 @@ from typing import Any
 from hexorl.dashboard.db import DashboardStore
 from hexorl.dashboard.play import create_session, session_payload
 from hexorl.dashboard.replay import Move, encode_move_history
+from hexorl.engine.rust import engine_available, hex_game_class
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ def generate_classical_fixtures(
 ) -> list[dict[str, Any]]:
     """Generate varied Rust-classical self-play positions as play sessions."""
     config = config or ClassicalFixtureConfig()
-    if importlib.util.find_spec("_engine") is None:  # pragma: no cover - depends on local build artifacts.
+    if not engine_available():  # pragma: no cover - depends on local build artifacts.
         raise RuntimeError("Rust _engine extension is required for classical fixtures")
 
     move_counts = tuple(max(0, int(v)) for v in config.move_counts) or (16,)
@@ -90,11 +90,11 @@ def _generate_fixture_record(
     spec: tuple[int, int, int, ClassicalFixtureConfig],
 ) -> tuple[bytes, dict[str, Any], int]:
     index, target_moves, example_index, config = spec
-    import _engine  # type: ignore
 
     fixture_seed = int(config.seed) + index * 1009 + target_moves * 17
     rng = random.Random(fixture_seed)
-    game = _engine.HexGame()
+    game_cls = hex_game_class(required=True)
+    game = game_cls()
     moves: list[Move] = []
     searches: list[dict[str, Any]] = []
 
