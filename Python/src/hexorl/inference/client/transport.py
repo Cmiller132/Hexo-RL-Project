@@ -223,6 +223,8 @@ class ShmTransport:
                     "legal_mask": np.array(self.slot.req_graph_legal_mask[:legal_count].astype(bool), copy=True),
                 },
             }
+            if getattr(self.slot, "res_graph_regret_value", None) is not None:
+                heads["regret_value"] = np.array(self.slot.res_graph_regret_value[:1], copy=True)
         else:
             k = int(np.max(self.slot.req_candidate_count[:count])) if count else 0
             p = int(np.max(self.slot.req_pair_count[:count])) if count else 0
@@ -236,6 +238,7 @@ class ShmTransport:
                 heads["pair_policy"] = np.array(self.slot.res_pair_logits[:count, :p], copy=True)
             if request.request_kind == InferenceRequestKind.REGRET_RANK_POLICY_VALUE:
                 heads["regret_rank"] = np.array(self.slot.res_regret_rank[:count], copy=True)
+                heads["regret_value"] = np.array(self.slot.res_regret_value[:count], copy=True)
         telemetry = InferenceTelemetry(
             request_id=request.request_id,
             trace_id=request.trace_id,

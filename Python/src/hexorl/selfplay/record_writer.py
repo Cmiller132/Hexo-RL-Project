@@ -63,6 +63,7 @@ class QueueSelfPlayRecordWriter(SelfPlayRecordWriter):
             if self.rgsc_service is not None:
                 restart_idx = getattr(record, "rgsc_restart_entry_index", None)
                 refreshes_before = int(getattr(self.rgsc_service, "refreshes", 0))
+                tree_insertions_before = int(getattr(self.rgsc_service, "tree_node_insertions", 0))
                 inserted = self.rgsc_service.observe_game(
                     record,
                     restart_entry_index=restart_idx,
@@ -79,7 +80,10 @@ class QueueSelfPlayRecordWriter(SelfPlayRecordWriter):
                     "rgsc_prb_refreshes": float(int(getattr(self.rgsc_service, "refreshes", 0)) - refreshes_before),
                     "rgsc_last_ema_delta": float(getattr(self.rgsc_service, "last_ema_delta", 0.0)),
                     "rgsc_last_staleness": float(getattr(self.rgsc_service, "last_staleness", 0.0)),
-                    "rgsc_tree_node_insertions": float(getattr(record, "rgsc_tree_node_insertions", 0)),
+                    "rgsc_tree_node_insertions": float(
+                        int(getattr(self.rgsc_service, "tree_node_insertions", 0))
+                        - tree_insertions_before
+                    ),
                 }
                 record.rgsc_prb_snapshot = self.rgsc_service.snapshot_entries()
 

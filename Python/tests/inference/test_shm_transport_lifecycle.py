@@ -2,7 +2,7 @@ import numpy as np
 
 from hexorl.inference.adapters.dense import DensePolicyValueAdapter
 from hexorl.inference.protocol import InferenceRequestKind, default_protocol_manifest, make_request
-from hexorl.inference.shm_transport import ShmTransport, TransportState
+from hexorl.inference.client.transport import ShmTransport, TransportState
 from .fakes import FakeSlot
 
 

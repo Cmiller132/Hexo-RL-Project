@@ -15,13 +15,15 @@ regret_rank head: implemented as an auxiliary scalar head
 regret_value head: implemented as a binned auxiliary head
 selected_action_value recording: implemented in current self-play records
 regret-biased replay sampling: implemented through RingBuffer regret_fraction
-PrioritizedRegretBuffer class: exists, but is not the active self-play restart path
-full RGSC search control: not complete
+PrioritizedRegretBuffer class: owned by the self-play RGSC restart service
+full RGSC search control: implemented for active self-play workers
 ```
 
-The active training system currently uses regret mostly as an auxiliary target
-and replay-sampling bias. That is a good intermediate diagnostic, but it is not
-paper-complete RGSC.
+The active training system now has the paper RGSC loop: completed trajectories
+produce selected-action regret targets, the active regret heads score trajectory
+and MCTS-tree candidate states, one rank-selected candidate is admitted to PRB
+after non-restart games, PRB openings are sampled by stored regret, and sampled
+openings are refreshed by EMA after replay.
 
 ## Paper Contract
 
@@ -66,21 +68,19 @@ R(s_t) = (1 / (T - t)) * sum_{i=t..T} (V_selected(s_i) - z)^2
 Current code:
 
 ```text
-Python/src/hexorl/buffer/regret_buffer.py::compute_regret()
-Python/src/hexorl/buffer/targets.py::_assign_auxiliary_targets()
+Python/src/hexorl/selfplay/regret_buffer.py::compute_regret()
+Python/src/hexorl/replay/codec.py::_assign_auxiliary_targets()
+Python/src/hexorl/selfplay/game_runner.py::_attach_rgsc_ranked_candidates()
 ```
 
-Current gap:
+Current status:
 
-- `selected_action_value` is recorded in self-play and the active target path
-  uses a suffix average, but missing selected values can still fall back to
-  root value in some helper paths.
-- Truncated/max-move games can have pseudo-outcome `0.0`. Those records should
-  keep policy/structure data, but regret heads should receive zero weight
-  because Hexo has no real draw outcome.
-- A finished production path should treat missing selected-action value in new
-  records as invalid or set regret weight to zero. Silent fallback should be
-  limited to explicitly marked legacy/research records.
+- Production RGSC candidate scoring uses `selected_action_value`; missing
+  selected values make trajectory regret invalid for candidate admission.
+- Replay targets use the same suffix-average formula and set regret weight to
+  zero for truncated/no-outcome games.
+- The legacy `compute_regret(..., allow_root_value_fallback=True)` escape hatch
+  remains explicit and is not used for active production RGSC scoring.
 
 Required tests:
 
@@ -102,25 +102,20 @@ rho(s | S) is induced by the regret-rank network over candidate states
 Current code:
 
 ```text
-Python/src/hexorl/buffer/regret_buffer.py::PrioritizedRegretBuffer.sample()
-Python/src/hexorl/buffer/ring.py::sample_regret_indices()
+Python/src/hexorl/selfplay/regret_buffer.py::PrioritizedRegretBuffer.sample()
+Python/src/hexorl/selfplay/rgsc.py::RGSCRestartService.maybe_restart()
 ```
 
-Current gap:
+Current status:
 
-- `PrioritizedRegretBuffer.sample()` exists, but the active self-play worker is
-  not sampling PRB restart states and resuming games from them.
-- `RingBuffer.sample_regret_indices()` biases training batches toward
-  high-regret replay rows. That is prioritized replay, not RGSC search control.
-
-Required implementation:
-
-- Add an owned RGSC service used by self-play orchestration.
-- At the start of a self-play game, with probability `rgsc_beta`, sample a PRB
-  entry and restore the `HexGame` from its compact move history.
-- Validate restored game legality, current player, and whether the position is
-  at a turn boundary or mid-turn.
-- Log every restart attempt, success, rejection, and resulting terminal reason.
+- `RGSCRestartService` is constructed by the self-play runner and samples PRB
+  openings with probability `rgsc_beta`.
+- PRB sampling follows the paper's regret-temperature distribution over stored
+  EMA regret values.
+- Restart restore validates compact history, current player, terminal status,
+  move cap, and Hexo's one-placement/two-placement turn phase.
+- Restart attempts, successes, rejections, EMA deltas, staleness, insertions,
+  and PRB snapshots are recorded through self-play metrics/dashboard payloads.
 
 Required tests:
 
@@ -136,26 +131,22 @@ Current code:
 
 ```text
 Python/src/hexorl/train/losses.py::regret_rank_loss()
+Python/src/hexorl/selfplay/game_runner.py::_attach_rgsc_ranked_candidates()
+Python/src/hexorl/inference/client.py::evaluate_regret_heads()
 ```
 
 Current status:
 
 - The loss shape follows the paper-style batch distribution objective.
-- The full adaptation is incomplete until the scores drive PRB candidate
-  selection and restart-state ranking, not only an auxiliary loss.
-
-Required implementation:
-
-- During PRB insertion, score candidate states with the current/EMA regret-rank
-  network.
-- Candidate states must include both played trajectory states and eligible MCTS
-  tree states, because RGSC search control is meant to restart from high-regret
-  learning opportunities discovered during search, not only from positions that
-  happened to be played.
-- Select or refresh PRB entries using rank score plus observed regret according
-  to the paper's intended control loop.
-- Persist rank score, observed regret, EMA regret, model checkpoint used for
-  scoring, and staleness.
+- The self-play runner scores played trajectory histories and extracted MCTS
+  tree-node histories with the active regret-rank head.
+- The highest rank-scored candidate is selected for PRB admission after
+  non-restart games.
+- If the selected candidate is on the played trajectory, its stored regret is
+  the true Equation 2 trajectory regret; if it is tree-only, its stored regret
+  is the active regret-value head estimate.
+- PRB entries preserve rank score, observed regret, EMA regret, source, sample
+  and update steps, refresh count, and dashboard snapshot fields.
 
 Required tests:
 
@@ -171,20 +162,18 @@ test_rgsc_restart_distribution_changes_when_rank_scores_change
 Current code:
 
 ```text
-Python/src/hexorl/buffer/regret_buffer.py::PrioritizedRegretBuffer.update_regret()
+Python/src/hexorl/selfplay/regret_buffer.py::PrioritizedRegretBuffer.update_regret()
+Python/src/hexorl/selfplay/rgsc.py::RGSCRestartService.observe_game()
 ```
 
-Current gap:
+Current status:
 
-- The method exists, but no active loop proves entries are re-evaluated after
-  replay, updated by EMA, and kept/dropped based on the refreshed value.
-
-Required implementation:
-
-- After a PRB-sampled restart game finishes, recompute regret for the sampled
-  entry and update it with the configured EMA alpha.
-- Track `rgsc_staleness`, `rgsc_refresh_count`, `rgsc_ema_delta`, and
-  `rgsc_eviction_reason`.
+- After a PRB-sampled restart game finishes, the starting position's recomputed
+  trajectory regret refreshes the sampled entry using the configured EMA alpha.
+- Restart games update the sampled opening; non-restart games admit the
+  rank-selected candidate.
+- Metrics track PRB refreshes, EMA delta, staleness, restart success/rejection,
+  and tree-node candidate insertions.
 
 Required tests:
 
@@ -212,16 +201,4 @@ RGSC metrics are persisted to SQLite/JSONL/dashboard
 truncated games do not train regret heads against pseudo-draw outcomes
 D6 tests cover regret labels and restarted histories
 end-to-end test proves beta=1 starts from PRB states
-```
-
-Until then, describe the system as:
-
-```text
-regret auxiliary heads + regret-biased replay sampling
-```
-
-not:
-
-```text
-full RGSC search control
 ```

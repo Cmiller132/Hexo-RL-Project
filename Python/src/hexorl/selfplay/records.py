@@ -177,6 +177,8 @@ class GameRecord:
     rgsc_restart_move_count: int = 0
     rgsc_prb_inserted: bool = False
     rgsc_metrics: Dict[str, float] = field(default_factory=dict)
+    rgsc_ranked_candidates: List[object] = field(default_factory=list)
+    rgsc_prb_snapshot: List[Dict[str, object]] = field(default_factory=list)
 
     def assign_outcomes(self):
         """Assign the game outcome to all positions."""

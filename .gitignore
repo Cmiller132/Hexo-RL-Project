@@ -85,6 +85,10 @@ models/
 !Python/src/hexorl/models/**
 !Python/tests/models/
 !Python/tests/models/**
+Python/src/hexorl/models/**/__pycache__/
+Python/src/hexorl/models/**/*.py[cod]
+Python/tests/models/**/__pycache__/
+Python/tests/models/**/*.py[cod]
 checkpoints/
 data/
 logs/

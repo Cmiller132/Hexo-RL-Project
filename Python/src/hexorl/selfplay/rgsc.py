@@ -52,6 +52,15 @@ class RGSCRestartDecision:
     rank_score: float = 0.0
 
 
+@dataclass(frozen=True)
+class RGSCCandidate:
+    move_history: bytes
+    rank_score: float
+    regret: float
+    game_id: int = 0
+    source: str = "trajectory_ranked_regret"
+
+
 def decode_move_history(move_history: bytes) -> list[tuple[int, int, int]]:
     """Decode compact `(player, q, r)` little-endian i32 move history."""
     return list(MoveHistory.decode(move_history, source="rust").rows)
@@ -196,34 +205,38 @@ class RGSCRestartService:
         *,
         restart_entry_index: int | None = None,
     ) -> bool:
-        """Refresh sampled entries and insert the highest observed trajectory regret."""
+        """Refresh sampled entries or insert the rank-network selected candidate."""
         if not self.enabled:
             return False
-        if restart_entry_index is not None and record.positions:
-            restart_pos = record.positions[0]
-            if float(getattr(restart_pos, "regret_weight", 0.0)) > 0.0:
-                before = self.prb.get_entries()
-                sampled = before[restart_entry_index] if 0 <= restart_entry_index < len(before) else None
-                self.last_ema_delta = self.prb.update_regret(
-                    restart_entry_index,
-                    float(restart_pos.regret_value),
-                )
-                if sampled is not None:
-                    self.last_staleness = float(max(0, len(record.positions) - 1))
-                self.refreshes += 1
+        if restart_entry_index is not None:
+            if record.positions:
+                restart_pos = record.positions[0]
+                if float(getattr(restart_pos, "regret_weight", 0.0)) > 0.0:
+                    before = self.prb.get_entries()
+                    sampled = before[restart_entry_index] if 0 <= restart_entry_index < len(before) else None
+                    self.last_ema_delta = self.prb.update_regret(
+                        restart_entry_index,
+                        float(restart_pos.regret_value),
+                    )
+                    if sampled is not None:
+                        self.last_staleness = float(max(0, len(record.positions) - 1))
+                    self.refreshes += 1
+            return False
 
-        candidate = self._best_observed_position(record.positions)
+        candidate = self._selected_ranked_candidate(record)
         if candidate is None:
             return False
         inserted = self.prb.add(
             candidate.move_history,
-            regret=float(candidate.regret_value),
-            rank_score=float(candidate.regret_rank),
+            regret=float(candidate.regret),
+            rank_score=float(candidate.rank_score),
             game_id=int(candidate.game_id),
-            source="trajectory_observed_regret",
+            source=str(candidate.source),
         )
         if inserted:
             self.insertions += 1
+            if str(candidate.source).startswith("mcts_tree_node"):
+                self.tree_node_insertions += 1
         return inserted
 
     def observe_tree_node_candidates(
@@ -263,19 +276,39 @@ class RGSCRestartService:
         return inserted
 
     @staticmethod
-    def _best_observed_position(positions: list[PositionRecord]) -> Optional[PositionRecord]:
-        candidates = [
-            pos for pos in positions
-            if pos.move_history
-            and float(getattr(pos, "regret_weight", 0.0)) > 0.0
-            and math.isfinite(float(pos.regret_rank))
-            and math.isfinite(float(pos.regret_value))
-        ]
+    def _selected_ranked_candidate(record: GameRecord) -> Optional[RGSCCandidate]:
+        raw_candidates = getattr(record, "rgsc_ranked_candidates", ()) or ()
+        candidates: list[RGSCCandidate] = []
+        for raw in raw_candidates:
+            if isinstance(raw, RGSCCandidate):
+                candidate = raw
+            else:
+                try:
+                    candidate = RGSCCandidate(
+                        move_history=bytes(raw["move_history"]),
+                        rank_score=float(raw["rank_score"]),
+                        regret=float(raw["regret"]),
+                        game_id=int(raw.get("game_id", getattr(record, "game_id", 0))),
+                        source=str(raw.get("source", "ranked_regret_candidate")),
+                    )
+                except Exception:
+                    continue
+            if (
+                candidate.move_history
+                and math.isfinite(float(candidate.rank_score))
+                and math.isfinite(float(candidate.regret))
+                and float(candidate.regret) > 0.0
+            ):
+                candidates.append(candidate)
         if not candidates:
             return None
         return max(
             candidates,
-            key=lambda pos: (float(pos.regret_rank), float(pos.regret_value), len(pos.move_history)),
+            key=lambda candidate: (
+                float(candidate.rank_score),
+                float(candidate.regret),
+                len(candidate.move_history),
+            ),
         )
 
     @property

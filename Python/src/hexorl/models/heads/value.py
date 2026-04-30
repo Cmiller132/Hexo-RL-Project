@@ -52,7 +52,22 @@ def bins_to_value(logits: torch.Tensor) -> torch.Tensor:
     bin_centers = torch.linspace(-1.0, 1.0, n_bins, device=logits.device, dtype=logits.dtype)
     return (probs * bin_centers).sum(dim=-1)
 
+
+def bins_to_scalar(logits: torch.Tensor, *, min_value: float, max_value: float) -> torch.Tensor:
+    """Convert binned scalar logits to expected values over a fixed range."""
+    n_bins = logits.shape[-1]
+    probs = torch.softmax(logits, dim=-1)
+    bin_centers = torch.linspace(
+        float(min_value),
+        float(max_value),
+        n_bins,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    return (probs * bin_centers).sum(dim=-1)
+
+
 VALUE_HEAD = "value"
 
 
-__all__ = ["VALUE_HEAD", "ValueBinnedHead", "bins_to_value", "value_to_bins"]
+__all__ = ["VALUE_HEAD", "ValueBinnedHead", "bins_to_scalar", "bins_to_value", "value_to_bins"]

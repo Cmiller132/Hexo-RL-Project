@@ -36,7 +36,8 @@ from hexorl.search.pair_strategy import (
 from hexorl.search.policy_provider import PolicyProvider, create_policy_provider
 from hexorl.search.priors import PRIOR_SOURCE_DEFAULT, SearchEvaluation
 from hexorl.search.mcts_runner import choose_leaf_batch, commit_leaf_batch, commit_root, start_root
-from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
+from hexorl.selfplay.regret_buffer import compute_regret
+from hexorl.selfplay.rgsc import RGSCCandidate, RGSCRestartService, encode_move_history, restore_game_from_history
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
@@ -789,6 +790,189 @@ class GameRunner:
             commit_leaf_batch(engine, evaluations, source_mode="dense")
         return elapsed
 
+    def _rgsc_inference_client(self):
+        return getattr(self.policy_provider, "client", None)
+
+    def _score_rgsc_histories(self, histories: list[bytes]) -> dict[bytes, tuple[float, float]]:
+        client = self._rgsc_inference_client()
+        if client is None:
+            self.telemetry_sink.emit(
+                "selfplay_phase_transition",
+                {
+                    "worker_id": int(self.worker_id),
+                    "phase": "rgsc_scoring_unavailable",
+                    "reason": "missing_inference_client",
+                    "candidate_count": len(histories),
+                },
+            )
+            return {}
+        unique_histories = list(dict.fromkeys(bytes(history) for history in histories if history))
+        if not unique_histories:
+            return {}
+
+        scores: dict[bytes, tuple[float, float]] = {}
+        if self.uses_global_policy:
+            for history in unique_histories:
+                try:
+                    graph_batch = self.contract_builders.graph_batch_builder(
+                        history,
+                        radius=8,
+                        max_pair_rows=0,
+                        include_pair_rows=False,
+                    )
+                    out = client.evaluate_global_graph(graph_batch)
+                    rank = float(np.asarray(out["regret_rank"], dtype=np.float32).reshape(-1)[0])
+                    value = float(np.asarray(out["regret_value"], dtype=np.float32).reshape(-1)[0])
+                except Exception as exc:
+                    logger.debug("Worker %s: RGSC graph candidate scoring failed: %s", self.worker_id, exc)
+                    continue
+                if np.isfinite(rank) and np.isfinite(value):
+                    scores[history] = (rank, max(0.0, min(4.0, value)))
+            return scores
+
+        if self.game_factory is None:
+            return {}
+        batch_histories: list[bytes] = []
+        batch_tensors: list[np.ndarray] = []
+        max_batch = max(1, int(self.runtime_spec.inference_queue_capacity))
+        for history in unique_histories:
+            restored = restore_game_from_history(
+                history,
+                self.game_factory,
+                max_game_moves=self.max_game_moves,
+            )
+            if not restored.ok or restored.game is None:
+                continue
+            try:
+                encoded = restored.game.encode_board_and_legal(
+                    int(self.near_radius),
+                    bool(self.constrain_threats),
+                )
+                tensor_3d = np.asarray(encoded[0], dtype=np.float32).reshape(13, 33, 33)
+            except Exception as exc:
+                logger.debug("Worker %s: RGSC tensor encoding failed: %s", self.worker_id, exc)
+                continue
+            batch_histories.append(history)
+            batch_tensors.append(tensor_3d)
+            if len(batch_tensors) >= max_batch:
+                scores.update(self._submit_rgsc_tensor_batch(client, batch_histories, batch_tensors))
+                batch_histories = []
+                batch_tensors = []
+        if batch_tensors:
+            scores.update(self._submit_rgsc_tensor_batch(client, batch_histories, batch_tensors))
+        return scores
+
+    @staticmethod
+    def _submit_rgsc_tensor_batch(client, histories: list[bytes], tensors: list[np.ndarray]) -> dict[bytes, tuple[float, float]]:
+        tensor_batch = np.asarray(tensors, dtype=np.float32)
+        rank_values, regret_values = client.evaluate_regret_heads(tensor_batch, len(tensors))
+        ranks = np.asarray(rank_values, dtype=np.float32).reshape(-1)
+        regrets = np.asarray(regret_values, dtype=np.float32).reshape(-1)
+        scored: dict[bytes, tuple[float, float]] = {}
+        for history, rank, regret in zip(histories, ranks, regrets):
+            rank_f = float(rank)
+            regret_f = float(regret)
+            if np.isfinite(rank_f) and np.isfinite(regret_f):
+                scored[history] = (rank_f, max(0.0, min(4.0, regret_f)))
+        return scored
+
+    def _attach_rgsc_ranked_candidates(
+        self,
+        record: GameRecord,
+        *,
+        tree_histories: list[bytes],
+    ) -> None:
+        if not self.rgsc.enabled:
+            return
+
+        trajectory_regrets: list[float] = []
+        trajectory_valid = False
+        if not bool(record.truncated) and float(record.outcome) != 0.0:
+            try:
+                trajectory_regrets = compute_regret(record.positions, record.outcome)
+                trajectory_valid = True
+            except ValueError as exc:
+                self.telemetry_sink.emit(
+                    "selfplay_phase_transition",
+                    {
+                        "worker_id": int(self.worker_id),
+                        "game_id": int(record.game_id),
+                        "phase": "rgsc_trajectory_regret_invalid",
+                        "reason": str(exc),
+                    },
+                )
+
+        trajectory_by_history: dict[bytes, float] = {}
+        for idx, pos in enumerate(record.positions):
+            if trajectory_valid:
+                regret = float(trajectory_regrets[idx])
+                pos.regret_rank = regret
+                pos.regret_value = regret
+                pos.regret_weight = 1.0
+                if pos.move_history:
+                    trajectory_by_history[bytes(pos.move_history)] = regret
+            else:
+                pos.regret_rank = 0.0
+                pos.regret_value = 0.0
+                pos.regret_weight = 0.0
+
+        candidate_histories = list(trajectory_by_history.keys())
+        candidate_histories.extend(
+            bytes(history)
+            for history in tree_histories
+            if history and bytes(history) not in trajectory_by_history
+        )
+        scores = self._score_rgsc_histories(candidate_histories)
+        candidates: list[RGSCCandidate] = []
+        for history, regret in trajectory_by_history.items():
+            scored = scores.get(history)
+            if scored is None:
+                continue
+            rank_score, _estimated = scored
+            candidates.append(
+                RGSCCandidate(
+                    move_history=history,
+                    rank_score=rank_score,
+                    regret=regret,
+                    game_id=int(record.game_id),
+                    source="trajectory_ranked_regret",
+                )
+            )
+        for history in dict.fromkeys(bytes(item) for item in tree_histories if item):
+            if history in trajectory_by_history:
+                continue
+            scored = scores.get(history)
+            if scored is None:
+                continue
+            rank_score, estimated_regret = scored
+            candidates.append(
+                RGSCCandidate(
+                    move_history=history,
+                    rank_score=rank_score,
+                    regret=estimated_regret,
+                    game_id=int(record.game_id),
+                    source="mcts_tree_node_regret_value_estimate",
+                )
+            )
+        if candidates:
+            selected = max(
+                candidates,
+                key=lambda item: (float(item.rank_score), float(item.regret), len(item.move_history)),
+            )
+            record.rgsc_ranked_candidates = [selected]
+        self.telemetry_sink.emit(
+            "selfplay_phase_transition",
+            {
+                "worker_id": int(self.worker_id),
+                "game_id": int(record.game_id),
+                "phase": "rgsc_candidate_scoring",
+                "trajectory_candidates": len(trajectory_by_history),
+                "tree_candidates": len({bytes(item) for item in tree_histories if item}),
+                "scored_candidates": len(scores),
+                "selected_source": record.rgsc_ranked_candidates[0].source if record.rgsc_ranked_candidates else "",
+            },
+        )
+
     def run_game(self, request: GameRunRequest) -> GameRunResult:
         t0 = time.monotonic()
         self.telemetry_sink.emit(
@@ -910,6 +1094,7 @@ class GameRunner:
             )
 
         positions: List[PositionRecord] = []
+        rgsc_tree_histories: list[bytes] = []
         move_history = bytearray(rgsc_restart.move_history if rgsc_restart and rgsc_restart.used else b"")
         move_idx = int(rgsc_restart.move_count) if rgsc_restart and rgsc_restart.used else 0
         terminal_reason = "unknown"
@@ -1042,27 +1227,20 @@ class GameRunner:
                 if leaf_expansions > 0.0
                 else 0.0
             )
-            rgsc_tree_node_insertions = 0
             if self.rgsc.enabled and hasattr(engine, "extract_tree_node_histories"):
                 try:
                     min_tree_visits = max(2, int(sims) // 16)
                     histories = engine.extract_tree_node_histories(min_tree_visits)
-                    scored = []
                     if histories:
+                        rgsc_tree_histories.extend(bytes(history) for history in histories if history)
                         self.telemetry_sink.emit(
                             "selfplay_phase_transition",
                             {
                                 "worker_id": int(self.worker_id),
                                 "game_id": int(game_id),
-                                "phase": "rgsc_tree_candidates_unscored",
+                                "phase": "rgsc_tree_candidates_extracted",
                                 "candidate_count": len(histories),
                             },
-                        )
-                    if scored:
-                        rgsc_tree_node_insertions = self.rgsc.observe_tree_node_candidates(
-                            scored,
-                            game_id=game_id,
-                            score_source="explicit_regret_scorer",
                         )
                 except Exception as exc:
                     logger.debug("Worker %s: RGSC tree extraction failed: %s", self.worker_id, exc)
@@ -1270,12 +1448,12 @@ class GameRunner:
             record.rgsc_restart_entry_index = rgsc_restart.entry_index
             record.rgsc_restart_entry_id = rgsc_restart.entry_id
             record.rgsc_restart_move_count = rgsc_restart.move_count
-        record.rgsc_tree_node_insertions = int(self.rgsc.tree_node_insertions)
         record.final_move_history = full_history
         record.truncated = truncated
         record.terminal_reason = terminal_reason
 
         record.assign_outcomes()
+        self._attach_rgsc_ranked_candidates(record, tree_histories=rgsc_tree_histories)
         return record
 
 

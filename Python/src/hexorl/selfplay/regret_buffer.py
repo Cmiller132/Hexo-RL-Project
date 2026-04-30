@@ -81,9 +81,9 @@ class PrioritizedRegretBuffer:
     def sample_with_index(self, rng: Optional[np.random.RandomState] = None) -> Optional[tuple[int, PRBEntry]]:
         if not self._entries:
             return None
-        ranks = np.array([e.rank_score if e.rank_score > 0.0 else e.regret for e in self._entries], dtype=np.float64)
-        ranks = np.maximum(ranks, 1e-8)
-        weights = ranks ** (1.0 / max(self.sampling_temperature, 1e-8))
+        regrets = np.array([e.regret for e in self._entries], dtype=np.float64)
+        regrets = np.maximum(regrets, 1e-8)
+        weights = regrets ** (1.0 / max(self.sampling_temperature, 1e-8))
         probs = weights / weights.sum()
         rng = rng or np.random.RandomState()
         idx = int(rng.choice(len(self._entries), p=probs))

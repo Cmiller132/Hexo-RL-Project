@@ -17,6 +17,9 @@ from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import CANDIDATE_FEATURES, connect_inference_queue
+from hexorl.inference.server.execution import ServerExecutor
+from hexorl.inference.server.metrics import ServerMetrics
+from hexorl.inference.server.outputs import bounded_policy_logits, bounded_value_logits
 from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
 from hexorl.models.factory import build_inference_model
 
@@ -87,10 +90,16 @@ class TestInferenceServer(unittest.TestCase):
         cfg.model.heads = ["policy", "value", "sparse_policy", "pair_policy"]
         cfg.inference.max_batch_size = 16
         cfg.inference.fp16 = False
-        server = InferenceServer(cfg, num_workers=1)
-        server._device = torch.device("cpu")
-        server._model = build_inference_model(cfg, device=server._device)
-        server._model.eval()
+        device = torch.device("cpu")
+        model = build_inference_model(cfg, device=device)
+        model.eval()
+        executor = ServerExecutor(
+            model=model,
+            device=device,
+            forward_stream=None,
+            fp16=False,
+            metrics=ServerMetrics(),
+        )
 
         count = 2
         k = 4
@@ -108,7 +117,7 @@ class TestInferenceServer(unittest.TestCase):
         )
         pair_mask = torch.ones(count, p_rows, dtype=torch.bool)
 
-        policies, values, sparse, pair, regret = server._forward(
+        outputs = executor.forward_dense(
             tensor,
             {
                 "candidate_indices": candidate_indices,
@@ -119,13 +128,14 @@ class TestInferenceServer(unittest.TestCase):
             },
         )
 
-        self.assertEqual(policies.shape, (count, 1089))
-        self.assertEqual(values.shape, (count,))
-        self.assertEqual(sparse.shape, (count, k))
-        self.assertEqual(pair.shape, (count, p_rows))
-        self.assertIsNone(regret)
-        self.assertTrue(np.isfinite(sparse).all())
-        self.assertTrue(np.isfinite(pair).all())
+        self.assertEqual(outputs.policies.shape, (count, 1089))
+        self.assertEqual(outputs.values.shape, (count,))
+        self.assertEqual(outputs.sparse_logits.shape, (count, k))
+        self.assertEqual(outputs.pair_logits.shape, (count, p_rows))
+        self.assertIsNone(outputs.regret_rank)
+        self.assertIsNone(outputs.regret_value)
+        self.assertTrue(np.isfinite(outputs.sparse_logits).all())
+        self.assertTrue(np.isfinite(outputs.pair_logits).all())
 
     def test_server_forward_graph_returns_keyed_logits(self):
         cfg = load_config()
@@ -136,10 +146,16 @@ class TestInferenceServer(unittest.TestCase):
         cfg.model.heads = ["value", "policy_place", "policy_pair_joint", "opp_policy"]
         cfg.inference.max_batch_size = 2
         cfg.inference.fp16 = False
-        server = InferenceServer(cfg, num_workers=1)
-        server._device = torch.device("cpu")
-        server._model = build_inference_model(cfg, device=server._device)
-        server._model.eval()
+        device = torch.device("cpu")
+        model = build_inference_model(cfg, device=device)
+        model.eval()
+        executor = ServerExecutor(
+            model=model,
+            device=device,
+            forward_stream=None,
+            fp16=False,
+            metrics=ServerMetrics(),
+        )
         graph = collate_graph_batches([
             build_graph_batch_from_history(b"", include_pair_rows=False),
         ])
@@ -159,19 +175,20 @@ class TestInferenceServer(unittest.TestCase):
             "relation_bias": torch.from_numpy(graph.relation_bias),
         }
 
-        place, values, opp, pair_first, pair_joint, pair_second, regret = server._forward_graph(graph_inputs)
+        outputs = executor.forward_graph(graph_inputs)
 
-        self.assertEqual(place.shape, graph.legal_mask.shape)
-        self.assertEqual(values.shape, (1,))
-        self.assertTrue(np.isfinite(place).all())
-        self.assertTrue(np.isfinite(values).all())
-        self.assertIsNotNone(opp)
-        self.assertIsNotNone(pair_first)
-        self.assertEqual(pair_first.shape, graph.legal_mask.shape)
-        self.assertIsNotNone(pair_joint)
-        self.assertIsNotNone(pair_second)
-        self.assertIsNotNone(regret)
-        self.assertEqual(regret.shape, (1,))
+        self.assertEqual(outputs.place_logits.shape, graph.legal_mask.shape)
+        self.assertEqual(outputs.values.shape, (1,))
+        self.assertTrue(np.isfinite(outputs.place_logits).all())
+        self.assertTrue(np.isfinite(outputs.values).all())
+        self.assertIsNotNone(outputs.regret_value)
+        self.assertIsNotNone(outputs.opp_logits)
+        self.assertIsNotNone(outputs.pair_first_logits)
+        self.assertEqual(outputs.pair_first_logits.shape, graph.legal_mask.shape)
+        self.assertIsNotNone(outputs.pair_joint_logits)
+        self.assertIsNotNone(outputs.pair_second_logits)
+        self.assertIsNotNone(outputs.regret_rank)
+        self.assertEqual(outputs.regret_rank.shape, (1,))
 
     def test_adaptive_batching_two_clients(self):
         """Two clients submitting simultaneously get correct results."""
@@ -209,9 +226,9 @@ class TestInferenceServer(unittest.TestCase):
         value = torch.tensor([[float("nan"), float("inf"), -float("inf"), 0.0]])
 
         with self.assertRaises(RuntimeError):
-            InferenceServer._bounded_policy_logits(policy, head_name="policy")
+            bounded_policy_logits(policy, head_name="policy")
         with self.assertRaises(RuntimeError):
-            InferenceServer._bounded_value_logits(value, head_name="value")
+            bounded_value_logits(value, head_name="value")
 
 
 @unittest.skipUnless(HAS_ENGINE, "Rust _engine extension not available")

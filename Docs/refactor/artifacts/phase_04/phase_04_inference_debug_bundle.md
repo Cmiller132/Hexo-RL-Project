@@ -18,7 +18,8 @@ Debuggable identities now available per request/response:
 Primary code paths:
 
 - `Python/src/hexorl/inference/protocol.py`
-- `Python/src/hexorl/inference/shm_transport.py`
+- `Python/src/hexorl/inference/client/transport.py`
+- `Python/src/hexorl/inference/server/scheduler.py`
 - `Python/src/hexorl/inference/telemetry.py`
 - `Python/src/hexorl/inference/adapters/`
 

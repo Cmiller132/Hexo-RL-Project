@@ -1,6 +1,6 @@
 # Phase 04 Timeout Audit
 
-Transport wait owner: `Python/src/hexorl/inference/shm_transport.py`.
+Transport wait owner: `Python/src/hexorl/inference/client/transport.py`.
 
 Bounded waits:
 

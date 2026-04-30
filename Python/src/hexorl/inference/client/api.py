@@ -17,12 +17,12 @@ from hexorl.inference.protocol import (
     InferenceProtocolManifest,
     InferenceRequestKind,
     default_protocol_manifest,
-    load_server_manifest,
     make_request,
-    negotiate_protocol,
 )
 from hexorl.inference.shm_queue import InferenceQueue, connect_inference_queue
-from hexorl.inference.shm_transport import ShmTransport, TransportState
+from hexorl.inference.client.handshake import load_declared_server_manifest, negotiate_client_handshake
+from hexorl.inference.client.static_response import zero_count_response
+from hexorl.inference.client.transport import ShmTransport, TransportState
 
 
 class InferenceClient:
@@ -83,33 +83,20 @@ class InferenceClient:
             timeout_ms=self.timeout_ms,
         )
         self._transport.state = TransportState.HANDSHAKING
-        server_manifest = self.server_manifest or load_server_manifest(
+        server_manifest = load_declared_server_manifest(
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
+            explicit_manifest=self.server_manifest,
         )
         if not self._manifest_explicit:
             self.manifest = server_manifest
             self._adapters = self._build_adapters()
-        selected_kind = self._select_request_kind(server_manifest)
-        self.handshake = negotiate_protocol(
+        self.handshake = negotiate_client_handshake(
             client_manifest=self.manifest,
             server_manifest=server_manifest,
-            request_kind=selected_kind,
-            required_heads=tuple(self.manifest.heads),
         )
         self._transport.mark_ready()
         self._connected = True
-
-    def _select_request_kind(self, server_manifest: InferenceProtocolManifest) -> InferenceRequestKind:
-        client_kinds = [InferenceRequestKind(kind) for kind in self.manifest.request_kind]
-        server_kinds = set(server_manifest.request_kind)
-        for kind in client_kinds:
-            if kind.value in server_kinds:
-                return kind
-        raise RuntimeError(
-            "no compatible inference request kind between client and server: "
-            f"client={list(self.manifest.request_kind)} server={list(server_manifest.request_kind)}"
-        )
 
     def disconnect(self):
         if self._transport is not None:
@@ -187,13 +174,19 @@ class InferenceClient:
         )
 
     def evaluate_regret_rank(self, tensor: np.ndarray, count: int) -> np.ndarray:
+        rank, _value = self.evaluate_regret_heads(tensor, count)
+        return rank
+
+    def evaluate_regret_heads(self, tensor: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
         response = self._request(
             InferenceRequestKind.REGRET_RANK_POLICY_VALUE,
             {"tensor": tensor, "count": int(count)},
         )
         if "regret_rank" not in response.head_outputs:
             raise RuntimeError("inference response does not expose regret-rank head")
-        return response.head_outputs["regret_rank"]
+        if "regret_value" not in response.head_outputs:
+            raise RuntimeError("inference response does not expose regret-value head")
+        return response.head_outputs["regret_rank"], response.head_outputs["regret_value"]
 
     def evaluate_global_graph(self, graph_batch) -> dict[str, np.ndarray | dict[str, object]]:
         response = self._request(
@@ -213,17 +206,7 @@ class InferenceClient:
         if not self._connected or self._transport is None:
             raise RuntimeError("InferenceClient not connected. Call connect() first.")
         if int(payload.get("count", 1)) <= 0 and kind != InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE:
-            empty = np.empty(0, dtype=np.float32)
-            if kind == InferenceRequestKind.SPARSE_POLICY_VALUE:
-                return _StaticResponse({"policy": empty, "value": empty, "sparse_policy": np.empty((0, 0), dtype=np.float32)})
-            if kind == InferenceRequestKind.PAIR_SCORING:
-                return _StaticResponse({
-                    "policy": empty,
-                    "value": empty,
-                    "sparse_policy": np.empty((0, 0), dtype=np.float32),
-                    "pair_policy": np.empty((0, 0), dtype=np.float32),
-                })
-            return _StaticResponse({"policy": empty, "value": empty})
+            return zero_count_response(kind.value)
         request = make_request(
             kind=kind,
             manifest=self.manifest,
@@ -244,8 +227,3 @@ class InferenceClient:
 
     def __del__(self):
         self.disconnect()
-
-
-class _StaticResponse:
-    def __init__(self, heads: dict[str, np.ndarray]):
-        self.head_outputs = heads

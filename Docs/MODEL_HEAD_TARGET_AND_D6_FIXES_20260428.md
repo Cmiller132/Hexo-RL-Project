@@ -344,6 +344,10 @@ Server and clients share the same mapping, so the protocol is unchanged except f
 
 ## Remaining Notes
 
-The regret heads are now aligned with the RGSC target formula for trajectory states, but this is not a full prioritized-regret-buffer restart implementation. The current replay sampler still uses `regret_fraction` and `sample_regret_indices()` as the practical training hook. A full RGSC PRB would also need restart-state selection, stored opening states, and EMA regret updates for replayed PRB states.
+Update 2026-04-30: the RGSC path now includes the prioritized-regret-buffer
+restart loop. Self-play scores played trajectory histories and extracted MCTS
+tree histories with the active regret heads, admits the rank-selected candidate
+after non-restart games, samples PRB openings by stored EMA regret, and refreshes
+sampled openings by EMA after replay.
 
 The D6 path now uses transformed history re-encoding, which is the safest route for sparse/graph_hybrid_0 models. If performance ever becomes a bottleneck, the optimization should be a tested Rust batch transform/re-encode helper, not a return to rotating already-cropped tensors.

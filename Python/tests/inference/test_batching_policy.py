@@ -1,4 +1,4 @@
-from hexorl.inference.batching import BatchingPolicy, ReadyRequest
+from hexorl.inference.server.batching import BatchingPolicy, ReadyRequest
 
 
 def test_batching_policy_keeps_request_kinds_compatible():

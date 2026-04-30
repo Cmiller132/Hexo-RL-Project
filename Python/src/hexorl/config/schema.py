@@ -343,6 +343,11 @@ class Config(BaseModel):
                 "buffer.regret_fraction > 0 requires enabled and weighted regret heads "
                 "or buffer.regret_replay_only = true"
             )
+        if self.selfplay.rgsc_beta > 0.0 and not regret_heads_active:
+            raise ValueError(
+                "selfplay.rgsc_beta > 0 requires enabled and weighted regret_rank "
+                "and regret_value heads"
+            )
         if self.model.sparse_prior_stage > 0 and not self.model.sparse_policy:
             raise ValueError("model.sparse_prior_stage > 0 requires model.sparse_policy = true")
         if not 0.0 <= self.selfplay.rgsc_beta <= 1.0:

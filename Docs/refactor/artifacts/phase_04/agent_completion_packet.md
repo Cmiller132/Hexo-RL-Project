@@ -12,14 +12,14 @@ Closed V2 rows:
 
 Runtime consumers changed:
 
-- `Python/src/hexorl/inference/client.py`
-- `Python/src/hexorl/inference/server.py`
+- `Python/src/hexorl/inference/client/`
+- `Python/src/hexorl/inference/server/`
 - `Python/src/hexorl/inference/shm_queue.py`
 - `Python/src/hexorl/selfplay/worker.py`
 
 Files changed:
 
-- Added protocol, transport, telemetry, batching, and adapter modules under `Python/src/hexorl/inference/`.
+- Added protocol, client transport, server batching, telemetry, and adapter modules under `Python/src/hexorl/inference/`.
 - Added required Phase 04 inference tests under `Python/tests/inference/`.
 - Updated `Python/tests/test_inference_server.py`.
 - Added Phase 04 artifacts under `Docs/refactor/artifacts/phase_04/`.

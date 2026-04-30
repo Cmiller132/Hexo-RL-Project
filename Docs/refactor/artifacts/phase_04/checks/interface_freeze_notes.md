@@ -8,11 +8,11 @@ Frozen public surfaces before implementation:
   - response contract
   - handshake request/response
   - `InferenceProtocolMismatch`
-- `Python/src/hexorl/inference/shm_transport.py`
+- `Python/src/hexorl/inference/client/transport.py`
   - transport lifecycle states: `created`, `handshaking`, `ready`, `draining`, `closed`, `failed`
   - bounded wait/deadline/heartbeat/backpressure ownership
   - slot request/response generation counters
-- `Python/src/hexorl/inference/batching.py`
+- `Python/src/hexorl/inference/server/batching.py`
   - compatible request grouping by request kind, protocol, schema, and adapter capability
   - fill-rate, wait, forward, decode, queue-depth telemetry
 - `Python/src/hexorl/inference/adapters/*`

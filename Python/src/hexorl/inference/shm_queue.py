@@ -48,6 +48,7 @@ def _shm_name(base: str, worker_id: int) -> str:
         "res_policy": "rp",
         "res_value": "rv",
         "res_regret_rank": "rrr",
+        "res_regret_value": "rrv",
         "req_candidate_count": "qcc",
         "req_candidate_indices": "qci",
         "req_candidate_features": "qcf",
@@ -80,6 +81,7 @@ def _shm_name(base: str, worker_id: int) -> str:
         "res_graph_pair_logits": "rgpr",
         "res_graph_pair_second_logits": "rgps",
         "res_graph_regret_rank": "rgrr",
+        "res_graph_regret_value": "rgrv",
         "req_ready": "qr",
         "res_ready": "rr",
     }
@@ -173,6 +175,8 @@ class WorkerSlots:
         self.res_value: Optional[np.ndarray] = None
         self.res_regret_rank_shm: Optional[SharedMemory] = None
         self.res_regret_rank: Optional[np.ndarray] = None
+        self.res_regret_value_shm: Optional[SharedMemory] = None
+        self.res_regret_value: Optional[np.ndarray] = None
         self.req_candidate_count_shm: Optional[SharedMemory] = None
         self.req_candidate_count: Optional[np.ndarray] = None
         self.req_candidate_indices_shm: Optional[SharedMemory] = None
@@ -235,6 +239,8 @@ class WorkerSlots:
         self.res_graph_pair_second_logits: Optional[np.ndarray] = None
         self.res_graph_regret_rank_shm: Optional[SharedMemory] = None
         self.res_graph_regret_rank: Optional[np.ndarray] = None
+        self.res_graph_regret_value_shm: Optional[SharedMemory] = None
+        self.res_graph_regret_value: Optional[np.ndarray] = None
 
         self.req_ready: Optional[SharedEvent] = None
         self.res_ready: Optional[SharedEvent] = None
@@ -290,6 +296,12 @@ class WorkerSlots:
         )
         self.res_regret_rank = np.ndarray(
             (self.max_batch,), dtype=np.float32, buffer=self.res_regret_rank_shm.buf
+        )
+        self.res_regret_value_shm = _create_shm(
+            _shm_name("res_regret_value", self.worker_id), self.max_batch * 4
+        )
+        self.res_regret_value = np.ndarray(
+            (self.max_batch,), dtype=np.float32, buffer=self.res_regret_value_shm.buf
         )
 
         self.req_candidate_count_shm = _create_shm(
@@ -514,6 +526,12 @@ class WorkerSlots:
         self.res_graph_regret_rank = np.ndarray(
             (1,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf
         )
+        self.res_graph_regret_value_shm = _create_shm(
+            _shm_name("res_graph_regret_value", self.worker_id), 4
+        )
+        self.res_graph_regret_value = np.ndarray(
+            (1,), dtype=np.float32, buffer=self.res_graph_regret_value_shm.buf
+        )
 
     def _connect(self):
         """Connect to existing shared-memory segments (worker side)."""
@@ -557,6 +575,12 @@ class WorkerSlots:
         )
         self.res_regret_rank = np.ndarray(
             (self.max_batch,), dtype=np.float32, buffer=self.res_regret_rank_shm.buf
+        )
+        self.res_regret_value_shm = SharedMemory(
+            name=_shm_name("res_regret_value", self.worker_id), create=False
+        )
+        self.res_regret_value = np.ndarray(
+            (self.max_batch,), dtype=np.float32, buffer=self.res_regret_value_shm.buf
         )
 
         self.req_candidate_count_shm = SharedMemory(
@@ -677,6 +701,8 @@ class WorkerSlots:
         self.res_graph_pair_second_logits = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_second_logits_shm.buf)
         self.res_graph_regret_rank_shm = SharedMemory(name=_shm_name("res_graph_regret_rank", self.worker_id), create=False)
         self.res_graph_regret_rank = np.ndarray((1,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf)
+        self.res_graph_regret_value_shm = SharedMemory(name=_shm_name("res_graph_regret_value", self.worker_id), create=False)
+        self.res_graph_regret_value = np.ndarray((1,), dtype=np.float32, buffer=self.res_graph_regret_value_shm.buf)
 
     def close(self):
         """Close and unlink all shared memory segments."""
@@ -687,6 +713,7 @@ class WorkerSlots:
             "res_policy_shm",
             "res_value_shm",
             "res_regret_rank_shm",
+            "res_regret_value_shm",
             "req_candidate_count_shm",
             "req_candidate_indices_shm",
             "req_candidate_features_shm",
@@ -718,6 +745,7 @@ class WorkerSlots:
             "res_graph_pair_logits_shm",
             "res_graph_pair_second_logits_shm",
             "res_graph_regret_rank_shm",
+            "res_graph_regret_value_shm",
         ):
             shm = getattr(self, attr, None)
             if shm is not None:

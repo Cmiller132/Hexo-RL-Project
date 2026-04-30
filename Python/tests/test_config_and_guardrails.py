@@ -547,6 +547,7 @@ def test_sparse_prior_stage_requires_sparse_policy_contract():
 def test_rgsc_selfplay_config_bounds():
     cfg = Config.model_validate(
         {
+            "model": {"heads": ["policy", "value", "regret_rank", "regret_value"]},
             "selfplay": {
                 "rgsc_beta": 0.75,
                 "rgsc_prb_capacity": 8,
@@ -565,3 +566,8 @@ def test_rgsc_selfplay_config_bounds():
         Config.model_validate({"selfplay": {"rgsc_prb_temperature": 0.0}})
     with pytest.raises(ValueError, match="rgsc_prb_ema_alpha"):
         Config.model_validate({"selfplay": {"rgsc_prb_ema_alpha": -0.1}})
+
+
+def test_rgsc_beta_requires_active_regret_heads():
+    with pytest.raises(ValueError, match="rgsc_beta"):
+        Config.model_validate({"selfplay": {"rgsc_beta": 0.5}})

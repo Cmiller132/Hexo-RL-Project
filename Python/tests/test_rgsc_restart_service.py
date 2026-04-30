@@ -5,7 +5,7 @@ import pytest
 
 from hexorl.selfplay.records import GameRecord, PositionRecord
 from hexorl.selfplay.regret_buffer import PrioritizedRegretBuffer
-from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history, restore_game_from_history
+from hexorl.selfplay.rgsc import RGSCCandidate, RGSCRestartService, encode_move_history, restore_game_from_history
 
 
 def _move(player: int, q: int, r: int) -> bytes:
@@ -104,6 +104,28 @@ def test_prb_ema_update_after_restart_game():
     assert entries[0].refresh_count == 1
     assert entries[0].observed_regret == pytest.approx(4.0)
     assert service.metrics["rgsc_prb_refreshes"] == pytest.approx(1.0)
+    assert len(entries) == 1
+
+
+def test_non_restart_game_inserts_highest_ranked_candidate():
+    service = RGSCRestartService(beta=1.0, capacity=4, seed=19, enabled=True)
+    low_rank = _move(0, 0, 0)
+    high_rank = _move(0, 0, 0) + _move(1, 1, 0)
+    record = GameRecord(outcome=1.0, game_id=3)
+    record.rgsc_ranked_candidates = [
+        RGSCCandidate(low_rank, rank_score=10.0, regret=4.0, game_id=3, source="trajectory_ranked_regret"),
+        RGSCCandidate(high_rank, rank_score=20.0, regret=1.0, game_id=3, source="mcts_tree_node_regret_value_estimate"),
+    ]
+
+    assert service.observe_game(record)
+
+    entries = service.prb.get_entries()
+    assert len(entries) == 1
+    assert entries[0].move_history == high_rank
+    assert entries[0].regret == pytest.approx(1.0)
+    assert entries[0].rank_score == pytest.approx(20.0)
+    assert entries[0].source == "mcts_tree_node_regret_value_estimate"
+    assert service.metrics["rgsc_tree_node_insertions"] == pytest.approx(1.0)
 
 
 def test_rgsc_tree_node_states_can_enter_prb():
@@ -137,11 +159,11 @@ def test_rgsc_tree_node_source_is_persisted_honestly():
     assert service.prb.get_entries()[0].source == "mcts_tree_node_depth_heuristic"
 
 
-def test_prb_sampling_uses_rank_score_not_ema_regret():
+def test_prb_sampling_uses_ema_regret_not_rank_score():
     prb = PrioritizedRegretBuffer(capacity=4, sampling_temperature=0.5)
-    low_rank = _move(0, 0, 0)
+    high_regret = _move(0, 0, 0)
     high_rank = _move(0, 0, 0) + _move(1, 1, 0)
-    assert prb.add(low_rank, regret=100.0, rank_score=1.0)
+    assert prb.add(high_regret, regret=100.0, rank_score=1.0)
     assert prb.add(high_rank, regret=1.0, rank_score=100.0)
 
     sampled = [
@@ -149,7 +171,7 @@ def test_prb_sampling_uses_rank_score_not_ema_regret():
         for seed in range(10)
     ]
 
-    assert sampled.count(high_rank) >= 9
+    assert sampled.count(high_regret) >= 9
 
 
 def test_prb_eviction_prefers_lower_ema_regret_then_oldest_sampled():

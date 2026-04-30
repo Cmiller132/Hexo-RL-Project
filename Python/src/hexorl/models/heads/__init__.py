@@ -5,7 +5,7 @@ from hexorl.models.heads.policy import DENSE_POLICY_HEADS, GLOBAL_PLACE_HEAD, Po
 from hexorl.models.heads.regret import REGRET_HEADS, RegretRankHead
 from hexorl.models.heads.sparse_policy import GRAPH_HYBRID_POLICY_HEADS, SPARSE_POLICY_HEAD, SparsePolicyHead
 from hexorl.models.heads.tactical import AuxPolicyHead, AxisHead, AxisMapHead, GLOBAL_GRAPH_OUTPUT_HEADS, MovesLeftHead
-from hexorl.models.heads.value import VALUE_HEAD, ValueBinnedHead, bins_to_value, value_to_bins
+from hexorl.models.heads.value import VALUE_HEAD, ValueBinnedHead, bins_to_scalar, bins_to_value, value_to_bins
 
 __all__ = [
     "AuxPolicyHead",
@@ -26,6 +26,7 @@ __all__ = [
     "SparsePolicyHead",
     "VALUE_HEAD",
     "ValueBinnedHead",
+    "bins_to_scalar",
     "bins_to_value",
     "value_to_bins",
 ]

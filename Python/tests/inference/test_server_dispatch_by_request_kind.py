@@ -1,7 +1,7 @@
 import numpy as np
 
 from hexorl.inference.protocol import InferenceRequestKind, REQUEST_KIND_TO_CODE
-from hexorl.inference.server import InferenceServer
+from hexorl.inference.server.scheduler import InferenceScheduler
 
 
 class _Queue:
@@ -17,8 +17,8 @@ class _Queue:
 
 
 def test_server_dispatches_graph_path_by_request_kind_not_architecture_string():
-    server = object.__new__(InferenceServer)
-    server._queue = _Queue(REQUEST_KIND_TO_CODE[InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE])
-    assert server._is_graph_request([0]) is True
-    server._queue = _Queue(REQUEST_KIND_TO_CODE[InferenceRequestKind.DENSE_POLICY_VALUE])
-    assert server._is_graph_request([0]) is False
+    scheduler = object.__new__(InferenceScheduler)
+    scheduler.queue = _Queue(REQUEST_KIND_TO_CODE[InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE])
+    assert scheduler.is_graph_request([0]) is True
+    scheduler.queue = _Queue(REQUEST_KIND_TO_CODE[InferenceRequestKind.DENSE_POLICY_VALUE])
+    assert scheduler.is_graph_request([0]) is False
