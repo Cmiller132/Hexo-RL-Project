@@ -1114,11 +1114,12 @@ impl PyMCTSEngine {
             .into_iter()
             .map(|(oq, or_, legal, history)| {
                 let legal_buf = protocol::encode_legal_rows(&legal);
+                let history_buf = protocol::encode_compact_history_rows(&history);
                 (
                     oq,
                     or_,
                     PyBytes::new(py, &legal_buf),
-                    PyBytes::new(py, &history),
+                    PyBytes::new(py, &history_buf),
                 )
             })
             .collect()

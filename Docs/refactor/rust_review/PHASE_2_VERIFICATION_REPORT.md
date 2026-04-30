@@ -46,7 +46,7 @@ older convenience wrappers that still panic on misuse in direct Rust tests.
 - `extract_tree_node_states` cleanup now uses edge-depth from the current root,
   avoiding off-by-one unplace cleanup on error paths.
 - single-placement root and inner search turn generation now applies
-  `turn_satisfies_status`, so must-block/winning constraints are not bypassed
+  `turn_satisfies_tactical`, so must-block/winning constraints are not bypassed
   when `placements_remaining() == 1`.
 - Python MCTS root expansion validates `legal_bytes` and tensor offsets against
   the latest `init_root`.
@@ -104,7 +104,7 @@ Continuation verification:
 - `cargo test -p hexgame-cli --release` passed.
 - `cargo test -p hexgame-bench --release` passed.
 - `cargo bench -p hexgame-bench --bench threats -- --warm-up-time 1 --measurement-time 2`
-  passed; `threat_status` measured about 5.8 microseconds on the local machine.
+  passed; `tactical_status` measured about 5.8 microseconds on the local machine.
 - `cargo bench -p hexgame-bench --bench mcts -- --warm-up-time 1 --measurement-time 2`
   passed; `single_mcts_full_sim` measured about 0.50 milliseconds on the local
   machine.
@@ -154,7 +154,7 @@ Deep verification:
 | H5 | Fixed | Root and batch generation tokens are implemented in Rust and Python. Stale root and stale batch responses return errors. |
 | H6 | Fixed for tactical correctness | Tactical status no longer depends on bounded eval-grid hot windows; far-grid 4/5/6 fixtures cover sparse full-board tactical detection. Eval scoring itself remains a bounded incremental heuristic. |
 | H7 | Fixed for engine tactical filtering | The tactical scanner now independently scans sparse full-board windows touching stones rather than depending on `CandidateSet`, `EvalState`, `live_cells`, or hot windows. |
-| H8 | Resolved by split semantics | `TacticalStatus` carries complete masks/turn sets. Legacy `ThreatStatus` remains compatibility/sufficient-move oriented and is derived from `TacticalStatus`. |
+| H8 | Fixed | `TacticalStatus` carries complete masks/turn sets and the legacy `ThreatStatus` compatibility model has been removed from active core code. |
 | H9 | Fixed | single-placement filtering is fixed and mandatory tactical turns bypass normal candidate/pair caps for search and masking paths. |
 | H10 | Partially verified | Release-mode fast tests pass; full ignored oracle suite is now a deep gate. Counts/hot-window full recompute coverage should be expanded. |
 
@@ -237,10 +237,11 @@ Confirmed fixed:
 
 Accepted current behavior:
 
-- Legacy `ThreatStatus::WinningTurn` returns one sufficient winning turn for
-  compatibility.
-- `Unblockable` makes `turn_satisfies_status` unconstrained for search-pruning
-  semantics.
+- `TacticalStatus::WinningTurns` is the source of truth for tactical masks,
+  diagnostics, and search filtering.
+- `Unblockable` makes `turn_satisfies_tactical` unconstrained because the branch
+  is already tactically lost; callers that need labels should preserve the
+  `Unblockable` status itself rather than treating the predicate as a mask.
 
 Still open:
 

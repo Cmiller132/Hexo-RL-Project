@@ -10,11 +10,11 @@
 //! 1. **Instant-win detection** — at every node, check if the current player
 //!    can win immediately (`find_instant_win`). If yes, return the winning
 //!    score without expanding children.
-//! 2. **Unblockable-loss pruning** — if `threat_status` reports `Unblockable`,
+//! 2. **Unblockable-loss pruning** — if `tactical_status` reports `Unblockable`,
 //!    the opponent has disjoint threats we cannot stop; return a large
 //!    negative score immediately.
 //! 3. **Threat-filtered move generation** — `generate_root_turns` and
-//!    `generate_inner_turns` compute `threat_status` **once per node**, then
+//!    `generate_inner_turns` compute `tactical_status` **once per node**, then
 //!    retain only turns that satisfy the blocking constraint.  This often
 //!    reduces the branching factor from hundreds to a handful.
 //! 4. **Reverse futility pruning** — at shallow depth (`depth <= 2`), if the

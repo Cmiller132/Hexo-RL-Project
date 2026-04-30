@@ -6,8 +6,8 @@
 //!
 //! ## What is tested
 //!
-//! 1. **`threat_status_matches_oracle`** — For every random position, the
-//!    [`ThreatStatus`](crate::threats::ThreatStatus) returned by the fast path
+//! 1. **`tactical_status_matches_oracle`** — For every random position, the
+//!    [`TacticalStatus`](crate::threats::TacticalStatus) returned by the fast path
 //!    must agree with the oracle on winning turns, blocking singles/pairs, and
 //!    unblockable positions.
 //! 2. **`turn_satisfies_threats_matches_oracle`** — Every legal turn must be
@@ -30,7 +30,7 @@
 use crate::board::HexGameState;
 use crate::core::Turn;
 use crate::tests::oracle::{analyse, TurnAnalysis};
-use crate::threats::{live_cells, threat_status, turn_satisfies_status, ThreatStatus};
+use crate::threats::{live_cells, tactical_status, turn_satisfies_tactical, TacticalStatus};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ impl Prng {
 // Comparison helper: fast path vs oracle
 // ---------------------------------------------------------------------------
 
-/// Assert that a [`ThreatStatus`](crate::threats::ThreatStatus) from the fast
+/// Assert that a [`TacticalStatus`](crate::threats::TacticalStatus) from the fast
 /// path matches a [`TurnAnalysis`] from the brute-force oracle.
 ///
 /// # Bidirectional checks
@@ -81,28 +81,31 @@ impl Prng {
 /// The oracle is treated as ground truth. For every category the helper
 /// checks **both** directions:
 ///
-/// - **Winning turns:** if the fast path says the position is a
-///   `WinningTurn`, that exact turn must be in the oracle's winning set;
+/// - **Winning turns:** if the fast path says the position has
+///   `WinningTurns`, each reported turn must be in the oracle's winning set;
 ///   conversely, if the oracle finds any winning turn, the fast path must
-///   report `WinningTurn`.
+///   report `WinningTurns`.
 /// - **Blocking singles** (one placement remaining): the fast path's
 ///   `MustBlock.cells` set must equal the oracle's `blocking_single` set.
 /// - **Blocking pairs** (two placements remaining): every oracle blocking
 ///   pair must satisfy the fast-path constraint, and every fast-path pair
 ///   must appear in the oracle.
-fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameState) {
+fn assert_matches(fast: &TacticalStatus, oracle: &TurnAnalysis, game: &HexGameState) {
     let remaining = game.placements_remaining();
     let opp = 1 - game.current_player();
     let opp_has_threats = player_has_tactical_threats(game, opp);
 
     // 1. Winning turn handling — bidirectional
     match fast {
-        ThreatStatus::WinningTurn(t) => {
-            assert!(
-                oracle.winning.contains(t),
-                "fast said winning {:?} but oracle disagrees",
-                t
-            );
+        TacticalStatus::WinningTurns(turns) => {
+            assert!(!turns.is_empty(), "WinningTurns must not be empty");
+            for turn in turns {
+                assert!(
+                    oracle.winning.contains(turn),
+                    "fast said winning {:?} but oracle disagrees",
+                    turn
+                );
+            }
             // Blocking moves are irrelevant when the current player can win.
             return;
         }
@@ -126,7 +129,7 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
 
         if has_blocking {
             match fast {
-                ThreatStatus::MustBlock(b) => {
+                TacticalStatus::MustBlock(b) => {
                     if remaining == 1 {
                         // Bidirectional: oracle blocking singles == fast blocking cells
                         for &cell in &oracle.blocking_single {
@@ -147,7 +150,7 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
                         // Oracle blocking pairs must be accepted by fast path.
                         for turn in &oracle.blocking_pairs {
                             assert!(
-                                turn_satisfies_status(fast, *turn),
+                                turn_satisfies_tactical(fast, *turn),
                                 "oracle blocking pair {:?} not accepted by fast path",
                                 turn
                             );
@@ -163,7 +166,7 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
                         }
                     }
                 }
-                ThreatStatus::Unblockable => {
+                TacticalStatus::Unblockable => {
                     if remaining == 1 {
                         assert!(
                             oracle.blocking_single.is_empty(),
@@ -176,17 +179,17 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
                         );
                     }
                 }
-                ThreatStatus::Quiet => {
+                TacticalStatus::Quiet => {
                     panic!(
                         "expected MustBlock or Unblockable when opponent has threats, got Quiet"
                     );
                 }
-                ThreatStatus::WinningTurn(_) => unreachable!(), // handled above
+                TacticalStatus::WinningTurns(_) => unreachable!(), // handled above
             }
         } else {
             // Opponent has threats but no blocking moves exist → Unblockable.
             match fast {
-                ThreatStatus::Unblockable => {}
+                TacticalStatus::Unblockable => {}
                 _ => panic!(
                     "expected Unblockable when opponent has threats but no blocking moves exist, got {:?}",
                     fast
@@ -196,7 +199,7 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
     } else {
         // No opponent threats. Fast path should be Quiet.
         match fast {
-            ThreatStatus::Quiet => {}
+            TacticalStatus::Quiet => {}
             _ => panic!(
                 "expected Quiet when opponent has no threats, got {:?}",
                 fast
@@ -218,7 +221,7 @@ fn player_has_tactical_threats(game: &HexGameState, player: u8) -> bool {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 500, ..ProptestConfig::default() })]
 
-    /// Play a compact deterministic random game and verify `threat_status`
+    /// Play a compact deterministic random game and verify `tactical_status`
     /// against the brute-force oracle after every completed turn.
     ///
     /// A random game of 1–40 moves is generated from the proptest seed.
@@ -226,7 +229,7 @@ proptest! {
     /// the oracle are run and compared with [`assert_matches`].
     #[test]
     #[ignore = "slow oracle: run with cargo test --release -- --ignored"]
-    fn threat_status_matches_oracle_random_positions(seed in any::<u64>()) {
+    fn tactical_status_matches_oracle_random_positions(seed in any::<u64>()) {
         let mut rng = Prng::new(seed);
         let mut game = HexGameState::new();
         let mut moves_played = 0;
@@ -244,7 +247,7 @@ proptest! {
             if turn_ended {
                 moves_played += 1;
                 if !game.is_over() {
-                    let fast = threat_status(&game);
+                    let fast = tactical_status(&game);
                     let oracle = analyse(&mut game.clone());
                     assert_matches(&fast, &oracle, &game);
                 }
@@ -279,7 +282,7 @@ proptest! {
             if turn_ended {
                 moves_played += 1;
                 if !game.is_over() {
-                    let fast = threat_status(&game);
+                    let fast = tactical_status(&game);
                     let oracle = analyse(&mut game.clone());
 
                     let opp = 1 - game.current_player();
@@ -306,34 +309,34 @@ proptest! {
                         }
                     }
 
-                    let status = threat_status(&game);
+                    let status = tactical_status(&game);
                     for turn in &oracle.legal {
-                        let satisfies = turn_satisfies_status(&status, *turn);
+                        let satisfies = turn_satisfies_tactical(&status, *turn);
                         let is_must_play = must_play.contains(turn);
 
                         if is_must_play {
                             // Fast path may only expose the first winning turn when
                             // several exist. Allow other winning turns through.
-                            if let ThreatStatus::WinningTurn(w) = &fast {
-                                if oracle.winning.contains(turn) && turn != w {
+                            if let TacticalStatus::WinningTurns(turns) = &fast {
+                                if oracle.winning.contains(turn) && !turns.contains(turn) {
                                     continue;
                                 }
                             }
                             assert!(
                                 satisfies,
-                                "turn {:?} is must-play but turn_satisfies_status returned false",
+                                "turn {:?} is must-play but turn_satisfies_tactical returned false",
                                 turn
                             );
                         } else {
                             match &fast {
-                                ThreatStatus::Quiet | ThreatStatus::Unblockable => {
+                                TacticalStatus::Quiet | TacticalStatus::Unblockable => {
                                     assert!(
                                         satisfies,
                                         "turn {:?} should satisfy when no constraint",
                                         turn
                                     );
                                 }
-                                ThreatStatus::WinningTurn(_) | ThreatStatus::MustBlock(_) => {
+                                TacticalStatus::WinningTurns(_) | TacticalStatus::MustBlock(_) => {
                                     assert!(
                                         !satisfies,
                                         "turn {:?} should not satisfy under constraint {:?}",
@@ -431,7 +434,7 @@ proptest! {
 
     #[test]
     #[ignore = "slow oracle: run with cargo test --release -- --ignored"]
-    fn threat_status_matches_oracle_random_positions_b(seed in any::<u64>()) {
+    fn tactical_status_matches_oracle_random_positions_b(seed in any::<u64>()) {
         let mut rng = Prng::new(seed.wrapping_add(0xFEDC_BA98_7654_3210));
         let mut game = HexGameState::new();
         let mut moves_played = 0;
@@ -448,7 +451,7 @@ proptest! {
             if turn_ended {
                 moves_played += 1;
                 if !game.is_over() {
-                    let fast = threat_status(&game);
+                    let fast = tactical_status(&game);
                     let oracle = analyse(&mut game.clone());
                     assert_matches(&fast, &oracle, &game);
                 }
@@ -475,7 +478,7 @@ proptest! {
             if turn_ended {
                 moves_played += 1;
                 if !game.is_over() {
-                    let fast = threat_status(&game);
+                    let fast = tactical_status(&game);
                     let oracle = analyse(&mut game.clone());
 
                     let opp = 1 - game.current_player();
@@ -496,32 +499,32 @@ proptest! {
                         }
                     }
 
-                    let status = threat_status(&game);
+                    let status = tactical_status(&game);
                     for turn in &oracle.legal {
-                        let satisfies = turn_satisfies_status(&status, *turn);
+                        let satisfies = turn_satisfies_tactical(&status, *turn);
                         let is_must_play = must_play.contains(turn);
 
                         if is_must_play {
-                            if let ThreatStatus::WinningTurn(w) = &fast {
-                                if oracle.winning.contains(turn) && turn != w {
+                            if let TacticalStatus::WinningTurns(turns) = &fast {
+                                if oracle.winning.contains(turn) && !turns.contains(turn) {
                                     continue;
                                 }
                             }
                             assert!(
                                 satisfies,
-                                "turn {:?} is must-play but turn_satisfies_status returned false",
+                                "turn {:?} is must-play but turn_satisfies_tactical returned false",
                                 turn
                             );
                         } else {
                             match &fast {
-                                ThreatStatus::Quiet | ThreatStatus::Unblockable => {
+                                TacticalStatus::Quiet | TacticalStatus::Unblockable => {
                                     assert!(
                                         satisfies,
                                         "turn {:?} should satisfy when no constraint",
                                         turn
                                     );
                                 }
-                                ThreatStatus::WinningTurn(_) | ThreatStatus::MustBlock(_) => {
+                                TacticalStatus::WinningTurns(_) | TacticalStatus::MustBlock(_) => {
                                     assert!(
                                         !satisfies,
                                         "turn {:?} should not satisfy under constraint {:?}",
@@ -604,7 +607,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 10, ..ProptestConfig::default() })]
 
     #[test]
-    fn threat_status_matches_oracle_smoke(seed in any::<u64>()) {
+    fn tactical_status_matches_oracle_smoke(seed in any::<u64>()) {
         let mut rng = Prng::new(seed);
         let mut game = HexGameState::new();
         let mut moves_played = 0;
@@ -622,7 +625,7 @@ proptest! {
             if turn_ended {
                 moves_played += 1;
                 if !game.is_over() {
-                    let fast = threat_status(&game);
+                    let fast = tactical_status(&game);
                     let oracle = analyse(&mut game.clone());
                     assert_matches(&fast, &oracle, &game);
                 }
@@ -648,7 +651,7 @@ proptest! {
             if turn_ended {
                 moves_played += 1;
                 if !game.is_over() {
-                    let fast = threat_status(&game);
+                    let fast = tactical_status(&game);
                     let oracle = analyse(&mut game.clone());
 
                     let opp = 1 - game.current_player();
@@ -669,32 +672,32 @@ proptest! {
                         }
                     }
 
-                    let status = threat_status(&game);
+                    let status = tactical_status(&game);
                     for turn in &oracle.legal {
-                        let satisfies = turn_satisfies_status(&status, *turn);
+                        let satisfies = turn_satisfies_tactical(&status, *turn);
                         let is_must_play = must_play.contains(turn);
 
                         if is_must_play {
-                            if let ThreatStatus::WinningTurn(w) = &fast {
-                                if oracle.winning.contains(turn) && turn != w {
+                            if let TacticalStatus::WinningTurns(turns) = &fast {
+                                if oracle.winning.contains(turn) && !turns.contains(turn) {
                                     continue;
                                 }
                             }
                             assert!(
                                 satisfies,
-                                "turn {:?} is must-play but turn_satisfies_status returned false",
+                                "turn {:?} is must-play but turn_satisfies_tactical returned false",
                                 turn
                             );
                         } else {
                             match &fast {
-                                ThreatStatus::Quiet | ThreatStatus::Unblockable => {
+                                TacticalStatus::Quiet | TacticalStatus::Unblockable => {
                                     assert!(
                                         satisfies,
                                         "turn {:?} should satisfy when no constraint",
                                         turn
                                     );
                                 }
-                                ThreatStatus::WinningTurn(_) | ThreatStatus::MustBlock(_) => {
+                                TacticalStatus::WinningTurns(_) | TacticalStatus::MustBlock(_) => {
                                     assert!(
                                         !satisfies,
                                         "turn {:?} should not satisfy under constraint {:?}",
@@ -776,7 +779,7 @@ proptest! {
 #![proptest_config(ProptestConfig { cases: 25, ..ProptestConfig::default() })]
 
 #[test]
-fn threat_status_matches_oracle_medium(seed in any::<u64>()) {
+fn tactical_status_matches_oracle_medium(seed in any::<u64>()) {
     let mut rng = Prng::new(seed);
     let mut game = HexGameState::new();
     let mut moves_played = 0;
@@ -793,7 +796,7 @@ fn threat_status_matches_oracle_medium(seed in any::<u64>()) {
         if turn_ended {
             moves_played += 1;
             if !game.is_over() {
-                let fast = threat_status(&game);
+                let fast = tactical_status(&game);
                 let oracle = analyse(&mut game.clone());
                 assert_matches(&fast, &oracle, &game);
             }
@@ -859,7 +862,7 @@ fn live_cells_matches_oracle_medium(seed in any::<u64>()) {
 }
 
 #[test]
-fn turn_satisfies_status_matches_oracle_medium(seed in any::<u64>()) {
+fn turn_satisfies_tactical_matches_oracle_medium(seed in any::<u64>()) {
     let mut rng = Prng::new(seed);
     let mut game = HexGameState::new();
     let mut moves_played = 0;
@@ -876,7 +879,7 @@ fn turn_satisfies_status_matches_oracle_medium(seed in any::<u64>()) {
         if turn_ended {
             moves_played += 1;
             if !game.is_over() {
-                let fast = threat_status(&game);
+                let fast = tactical_status(&game);
                 let oracle = analyse(&mut game.clone());
 
                 let opp = 1 - game.current_player();
@@ -897,32 +900,32 @@ fn turn_satisfies_status_matches_oracle_medium(seed in any::<u64>()) {
                     }
                 }
 
-                let status = threat_status(&game);
+                let status = tactical_status(&game);
                 for turn in &oracle.legal {
-                    let satisfies = turn_satisfies_status(&status, *turn);
+                    let satisfies = turn_satisfies_tactical(&status, *turn);
                     let is_must_play = must_play.contains(turn);
 
                     if is_must_play {
-                        if let ThreatStatus::WinningTurn(w) = &fast {
-                            if oracle.winning.contains(turn) && turn != w {
-                                continue;
+                        if let TacticalStatus::WinningTurns(turns) = &fast {
+                                if oracle.winning.contains(turn) && !turns.contains(turn) {
+                                    continue;
+                                }
                             }
-                        }
                         assert!(
                             satisfies,
-                            "turn {:?} is must-play but turn_satisfies_status returned false",
+                            "turn {:?} is must-play but turn_satisfies_tactical returned false",
                             turn
                         );
                     } else {
                         match &fast {
-                            ThreatStatus::Quiet | ThreatStatus::Unblockable => {
+                            TacticalStatus::Quiet | TacticalStatus::Unblockable => {
                                 assert!(
                                     satisfies,
                                     "turn {:?} should satisfy when no constraint",
                                     turn
                                 );
                             }
-                            ThreatStatus::WinningTurn(_) | ThreatStatus::MustBlock(_) => {
+                            TacticalStatus::WinningTurns(_) | TacticalStatus::MustBlock(_) => {
                                 assert!(
                                     !satisfies,
                                     "turn {:?} should not satisfy under constraint {:?}",

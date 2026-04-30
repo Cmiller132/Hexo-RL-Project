@@ -29,20 +29,6 @@ use crate::core::{Hex, Turn, WindowKey, HEX_DIRECTIONS, WIN_LENGTH};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
-// -------------------------------------------------------------------------
-// Test-only compact compatibility status
-// -------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-#[cfg(test)]
-pub(crate) enum ThreatStatus {
-    Quiet,
-    WinningTurn(Turn),
-    MustBlock(BlockConstraint),
-    Unblockable,
-}
-
 /// Complete tactical classification for filtering and training masks.
 ///
 /// This representation keeps every immediate winning continuation. Search
@@ -285,32 +271,6 @@ pub fn tactical_status(game: &HexGameState) -> TacticalStatus {
     match block_constraint_from_windows(&opp_windows, remaining) {
         Some(block) => TacticalStatus::MustBlock(block),
         None => TacticalStatus::Unblockable,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn threat_status(game: &HexGameState) -> ThreatStatus {
-    match tactical_status(game) {
-        TacticalStatus::Quiet => ThreatStatus::Quiet,
-        TacticalStatus::WinningTurns(turns) => ThreatStatus::WinningTurn(turns[0]),
-        TacticalStatus::MustBlock(block) => ThreatStatus::MustBlock(block),
-        TacticalStatus::Unblockable => ThreatStatus::Unblockable,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
-    match status {
-        // Quiet positions impose no restrictions.
-        ThreatStatus::Quiet => true,
-
-        // WinningTurn: the only legal move is the exact winning turn.
-        ThreatStatus::WinningTurn(w) => turn == *w,
-
-        ThreatStatus::MustBlock(bc) => block_constraint_satisfied(bc, turn),
-
-        // Unblockable means the threat filter does not constrain moves.
-        ThreatStatus::Unblockable => true,
     }
 }
 

@@ -8,7 +8,7 @@
 //!
 //! ## Why brute-force?
 //!
-//! The fast path ([`threat_status`](crate::threats::threat_status)) uses
+//! The fast path ([`tactical_status`](crate::threats::tactical_status)) uses
 //! incremental pattern counts and carefully pruned logic to classify positions
 //! in microseconds. The oracle does none of that optimization — it simply tries
 //! every move. Because the two implementations share almost no code, any

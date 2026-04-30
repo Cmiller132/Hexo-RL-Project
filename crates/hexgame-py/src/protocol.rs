@@ -39,20 +39,6 @@ where
     out
 }
 
-#[allow(dead_code)]
-pub(crate) fn decode_board_piece_rows(board_bytes: &[u8]) -> PyResult<Vec<(i32, i32, u8)>> {
-    validate_row_bytes("board_bytes", board_bytes, BOARD_PIECE_ROW_BYTES)?;
-    let mut rows = Vec::with_capacity(board_bytes.len() / BOARD_PIECE_ROW_BYTES);
-    for chunk in board_bytes.chunks_exact(BOARD_PIECE_ROW_BYTES) {
-        let player = read_i32(chunk, 8);
-        let player = u8::try_from(player).map_err(|_| {
-            PyValueError::new_err(format!("board player {player} is outside u8 range"))
-        })?;
-        rows.push((read_i32(chunk, 0), read_i32(chunk, 4), player));
-    }
-    Ok(rows)
-}
-
 pub(crate) fn encode_compact_history_rows(history: &[MoveRecord]) -> Vec<u8> {
     let mut out = Vec::with_capacity(history.len() * COMPACT_HISTORY_ROW_BYTES);
     for record in history {

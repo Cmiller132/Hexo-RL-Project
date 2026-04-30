@@ -51,7 +51,7 @@ mod tests {
         let mut game = HexGameState::new();
         game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 1)
             .unwrap();
-        assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
+        assert!(matches!(tactical_status(&game), TacticalStatus::Quiet));
     }
 
     // ── Blocking single placement ─────────────────────────────────────────
@@ -75,8 +75,8 @@ mod tests {
         )
         .unwrap();
 
-        match threat_status(&game) {
-            ThreatStatus::MustBlock(b) => {
+        match tactical_status(&game) {
+            TacticalStatus::MustBlock(b) => {
                 assert_eq!(b.cells().len(), 1);
                 assert_eq!(b.cells()[0], Hex::new(7, 0));
                 assert!(b.pairs().is_empty());
@@ -94,8 +94,8 @@ mod tests {
         game.set_position(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 0, 2)
             .unwrap();
 
-        match threat_status(&game) {
-            ThreatStatus::MustBlock(b) => {
+        match tactical_status(&game) {
+            TacticalStatus::MustBlock(b) => {
                 // Valid covering pairs for the three hot windows.
                 assert!(b.pairs().contains(&(Hex::new(-2, 0), Hex::new(4, 0))));
                 assert!(b.pairs().contains(&(Hex::new(-1, 0), Hex::new(4, 0))));
@@ -133,7 +133,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(threat_status(&game), ThreatStatus::Unblockable));
+        assert!(matches!(
+            tactical_status(&game),
+            TacticalStatus::Unblockable
+        ));
     }
 
     #[test]
@@ -158,7 +161,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(threat_status(&game), ThreatStatus::Unblockable));
+        assert!(matches!(
+            tactical_status(&game),
+            TacticalStatus::Unblockable
+        ));
     }
 
     #[test]
@@ -180,18 +186,18 @@ mod tests {
         )
         .unwrap();
 
-        match threat_status(&game) {
-            ThreatStatus::MustBlock(b) => {
+        match tactical_status(&game) {
+            TacticalStatus::MustBlock(b) => {
                 assert!(b.cells().contains(&Hex::new(7, 0)));
             }
             other => panic!("expected MustBlock, got {:?}", other),
         }
     }
 
-    // ── turn_satisfies_status ────────────────────────────────────────────
+    // ── turn_satisfies_tactical ────────────────────────────────────────────
 
     #[test]
-    fn turn_satisfies_status_own_win() {
+    fn turn_satisfies_tactical_own_win() {
         let mut game = HexGameState::new();
         game.set_position(
             &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
@@ -200,21 +206,21 @@ mod tests {
         )
         .unwrap();
 
-        let status = threat_status(&game);
+        let status = tactical_status(&game);
         let winning = match status {
-            ThreatStatus::WinningTurn(t) => t,
-            _ => panic!("expected winning turn"),
+            TacticalStatus::WinningTurns(ref turns) => turns[0],
+            _ => panic!("expected winning turns"),
         };
 
-        assert!(turn_satisfies_status(&status, winning));
-        assert!(!turn_satisfies_status(
+        assert!(turn_satisfies_tactical(&status, winning));
+        assert!(!turn_satisfies_tactical(
             &status,
             Turn::single(Hex::new(100, 0))
         ));
     }
 
     #[test]
-    fn turn_satisfies_status_must_block_single() {
+    fn turn_satisfies_tactical_must_block_single() {
         let mut game = HexGameState::new();
         game.set_position(
             &[
@@ -230,55 +236,58 @@ mod tests {
         )
         .unwrap();
 
-        let status = threat_status(&game);
-        assert!(turn_satisfies_status(&status, Turn::single(Hex::new(7, 0))));
-        assert!(!turn_satisfies_status(
+        let status = tactical_status(&game);
+        assert!(turn_satisfies_tactical(
+            &status,
+            Turn::single(Hex::new(7, 0))
+        ));
+        assert!(!turn_satisfies_tactical(
             &status,
             Turn::single(Hex::new(2, 0))
         ));
     }
 
     #[test]
-    fn turn_satisfies_status_must_block_pair() {
+    fn turn_satisfies_tactical_must_block_pair() {
         let mut game = HexGameState::new();
         game.set_position(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 0, 2)
             .unwrap();
 
-        let status = threat_status(&game);
+        let status = tactical_status(&game);
 
         // Valid blocking pairs
-        assert!(turn_satisfies_status(
+        assert!(turn_satisfies_tactical(
             &status,
             Turn::pair(Hex::new(-1, 0), Hex::new(4, 0))
         ));
-        assert!(turn_satisfies_status(
+        assert!(turn_satisfies_tactical(
             &status,
             Turn::pair(Hex::new(-1, 0), Hex::new(5, 0))
         ));
-        assert!(turn_satisfies_status(
+        assert!(turn_satisfies_tactical(
             &status,
             Turn::pair(Hex::new(-2, 0), Hex::new(4, 0))
         ));
 
         // Invalid pair
-        assert!(!turn_satisfies_status(
+        assert!(!turn_satisfies_tactical(
             &status,
             Turn::pair(Hex::new(-2, 0), Hex::new(5, 0))
         ));
 
         // Single placement cannot block all threats when 2 placements are required.
-        assert!(!turn_satisfies_status(
+        assert!(!turn_satisfies_tactical(
             &status,
             Turn::single(Hex::new(-1, 0))
         ));
-        assert!(!turn_satisfies_status(
+        assert!(!turn_satisfies_tactical(
             &status,
             Turn::single(Hex::new(100, 0))
         ));
     }
 
     #[test]
-    fn turn_satisfies_status_unblockable_returns_true() {
+    fn turn_satisfies_tactical_unblockable_returns_true() {
         let mut game = HexGameState::new();
         game.set_position(
             &[
@@ -298,10 +307,13 @@ mod tests {
         )
         .unwrap();
 
-        let status = threat_status(&game);
+        let status = tactical_status(&game);
         // Unblockable means the threat filter does not constrain moves.
-        assert!(turn_satisfies_status(&status, Turn::single(Hex::new(5, 0))));
-        assert!(turn_satisfies_status(
+        assert!(turn_satisfies_tactical(
+            &status,
+            Turn::single(Hex::new(5, 0))
+        ));
+        assert!(turn_satisfies_tactical(
             &status,
             Turn::single(Hex::new(100, 0))
         ));
@@ -387,7 +399,7 @@ mod tests {
             .unwrap();
 
         assert!(game.eval().hot_is_empty(0));
-        assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
+        assert!(matches!(tactical_status(&game), TacticalStatus::Quiet));
     }
 
     #[test]
@@ -408,9 +420,12 @@ mod tests {
         .unwrap();
 
         assert!(game.winner().is_some());
-        assert!(matches!(threat_status(&game), ThreatStatus::Quiet));
-        let status = threat_status(&game);
-        assert!(turn_satisfies_status(&status, Turn::single(Hex::new(0, 0))));
+        assert!(matches!(tactical_status(&game), TacticalStatus::Quiet));
+        let status = tactical_status(&game);
+        assert!(turn_satisfies_tactical(
+            &status,
+            Turn::single(Hex::new(0, 0))
+        ));
     }
 
     #[test]

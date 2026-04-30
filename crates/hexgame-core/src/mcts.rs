@@ -45,7 +45,7 @@
 //! (or parallel threads) from exploring the same branch simultaneously,
 //! improving diversity in the batch.
 
-use crate::board::HexGameState;
+use crate::board::{HexGameState, MoveRecord};
 use crate::core::Hex;
 use crate::encoder::{self, BOARD_AREA, BOARD_SIZE, TENSOR_SIZE};
 use smallvec::SmallVec;
@@ -219,8 +219,8 @@ struct PendingLeaf {
     offset_r: i32,
     /// Legal moves at this leaf position (needed for node expansion).
     legal_moves: Vec<Hex>,
-    /// Packed move history at this leaf as `(player, q, r)` little-endian i32 triples.
-    move_history: Vec<u8>,
+    /// Move history at this leaf.
+    move_history: Vec<MoveRecord>,
 }
 
 pub struct RootInit {
@@ -236,17 +236,6 @@ pub struct LeafBatch<'a> {
     pub non_terminal_count: u32,
     pub root_generation: u64,
     pub batch_generation: u64,
-}
-
-fn pack_move_history(game: &HexGameState) -> Vec<u8> {
-    let hist = game.move_history();
-    let mut buf = Vec::with_capacity(hist.len() * 12);
-    for rec in hist {
-        buf.extend_from_slice(&(rec.player() as i32).to_le_bytes());
-        buf.extend_from_slice(&rec.cell().q.to_le_bytes());
-        buf.extend_from_slice(&rec.cell().r.to_le_bytes());
-    }
-    buf
 }
 
 // ── Policy gathering ───────────────────────────────────────────────────
@@ -1437,7 +1426,7 @@ impl MCTSEngine {
                     offset_q: 0,
                     offset_r: 0,
                     legal_moves: Vec::new(),
-                    move_history: pack_move_history(&self.game),
+                    move_history: self.game.move_history().to_vec(),
                 });
             } else {
                 let start = non_terminal_count as usize * TENSOR_SIZE;
@@ -1466,7 +1455,7 @@ impl MCTSEngine {
                     offset_q: oq,
                     offset_r: or_,
                     legal_moves: self.legal_buf.clone(),
-                    move_history: pack_move_history(&self.game),
+                    move_history: self.game.move_history().to_vec(),
                 });
             }
 
@@ -1730,7 +1719,7 @@ impl MCTSEngine {
         Ok(())
     }
 
-    pub fn pending_leaf_metadata(&self) -> Vec<(i32, i32, Vec<Hex>, Vec<u8>)> {
+    pub fn pending_leaf_metadata(&self) -> Vec<(i32, i32, Vec<Hex>, Vec<MoveRecord>)> {
         self.pending
             .iter()
             .filter(|leaf| !leaf.is_terminal)

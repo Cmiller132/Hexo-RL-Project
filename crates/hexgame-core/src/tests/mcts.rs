@@ -161,7 +161,7 @@ mod tests {
         );
     }
 
-    /// Verify that the tokenized API returns Err on wrong-length batch.
+    /// Verify that the canonical MCTS API returns Err on wrong-length batch.
     #[test]
     fn mcts_expand_and_backprop_wrong_length_returns_err() {
         let game = HexGameState::new();
@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn mcts_tokenized_happy_path_runs_to_completion() {
+    fn mcts_canonical_happy_path_runs_to_completion() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 6, 50, 1.5, 2, false, 0.0, 0);
         let init = engine.init_root().expect("init_root").expect("root init");

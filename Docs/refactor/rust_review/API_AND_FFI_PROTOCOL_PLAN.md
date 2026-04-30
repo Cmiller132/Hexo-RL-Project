@@ -23,7 +23,9 @@ The crate root should not be a catch-all convenience namespace. New callers shou
 
 `ThreatStatus` is not part of the public API. The public tactical model is `tactics::TacticalStatus`, because it preserves all immediate winning turns rather than collapsing them to a single deterministic move. Legacy `ThreatStatus` language should not appear in public docs, README material, or root exports.
 
-Test-only compatibility helpers may remain private to the crate while older oracle tests are being converted. They are not a supported downstream contract and should not be referenced by user-facing API docs.
+The compatibility helpers have been removed rather than kept private. Oracle
+tests now exercise `TacticalStatus` directly, so there is no second tactical
+model inside the core crate.
 
 ## FFI Protocol Ownership
 
@@ -40,7 +42,7 @@ The FFI byte protocols are owned by `crates/hexgame-py/src/protocol.rs`. They sh
 | Protocol | Row layout | Owner |
 | --- | --- | --- |
 | Legal rows | `i32 q`, `i32 r` | `protocol::encode_legal_rows` / `decode_legal_rows` |
-| Board piece rows | `i32 q`, `i32 r`, `i32 player` | `protocol::encode_board_piece_rows` / `decode_board_piece_rows` |
+| Board piece rows | `i32 q`, `i32 r`, `i32 player` | `protocol::encode_board_piece_rows` |
 | Compact history rows | `i32 player`, `i32 q`, `i32 r` | `protocol::encode_compact_history_rows` / `decode_compact_history_rows` |
 | Pair rows | `i32 q1`, `i32 r1`, `i32 q2`, `i32 r2` ndarray view | `protocol::decode_pair_rows` |
 

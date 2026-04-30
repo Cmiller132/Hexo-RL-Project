@@ -329,8 +329,8 @@ Classifies the tactical situation, checks turn legality under threat constraints
 
 - **`BlockConstraint` is exact** — in the 2-placement case it enumerates covering pairs up front, rather than returning a permissive superset. This eliminates the need for callers to re-validate.
 - **`opponent_threat_windows`** returns a **flat representation**: `(SmallVec<[Hex; 32]>, SmallVec<[u8; 16]>)` — all empty cells concatenated plus per-window length markers. No per-window `SmallVec` clones.
-- `threat_status` returns `Quiet` immediately when `game.winner().is_some()` (no threats matter after game ends).
-- All hot-path data structures use `SmallVec` with inline capacity; no heap allocation in `threat_status`.
+- `tactical_status` returns `Quiet` immediately when `game.winner().is_some()` (no threats matter after game ends).
+- All hot-path data structures use `SmallVec` with inline capacity; no heap allocation in `tactical_status`.
 
 **Depends on:** `board`, `core`.
 
@@ -544,7 +544,7 @@ Exhaustive brute-force solver used as ground truth for property-based tests. Enu
 
 #### `src/tests/threats.rs` — Proptest: Fast Path vs Oracle
 
-Property-based tests comparing `threat_status`, `turn_satisfies_status`, and `live_cells` against the oracle on randomized game positions. Three test tiers:
+Property-based tests comparing `tactical_status`, `turn_satisfies_tactical`, and `live_cells` against the oracle on randomized game positions. Three test tiers:
 
 - **Heavy:** 500 cases, `#[ignore]` — run manually with `--ignored`.
 - **Medium:** 25 cases, NOT ignored — runs in CI.
@@ -673,9 +673,9 @@ One `analyse()` function serves as the single ground truth for all threat-relate
 | ---------------------------- | ----------------------------------------------------------------- | -------- |
 | `EvalState::place`           | 1 push to `delta_stack` (amortized no-alloc)                      | < 90 ns  |
 | `EvalState::unplace`         | Pop from stack                                                    | < 50 ns  |
-| `threat_status` (Quiet)      | 0                                                                 | < 20 ns  |
-| `threat_status` (full)       | 0 (SmallVec inline)                                               | < 1 µs   |
-| `turn_satisfies_status`      | 0                                                                 | < 50 ns  |
+| `tactical_status` (Quiet)    | 0                                                                 | < 20 ns  |
+| `tactical_status` (full)     | 0 (SmallVec inline)                                               | < 1 µs   |
+| `turn_satisfies_tactical`      | 0                                                                 | < 50 ns  |
 | `live_cells`                 | 0 (caller-owned Vec + local FxHashSet)                            | < 500 ns |
 | `hypothetical_score_delta`   | 0                                                                 | < 50 ns  |
 | `validate_move` radius check | 0 (O(1) FxHashMap lookup via `placement_candidates.contains()`)   | < 30 ns  |
