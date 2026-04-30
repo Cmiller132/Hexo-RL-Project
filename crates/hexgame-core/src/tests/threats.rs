@@ -93,8 +93,7 @@ impl Prng {
 fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameState) {
     let remaining = game.placements_remaining();
     let opp = 1 - game.current_player();
-    let opp_counts = game.eval().counts(opp);
-    let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+    let opp_has_threats = player_has_tactical_threats(game, opp);
 
     // 1. Winning turn handling — bidirectional
     match fast {
@@ -206,6 +205,12 @@ fn assert_matches(fast: &ThreatStatus, oracle: &TurnAnalysis, game: &HexGameStat
     }
 }
 
+fn player_has_tactical_threats(game: &HexGameState, player: u8) -> bool {
+    let mut cells = Vec::new();
+    live_cells(game, player, &mut cells);
+    !cells.is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // Property tests — first 500 cases
 // ---------------------------------------------------------------------------
@@ -278,8 +283,7 @@ proptest! {
                     let oracle = analyse(&mut game.clone());
 
                     let opp = 1 - game.current_player();
-                    let opp_counts = game.eval().counts(opp);
-                    let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+                    let opp_has_threats = player_has_tactical_threats(&game, opp);
 
                     // Build the set of turns that the oracle says are special.
                     // When the opponent has no real threats the oracle flags every
@@ -475,8 +479,7 @@ proptest! {
                     let oracle = analyse(&mut game.clone());
 
                     let opp = 1 - game.current_player();
-                    let opp_counts = game.eval().counts(opp);
-                    let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+                    let opp_has_threats = player_has_tactical_threats(&game, opp);
 
                     let mut must_play = std::collections::HashSet::new();
                     for turn in &oracle.winning {
@@ -649,8 +652,7 @@ proptest! {
                     let oracle = analyse(&mut game.clone());
 
                     let opp = 1 - game.current_player();
-                    let opp_counts = game.eval().counts(opp);
-                    let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+                    let opp_has_threats = player_has_tactical_threats(&game, opp);
 
                     let mut must_play = std::collections::HashSet::new();
                     for turn in &oracle.winning {
@@ -878,8 +880,7 @@ fn turn_satisfies_status_matches_oracle_medium(seed in any::<u64>()) {
                 let oracle = analyse(&mut game.clone());
 
                 let opp = 1 - game.current_player();
-                let opp_counts = game.eval().counts(opp);
-                let opp_has_threats = opp_counts.fours() > 0 || opp_counts.fives() > 0;
+                let opp_has_threats = player_has_tactical_threats(&game, opp);
 
                 let mut must_play = std::collections::HashSet::new();
                 for turn in &oracle.winning {

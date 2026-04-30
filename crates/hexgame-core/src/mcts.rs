@@ -55,7 +55,41 @@ use smallvec::SmallVec;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MCTSError {
     /// re_root was called with an action that is not a child of the current root.
-    ChildNotFound { q: i16, r: i16 },
+    ChildNotFound { q: i32, r: i32 },
+    /// A root expansion response was submitted for an older root/init state.
+    StaleRootToken { expected: u64, received: u64 },
+    /// A leaf batch response was submitted for an older selected batch.
+    StaleBatchToken { expected: u64, received: u64 },
+    /// A root operation was called in an invalid state.
+    InvalidRootState(&'static str),
+    /// A batch operation was called in an invalid state.
+    InvalidBatchState(&'static str),
+    /// A dense policy slice had the wrong flat length.
+    WrongPolicyLength { expected: usize, actual: usize },
+    /// A value slice had the wrong flat length.
+    WrongValueLength { expected: usize, actual: usize },
+    /// Sparse policy metadata did not match the selected non-terminal leaves.
+    WrongSparseMetadataLength {
+        expected: usize,
+        actions: usize,
+        logits: usize,
+        sources: Option<usize>,
+    },
+    /// A dense policy logit was NaN or infinite.
+    NonFinitePolicy { index: usize },
+    /// A value was NaN or infinite.
+    NonFiniteValue { index: usize },
+    /// Sparse policy metadata contained a NaN or infinite logit.
+    NonFiniteSparsePolicy { leaf: usize, index: usize },
+    /// Dirichlet noise was shorter than the current root child count.
+    WrongNoiseLength {
+        expected_at_least: usize,
+        actual: usize,
+    },
+    /// Dirichlet noise had invalid values or zero mass.
+    InvalidNoise(&'static str),
+    /// The tree contained an action that the game state rejected during traversal.
+    IllegalTreeAction { q: i32, r: i32, node_idx: u32 },
 }
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -113,7 +147,7 @@ pub(crate) struct MCTSNode {
     /// Arena index of the parent node. `NO_PARENT` for the root.
     parent: u32,
     /// The move `(q, r)` that led to this node, relative to board origin.
-    action: (i16, i16),
+    action: (i32, i32),
     /// Neural network policy prior for this node (probability of selecting
     /// the move that leads here, as assigned by the parent expansion).
     prior: f32,
@@ -137,7 +171,7 @@ pub(crate) struct MCTSNode {
 
 impl MCTSNode {
     /// Create a new unexpanded node.
-    fn new(parent: u32, action: (i16, i16), prior: f32) -> Self {
+    fn new(parent: u32, action: (i32, i32), prior: f32) -> Self {
         Self {
             parent,
             action,
@@ -186,6 +220,21 @@ struct PendingLeaf {
     legal_moves: Vec<Hex>,
     /// Packed move history at this leaf as `(player, q, r)` little-endian i32 triples.
     move_history: Vec<u8>,
+}
+
+pub struct RootInit {
+    pub tensor: Vec<f32>,
+    pub offset_q: i32,
+    pub offset_r: i32,
+    pub legal_moves: Vec<Hex>,
+    pub root_generation: u64,
+}
+
+pub struct LeafBatch<'a> {
+    pub tensors: &'a [f32],
+    pub non_terminal_count: u32,
+    pub root_generation: u64,
+    pub batch_generation: u64,
 }
 
 fn pack_move_history(game: &HexGameState) -> Vec<u8> {
@@ -253,6 +302,40 @@ fn summarize_sources(sources: &[u8]) -> (u32, u32, u32, u32, u32) {
 
 fn count_prior_source(sources: &[u8], wanted: u8) -> u32 {
     sources.iter().filter(|&&source| source == wanted).count() as u32
+}
+
+fn validate_policy_slice(policy_logits: &[f32], expected: usize) -> Result<(), MCTSError> {
+    if policy_logits.len() != expected {
+        return Err(MCTSError::WrongPolicyLength {
+            expected,
+            actual: policy_logits.len(),
+        });
+    }
+    if let Some(index) = policy_logits.iter().position(|value| !value.is_finite()) {
+        return Err(MCTSError::NonFinitePolicy { index });
+    }
+    Ok(())
+}
+
+fn validate_values(values: &[f32], expected: usize) -> Result<(), MCTSError> {
+    if values.len() != expected {
+        return Err(MCTSError::WrongValueLength {
+            expected,
+            actual: values.len(),
+        });
+    }
+    if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+        return Err(MCTSError::NonFiniteValue { index });
+    }
+    Ok(())
+}
+
+fn validate_root_value(value: f32) -> Result<(), MCTSError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(MCTSError::NonFiniteValue { index: 0 })
+    }
 }
 
 /// Gather policy logits for legal moves and normalize them with softmax.
@@ -497,6 +580,10 @@ pub struct MCTSEngine {
     scratch_sources: Vec<u8>,
     /// Prior-source labels for the current root children.
     root_prior_sources: Vec<u8>,
+    root_generation: u64,
+    batch_generation: u64,
+    last_root_init_generation: Option<u64>,
+    pending_batch_generation: Option<u64>,
     root_sparse_candidate_count: u32,
     root_pair_candidate_count: u32,
     leaf_sparse_candidate_count: u32,
@@ -512,7 +599,7 @@ pub struct MCTSEngine {
     seed: u64,
 }
 
-type TreeNodeStates = (Vec<f32>, Vec<Vec<(u8, i16, i16)>>, usize);
+type TreeNodeStates = (Vec<f32>, Vec<Vec<(u8, i32, i32)>>, usize);
 
 impl MCTSEngine {
     // ── Construction ───────────────────────────────────────────────────
@@ -581,6 +668,10 @@ impl MCTSEngine {
             scratch_priors: Vec::new(),
             scratch_sources: Vec::new(),
             root_prior_sources: Vec::new(),
+            root_generation: 0,
+            batch_generation: 0,
+            last_root_init_generation: None,
+            pending_batch_generation: None,
             root_sparse_candidate_count: 0,
             root_pair_candidate_count: 0,
             leaf_sparse_candidate_count: 0,
@@ -620,6 +711,30 @@ impl MCTSEngine {
         self.leaf_expansion_count += 1;
     }
 
+    fn validate_root_generation(&self, received: u64) -> Result<(), MCTSError> {
+        let Some(expected) = self.last_root_init_generation else {
+            return Err(MCTSError::InvalidRootState(
+                "root must be initialized before expansion",
+            ));
+        };
+        if received != expected || received != self.root_generation {
+            return Err(MCTSError::StaleRootToken { expected, received });
+        }
+        Ok(())
+    }
+
+    fn validate_batch_generation(&self, received: u64) -> Result<(), MCTSError> {
+        let Some(expected) = self.pending_batch_generation else {
+            return Err(MCTSError::InvalidBatchState(
+                "no selected leaf batch is pending backpropagation",
+            ));
+        };
+        if received != expected {
+            return Err(MCTSError::StaleBatchToken { expected, received });
+        }
+        Ok(())
+    }
+
     // ── Root initialization ────────────────────────────────────────────
 
     /// Encode the root board state and return tensor data for GPU evaluation.
@@ -629,8 +744,14 @@ impl MCTSEngine {
     /// flat `Vec<f32>` of length `TENSOR_SIZE` (13×33×33).  Returns `None` if
     /// the game is already over.
     pub fn init_root(&mut self) -> Option<(Vec<f32>, i32, i32, Vec<Hex>)> {
+        self.init_root_tokenized()
+            .expect("init_root failed")
+            .map(|init| (init.tensor, init.offset_q, init.offset_r, init.legal_moves))
+    }
+
+    pub fn init_root_tokenized(&mut self) -> Result<Option<RootInit>, MCTSError> {
         if self.game.is_over() {
-            return None;
+            return Ok(None);
         }
 
         // Allocate a local tensor buffer and encode directly into it.
@@ -645,7 +766,16 @@ impl MCTSEngine {
             &mut self.legal_buf,
         );
 
-        Some((tensor, oq, or_, self.legal_buf.clone()))
+        self.root_generation = self.root_generation.wrapping_add(1);
+        self.last_root_init_generation = Some(self.root_generation);
+
+        Ok(Some(RootInit {
+            tensor,
+            offset_q: oq,
+            offset_r: or_,
+            legal_moves: self.legal_buf.clone(),
+            root_generation: self.root_generation,
+        }))
     }
 
     /// Expand the root node with policy output from the GPU.
@@ -658,7 +788,35 @@ impl MCTSEngine {
     pub fn expand_root(
         &mut self,
         policy_logits: &[f32],
-        _value: f32,
+        value: f32,
+        offset_q: i32,
+        offset_r: i32,
+        legal: &[Hex],
+    ) {
+        validate_policy_slice(policy_logits, BOARD_AREA).expect("expand_root failed");
+        validate_root_value(value).expect("expand_root failed");
+        self.expand_root_impl(policy_logits, offset_q, offset_r, legal);
+    }
+
+    pub fn try_expand_root(
+        &mut self,
+        root_generation: u64,
+        policy_logits: &[f32],
+        value: f32,
+        offset_q: i32,
+        offset_r: i32,
+        legal: &[Hex],
+    ) -> Result<(), MCTSError> {
+        self.validate_root_generation(root_generation)?;
+        validate_policy_slice(policy_logits, BOARD_AREA)?;
+        validate_root_value(value)?;
+        self.expand_root_impl(policy_logits, offset_q, offset_r, legal);
+        Ok(())
+    }
+
+    fn expand_root_impl(
+        &mut self,
+        policy_logits: &[f32],
         offset_q: i32,
         offset_r: i32,
         legal: &[Hex],
@@ -683,7 +841,73 @@ impl MCTSEngine {
     pub fn expand_root_with_sparse_priors(
         &mut self,
         policy_logits: &[f32],
-        _value: f32,
+        value: f32,
+        offset_q: i32,
+        offset_r: i32,
+        legal: &[Hex],
+        sparse_actions: &[(i32, i32)],
+        sparse_logits: &[f32],
+        stage: u8,
+        sparse_mix: f32,
+    ) {
+        validate_policy_slice(policy_logits, BOARD_AREA)
+            .expect("expand_root_with_sparse_priors failed");
+        validate_root_value(value).expect("expand_root_with_sparse_priors failed");
+        if let Some(index) = sparse_logits.iter().position(|logit| !logit.is_finite()) {
+            panic!(
+                "expand_root_with_sparse_priors failed: {:?}",
+                MCTSError::NonFiniteSparsePolicy { leaf: 0, index }
+            );
+        }
+        self.expand_root_with_sparse_priors_impl(
+            policy_logits,
+            offset_q,
+            offset_r,
+            legal,
+            sparse_actions,
+            sparse_logits,
+            stage,
+            sparse_mix,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_expand_root_with_sparse_priors(
+        &mut self,
+        root_generation: u64,
+        policy_logits: &[f32],
+        value: f32,
+        offset_q: i32,
+        offset_r: i32,
+        legal: &[Hex],
+        sparse_actions: &[(i32, i32)],
+        sparse_logits: &[f32],
+        stage: u8,
+        sparse_mix: f32,
+    ) -> Result<(), MCTSError> {
+        self.validate_root_generation(root_generation)?;
+        validate_policy_slice(policy_logits, BOARD_AREA)?;
+        validate_root_value(value)?;
+        if let Some(index) = sparse_logits.iter().position(|logit| !logit.is_finite()) {
+            return Err(MCTSError::NonFiniteSparsePolicy { leaf: 0, index });
+        }
+        self.expand_root_with_sparse_priors_impl(
+            policy_logits,
+            offset_q,
+            offset_r,
+            legal,
+            sparse_actions,
+            sparse_logits,
+            stage,
+            sparse_mix,
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_root_with_sparse_priors_impl(
+        &mut self,
+        policy_logits: &[f32],
         offset_q: i32,
         offset_r: i32,
         legal: &[Hex],
@@ -772,6 +996,20 @@ impl MCTSEngine {
         Ok(())
     }
 
+    pub fn try_expand_root_with_global_priors(
+        &mut self,
+        root_generation: u64,
+        legal: &[Hex],
+        global_actions: &[(i32, i32)],
+        global_logits: &[f32],
+        value: f32,
+    ) -> Result<(), String> {
+        self.validate_root_generation(root_generation)
+            .map_err(|err| format!("{err:?}"))?;
+        validate_root_value(value).map_err(|err| format!("{err:?}"))?;
+        self.expand_root_with_global_priors(legal, global_actions, global_logits, value)
+    }
+
     /// Blend joint pair-action logits into root first-placement priors.
     ///
     /// `pair_actions` stores unordered pairs `(q1, r1, q2, r2)` keyed by
@@ -809,7 +1047,7 @@ impl MCTSEngine {
         let root_actions: Vec<(i32, i32)> = (0..count)
             .map(|idx| {
                 let child = &self.arena[start + idx];
-                (child.action.0 as i32, child.action.1 as i32)
+                (child.action.0, child.action.1)
             })
             .collect();
 
@@ -962,6 +1200,7 @@ impl MCTSEngine {
                 *source = PRIOR_SOURCE_PAIR;
             }
         }
+        self.root_pair_candidate_count = count as u32;
         Ok(())
     }
 
@@ -1011,7 +1250,7 @@ impl MCTSEngine {
         let root_actions: Vec<(i32, i32)> = (0..count)
             .map(|idx| {
                 let child = &self.arena[start + idx];
-                (child.action.0 as i32, child.action.1 as i32)
+                (child.action.0, child.action.1)
             })
             .collect();
 
@@ -1083,25 +1322,57 @@ impl MCTSEngine {
 
     /// Add Dirichlet noise to root priors for exploration.
     ///
-    /// `noise` must have at least as many elements as root children.
+    /// `noise` must have at least as many elements as root children.  Noise
+    /// values are normalized over the current root children before blending.
     /// `noise_fraction` controls the blend between original prior and noise
     /// (0.0 = no noise, 1.0 = pure noise).
-    pub fn add_dirichlet_noise(&mut self, noise: &[f32], noise_fraction: f32) {
+    pub fn add_dirichlet_noise(
+        &mut self,
+        noise: &[f32],
+        noise_fraction: f32,
+    ) -> Result<(), MCTSError> {
         let count = self.arena[self.root_idx as usize].children_count as usize;
-        assert!(
-            noise.len() >= count,
-            "add_dirichlet_noise: noise length {} < root children count {}",
-            noise.len(),
-            count
-        );
+        if noise.len() < count {
+            return Err(MCTSError::WrongNoiseLength {
+                expected_at_least: count,
+                actual: noise.len(),
+            });
+        }
         let root = &self.arena[self.root_idx as usize];
         let start = root.children_start as usize;
         let count = root.children_count as usize;
         let n = count.min(noise.len());
-        for (i, &noise_val) in noise.iter().enumerate().take(n) {
-            let child = &mut self.arena[start + i];
-            child.prior = (1.0 - noise_fraction) * child.prior + noise_fraction * noise_val;
+
+        let noise_slice = &noise[..n];
+        if !noise_slice
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        {
+            return Err(MCTSError::InvalidNoise(
+                "noise values must be finite and non-negative",
+            ));
         }
+        let noise_sum: f32 = noise_slice.iter().sum();
+        if noise_sum <= 0.0 || !noise_sum.is_finite() {
+            return Err(MCTSError::InvalidNoise(
+                "noise values must have positive finite mass",
+            ));
+        }
+
+        let mix = noise_fraction.clamp(0.0, 1.0);
+        for (i, &noise_val) in noise_slice.iter().enumerate() {
+            let child = &mut self.arena[start + i];
+            child.prior = (1.0 - mix) * child.prior + mix * (noise_val / noise_sum);
+        }
+        let total_prior: f32 = (start..start + count)
+            .map(|idx| self.arena[idx].prior)
+            .sum();
+        if total_prior > 0.0 && total_prior.is_finite() {
+            for idx in start..start + count {
+                self.arena[idx].prior /= total_prior;
+            }
+        }
+        Ok(())
     }
 
     // ── Core MCTS loop ─────────────────────────────────────────────────
@@ -1126,8 +1397,15 @@ impl MCTSEngine {
     /// `non_terminal_count × TENSOR_SIZE` floats, and the count of
     /// non-terminal leaves.
     pub fn select_leaves(&mut self, batch_size: u32) -> (&[f32], u32) {
+        let batch = self
+            .select_leaves_tokenized(batch_size)
+            .expect("select_leaves failed");
+        (batch.tensors, batch.non_terminal_count)
+    }
+
+    pub fn select_leaves_tokenized(&mut self, batch_size: u32) -> Result<LeafBatch<'_>, MCTSError> {
         // Clamp batch size to the remaining simulation budget.
-        let actual_batch = batch_size.min(self.num_simulations - self.sims_done);
+        let actual_batch = batch_size.min(self.num_simulations.saturating_sub(self.sims_done));
 
         // Clear previous pending state from any prior batch, rolling back
         // virtual loss if a caller selected a new batch before backpropagating
@@ -1152,9 +1430,18 @@ impl MCTSEngine {
             {
                 node_idx = self.select_child_puct(node_idx);
                 let child = &self.arena[node_idx as usize];
-                let _ = self
-                    .game
-                    .place(child.action.0 as i32, child.action.1 as i32);
+                if let Err(_err) = self.game.place(child.action.0, child.action.1) {
+                    for _ in 0..search_path.len().saturating_sub(1) {
+                        self.game
+                            .unplace()
+                            .expect("selected path rollback should match applied moves");
+                    }
+                    return Err(MCTSError::IllegalTreeAction {
+                        q: child.action.0,
+                        r: child.action.1,
+                        node_idx,
+                    });
+                }
                 search_path.push(node_idx);
             }
 
@@ -1225,14 +1512,24 @@ impl MCTSEngine {
 
             // Restore root state for the next simulation.
             for _ in 0..depth {
-                self.game.unplace();
+                self.game
+                    .unplace()
+                    .expect("selection depth rollback should match applied moves");
             }
         }
 
-        (
-            &self.batch_buf[..non_terminal_count as usize * TENSOR_SIZE],
+        self.batch_generation = self.batch_generation.wrapping_add(1);
+        self.pending_batch_generation = if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.batch_generation)
+        };
+        Ok(LeafBatch {
+            tensors: &self.batch_buf[..non_terminal_count as usize * TENSOR_SIZE],
             non_terminal_count,
-        )
+            root_generation: self.root_generation,
+            batch_generation: self.batch_generation,
+        })
     }
 
     /// Expand leaves and backpropagate using GPU-provided policies and values.
@@ -1250,21 +1547,25 @@ impl MCTSEngine {
     ///    level so that every node stores values from its own player's
     ///    perspective.
     pub fn expand_and_backprop(&mut self, policies: &[f32], values: &[f32]) {
+        if self.pending.is_empty() {
+            validate_policy_slice(policies, 0).expect("expand_and_backprop failed");
+            validate_values(values, 0).expect("expand_and_backprop failed");
+            return;
+        }
+        self.try_expand_and_backprop(self.batch_generation, policies, values)
+            .expect("expand_and_backprop failed");
+    }
+
+    pub fn try_expand_and_backprop(
+        &mut self,
+        batch_generation: u64,
+        policies: &[f32],
+        values: &[f32],
+    ) -> Result<(), MCTSError> {
+        self.validate_batch_generation(batch_generation)?;
         let non_terminal_count = self.pending.iter().filter(|l| !l.is_terminal).count();
-        assert!(
-            policies.len() == non_terminal_count * BOARD_AREA,
-            "expand_and_backprop: policies length {} != {} (non_terminal={} * BOARD_AREA={})",
-            policies.len(),
-            non_terminal_count * BOARD_AREA,
-            non_terminal_count,
-            BOARD_AREA,
-        );
-        assert!(
-            values.len() == non_terminal_count,
-            "expand_and_backprop: values length {} != non_terminal_count {}",
-            values.len(),
-            non_terminal_count,
-        );
+        validate_policy_slice(policies, non_terminal_count * BOARD_AREA)?;
+        validate_values(values, non_terminal_count)?;
 
         let mut eval_idx = 0usize;
 
@@ -1290,12 +1591,6 @@ impl MCTSEngine {
                 let policy_start = eval_idx * BOARD_AREA;
                 let policy_slice = &policies[policy_start..policy_start + BOARD_AREA];
                 let v = values[eval_idx];
-                assert!(
-                    v.is_finite(),
-                    "expand_and_backprop: NN returned non-finite value at leaf {} (v={})",
-                    leaf.node_idx,
-                    v
-                );
 
                 // Expand the leaf node with its policy and legal moves.
                 self.expand_node(
@@ -1328,6 +1623,8 @@ impl MCTSEngine {
 
         leaves.clear();
         std::mem::swap(&mut leaves, &mut self.pending);
+        self.pending_batch_generation = None;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1340,7 +1637,36 @@ impl MCTSEngine {
         stage: u8,
         sparse_mix: f32,
     ) {
+        if self.pending.is_empty() {
+            validate_policy_slice(policies, 0).expect("expand_and_backprop_with_sparse failed");
+            validate_values(values, 0).expect("expand_and_backprop_with_sparse failed");
+            return;
+        }
+        self.try_expand_and_backprop_with_sparse(
+            self.batch_generation,
+            policies,
+            values,
+            sparse_actions,
+            sparse_logits,
+            stage,
+            sparse_mix,
+        )
+        .expect("expand_and_backprop_with_sparse failed");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_expand_and_backprop_with_sparse(
+        &mut self,
+        batch_generation: u64,
+        policies: &[f32],
+        values: &[f32],
+        sparse_actions: &[Vec<(i32, i32)>],
+        sparse_logits: &[Vec<f32>],
+        stage: u8,
+        sparse_mix: f32,
+    ) -> Result<(), MCTSError> {
         self.expand_and_backprop_with_sparse_impl(
+            batch_generation,
             policies,
             values,
             sparse_actions,
@@ -1362,7 +1688,39 @@ impl MCTSEngine {
         stage: u8,
         sparse_mix: f32,
     ) {
+        if self.pending.is_empty() {
+            validate_policy_slice(policies, 0)
+                .expect("expand_and_backprop_with_sparse_sources failed");
+            validate_values(values, 0).expect("expand_and_backprop_with_sparse_sources failed");
+            return;
+        }
+        self.try_expand_and_backprop_with_sparse_sources(
+            self.batch_generation,
+            policies,
+            values,
+            sparse_actions,
+            sparse_logits,
+            sparse_sources,
+            stage,
+            sparse_mix,
+        )
+        .expect("expand_and_backprop_with_sparse_sources failed");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_expand_and_backprop_with_sparse_sources(
+        &mut self,
+        batch_generation: u64,
+        policies: &[f32],
+        values: &[f32],
+        sparse_actions: &[Vec<(i32, i32)>],
+        sparse_logits: &[Vec<f32>],
+        sparse_sources: &[Vec<u8>],
+        stage: u8,
+        sparse_mix: f32,
+    ) -> Result<(), MCTSError> {
         self.expand_and_backprop_with_sparse_impl(
+            batch_generation,
             policies,
             values,
             sparse_actions,
@@ -1376,6 +1734,7 @@ impl MCTSEngine {
     #[allow(clippy::too_many_arguments)]
     fn expand_and_backprop_with_sparse_impl(
         &mut self,
+        batch_generation: u64,
         policies: &[f32],
         values: &[f32],
         sparse_actions: &[Vec<(i32, i32)>],
@@ -1383,29 +1742,30 @@ impl MCTSEngine {
         sparse_sources: Option<&[Vec<u8>]>,
         stage: u8,
         sparse_mix: f32,
-    ) {
+    ) -> Result<(), MCTSError> {
+        self.validate_batch_generation(batch_generation)?;
         let non_terminal_count = self.pending.iter().filter(|l| !l.is_terminal).count();
-        assert!(
-            policies.len() == non_terminal_count * BOARD_AREA,
-            "expand_and_backprop_with_sparse: policies length {} != {}",
-            policies.len(),
-            non_terminal_count * BOARD_AREA,
-        );
-        assert!(
-            values.len() == non_terminal_count,
-            "expand_and_backprop_with_sparse: values length {} != non_terminal_count {}",
-            values.len(),
-            non_terminal_count,
-        );
-        assert!(
-            sparse_actions.len() == non_terminal_count && sparse_logits.len() == non_terminal_count,
-            "expand_and_backprop_with_sparse: sparse metadata length must equal non-terminal count"
-        );
-        if let Some(sources) = sparse_sources {
-            assert!(
-                sources.len() == non_terminal_count,
-                "expand_and_backprop_with_sparse: sparse source metadata length must equal non-terminal count"
-            );
+        validate_policy_slice(policies, non_terminal_count * BOARD_AREA)?;
+        validate_values(values, non_terminal_count)?;
+        let source_len = sparse_sources.map(|sources| sources.len());
+        if sparse_actions.len() != non_terminal_count
+            || sparse_logits.len() != non_terminal_count
+            || source_len.is_some_and(|len| len != non_terminal_count)
+        {
+            return Err(MCTSError::WrongSparseMetadataLength {
+                expected: non_terminal_count,
+                actions: sparse_actions.len(),
+                logits: sparse_logits.len(),
+                sources: source_len,
+            });
+        }
+        for (leaf_idx, logits) in sparse_logits.iter().enumerate() {
+            if let Some(index) = logits.iter().position(|logit| !logit.is_finite()) {
+                return Err(MCTSError::NonFiniteSparsePolicy {
+                    leaf: leaf_idx,
+                    index,
+                });
+            }
         }
 
         let mut eval_idx = 0usize;
@@ -1427,11 +1787,6 @@ impl MCTSEngine {
                 let policy_start = eval_idx * BOARD_AREA;
                 let policy_slice = &policies[policy_start..policy_start + BOARD_AREA];
                 let v = values[eval_idx];
-                assert!(
-                    v.is_finite(),
-                    "expand_and_backprop_with_sparse: NN returned non-finite value at leaf {}",
-                    leaf.node_idx,
-                );
                 let sparse_source = sparse_sources
                     .and_then(|sources| sources.get(eval_idx))
                     .and_then(|row| row.first().copied())
@@ -1476,6 +1831,8 @@ impl MCTSEngine {
 
         leaves.clear();
         std::mem::swap(&mut leaves, &mut self.pending);
+        self.pending_batch_generation = None;
+        Ok(())
     }
 
     pub fn pending_leaf_metadata(&self) -> Vec<(i32, i32, Vec<Hex>, Vec<u8>)> {
@@ -1495,6 +1852,7 @@ impl MCTSEngine {
 
     pub fn clear_pending_leaves(&mut self) {
         if self.pending.is_empty() {
+            self.pending_batch_generation = None;
             return;
         }
         let mut leaves = Vec::new();
@@ -1508,6 +1866,7 @@ impl MCTSEngine {
         }
         leaves.clear();
         std::mem::swap(&mut leaves, &mut self.pending);
+        self.pending_batch_generation = None;
     }
 
     // ── Tree management ────────────────────────────────────────────────
@@ -1524,7 +1883,7 @@ impl MCTSEngine {
     /// The arena is not compacted — dead sibling subtrees remain in memory but
     /// are never referenced.  With typical tree sizes this wastes ~400KB, which
     /// is acceptable since the arena is recreated per turn.
-    pub fn re_root(&mut self, q: i16, r: i16, new_num_simulations: u32) -> Result<(), MCTSError> {
+    pub fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> Result<(), MCTSError> {
         self.clear_pending_leaves();
 
         let root = &self.arena[self.root_idx as usize];
@@ -1548,9 +1907,7 @@ impl MCTSEngine {
 
         // Apply the placement to the internal game state so that subsequent
         // select_leaves traversals start from the correct board position.
-        self.game
-            .place(q as i32, r as i32)
-            .expect("re_root: illegal placement");
+        self.game.place(q, r).expect("re_root: illegal placement");
 
         // Update root pointer.
         self.root_idx = child_idx;
@@ -1579,6 +1936,8 @@ impl MCTSEngine {
         // Reset simulation state for the new search.
         self.sims_done = 0;
         self.num_simulations = new_num_simulations;
+        self.root_generation = self.root_generation.wrapping_add(1);
+        self.last_root_init_generation = None;
 
         Ok(())
     }
@@ -1601,8 +1960,8 @@ impl MCTSEngine {
 
         for i in start..start + count {
             let child = &self.arena[i];
-            moves_q.push(child.action.0 as i32);
-            moves_r.push(child.action.1 as i32);
+            moves_q.push(child.action.0);
+            moves_r.push(child.action.1);
             visits.push(child.visit_count);
         }
 
@@ -1705,10 +2064,10 @@ impl MCTSEngine {
                     continue;
                 }
                 rows.push((
-                    first.action.0 as i32,
-                    first.action.1 as i32,
-                    second.action.0 as i32,
-                    second.action.1 as i32,
+                    first.action.0,
+                    first.action.1,
+                    second.action.0,
+                    second.action.1,
                     second.visit_count,
                 ));
             }
@@ -1736,18 +2095,21 @@ impl MCTSEngine {
         // Cap candidates to avoid OOM on large trees (48MB+ with 800+ nodes).
         const MAX_CANDIDATES: usize = 128;
 
-        let mut candidates: Vec<u32> = self
-            .arena
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, node)| {
-                let idx = idx as u32;
-                if idx == self.root_idx || !node.is_expanded || node.visit_count < min_visits {
-                    return None;
+        let mut candidates: Vec<u32> = Vec::new();
+        let mut reachable_stack = vec![self.root_idx];
+        while let Some(node_idx) = reachable_stack.pop() {
+            let node = &self.arena[node_idx as usize];
+            if node_idx != self.root_idx && node.is_expanded && node.visit_count >= min_visits {
+                candidates.push(node_idx);
+            }
+            if node.is_expanded && node.children_count > 0 {
+                let start = node.children_start as usize;
+                let count = node.children_count as usize;
+                for child_idx in (start..start + count).rev() {
+                    reachable_stack.push(child_idx as u32);
                 }
-                Some(idx)
-            })
-            .collect();
+            }
+        }
 
         if candidates.len() > MAX_CANDIDATES {
             candidates.sort_unstable_by(|a, b| {
@@ -1775,18 +2137,18 @@ impl MCTSEngine {
             Unplace,
         }
 
-        /// Depth of `node_idx` from the root (number of ancestors).
-        fn depth_from_root(node_idx: u32, arena: &[MCTSNode]) -> u32 {
+        /// Depth of `node_idx` from the current root, measured in placed edges.
+        fn depth_from_root(node_idx: u32, root_idx: u32, arena: &[MCTSNode]) -> u32 {
             let mut depth = 0;
             let mut idx = node_idx;
-            while idx != NO_PARENT {
+            while idx != root_idx && idx != NO_PARENT {
                 depth += 1;
                 idx = arena[idx as usize].parent;
             }
             depth
         }
 
-        let mut scratch_history: Vec<(u8, i16, i16)> = Vec::new();
+        let mut scratch_history: Vec<(u8, i32, i32)> = Vec::new();
         let mut stack: Vec<Frame> = Vec::new();
         stack.push(Frame::Visit(self.root_idx));
 
@@ -1796,9 +2158,11 @@ impl MCTSEngine {
                     if candidate_set.contains(&node_idx) && node_idx != self.root_idx {
                         if self.game.is_over() {
                             // Restore game state before returning the error.
-                            let d = depth_from_root(node_idx, &self.arena);
+                            let d = depth_from_root(node_idx, self.root_idx, &self.arena);
                             for _ in 0..d {
-                                self.game.unplace();
+                                self.game
+                                    .unplace()
+                                    .expect("extraction rollback should match traversal depth");
                             }
                             return Err("sampled node is terminal during extraction");
                         }
@@ -1818,7 +2182,7 @@ impl MCTSEngine {
                             self.game
                                 .move_history()
                                 .iter()
-                                .map(|rec| (rec.player, rec.cell.q as i16, rec.cell.r as i16)),
+                                .map(|rec| (rec.player, rec.cell.q, rec.cell.r)),
                         );
                         histories.push(scratch_history.clone());
                     }
@@ -1842,14 +2206,12 @@ impl MCTSEngine {
                     let node = &self.arena[parent_idx as usize];
                     let start = node.children_start as usize;
                     let child = &self.arena[start + child_offset];
-                    if self
-                        .game
-                        .place(child.action.0 as i32, child.action.1 as i32)
-                        .is_err()
-                    {
-                        let d = depth_from_root(parent_idx, &self.arena);
+                    if self.game.place(child.action.0, child.action.1).is_err() {
+                        let d = depth_from_root(parent_idx, self.root_idx, &self.arena);
                         for _ in 0..d {
-                            self.game.unplace();
+                            self.game
+                                .unplace()
+                                .expect("extraction error rollback should match traversal depth");
                         }
                         return Err("illegal move during tree node extraction");
                     }
@@ -1858,7 +2220,9 @@ impl MCTSEngine {
                     stack.push(Frame::Visit(start as u32 + child_offset as u32));
                 }
                 Frame::Unplace => {
-                    self.game.unplace();
+                    self.game
+                        .unplace()
+                        .expect("tree extraction stack should unplace an applied child");
                 }
             }
         }
@@ -2019,7 +2383,7 @@ impl MCTSEngine {
         let children_count = child_count as u16;
 
         for (i, h) in legal_moves.iter().enumerate() {
-            let child = MCTSNode::new(node_idx, (h.q as i16, h.r as i16), self.scratch_priors[i]);
+            let child = MCTSNode::new(node_idx, (h.q, h.r), self.scratch_priors[i]);
             self.arena.push(child);
         }
 
@@ -2038,7 +2402,7 @@ impl MCTSEngine {
     ///
     /// `rng_state` is an in-out XOR-shift state. The caller should seed it
     /// from the deterministic seed chain and pass it by mutable reference.
-    pub fn sample_action(&mut self, temperature: f32, rng_state: &mut u64) -> (i16, i16) {
+    pub fn sample_action(&mut self, temperature: f32, rng_state: &mut u64) -> (i32, i32) {
         if *rng_state == 0 {
             *rng_state = self.seed.max(1);
         }

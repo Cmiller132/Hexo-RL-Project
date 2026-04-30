@@ -16,8 +16,8 @@ mod tests {
         assert_legal_matches_bruteforce(&game, PLACEMENT_RADIUS);
         assert_legal_matches_bruteforce(&game, PLACEMENT_RADIUS + 10);
 
-        game.unplace();
-        game.unplace();
+        game.unplace().unwrap();
+        game.unplace().unwrap();
 
         assert_legal_matches_bruteforce(&game, 2);
         assert_legal_matches_bruteforce(&game, PLACEMENT_RADIUS);
@@ -46,7 +46,7 @@ mod tests {
 
             for (q, r, undo) in ops {
                 if undo && game.move_count() > 0 {
-                    game.unplace();
+                    game.unplace().unwrap();
                 } else {
                     let _ = game.place(q, r);
                 }

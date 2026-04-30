@@ -1,7 +1,7 @@
 use crate::board::HexGameState;
 use crate::core::Hex;
 use crate::encoder::BOARD_AREA;
-use crate::mcts::MCTSEngine;
+use crate::mcts::{MCTSEngine, MCTSError};
 
 #[cfg(test)]
 mod tests {
@@ -79,7 +79,7 @@ mod tests {
         let best_r = moves_r[best_idx];
 
         engine
-            .re_root(best_q as i16, best_r as i16, 50)
+            .re_root(best_q, best_r, 50)
             .expect("re_root should find child");
         let root_visits = engine.arena[engine.root_idx as usize].visit_count;
         assert_eq!(root_visits, visits_before, "re_root: visit count mismatch");
@@ -117,10 +117,9 @@ mod tests {
         );
     }
 
-    /// Verify that T1-4's assertion fires on wrong-length batch.
+    /// Verify that the tokenized API returns Err on wrong-length batch.
     #[test]
-    #[should_panic(expected = "policies length")]
-    fn mcts_expand_and_backprop_wrong_length_panics() {
+    fn mcts_expand_and_backprop_wrong_length_returns_err() {
         let game = HexGameState::new();
         let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
         let (_tensor, oq, or_, legal) = engine.init_root().expect("init_root");
@@ -128,12 +127,164 @@ mod tests {
         engine.expand_root(&uniform, 0.0, oq, or_, &legal);
 
         // Run a few selections to create pending leaves
-        let (_, count) = engine.select_leaves(8);
+        let (batch_generation, count) = {
+            let batch = engine.select_leaves_tokenized(8).expect("select_leaves");
+            (batch.batch_generation, batch.non_terminal_count)
+        };
+        assert!(count > 0);
 
         // Give wrong-length policies (should be count * BOARD_AREA)
-        let wrong_policies = vec![0.0f32; BOARD_AREA]; // should be count * BOARD_AREA
+        let wrong_policies = vec![0.0f32; count as usize * BOARD_AREA - 1];
         let values = vec![0.0f32; count as usize];
-        engine.expand_and_backprop(&wrong_policies, &values);
+        let err = engine
+            .try_expand_and_backprop(batch_generation, &wrong_policies, &values)
+            .expect_err("wrong-length batch should return Err");
+        assert!(matches!(err, MCTSError::WrongPolicyLength { .. }));
+    }
+
+    #[test]
+    fn mcts_i32_far_coordinate_roundtrip() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 10, 1.5, 2, false, 0.0, 0);
+        let far = Hex::new(50_000, -50_000);
+        let legal = vec![far, Hex::new(0, 0)];
+        let policy = vec![0.0f32; BOARD_AREA];
+
+        engine.expand_root(&policy, 0.0, -16, -16, &legal);
+
+        let (moves_q, moves_r, _visits, _root_q) = engine.get_results();
+        assert_eq!((moves_q[0], moves_r[0]), (far.q, far.r));
+        engine.arena[1].visit_count = 1;
+        let mut rng = 1;
+        assert_eq!(engine.sample_action(0.0, &mut rng), (far.q, far.r));
+    }
+
+    #[test]
+    fn mcts_stale_root_token_rejected() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 10, 1.5, 2, false, 0.0, 0);
+        let init1 = engine
+            .init_root_tokenized()
+            .expect("init_root")
+            .expect("root init");
+        let init2 = engine
+            .init_root_tokenized()
+            .expect("init_root")
+            .expect("root init");
+        let policy = vec![0.0f32; BOARD_AREA];
+
+        let err = engine
+            .try_expand_root(
+                init1.root_generation,
+                &policy,
+                0.0,
+                init1.offset_q,
+                init1.offset_r,
+                &init1.legal_moves,
+            )
+            .expect_err("stale root token should be rejected");
+        assert!(matches!(
+            err,
+            MCTSError::StaleRootToken {
+                expected,
+                received
+            } if expected == init2.root_generation && received == init1.root_generation
+        ));
+
+        engine
+            .try_expand_root(
+                init2.root_generation,
+                &policy,
+                0.0,
+                init2.offset_q,
+                init2.offset_r,
+                &init2.legal_moves,
+            )
+            .expect("current root token should expand");
+    }
+
+    #[test]
+    fn mcts_stale_batch_token_rejected() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 8, 50, 1.5, 2, false, 0.0, 0);
+        let init = engine
+            .init_root_tokenized()
+            .expect("init_root")
+            .expect("root init");
+        let policy = vec![0.0f32; BOARD_AREA];
+        engine
+            .try_expand_root(
+                init.root_generation,
+                &policy,
+                0.0,
+                init.offset_q,
+                init.offset_r,
+                &init.legal_moves,
+            )
+            .expect("expand root");
+
+        let first_token = {
+            let batch = engine.select_leaves_tokenized(2).expect("first select");
+            assert!(batch.non_terminal_count > 0);
+            batch.batch_generation
+        };
+        let (second_token, second_count) = {
+            let batch = engine.select_leaves_tokenized(2).expect("second select");
+            assert!(batch.non_terminal_count > 0);
+            (batch.batch_generation, batch.non_terminal_count)
+        };
+        let policies = vec![0.0f32; second_count as usize * BOARD_AREA];
+        let values = vec![0.0f32; second_count as usize];
+
+        let err = engine
+            .try_expand_and_backprop(first_token, &policies, &values)
+            .expect_err("stale batch token should be rejected");
+        assert!(matches!(
+            err,
+            MCTSError::StaleBatchToken { expected, received }
+                if expected == second_token && received == first_token
+        ));
+
+        engine
+            .try_expand_and_backprop(second_token, &policies, &values)
+            .expect("current batch token should backpropagate");
+    }
+
+    #[test]
+    fn mcts_tokenized_happy_path_runs_to_completion() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 6, 50, 1.5, 2, false, 0.0, 0);
+        let init = engine
+            .init_root_tokenized()
+            .expect("init_root")
+            .expect("root init");
+        let policy = vec![0.0f32; BOARD_AREA];
+        engine
+            .try_expand_root(
+                init.root_generation,
+                &policy,
+                0.0,
+                init.offset_q,
+                init.offset_r,
+                &init.legal_moves,
+            )
+            .expect("expand root");
+
+        while !engine.done() {
+            let (batch_generation, count) = {
+                let batch = engine.select_leaves_tokenized(3).expect("select leaves");
+                (batch.batch_generation, batch.non_terminal_count)
+            };
+            let policies = vec![0.0f32; count as usize * BOARD_AREA];
+            let values = vec![0.0f32; count as usize];
+            engine
+                .try_expand_and_backprop(batch_generation, &policies, &values)
+                .expect("backprop batch");
+        }
+
+        let (_moves_q, _moves_r, visits, root_q) = engine.get_results();
+        assert_eq!(visits.iter().sum::<u32>(), 6);
+        assert!(root_q.is_finite());
     }
 
     /// After select_leaves but before expand_and_backprop, done() must be false
@@ -181,7 +332,7 @@ mod tests {
         );
 
         engine
-            .re_root(moves_q[0] as i16, moves_r[0] as i16, 50)
+            .re_root(moves_q[0], moves_r[0], 50)
             .expect("re_root should clear pending leaves and continue");
         assert!(
             engine.pending_leaf_metadata().is_empty(),
@@ -470,6 +621,64 @@ mod tests {
     }
 
     #[test]
+    fn mcts_pair_first_policy_reports_candidate_count() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+
+        let logits = vec![0.0f32; legal.len()];
+        engine
+            .apply_root_pair_first_priors(&logits, 1.0)
+            .expect("pair-first priors should apply");
+
+        let telemetry = engine.prior_source_telemetry();
+        assert_eq!(telemetry.root_pair_candidate_count, legal.len() as u32);
+        assert_eq!(telemetry.root_pair_count, legal.len() as u32);
+    }
+
+    #[test]
+    fn mcts_dirichlet_noise_normalizes_child_priors() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+
+        let mut noise = vec![0.0f32; legal.len()];
+        noise[0] = 2.0;
+        engine.add_dirichlet_noise(&noise, 1.0).unwrap();
+
+        let priors = engine.root_child_priors();
+        let total: f32 = priors.iter().sum();
+        assert!((total - 1.0).abs() < 1e-6, "priors must sum to one");
+        assert_eq!(priors[0], 1.0);
+        assert!(priors.iter().skip(1).all(|p| *p == 0.0));
+    }
+
+    #[test]
+    fn mcts_dirichlet_noise_rejects_non_finite_values_with_error() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 1, 50, 1.5, 2, false, 0.0, 0);
+        let (_tensor, oq, or_, legal) = engine.init_root().expect("init root");
+        let dense = vec![0.0f32; BOARD_AREA];
+        engine.expand_root(&dense, 0.0, oq, or_, &legal);
+
+        let mut noise = vec![1.0f32; legal.len()];
+        noise[0] = f32::NAN;
+        assert!(matches!(
+            engine.add_dirichlet_noise(&noise, 0.25),
+            Err(MCTSError::InvalidNoise(
+                "noise values must be finite and non-negative"
+            ))
+        ));
+    }
+
+    #[test]
     fn mcts_consumes_pair_policy_on_second_placement_root() {
         let mut game = HexGameState::new();
         game.place(0, 0).expect("opening move");
@@ -480,7 +689,7 @@ mod tests {
 
         let first = legal[0];
         engine
-            .re_root(first.q as i16, first.r as i16, 1)
+            .re_root(first.q, first.r, 1)
             .expect("reroot at first placement");
 
         let (_tensor2, oq2, or2, second_legal) = engine.init_root().expect("second root");
@@ -516,7 +725,7 @@ mod tests {
         engine.expand_root(&dense, 0.0, oq, or_, &legal);
         let first = legal[0];
         engine
-            .re_root(first.q as i16, first.r as i16, 1)
+            .re_root(first.q, first.r, 1)
             .expect("reroot at first placement");
         let (_tensor2, oq2, or2, second_legal) = engine.init_root().expect("second root");
         engine.expand_root(&dense, 0.0, oq2, or2, &second_legal);

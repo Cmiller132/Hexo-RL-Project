@@ -1,5 +1,5 @@
-use hexgame_core::board::HexGameState;
-use hexgame_core::encoder::*;
+use hexgame_core::encoding::*;
+use hexgame_core::HexGameState;
 
 #[cfg(test)]
 mod tests {

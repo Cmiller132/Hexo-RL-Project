@@ -129,7 +129,7 @@ pub fn analyse(game: &mut HexGameState) -> TurnAnalysis {
         }
         if had_one || c1_wins {
             // Turn is over, or the game is already won — no second placement.
-            game.unplace();
+            game.unplace().unwrap();
             continue;
         }
         for &c2 in &near2_me {
@@ -140,9 +140,9 @@ pub fn analyse(game: &mut HexGameState) -> TurnAnalysis {
             if game.winner() == Some(me) {
                 analysis.winning.push(Turn::pair(c1, c2));
             }
-            game.unplace();
+            game.unplace().unwrap();
         }
-        game.unplace();
+        game.unplace().unwrap();
     }
 
     // ── 2. Legal representative sample ──
@@ -283,7 +283,7 @@ fn all_winning_turns_for(game: &mut HexGameState, player: u8) -> Vec<Turn> {
         game.place_unchecked(c1);
         if game.winner() == Some(player) {
             winning.push(Turn::single(c1));
-            game.unplace();
+            game.unplace().unwrap();
             continue;
         }
         if !had_one {
@@ -295,10 +295,10 @@ fn all_winning_turns_for(game: &mut HexGameState, player: u8) -> Vec<Turn> {
                 if game.winner() == Some(player) {
                     winning.push(Turn::pair(c1, c2));
                 }
-                game.unplace();
+                game.unplace().unwrap();
             }
         }
-        game.unplace();
+        game.unplace().unwrap();
     }
     winning
 }
@@ -368,6 +368,56 @@ mod tests {
         let analysis = analyse(&mut g);
         let block = Turn::pair(Hex::new(-1, 0), Hex::new(4, 0));
         assert!(analysis.blocking_pairs.contains(&block));
+    }
+
+    /// Far-board threats should remain visible to the oracle even when they
+    /// are outside the bounded incremental eval grid.
+    #[test]
+    fn oracle_finds_far_grid_winning_and_blocking_turns() {
+        let mut win = HexGameState::new();
+        win.set_position(
+            &[
+                (0, 0, 0),
+                (8, 0, 0),
+                (16, 0, 0),
+                (24, 0, 0),
+                (32, 0, 0),
+                (40, 0, 0),
+                (41, 0, 0),
+                (42, 0, 0),
+                (43, 0, 0),
+                (44, 0, 0),
+            ],
+            0,
+            2,
+        )
+        .expect("oracle: far winning set_position");
+        let analysis = analyse(&mut win);
+        assert!(analysis.winning.contains(&Turn::single(Hex::new(39, 0))));
+        assert!(analysis.winning.contains(&Turn::single(Hex::new(45, 0))));
+
+        let mut block = HexGameState::new();
+        block
+            .set_position(
+                &[
+                    (0, 0, 0),
+                    (8, 0, 0),
+                    (16, 0, 0),
+                    (24, 0, 0),
+                    (32, 0, 0),
+                    (39, 0, 0),
+                    (40, 0, 1),
+                    (41, 0, 1),
+                    (42, 0, 1),
+                    (43, 0, 1),
+                    (44, 0, 1),
+                ],
+                0,
+                1,
+            )
+            .expect("oracle: far blocking set_position");
+        let analysis = analyse(&mut block);
+        assert!(analysis.blocking_single.contains(&Hex::new(45, 0)));
     }
 
     /// Player 1 has two independent five-in-a-row threats and player 0 has

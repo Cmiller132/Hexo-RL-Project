@@ -252,19 +252,19 @@ class TestInferenceServerWithEngine(unittest.TestCase):
         # Init root
         init = engine.init_root()
         self.assertIsNotNone(init, "init_root returned None (game over?)")
-        tensor_3d, oq, or_, legal_bytes = init
+        tensor_3d, oq, or_, legal_bytes, root_token = init
         self.assertEqual(tensor_3d.shape, (13, 33, 33))
 
         # Expand root with mock uniform policy
         uniform = np.ones(1089, dtype=np.float32) / 1089.0
-        engine.expand_root(uniform, 0.0, oq, or_, legal_bytes)
+        engine.expand_root(uniform, 0.0, oq, or_, legal_bytes, root_token)
 
         # MCTS loop with inference server
         while not engine.done():
-            tensor_4d, count = engine.select_leaves(8)
+            tensor_4d, count, batch_token = engine.select_leaves(8)
             tensor_np = np.array(tensor_4d).astype(np.float32)
             policies, values = client.submit(tensor_np, count)
-            engine.expand_and_backprop(policies, values)
+            engine.expand_and_backprop(policies, values, batch_token)
 
         # Get results
         moves_q, moves_r, visits, root_value = engine.get_results()

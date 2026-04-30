@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use crate::board::HexGameState;
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS, WIN_LENGTH};
-use crate::threats::{live_cells, threat_status, ThreatStatus};
+use crate::threats::{live_cells, tactical_mask_cells, tactical_status};
 
 // ── Pre-computed channel ─────────────────────────────────────────────────
 
@@ -249,40 +249,15 @@ pub fn encode_board_into(
     // ── Channel 3: legal moves mask ──
     game.legal_moves_near_into(near_radius, legal_out);
     if constrain_threats {
-        let maybe_constrained = match threat_status(game) {
-            ThreatStatus::Quiet | ThreatStatus::Unblockable => None,
-            ThreatStatus::WinningTurn(t) => {
-                let mut allowed = vec![t.first()];
-                if let Some(s) = t.second() {
-                    allowed.push(s);
-                }
-                Some(
-                    legal_out
-                        .iter()
-                        .copied()
-                        .filter(|h| allowed.contains(h))
-                        .collect::<Vec<_>>(),
-                )
-            }
-            ThreatStatus::MustBlock(b) => {
-                let mut allowed = b.cells().to_vec();
-                for (a, c) in b.pairs() {
-                    allowed.push(*a);
-                    allowed.push(*c);
-                }
-                Some(
-                    legal_out
-                        .iter()
-                        .copied()
-                        .filter(|h| allowed.contains(h))
-                        .collect::<Vec<_>>(),
-                )
-            }
-        };
-        if let Some(constrained) = maybe_constrained {
-            if !constrained.is_empty() {
-                *legal_out = constrained;
-            }
+        let status = tactical_status(game);
+        let mut tactical_cells = Vec::new();
+        if tactical_mask_cells(&status, &mut tactical_cells) {
+            legal_out.clear();
+            legal_out.extend(
+                tactical_cells
+                    .into_iter()
+                    .filter(|&cell| game.validate_move(cell).is_ok()),
+            );
         }
     }
     for h in legal_out.iter() {

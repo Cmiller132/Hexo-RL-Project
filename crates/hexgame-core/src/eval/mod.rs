@@ -19,5 +19,3 @@ pub mod grid;
 pub mod hot;
 pub mod patterns;
 pub mod state;
-
-pub use state::{EvalState, ThreatCounts};

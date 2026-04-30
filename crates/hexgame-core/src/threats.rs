@@ -72,6 +72,25 @@ pub enum ThreatStatus {
     Unblockable,
 }
 
+/// Complete tactical classification for filtering and training masks.
+///
+/// Unlike [`ThreatStatus::WinningTurn`], this representation keeps every
+/// immediate winning continuation.  Search and encoders should use this as
+/// the source of truth; [`threat_status`] is retained as a compact compatibility
+/// view for older callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum TacticalStatus {
+    /// No immediate wins or mandatory blocks.
+    Quiet,
+    /// Every turn that wins immediately for the current player.
+    WinningTurns(SmallVec<[Turn; 32]>),
+    /// The current player must block opponent winning threats.
+    MustBlock(BlockConstraint),
+    /// Opponent threats cannot be covered with this turn's placements.
+    Unblockable,
+}
+
 // -------------------------------------------------------------------------
 // BlockConstraint
 // -------------------------------------------------------------------------
@@ -121,50 +140,134 @@ impl BlockConstraint {
 // Helpers
 // -------------------------------------------------------------------------
 
-/// Collect opponent hot windows together with their empty cells.
-///
-/// Only windows with at least one empty cell are returned (fully-occupied
-/// 6-windows are filtered out — they represent an already-won game).
-///
-/// The return type is a stack-allocated `SmallVec` to avoid heap allocation
-/// in the common case where the opponent has fewer than 16 hot windows.
-///
-/// # Precondition
-/// Callers must handle an empty result (no opponent threats) gracefully;
-/// this function returns empty when the opponent has no fours or fives.
-/// Scan a single window and push its empty cells into `out`.
-///
-/// `out` is **not** cleared on entry; callers should call `.clear()` first
-/// if they want a fresh buffer.
-#[inline]
-fn window_empties(game: &HexGameState, key: WindowKey, out: &mut SmallVec<[Hex; 2]>) {
-    let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
-    for k in 0..WIN_LENGTH {
-        let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
-        if !game.stones().contains_key(&h) {
-            out.push(h);
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreatWindow {
+    empties: SmallVec<[Hex; 2]>,
 }
 
-fn opponent_threat_windows(game: &HexGameState) -> (SmallVec<[Hex; 32]>, SmallVec<[u8; 16]>) {
-    let opp = 1 - game.current_player();
-    debug_assert!(
-        game.eval().has_threats(opp),
-        "opponent_threat_windows called with no threats"
-    );
-    let mut flat = SmallVec::<[Hex; 32]>::new();
-    let mut lengths = SmallVec::<[u8; 16]>::new();
-    let mut empties = SmallVec::<[Hex; 2]>::new();
-    for key in game.eval().hot_windows(opp) {
-        empties.clear();
-        window_empties(game, key, &mut empties);
-        if !empties.is_empty() {
-            lengths.push(empties.len() as u8);
-            flat.extend_from_slice(&empties);
+/// Scan every six-cell window touching one of `player`'s stones.
+///
+/// This intentionally does not use `EvalState::hot_windows`: the incremental
+/// eval grid is bounded around the origin, while tactical legality must remain
+/// correct on the sparse infinite board.
+fn full_board_threat_windows(game: &HexGameState, player: u8) -> SmallVec<[ThreatWindow; 32]> {
+    let mut seen = FxHashSet::default();
+    let mut windows = SmallVec::<[ThreatWindow; 32]>::new();
+
+    for (&stone, &owner) in game.stones() {
+        if owner != player {
+            continue;
+        }
+
+        for (dir, &(dq, dr)) in HEX_DIRECTIONS.iter().enumerate() {
+            for off in 0..WIN_LENGTH {
+                let sq = stone.q - dq * off;
+                let sr = stone.r - dr * off;
+                let key = WindowKey::new(sq, sr, dir as u8);
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                let mut own = 0u8;
+                let mut blocked = false;
+                let mut empties = SmallVec::<[Hex; 2]>::new();
+
+                for k in 0..WIN_LENGTH {
+                    let h = Hex::new(sq + dq * k, sr + dr * k);
+                    match game.stones().get(&h) {
+                        Some(&p) if p == player => own += 1,
+                        Some(_) => {
+                            blocked = true;
+                            break;
+                        }
+                        None => {
+                            if empties.len() < 3 {
+                                empties.push(h);
+                            }
+                        }
+                    }
+                }
+
+                if !blocked && (own == 4 || own == 5) && !empties.is_empty() {
+                    windows.push(ThreatWindow { empties });
+                }
+            }
         }
     }
-    (flat, lengths)
+
+    windows
+}
+
+fn winning_turns_from_windows(windows: &[ThreatWindow], remaining: u8) -> SmallVec<[Turn; 32]> {
+    let mut turns = SmallVec::<[Turn; 32]>::new();
+    for window in windows {
+        match window.empties.as_slice() {
+            [cell] if remaining >= 1 => turns.push(Turn::single(*cell)),
+            [a, b] if remaining >= 2 => turns.push(Turn::pair(*a, *b)),
+            _ => {}
+        }
+    }
+    turns.sort_by(|a, b| {
+        a.placements()
+            .cmp(&b.placements())
+            .then(a.first().cmp(&b.first()))
+            .then(a.second().cmp(&b.second()))
+    });
+    turns.dedup();
+    turns
+}
+
+fn block_constraint_from_windows(
+    windows: &[ThreatWindow],
+    placements: u8,
+) -> Option<BlockConstraint> {
+    if windows.is_empty() {
+        return None;
+    }
+
+    let mut all_cells: SmallVec<[Hex; 32]> = windows
+        .iter()
+        .flat_map(|w| w.empties.iter().copied())
+        .collect();
+    all_cells.sort();
+    all_cells.dedup();
+
+    let mut cells = SmallVec::<[Hex; 16]>::new();
+    for &cell in &all_cells {
+        if windows.iter().all(|w| w.empties.contains(&cell)) {
+            cells.push(cell);
+        }
+    }
+
+    if placements <= 1 {
+        if cells.is_empty() {
+            return None;
+        }
+        return Some(BlockConstraint {
+            cells,
+            pairs: SmallVec::new(),
+        });
+    }
+
+    let mut pairs = SmallVec::<[(Hex, Hex); 32]>::new();
+    for i in 0..all_cells.len() {
+        for j in (i + 1)..all_cells.len() {
+            let c1 = all_cells[i];
+            let c2 = all_cells[j];
+            if windows
+                .iter()
+                .all(|w| w.empties.contains(&c1) || w.empties.contains(&c2))
+            {
+                pairs.push((c1, c2));
+            }
+        }
+    }
+
+    if cells.is_empty() && pairs.is_empty() {
+        None
+    } else {
+        Some(BlockConstraint { cells, pairs })
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -173,135 +276,61 @@ fn opponent_threat_windows(game: &HexGameState) -> (SmallVec<[Hex; 32]>, SmallVe
 
 /// Classify the current tactical situation.
 ///
-/// This is the entry point for threat-aware pruning.  It runs in
-/// O(opponent_hot_windows × WIN_LENGTH + all_cells²) time, which is
-/// negligible compared to search overhead.
+/// This is the entry point for threat-aware pruning.  It scans sparse windows
+/// touching actual stones rather than the bounded incremental eval grid, then
+/// enumerates hitting sets over the resulting threat-window empties.
 ///
 /// # Algorithm
 /// 1. **Game over?** → `Quiet` (no further constraints).
-/// 2. **Fast exit** — if neither side has fours or fives, the position is
-///    tactically quiet.
-/// 3. **Winning turn?** — scan the current player's hot windows.  A 5-window
-///    with 1 empty is an instant win; a 4-window with 2 empties is a win if
-///    we have ≥2 placements remaining.
-/// 4. **Opponent threats?** — collect all opponent hot windows and their
-///    empty cells.  If none, the position is `Quiet`.
-/// 5. **Build exact `BlockConstraint`**:
+/// 2. **Winning turns?** — scan the current player's full-board threat
+///    windows.  A 5-window with 1 empty is an instant win; a 4-window with 2
+///    empties is a win if we have ≥2 placements remaining.
+/// 3. **Opponent threats?** — collect all opponent full-board threat windows
+///    and their empty cells.  If none, the position is `Quiet`.
+/// 4. **Build exact `BlockConstraint`**:
 ///    - `cells` = intersection of all threat-window empties.
 ///    - `pairs` = all distinct pairs `(c1, c2)` that together intersect every
 ///      threat window.
-/// 6. **Unblockable?** — if `cells` is empty and no valid pair exists, the
+/// 5. **Unblockable?** — if `cells` is empty and no valid pair exists, the
 ///    threats cannot be stopped.
-pub fn threat_status(game: &HexGameState) -> ThreatStatus {
+pub fn tactical_status(game: &HexGameState) -> TacticalStatus {
     if game.winner().is_some() {
-        return ThreatStatus::Quiet;
+        return TacticalStatus::Quiet;
     }
 
     let current = game.current_player();
-    if !game.eval().has_any_threats() {
-        return ThreatStatus::Quiet;
-    }
-
-    // Can the current player win immediately?
-    //
-    // We do two passes: first look for 5-windows (single empty) so we always
-    // prefer a one-stone win over a two-stone win. Then look for 4-windows.
     let remaining = game.placements_remaining();
-    let mut pair_win: Option<Turn> = None;
 
-    let mut empties = SmallVec::<[Hex; 2]>::new();
-    for key in game.eval().hot_windows(current) {
-        empties.clear();
-        window_empties(game, key, &mut empties);
-
-        match empties.len() {
-            1 => {
-                // A single empty in a 5-window wins immediately, even with
-                // 2 placements remaining — the game ends as soon as the 6th
-                // stone is placed.
-                return ThreatStatus::WinningTurn(Turn::single(empties[0]));
-            }
-            2 if remaining >= 2 && pair_win.is_none() => {
-                // Remember the first 4-window, but keep scanning in case a
-                // 5-window appears later in the iteration order.
-                pair_win = Some(Turn::pair(empties[0], empties[1]));
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(turn) = pair_win {
-        return ThreatStatus::WinningTurn(turn);
+    let own_windows = full_board_threat_windows(game, current);
+    let winning = winning_turns_from_windows(&own_windows, remaining);
+    if !winning.is_empty() {
+        return TacticalStatus::WinningTurns(winning);
     }
 
     let opp = 1 - current;
-    if !game.eval().has_threats(opp) {
-        return ThreatStatus::Quiet;
+    let opp_windows = full_board_threat_windows(game, opp);
+    if opp_windows.is_empty() {
+        return TacticalStatus::Quiet;
     }
 
-    let (flat_empties, window_lengths) = opponent_threat_windows(game);
-    if flat_empties.is_empty() {
-        return ThreatStatus::Quiet;
+    match block_constraint_from_windows(&opp_windows, remaining) {
+        Some(block) => TacticalStatus::MustBlock(block),
+        None => TacticalStatus::Unblockable,
     }
+}
 
-    let mut must_hit = SmallVec::<[&[Hex]; 16]>::new();
-    let mut offset = 0usize;
-    for &len in &window_lengths {
-        let s = &flat_empties[offset..offset + len as usize];
-        must_hit.push(s);
-        offset += len as usize;
+/// Classify the current tactical situation.
+///
+/// This compatibility API collapses complete winning-turn output down to the
+/// first deterministic winning turn.  Use [`tactical_status`] when filtering
+/// moves or training masks.
+pub fn threat_status(game: &HexGameState) -> ThreatStatus {
+    match tactical_status(game) {
+        TacticalStatus::Quiet => ThreatStatus::Quiet,
+        TacticalStatus::WinningTurns(turns) => ThreatStatus::WinningTurn(turns[0]),
+        TacticalStatus::MustBlock(block) => ThreatStatus::MustBlock(block),
+        TacticalStatus::Unblockable => ThreatStatus::Unblockable,
     }
-
-    // Build exact BlockConstraint.
-    let placements = game.placements_remaining();
-
-    // Collect all unique empty cells across threat windows.
-    let mut all_cells: SmallVec<[Hex; 32]> =
-        must_hit.iter().flat_map(|w| w.iter().copied()).collect();
-    all_cells.sort();
-    all_cells.dedup();
-
-    // Intersection: cells that appear in EVERY threat window.
-    // These single-handedly block all threats, so any turn containing one
-    // of them is valid regardless of the other placement(s).
-    let mut cells = SmallVec::<[Hex; 16]>::new();
-    for &cell in &all_cells {
-        if must_hit.iter().all(|w| w.contains(&cell)) {
-            cells.push(cell);
-        }
-    }
-
-    // With only 1 placement left, we cannot play a pair.  If there is no
-    // single cell that blocks everything, the position is unblockable.
-    if placements <= 1 {
-        if cells.is_empty() {
-            return ThreatStatus::Unblockable;
-        }
-        let pairs = SmallVec::<[(Hex, Hex); 32]>::new();
-        return ThreatStatus::MustBlock(BlockConstraint { cells, pairs });
-    }
-
-    // placements >= 2: enumerate every distinct pair of candidate cells.
-    // A pair is valid if, for every threat window, at least one of the two
-    // cells lies inside that window.
-    let mut pairs = SmallVec::<[(Hex, Hex); 32]>::new();
-    for i in 0..all_cells.len() {
-        for j in (i + 1)..all_cells.len() {
-            let c1 = all_cells[i];
-            let c2 = all_cells[j];
-            debug_assert_ne!(c1, c2, "self-pair detected in BlockConstraint enumeration");
-            if must_hit.iter().all(|w| w.contains(&c1) || w.contains(&c2)) {
-                pairs.push((c1, c2));
-            }
-        }
-    }
-
-    // If neither single-cell blocks nor any valid pair exists, we lose.
-    if pairs.is_empty() && cells.is_empty() {
-        return ThreatStatus::Unblockable;
-    }
-
-    ThreatStatus::MustBlock(BlockConstraint { cells, pairs })
 }
 
 /// Check whether a single turn is legal under threat constraints,
@@ -317,31 +346,71 @@ pub fn turn_satisfies_status(status: &ThreatStatus, turn: Turn) -> bool {
         // WinningTurn: the only legal move is the exact winning turn.
         ThreatStatus::WinningTurn(w) => turn == *w,
 
-        ThreatStatus::MustBlock(bc) => {
-            if turn.placements() == 1 {
-                // With only 1 placement, the single stone must block every
-                // threat window by itself.
-                bc.cells().contains(&turn.first())
-            } else {
-                let second = turn.second().unwrap();
-
-                // If either cell alone blocks every threat window, any pair
-                // containing it is valid.
-                if bc.cells().contains(&turn.first()) || bc.cells().contains(&second) {
-                    return true;
-                }
-
-                // Otherwise the pair must exactly match a valid blocking pair.
-                bc.pairs().iter().any(|&(a, b_pair)| {
-                    (a == turn.first() && b_pair == second)
-                        || (a == second && b_pair == turn.first())
-                })
-            }
-        }
+        ThreatStatus::MustBlock(bc) => block_constraint_satisfied(bc, turn),
 
         // Unblockable means the threat filter does not constrain moves.
         ThreatStatus::Unblockable => true,
     }
+}
+
+fn block_constraint_satisfied(bc: &BlockConstraint, turn: Turn) -> bool {
+    if turn.placements() == 1 {
+        // With only 1 placement, the single stone must block every threat
+        // window by itself.
+        bc.cells().contains(&turn.first())
+    } else {
+        let second = turn.second().unwrap();
+
+        // If either cell alone blocks every threat window, any pair containing
+        // it is valid.
+        if bc.cells().contains(&turn.first()) || bc.cells().contains(&second) {
+            return true;
+        }
+
+        // Otherwise the pair must exactly match a valid blocking pair.
+        bc.pairs().iter().any(|&(a, b_pair)| {
+            (a == turn.first() && b_pair == second) || (a == second && b_pair == turn.first())
+        })
+    }
+}
+
+/// Check whether a turn is legal under complete tactical constraints.
+pub fn turn_satisfies_tactical(status: &TacticalStatus, turn: Turn) -> bool {
+    match status {
+        TacticalStatus::Quiet => true,
+        TacticalStatus::WinningTurns(turns) => turns.contains(&turn),
+        TacticalStatus::MustBlock(bc) => block_constraint_satisfied(bc, turn),
+        TacticalStatus::Unblockable => true,
+    }
+}
+
+/// Collect every cell that participates in a forced tactical turn.
+///
+/// Returns `false` when the status imposes no mask-level constraint
+/// (`Quiet`/`Unblockable`).
+pub fn tactical_mask_cells(status: &TacticalStatus, out: &mut Vec<Hex>) -> bool {
+    out.clear();
+    match status {
+        TacticalStatus::Quiet | TacticalStatus::Unblockable => return false,
+        TacticalStatus::WinningTurns(turns) => {
+            for &turn in turns {
+                out.push(turn.first());
+                if let Some(second) = turn.second() {
+                    out.push(second);
+                }
+            }
+        }
+        TacticalStatus::MustBlock(block) => {
+            out.extend(block.cells().iter().copied());
+            for &(a, b) in block.pairs() {
+                out.push(a);
+                out.push(b);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    true
 }
 
 // -------------------------------------------------------------------------
@@ -364,6 +433,41 @@ pub(crate) fn generate_threat_turns(
     my_buf: &mut Vec<Hex>,
 ) {
     out.clear();
+    match tactical_status(game) {
+        TacticalStatus::WinningTurns(turns) => {
+            out.extend(turns);
+            return;
+        }
+        TacticalStatus::MustBlock(block) => {
+            if game.placements_remaining() == 1 {
+                out.extend(block.cells().iter().copied().map(Turn::single));
+                return;
+            }
+
+            for &(a, b) in block.pairs() {
+                out.push(Turn::pair(a, b));
+            }
+
+            let mut mask_cells = Vec::new();
+            let status = TacticalStatus::MustBlock(block);
+            tactical_mask_cells(&status, &mut mask_cells);
+            if let TacticalStatus::MustBlock(block) = &status {
+                for &cell in block.cells() {
+                    for &other in &mask_cells {
+                        if cell != other {
+                            out.push(Turn::pair(cell, other));
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.first().cmp(&b.first()).then(a.second().cmp(&b.second())));
+            out.dedup();
+            return;
+        }
+        TacticalStatus::Unblockable => return,
+        TacticalStatus::Quiet => {}
+    }
+
     let player = game.current_player();
     let opp = 1 - player;
 
@@ -434,17 +538,9 @@ pub(crate) fn generate_threat_turns(
 pub fn live_cells(game: &HexGameState, player: u8, out: &mut Vec<Hex>) {
     out.clear();
 
-    // Fast exit: no fours or fives means no live cells.
-    if !game.eval().has_threats(player) {
-        return;
-    }
-
-    let mut empties = SmallVec::<[Hex; 2]>::new();
     let mut seen = FxHashSet::default();
-    for key in game.eval().hot_windows(player) {
-        empties.clear();
-        window_empties(game, key, &mut empties);
-        for &h in &empties {
+    for window in full_board_threat_windows(game, player) {
+        for h in window.empties {
             if seen.insert(h) {
                 out.push(h);
             }

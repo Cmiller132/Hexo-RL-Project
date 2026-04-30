@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use hexgame_core::board::HexGameState;
+use hexgame_core::HexGameState;
 use hexgame_core::MCTSEngine;
 
 fn bench_single_mcts_sim(c: &mut Criterion) {
@@ -34,19 +34,34 @@ fn bench_single_mcts_sim(c: &mut Criterion) {
                 0,     // seed
             );
 
-            if let Some((_tensor, oq, or_, legal)) = engine.init_root() {
+            if let Some(root) = engine
+                .init_root_tokenized()
+                .expect("bench root initialization should succeed")
+            {
                 let policy = vec![0.0f32; 1089]; // BOARD_AREA uniform logits
-                engine.expand_root(&policy, 0.0, oq, or_, &legal);
+                engine
+                    .try_expand_root(
+                        root.root_generation,
+                        &policy,
+                        0.0,
+                        root.offset_q,
+                        root.offset_r,
+                        &root.legal_moves,
+                    )
+                    .expect("bench root expansion should succeed");
 
                 while !engine.done() {
-                    let (_tensor_slice, count) = engine.select_leaves(1);
-                    if count == 0 {
-                        engine.expand_and_backprop(&[], &[]);
-                    } else {
-                        let mock_policy = vec![0.0f32; count as usize * 1089]; // BOARD_AREA
-                        let mock_values = vec![0.1f32; count as usize];
-                        engine.expand_and_backprop(&mock_policy, &mock_values);
-                    }
+                    let (batch_generation, count) = {
+                        let batch = engine
+                            .select_leaves_tokenized(1)
+                            .expect("bench leaf selection should succeed");
+                        (batch.batch_generation, batch.non_terminal_count)
+                    };
+                    let mock_policy = vec![0.0f32; count as usize * 1089]; // BOARD_AREA
+                    let mock_values = vec![0.1f32; count as usize];
+                    engine
+                        .try_expand_and_backprop(batch_generation, &mock_policy, &mock_values)
+                        .expect("bench backpropagation should succeed");
                 }
             }
             black_box(engine.done());

@@ -574,9 +574,11 @@ class MockMCTSEngine:
         self._root_value = 0.0
         self._sims_done = 0
         self._batch_size = 4
+        self._root_generation = 0
+        self._batch_generation = 0
 
-    def init_root(self) -> Optional[Tuple[np.ndarray, int, int, bytes]]:
-        """Return a mock (13,33,33) tensor, offsets, and legal moves bytes."""
+    def init_root(self) -> Optional[Tuple[np.ndarray, int, int, bytes, int]]:
+        """Return a mock (13,33,33) tensor, offsets, legal bytes, and root token."""
         if self._is_over:
             return None
 
@@ -594,7 +596,8 @@ class MockMCTSEngine:
             legal_bytes.extend(q.to_bytes(4, "little", signed=True))
             legal_bytes.extend(r.to_bytes(4, "little", signed=True))
 
-        return tensor, offset_q, offset_r, bytes(legal_bytes)
+        self._root_generation += 1
+        return tensor, offset_q, offset_r, bytes(legal_bytes), self._root_generation
 
     def expand_root(
         self,
@@ -603,6 +606,7 @@ class MockMCTSEngine:
         offset_q: int,
         offset_r: int,
         legal_bytes: bytes,
+        root_generation: int,
     ):
         """Mock root expansion with random priors."""
         legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
@@ -619,15 +623,16 @@ class MockMCTSEngine:
         offset_q: int,
         offset_r: int,
         legal_bytes: bytes,
+        root_generation: int,
         sparse_qr: np.ndarray,
         sparse_logits: np.ndarray,
         stage: int,
         sparse_mix: float,
     ):
         """Mock sparse root expansion by preserving dense mock semantics."""
-        self.expand_root(policy, value, offset_q, offset_r, legal_bytes)
+        self.expand_root(policy, value, offset_q, offset_r, legal_bytes, root_generation)
 
-    def expand_root_with_global_priors(self, legal_bytes: bytes, global_qr: np.ndarray, global_logits: np.ndarray, value: float):
+    def expand_root_with_global_priors(self, legal_bytes: bytes, root_generation: int, global_qr: np.ndarray, global_logits: np.ndarray, value: float):
         """Mock graph root expansion from keyed global priors."""
         legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
         if legal.shape != np.asarray(global_qr).shape or not np.array_equal(legal, np.asarray(global_qr, dtype=np.int32)):
@@ -677,21 +682,22 @@ class MockMCTSEngine:
         """Check if MCTS simulations are complete."""
         return self._sims_done >= self.num_simulations
 
-    def select_leaves(self, batch_size: int) -> Tuple[np.ndarray, int]:
-        """Return a mock batch of (count, 13, 33, 33) tensors."""
+    def select_leaves(self, batch_size: int) -> Tuple[np.ndarray, int, int]:
+        """Return a mock batch of (count, 13, 33, 33) tensors and a batch token."""
         count = min(batch_size, self.num_simulations - self._sims_done)
         count = min(count, self._batch_size)
+        self._batch_generation += 1
         if count == 0:
             self._sims_done = self.num_simulations
-            return np.zeros((0, 13, 33, 33), dtype=np.float32), 0
+            return np.zeros((0, 13, 33, 33), dtype=np.float32), 0, self._batch_generation
 
         self._sims_done += count
         tensors = self._rng.randn(
             count, self.NUM_CHANNELS, self.BOARD_SIZE, self.BOARD_SIZE
         ).astype(np.float32)
-        return tensors, count
+        return tensors, count, self._batch_generation
 
-    def expand_and_backprop(self, policies: np.ndarray, values: np.ndarray):
+    def expand_and_backprop(self, policies: np.ndarray, values: np.ndarray, batch_generation: int):
         """Mock backpropagation."""
         pass
 
@@ -708,9 +714,10 @@ class MockMCTSEngine:
         sparse_counts: np.ndarray,
         stage: int,
         sparse_mix: float,
+        batch_generation: int,
     ):
         """Mock sparse backpropagation by preserving dense mock semantics."""
-        self.expand_and_backprop(policies, values)
+        self.expand_and_backprop(policies, values, batch_generation)
 
     def expand_and_backprop_with_sparse_sources(
         self,
@@ -722,6 +729,7 @@ class MockMCTSEngine:
         sparse_sources: np.ndarray,
         stage: int,
         sparse_mix: float,
+        batch_generation: int,
     ):
         self.expand_and_backprop_with_sparse(
             policies,
@@ -731,6 +739,7 @@ class MockMCTSEngine:
             sparse_counts,
             stage,
             sparse_mix,
+            batch_generation,
         )
 
     def get_results(self) -> Tuple[List[int], List[int], List[int], float]:
@@ -879,16 +888,17 @@ class RealMCTSEngine:
         init = self._engine.init_root()
         if init is None:
             return None
-        tensor_3d, oq, or_, legal_bytes = init
+        tensor_3d, oq, or_, legal_bytes, root_generation = init
         return (
             np.asarray(tensor_3d, dtype=np.float32),
             oq,
             or_,
             legal_bytes,
+            root_generation,
         )
 
-    def expand_root(self, policy, value, oq, or_, legal_bytes):
-        self._engine.expand_root(policy, value, oq, or_, legal_bytes)
+    def expand_root(self, policy, value, oq, or_, legal_bytes, root_generation):
+        self._engine.expand_root(policy, value, oq, or_, legal_bytes, root_generation)
 
     def expand_root_with_sparse_priors(
         self,
@@ -897,6 +907,7 @@ class RealMCTSEngine:
         oq,
         or_,
         legal_bytes,
+        root_generation,
         sparse_qr,
         sparse_logits,
         stage,
@@ -909,19 +920,21 @@ class RealMCTSEngine:
                 oq,
                 or_,
                 legal_bytes,
+                root_generation,
                 np.asarray(sparse_qr, dtype=np.int32),
                 np.asarray(sparse_logits, dtype=np.float32),
                 int(stage),
                 float(sparse_mix),
             )
         else:
-            self._engine.expand_root(policy, value, oq, or_, legal_bytes)
+            self._engine.expand_root(policy, value, oq, or_, legal_bytes, root_generation)
 
-    def expand_root_with_global_priors(self, legal_bytes, global_qr, global_logits, value):
+    def expand_root_with_global_priors(self, legal_bytes, root_generation, global_qr, global_logits, value):
         if not hasattr(self._engine, "expand_root_with_global_priors"):
             raise RuntimeError("Rust engine does not expose expand_root_with_global_priors")
         self._engine.expand_root_with_global_priors(
             legal_bytes,
+            root_generation,
             np.asarray(global_qr, dtype=np.int32),
             np.asarray(global_logits, dtype=np.float32),
             float(value),
@@ -957,16 +970,16 @@ class RealMCTSEngine:
         return self._engine.done()
 
     def select_leaves(self, batch_size):
-        tensor_4d, count = self._engine.select_leaves(batch_size)
-        return np.asarray(tensor_4d, dtype=np.float32), count
+        tensor_4d, count, batch_generation = self._engine.select_leaves(batch_size)
+        return np.asarray(tensor_4d, dtype=np.float32), count, batch_generation
 
     def pending_leaf_metadata(self):
         if hasattr(self._engine, "pending_leaf_metadata"):
             return self._engine.pending_leaf_metadata()
         return []
 
-    def expand_and_backprop(self, policies, values):
-        self._engine.expand_and_backprop(policies, values)
+    def expand_and_backprop(self, policies, values, batch_generation):
+        self._engine.expand_and_backprop(policies, values, batch_generation)
 
     def expand_and_backprop_with_sparse(
         self,
@@ -977,11 +990,13 @@ class RealMCTSEngine:
         sparse_counts,
         stage,
         sparse_mix,
+        batch_generation,
     ):
         if hasattr(self._engine, "expand_and_backprop_with_sparse"):
             self._engine.expand_and_backprop_with_sparse(
                 policies,
                 values,
+                batch_generation,
                 np.asarray(sparse_qr, dtype=np.int32),
                 np.asarray(sparse_logits, dtype=np.float32),
                 np.asarray(sparse_counts, dtype=np.uint16),
@@ -989,7 +1004,7 @@ class RealMCTSEngine:
                 float(sparse_mix),
             )
         else:
-            self._engine.expand_and_backprop(policies, values)
+            self._engine.expand_and_backprop(policies, values, batch_generation)
 
     def expand_and_backprop_with_sparse_sources(
         self,
@@ -1001,11 +1016,13 @@ class RealMCTSEngine:
         sparse_sources,
         stage,
         sparse_mix,
+        batch_generation,
     ):
         if hasattr(self._engine, "expand_and_backprop_with_sparse_sources"):
             self._engine.expand_and_backprop_with_sparse_sources(
                 policies,
                 values,
+                batch_generation,
                 np.asarray(sparse_qr, dtype=np.int32),
                 np.asarray(sparse_logits, dtype=np.float32),
                 np.asarray(sparse_counts, dtype=np.uint16),
@@ -1022,6 +1039,7 @@ class RealMCTSEngine:
                 sparse_counts,
                 stage,
                 sparse_mix,
+                batch_generation,
             )
 
     def get_results(self):
@@ -1311,7 +1329,7 @@ class SelfPlayWorker:
                 terminal_reason = "no_root"
                 break
 
-            tensor, offset_q, offset_r, legal_bytes = init
+            tensor, offset_q, offset_r, legal_bytes, root_generation = init
             if isinstance(tensor, np.ndarray):
                 tensor_3d = tensor
             else:
@@ -1360,6 +1378,7 @@ class SelfPlayWorker:
                         )
                         engine.expand_root_with_global_priors(
                             legal_bytes,
+                            root_generation,
                             graph_legal,
                             policy_place,
                             graph_value,
@@ -1440,7 +1459,7 @@ class SelfPlayWorker:
                             if active_width <= 0:
                                 p, v = client.submit(root_tensor, 1)
                                 engine.expand_root(
-                                    p, v[0], offset_q, offset_r, legal_bytes
+                                    p, v[0], offset_q, offset_r, legal_bytes, root_generation
                                 )
                             else:
                                 root_candidate_qr = cand.qr[active_rows]
@@ -1472,13 +1491,14 @@ class SelfPlayWorker:
                                         offset_q,
                                         offset_r,
                                         legal_bytes,
+                                        root_generation,
                                         root_candidate_qr,
                                         root_sparse_logits,
                                         self.sparse_prior_stage,
                                         self.sparse_prior_mix,
                                     )
                                 else:
-                                    engine.expand_root(p, v[0], offset_q, offset_r, legal_bytes)
+                                    engine.expand_root(p, v[0], offset_q, offset_r, legal_bytes, root_generation)
                                 if self.pair_policy_enabled:
                                     pair_t0 = time.monotonic()
                                     first_qr = _last_move_qr(move_history) if root_placements_remaining == 1 else None
@@ -1511,7 +1531,7 @@ class SelfPlayWorker:
                         else:
                             p, v = client.submit(root_tensor, 1)
                             engine.expand_root(
-                                p, v[0], offset_q, offset_r, legal_bytes
+                                p, v[0], offset_q, offset_r, legal_bytes, root_generation
                             )
                 except Exception as exc:
                     logger.warning(
@@ -1529,6 +1549,7 @@ class SelfPlayWorker:
                         offset_q,
                         offset_r,
                         legal_bytes,
+                        root_generation,
                     )
             else:
                 if self.global_graph_enabled:
@@ -1544,6 +1565,7 @@ class SelfPlayWorker:
                     offset_q,
                     offset_r,
                     legal_bytes,
+                    root_generation,
                 )
 
             if self.dirichlet_alpha > 0:
@@ -1566,13 +1588,14 @@ class SelfPlayWorker:
 
             while not engine.done():
                 try:
-                    batch_tensor, count = engine.select_leaves(
+                    batch_tensor, count, batch_generation = engine.select_leaves(
                         self.batch_size
                     )
                     if count == 0:
                         engine.expand_and_backprop(
                             np.zeros(0, dtype=np.float32),
                             np.zeros(0, dtype=np.float32),
+                            batch_generation,
                         )
                         break
                     if isinstance(batch_tensor, np.ndarray):
@@ -1680,6 +1703,7 @@ class SelfPlayWorker:
                                     sparse_sources,
                                     2,
                                     1.0,
+                                    batch_generation,
                                 )
                             else:
                                 engine.expand_and_backprop_with_sparse(
@@ -1690,6 +1714,7 @@ class SelfPlayWorker:
                                     sparse_counts,
                                     2,
                                     1.0,
+                                    batch_generation,
                                 )
                         elif self.sparse_policy_enabled and self.sparse_prior_stage >= 2:
                             meta = engine.pending_leaf_metadata() if hasattr(engine, "pending_leaf_metadata") else []
@@ -1752,17 +1777,18 @@ class SelfPlayWorker:
                                     cand_counts,
                                     self.sparse_prior_stage,
                                     self.sparse_prior_mix,
+                                    batch_generation,
                                 )
                             else:
                                 p, v = client.submit(
                                     batch_4d.astype(np.float32, copy=False), count
                                 )
-                                engine.expand_and_backprop(p, v)
+                                engine.expand_and_backprop(p, v, batch_generation)
                         else:
                             p, v = client.submit(
                                 batch_4d.astype(np.float32, copy=False), count
                             )
-                            engine.expand_and_backprop(p, v)
+                            engine.expand_and_backprop(p, v, batch_generation)
                     else:
                         uniform_policy = np.full(
                             count * 1089,
@@ -1772,6 +1798,7 @@ class SelfPlayWorker:
                         engine.expand_and_backprop(
                             uniform_policy,
                             np.zeros(count, dtype=np.float32),
+                            batch_generation,
                         )
                 except Exception as exc:
                     logger.warning(

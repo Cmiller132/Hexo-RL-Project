@@ -1,5 +1,4 @@
-use hexgame_core::board::*;
-use hexgame_core::core::{Hex, PLACEMENT_RADIUS, WIN_LENGTH};
+use hexgame_core::{GameError, Hex, HexGameState, PLACEMENT_RADIUS, WIN_LENGTH};
 
 #[cfg(test)]
 mod tests {
@@ -365,8 +364,14 @@ mod tests {
         let h1 = g.zobrist();
         assert_ne!(h0, h1);
 
-        g.unplace();
+        g.unplace().unwrap();
         assert_eq!(g.zobrist(), h0);
+    }
+
+    #[test]
+    fn unplace_empty_returns_error() {
+        let mut g = HexGameState::new();
+        assert_eq!(g.unplace(), Err(GameError::NoMoveToUndo));
     }
 
     #[test]
@@ -408,6 +413,12 @@ mod tests {
         assert!(GameError::OutOfRadius(Hex::new(99, 99))
             .to_string()
             .contains("within"));
+        assert!(GameError::WrongPlayer {
+            expected: 1,
+            actual: 0,
+        }
+        .to_string()
+        .contains("Wrong player"));
     }
 
     // -- Full random game smoke test -------------------------------------
@@ -569,6 +580,88 @@ mod tests {
         }
     }
 
+    // -- load_history -----------------------------------------------------
+
+    #[test]
+    fn load_history_replays_opening_and_two_placement_turns() {
+        let mut g = HexGameState::new();
+        g.load_history(&[(0, 0, 0), (1, 0, 1), (0, 1, 1), (-1, 1, 0), (2, -1, 0)])
+            .unwrap();
+
+        assert_eq!(g.move_count(), 5);
+        assert_eq!(g.current_player(), 1);
+        assert_eq!(g.placements_remaining(), 2);
+        assert_eq!(g.stones().get(&Hex::ORIGIN), Some(&0));
+        assert_eq!(g.stones().get(&Hex::new(1, 0)), Some(&1));
+        assert_eq!(g.stones().get(&Hex::new(0, 1)), Some(&1));
+        assert_eq!(g.stones().get(&Hex::new(-1, 1)), Some(&0));
+        assert_eq!(g.stones().get(&Hex::new(2, -1)), Some(&0));
+        assert_eq!(g.move_history()[3].player(), 0);
+        assert_eq!(g.move_history()[4].player(), 0);
+    }
+
+    #[test]
+    fn load_history_rejects_wrong_player() {
+        let mut g = HexGameState::new();
+        let result = g.load_history(&[(0, 0, 0), (1, 0, 0)]);
+
+        assert!(matches!(
+            result,
+            Err(GameError::WrongPlayer {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert_eq!(g.move_count(), 0);
+        assert!(g.stones().is_empty());
+    }
+
+    #[test]
+    fn load_history_rejects_illegal_coordinates_and_order() {
+        let mut g = HexGameState::new();
+        assert!(matches!(
+            g.load_history(&[(1, 0, 0)]),
+            Err(GameError::MustPlaceAtOrigin)
+        ));
+
+        assert!(matches!(
+            g.load_history(&[(0, 0, 0), (1, 0, 1), (1, 0, 1)]),
+            Err(GameError::CellOccupied(_))
+        ));
+
+        assert_eq!(g.move_count(), 0);
+        assert!(g.stones().is_empty());
+    }
+
+    #[test]
+    fn load_history_is_transactional_from_populated_existing_game() {
+        let mut g = populated_nonterminal_game();
+        let before = snapshot(&g);
+
+        let result = g.load_history(&[(0, 0, 0), (1, 0, 1), (100, 100, 1)]);
+
+        assert!(matches!(result, Err(GameError::OutOfRadius(_))));
+        assert_eq!(snapshot(&g), before);
+    }
+
+    #[test]
+    fn load_history_terminal_history_has_no_remaining_and_rejects_trailing_moves() {
+        let mut g = HexGameState::new();
+        g.load_history(&winning_history()).unwrap();
+
+        assert_eq!(g.winner(), Some(0));
+        assert_eq!(g.placements_remaining(), 0);
+        assert!(g.legal_moves().is_empty());
+
+        let mut with_trailing = winning_history();
+        with_trailing.push((6, 0, 0));
+        let result = g.load_history(&with_trailing);
+
+        assert!(matches!(result, Err(GameError::GameOver)));
+        assert_eq!(g.winner(), Some(0));
+        assert_eq!(g.placements_remaining(), 0);
+    }
+
     // -- candidates_near2 --------------------------------------------------
 
     #[test]
@@ -604,7 +697,7 @@ mod tests {
         let hot0 = g.eval().hot_len(0);
 
         g.place(3, 0).unwrap();
-        g.unplace();
+        g.unplace().unwrap();
 
         assert_eq!(g.eval().score(), eval0);
         assert_eq!(
@@ -643,7 +736,7 @@ mod tests {
             }
             let _hash_before = game.zobrist();
             for _ in 0..placed + 1 {
-                game.unplace();
+                game.unplace().unwrap();
             }
             assert_eq!(game.zobrist(), 0, "zobrist after full unplace must be zero");
             assert_eq!(game.move_count(), 0);
@@ -682,6 +775,23 @@ mod tests {
         g.place(-2, 1).unwrap();
         g.place(5, 0).unwrap();
         g
+    }
+
+    fn winning_history() -> Vec<(i32, i32, u8)> {
+        vec![
+            (0, 0, 0),
+            (0, -1, 1),
+            (1, -1, 1),
+            (1, 0, 0),
+            (2, 0, 0),
+            (-1, 1, 1),
+            (0, -2, 1),
+            (3, 0, 0),
+            (4, 0, 0),
+            (-1, 0, 1),
+            (-2, 1, 1),
+            (5, 0, 0),
+        ]
     }
 
     fn populated_nonterminal_game() -> HexGameState {

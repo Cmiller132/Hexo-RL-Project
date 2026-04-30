@@ -72,6 +72,10 @@ pub enum GameError {
     InvalidPlayer(u8),
     /// The remaining argument must be 1 or 2.
     InvalidRemaining(u8),
+    /// A chronological history entry names the wrong player for the turn.
+    WrongPlayer { expected: u8, actual: u8 },
+    /// Undo was requested before any move had been played.
+    NoMoveToUndo,
 }
 
 impl std::fmt::Display for GameError {
@@ -92,6 +96,12 @@ impl std::fmt::Display for GameError {
             GameError::InvalidRemaining(r) => {
                 write!(f, "Invalid remaining: {}. Must be 1 or 2.", r)
             }
+            GameError::WrongPlayer { expected, actual } => write!(
+                f,
+                "Wrong player in history: expected {}, got {}.",
+                expected, actual
+            ),
+            GameError::NoMoveToUndo => write!(f, "No move available to undo."),
         }
     }
 }
@@ -300,6 +310,11 @@ impl HexGameState {
     }
 
     /// The incremental evaluation state.
+    ///
+    /// `EvalState` is a bounded tactical approximation: it maintains hot
+    /// windows only inside the finite eval grid documented in `eval::grid`.
+    /// Core board legality and win detection remain sparse/infinite, but
+    /// threat/eval consumers should treat this accessor as grid-bounded.
     pub fn eval(&self) -> &EvalState {
         &self.eval
     }
@@ -334,7 +349,11 @@ impl HexGameState {
         &self.move_history
     }
 
-    /// The incremental Zobrist hash of the current position.
+    /// The incremental Zobrist hash of the current board stones.
+    ///
+    /// This hash does not include side-to-move or placements remaining.  Use a
+    /// full-state hash when keying transposition tables or replay records that
+    /// distinguish turn phase.
     pub fn zobrist(&self) -> u64 {
         self.zobrist
     }
@@ -390,14 +409,13 @@ impl HexGameState {
     }
 
     /// Undo the last placement. Restores board, turn state, and hash.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on an empty game (no moves to undo).
-    pub fn unplace(&mut self) {
+    pub fn unplace(&mut self) -> Result<(), GameError> {
+        if self.move_history.is_empty() {
+            return Err(GameError::NoMoveToUndo);
+        }
         self.eval.unplace();
 
-        let rec = self.move_history.pop().expect("no move to undo");
+        let rec = self.move_history.pop().ok_or(GameError::NoMoveToUndo)?;
 
         self.stones.remove(&rec.cell);
         self.zobrist ^= zobrist_piece(rec.player, rec.cell);
@@ -410,6 +428,7 @@ impl HexGameState {
         self.placements_remaining = rec.placements_remaining_before;
         self.winner = rec.winner_before;
         self.winning_line = rec.winning_line_before;
+        Ok(())
     }
 
     /// Set the board to a custom synthetic fixture position.
@@ -516,6 +535,38 @@ impl HexGameState {
 
         next.current_player = player;
         next.placements_remaining = if next.winner.is_some() { 0 } else { remaining };
+        *self = next;
+        Ok(())
+    }
+
+    /// Load a chronological legal move history from a fresh game.
+    ///
+    /// Unlike [`set_position`](Self::set_position), this replays real moves
+    /// in order using the normal turn sequence and placement rules. Each
+    /// entry is `(q, r, player)`, where `player` must match the player whose
+    /// turn it is before that placement.
+    ///
+    /// The load is transactional: if any entry is invalid, the pre-existing
+    /// game state is left unchanged.
+    pub fn load_history(&mut self, history: &[(i32, i32, u8)]) -> Result<(), GameError> {
+        let mut next = Self::new();
+
+        for &(q, r, player) in history {
+            if player > 1 {
+                return Err(GameError::InvalidPlayer(player));
+            }
+            if next.is_over() {
+                return Err(GameError::GameOver);
+            }
+            if player != next.current_player {
+                return Err(GameError::WrongPlayer {
+                    expected: next.current_player,
+                    actual: player,
+                });
+            }
+            next.place(q, r)?;
+        }
+
         *self = next;
         Ok(())
     }

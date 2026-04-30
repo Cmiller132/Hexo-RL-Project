@@ -301,7 +301,7 @@ const fn sign_extend_15(raw: u32) -> i32 {
 /// # Examples
 ///
 /// ```
-/// use hexgame_core::core::{hex_distance, Hex};
+/// use hexgame_core::{hex_distance, Hex};
 ///
 /// assert_eq!(hex_distance(Hex::ORIGIN, Hex::ORIGIN), 0);
 /// assert_eq!(hex_distance(Hex::new(0, 0), Hex::new(3, 0)), 3);

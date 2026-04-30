@@ -177,7 +177,7 @@ fn print_legal_moves(game: &HexGameState, max_to_print: usize) {
 }
 
 fn cmd_bench() {
-    use hexgame_core::encoder::BOARD_AREA;
+    use hexgame_core::encoding::BOARD_AREA;
 
     println!("Running quick MCTS benchmark...");
     let mut game = HexGameState::new();
@@ -205,20 +205,33 @@ fn cmd_bench() {
     let num_games = 10u32;
     for i in 0..num_games {
         let mut engine = MCTSEngine::new(game.clone(), 50, 1.5, 2, false, i as u64);
-        if let Some((_, _, _, legal)) = engine.init_root() {
+        if let Some(root) = engine
+            .init_root_tokenized()
+            .expect("benchmark root initialization should succeed")
+        {
             let uniform = vec![0.0f32; BOARD_AREA];
-            engine.expand_root(&uniform, 0.0, 0, 0, &legal);
+            engine
+                .try_expand_root(
+                    root.root_generation,
+                    &uniform,
+                    0.0,
+                    root.offset_q,
+                    root.offset_r,
+                    &root.legal_moves,
+                )
+                .expect("benchmark root expansion should succeed");
             while !engine.done() {
-                let count = {
-                    let (_, c) = engine.select_leaves(2);
-                    c
+                let (batch_generation, count) = {
+                    let batch = engine
+                        .select_leaves_tokenized(2)
+                        .expect("benchmark leaf selection should succeed");
+                    (batch.batch_generation, batch.non_terminal_count)
                 };
-                if count == 0 {
-                    break;
-                }
                 let p = vec![0.0f32; count as usize * BOARD_AREA];
                 let v = vec![0.1f32; count as usize];
-                engine.expand_and_backprop(&p, &v);
+                engine
+                    .try_expand_and_backprop(batch_generation, &p, &v)
+                    .expect("benchmark backpropagation should succeed");
             }
         }
     }
@@ -253,7 +266,8 @@ fn perft(game: &mut HexGameState, depth: u32) -> u64 {
     for h in legal {
         if game.place(h.q, h.r).is_ok() {
             nodes += perft(game, depth - 1);
-            game.unplace();
+            game.unplace()
+                .expect("perft should undo only successfully placed moves");
         }
     }
     nodes

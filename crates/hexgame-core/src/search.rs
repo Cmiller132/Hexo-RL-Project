@@ -56,7 +56,10 @@ use crate::core::Turn;
 use crate::core::WIN_LENGTH;
 use crate::core::{hex_distance, Hex, HEX_DIRECTIONS};
 use crate::encoder::WIN_SCORE;
-use crate::threats::{generate_threat_turns, threat_status, turn_satisfies_status, ThreatStatus};
+use crate::threats::{
+    generate_threat_turns, tactical_mask_cells, tactical_status, turn_satisfies_tactical,
+    TacticalStatus,
+};
 use smallvec::SmallVec;
 
 // -------------------------------------------------------------------------
@@ -276,7 +279,8 @@ fn make_turn(game: &mut HexGameState, t: Turn) -> Result<(bool, u8), GameError> 
 /// Undo a full turn. `placed` = number of placements that were actually made.
 fn unmake_turn(game: &mut HexGameState, placed: u8) {
     for _ in 0..placed {
-        game.unplace();
+        game.unplace()
+            .expect("unmake_turn placement count should match move history");
     }
 }
 
@@ -412,55 +416,31 @@ fn generate_turn_pairs(cands: &[Hex], max_pair_sum: usize) -> Vec<Turn> {
     turns
 }
 
-// -------------------------------------------------------------------------
-// Instant-win detection
-// -------------------------------------------------------------------------
-
-/// Check if the current player can win this turn (with remaining placements).
-///
-/// Uses incrementally-maintained hot_windows for O(hot_set) performance.
-/// A 5-window (1 empty) is an instant win regardless of whether 1 or 2
-/// placements remain — the game ends as soon as the 6th stone is placed.
-/// A 4-window (2 empties) is a win only if we have at least 2 placements.
-fn find_instant_win(game: &HexGameState, player: u8) -> Option<Turn> {
-    if !game.eval().has_threats(player) {
-        return None;
+fn push_unique_turn(out: &mut Vec<Turn>, turn: Turn) {
+    if !out.contains(&turn) {
+        out.push(turn);
     }
-    let remaining = game.placements_remaining() as usize;
+}
 
-    for key in game.eval().hot_windows(player) {
-        let (dq, dr) = HEX_DIRECTIONS[key.dir() as usize];
-        // Stack-allocated buffer: a length-6 window can have at most 2 empties
-        // when fours or fives are present.
-        let mut empties: SmallVec<[Hex; 2]> = SmallVec::new();
+fn append_mandatory_block_turns(game: &HexGameState, turns: &mut Vec<Turn>, ts: &TacticalStatus) {
+    let TacticalStatus::MustBlock(block) = ts else {
+        return;
+    };
 
-        for k in 0..WIN_LENGTH {
-            let h = Hex::new(key.q() + dq * k, key.r() + dr * k);
-            if !game.stones().contains_key(&h) {
-                empties.push(h);
+    if game.placements_remaining() == 1 {
+        for &cell in block.cells() {
+            if game.validate_move(cell).is_ok() {
+                push_unique_turn(turns, Turn::single(cell));
             }
         }
+        return;
+    }
 
-        // A full window means the game is already over; skip it.
-        // A window needing more empties than placements is unreachable.
-        if empties.is_empty() || empties.len() > remaining {
-            continue;
-        }
-
-        match empties.len() {
-            1 => {
-                // A single empty in a 5-window wins immediately.
-                // Even with 2 placements remaining, Turn::single wins because
-                // the game ends after the 6th stone is placed.
-                return Some(Turn::single(empties[0]));
-            }
-            2 if remaining >= 2 => {
-                return Some(Turn::pair(empties[0], empties[1]));
-            }
-            _ => {}
+    for &(a, b) in block.pairs() {
+        if game.validate_move(a).is_ok() && game.validate_move(b).is_ok() {
+            push_unique_turn(turns, Turn::pair(a, b));
         }
     }
-    None
 }
 
 // -------------------------------------------------------------------------
@@ -487,9 +467,9 @@ fn generate_root_turns(
         return vec![Turn::single(Hex::ORIGIN)];
     }
 
-    // Check for instant wins (always deterministic, highest priority).
-    if let Some(win_turn) = find_instant_win(game, game.current_player()) {
-        return vec![win_turn];
+    let ts = tactical_status(game);
+    if let TacticalStatus::WinningTurns(turns) = &ts {
+        return turns.iter().copied().collect();
     }
 
     let mut cands =
@@ -536,16 +516,19 @@ fn generate_root_turns(
 
     // Handle single-placement turns.
     if game.placements_remaining() == 1 {
-        return cands.into_iter().map(Turn::single).collect();
+        let mut turns: Vec<Turn> = cands.into_iter().map(Turn::single).collect();
+        append_mandatory_block_turns(game, &mut turns, &ts);
+        turns.retain(|t| turn_satisfies_tactical(&ts, *t));
+        return turns;
     }
 
     // Generate pairs with pair-sum constraint at root too.
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
+    append_mandatory_block_turns(game, &mut turns, &ts);
 
     // ── Threat filter ──
-    // Compute threat_status ONCE and retain only legal turns.
-    let ts = threat_status(game);
-    turns.retain(|t| turn_satisfies_status(&ts, *t));
+    // Retain only turns allowed by the complete tactical status.
+    turns.retain(|t| turn_satisfies_tactical(&ts, *t));
     turns
 }
 
@@ -561,10 +544,14 @@ fn generate_inner_turns(
     game: &HexGameState,
     history: &FxHashMap<Hex, i32>,
     noise_seed: u64,
-    ts: &ThreatStatus,
+    ts: &TacticalStatus,
     out: &mut Vec<Turn>,
 ) {
     out.clear();
+    if let TacticalStatus::WinningTurns(turns) = ts {
+        out.extend(turns.iter().copied());
+        return;
+    }
     if game.stones().is_empty() {
         out.push(Turn::single(Hex::ORIGIN));
         return;
@@ -574,14 +561,17 @@ fn generate_inner_turns(
     if game.placements_remaining() == 1 {
         let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
         out.extend(cands.into_iter().map(Turn::single));
+        append_mandatory_block_turns(game, out, ts);
+        out.retain(|t| turn_satisfies_tactical(ts, *t));
         return;
     }
 
     let cands = generate_sorted_candidates(game, history, CANDIDATE_CAP, 0.0, noise_seed);
     let mut turns = generate_turn_pairs(&cands, PAIR_SUM_CAP);
+    append_mandatory_block_turns(game, &mut turns, ts);
 
     // Retain only turns that satisfy the pre-computed threat status.
-    turns.retain(|t| turn_satisfies_status(ts, *t));
+    turns.retain(|t| turn_satisfies_tactical(ts, *t));
     out.extend(turns);
 }
 
@@ -656,7 +646,7 @@ fn adjust_mate_load(score: i32, ply: usize) -> i32 {
 /// * `alpha`, `beta` — standard alpha-beta bounds.
 /// * `qdepth` — remaining quiescence depth (in turns).  Stops at 0.
 /// * `ply` — distance from root, used for mate-distance scoring.
-/// * `ts_opt` — pre-computed `ThreatStatus` from caller (avoids recomputation).
+/// * `ts_opt` — pre-computed `TacticalStatus` from caller (avoids recomputation).
 ///   Scratch buffers (`ss.scratch_turns/opp/my`) are reused via `SearchState`.
 fn quiesce(
     game: &mut HexGameState,
@@ -665,7 +655,7 @@ fn quiesce(
     beta: i32,
     qdepth: i32,
     ply: usize,
-    ts_opt: Option<&ThreatStatus>,
+    ts_opt: Option<&TacticalStatus>,
 ) -> Result<i32, GameError> {
     if ss.aborted {
         return Ok(0);
@@ -701,13 +691,14 @@ fn quiesce(
         return Ok(alpha);
     }
 
-    // Only extend when threats exist on either side.
-    if !game.eval().has_any_threats() {
+    let ts = ts_opt.cloned().unwrap_or_else(|| tactical_status(game));
+    if matches!(ts, TacticalStatus::Quiet) {
         return Ok(alpha);
     }
 
     // Instant win check.
-    if let Some(win_turn) = find_instant_win(game, player) {
+    if let TacticalStatus::WinningTurns(turns) = &ts {
+        let win_turn = turns[0];
         let (over, placed) = make_turn(game, win_turn)?;
 
         let score = if over && game.winner() == Some(player) {
@@ -725,8 +716,7 @@ fn quiesce(
     }
 
     // Unblockable opponent win: we cannot stop all threats.
-    let ts = ts_opt.cloned().unwrap_or_else(|| threat_status(game));
-    if matches!(ts, ThreatStatus::Unblockable) {
+    if matches!(ts, TacticalStatus::Unblockable) {
         return Ok(-(WIN_SCORE - ply as i32 - 1));
     }
 
@@ -814,7 +804,7 @@ fn alphabeta(
     }
 
     // Compute threat status once for quiescence, unblockable check, and move generation.
-    let ts = threat_status(game);
+    let ts = tactical_status(game);
 
     // Leaf: drop into quiescence search.
     if depth <= 0 {
@@ -822,7 +812,8 @@ fn alphabeta(
     }
 
     // Instant win check: if we can win right now, return immediately.
-    if let Some(win_turn) = find_instant_win(game, player) {
+    if let TacticalStatus::WinningTurns(turns) = &ts {
+        let win_turn = turns[0];
         let (over, placed) = make_turn(game, win_turn)?;
         let score = if over && game.winner() == Some(player) {
             WIN_SCORE - ply as i32
@@ -834,7 +825,7 @@ fn alphabeta(
     }
 
     // Unblockable opponent win check.
-    if matches!(ts, ThreatStatus::Unblockable) {
+    if matches!(ts, TacticalStatus::Unblockable) {
         return Ok(-(WIN_SCORE - ply as i32 - 1));
     }
 
@@ -1212,7 +1203,16 @@ pub fn iterative_deepening(
 
     // Build root_candidates for NN training compatibility (always deterministic).
     let root_candidates = if collect_candidates {
-        let cands = generate_sorted_candidates(game, &ss.history, 12, 0.0, ss.noise_seed);
+        let status = tactical_status(game);
+        let mut tactical_cells = Vec::new();
+        let cands = if tactical_mask_cells(&status, &mut tactical_cells) {
+            tactical_cells
+                .into_iter()
+                .filter(|&cell| game.validate_move(cell).is_ok())
+                .collect()
+        } else {
+            generate_sorted_candidates(game, &ss.history, 12, 0.0, ss.noise_seed)
+        };
         cands
             .iter()
             .map(|&m| {
@@ -1236,4 +1236,88 @@ pub fn iterative_deepening(
         nodes: ss.nodes,
         root_candidates,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::HexGameState;
+    use crate::threats::{tactical_status, turn_satisfies_tactical, TacticalStatus};
+
+    #[test]
+    fn root_single_placement_turns_obey_must_block_filter() {
+        let mut game = HexGameState::new();
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (3, 0, 1),
+                (4, 0, 1),
+                (5, 0, 1),
+                (6, 0, 1),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+
+        let turns = generate_root_turns(&game, &FxHashMap::default(), 0.0, 0);
+        assert!(!turns.is_empty());
+        assert!(turns
+            .iter()
+            .all(|turn| turn_satisfies_tactical(&tactical_status(&game), *turn)));
+        assert!(turns.contains(&Turn::single(Hex::new(7, 0))));
+        assert!(!turns.contains(&Turn::single(Hex::new(2, 0))));
+    }
+
+    #[test]
+    fn inner_single_placement_turns_obey_must_block_filter() {
+        let mut game = HexGameState::new();
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (1, 0, 0),
+                (3, 0, 1),
+                (4, 0, 1),
+                (5, 0, 1),
+                (6, 0, 1),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+
+        let status = tactical_status(&game);
+        let mut turns = Vec::new();
+        generate_inner_turns(&game, &FxHashMap::default(), 0, &status, &mut turns);
+
+        assert!(!turns.is_empty());
+        assert!(turns
+            .iter()
+            .all(|turn| turn_satisfies_tactical(&status, *turn)));
+        assert!(turns.contains(&Turn::single(Hex::new(7, 0))));
+        assert!(!turns.contains(&Turn::single(Hex::new(2, 0))));
+    }
+
+    #[test]
+    fn mandatory_block_pairs_are_appended_beyond_pair_cap() {
+        let mut game = HexGameState::new();
+        game.set_position(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 0, 2)
+            .unwrap();
+
+        let status = tactical_status(&game);
+        let TacticalStatus::MustBlock(block) = &status else {
+            panic!("expected MustBlock, got {:?}", status);
+        };
+        let mut turns = generate_turn_pairs(&[Hex::new(20, 20), Hex::new(21, 20)], 0);
+        append_mandatory_block_turns(&game, &mut turns, &status);
+
+        for &(a, b) in block.pairs() {
+            assert!(
+                turns.contains(&Turn::pair(a, b)),
+                "mandatory block pair {:?} was not appended",
+                Turn::pair(a, b)
+            );
+        }
+    }
 }

@@ -4,18 +4,18 @@ use pyo3::types::{PyBytes, PyDict};
 
 use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 
-use hexgame_core::board::{GameError, HexGameState};
-use hexgame_core::core::HEX_DIRECTIONS;
-use hexgame_core::encoder;
-use hexgame_core::search;
-use hexgame_core::threats::{threat_status, ThreatStatus};
+use hexgame_core::classical as search;
+use hexgame_core::encoding as encoder;
+use hexgame_core::tactics::{threat_status, ThreatStatus};
 use hexgame_core::Hex;
 use hexgame_core::MCTSEngine;
+use hexgame_core::HEX_DIRECTIONS;
 use hexgame_core::WIN_LENGTH;
+use hexgame_core::{GameError, HexGameState};
 
 use std::time::Duration;
 
-use hexgame_core::encoder::{BOARD_AREA, BOARD_SIZE, NUM_CHANNELS};
+use hexgame_core::encoding::{BOARD_AREA, BOARD_SIZE, NUM_CHANNELS};
 
 fn hex_to_tuple(h: Hex) -> (i32, i32) {
     (h.q, h.r)
@@ -37,6 +37,7 @@ struct RootSnapshot {
     offset_q: i32,
     offset_r: i32,
     legal: Vec<Hex>,
+    root_generation: u64,
 }
 
 fn decode_legal_bytes(legal_bytes: &[u8]) -> PyResult<Vec<Hex>> {
@@ -60,12 +61,19 @@ fn validate_root_snapshot(
     snapshot: &Option<RootSnapshot>,
     offset: Option<(i32, i32)>,
     legal: &[Hex],
+    root_generation: u64,
 ) -> PyResult<()> {
     let Some(snapshot) = snapshot else {
         return Err(PyValueError::new_err(
             "root expansion requires legal_bytes from the most recent init_root() call",
         ));
     };
+    if root_generation != snapshot.root_generation {
+        return Err(PyValueError::new_err(format!(
+            "root token mismatch: got {root_generation}, expected {}",
+            snapshot.root_generation
+        )));
+    }
     if let Some((offset_q, offset_r)) = offset {
         if offset_q != snapshot.offset_q || offset_r != snapshot.offset_r {
             return Err(PyValueError::new_err(format!(
@@ -185,11 +193,16 @@ impl PyHexGame {
 
     /// Undo the last placement.
     ///
-    /// If the game is over this resets the winner as well. Safe to call even
-    /// when the history is empty (no-op).
-    fn unplace(&mut self) {
+    /// If the game is over this resets the winner as well. Returns `False`
+    /// when the history is empty.
+    fn unplace(&mut self) -> PyResult<bool> {
         if self.inner.move_count() > 0 {
-            self.inner.unplace();
+            self.inner
+                .unplace()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -223,10 +236,11 @@ impl PyHexGame {
         self.inner.move_count()
     }
 
-    /// Incremental Zobrist hash of the board position.
+    /// Incremental Zobrist hash of the board stones.
     ///
-    /// This hash is updated in O(1) on every placement and is suitable for
-    /// transposition tables.
+    /// This hash is updated in O(1) on every placement, but it does not include
+    /// side-to-move or placements remaining.  Do not use it alone as a full game
+    /// state transposition key.
     #[getter]
     fn zobrist_hash(&self) -> u64 {
         self.inner.zobrist()
@@ -709,6 +723,17 @@ impl PyHexGame {
             .map_err(|e| PyValueError::new_err(format!("{}", e)))
     }
 
+    /// Load a real chronological move history from an empty board.
+    ///
+    /// `history` is a list of `(q, r, player)` placements.  Each player must
+    /// match the legal turn sequence at that point in the replay.  Unlike
+    /// `set_position`, this validates that the history could actually occur.
+    fn load_history(&mut self, history: Vec<(i32, i32, u8)>) -> PyResult<()> {
+        self.inner
+            .load_history(&history)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))
+    }
+
     /// Move history as a list of `(player, q, r)` tuples.
     fn move_history(&self) -> Vec<(u8, i32, i32)> {
         self.inner
@@ -741,17 +766,17 @@ impl PyHexGame {
 /// engine = MCTSEngine(game, num_sims, c_puct=1.4, near_radius=8)
 ///
 /// # 1. Encode root board for GPU inference
-/// tensor, oq, or_, legal_bytes = engine.init_root()
+/// tensor, oq, or_, legal_bytes, root_token = engine.init_root()
 ///
 /// # 2. Run GPU inference → root_policy, root_value
-/// engine.expand_root(root_policy, root_value, oq, or_, legal_bytes)
+/// engine.expand_root(root_policy, root_value, oq, or_, legal_bytes, root_token)
 /// engine.add_dirichlet_noise(noise_array, noise_fraction)
 ///
 /// # 3. Search loop
 /// while not engine.done():
-///     tensor, count = engine.select_leaves(batch_size)
+///     tensor, count, batch_token = engine.select_leaves(batch_size)
 ///     # ... GPU inference → policies, values ...
-///     engine.expand_and_backprop(policies, values)
+///     engine.expand_and_backprop(policies, values, batch_token)
 ///
 /// # 4. Extract results
 /// moves_q, moves_r, visit_counts, root_value = engine.get_results()
@@ -767,6 +792,7 @@ impl PyHexGame {
 pub struct PyMCTSEngine {
     inner: MCTSEngine,
     last_non_terminal_count: u32,
+    last_batch_generation: Option<u64>,
     root_snapshot: Option<RootSnapshot>,
 }
 
@@ -799,6 +825,7 @@ impl PyMCTSEngine {
         Self {
             inner: engine,
             last_non_terminal_count: 0,
+            last_batch_generation: None,
             root_snapshot: None,
         }
     }
@@ -807,28 +834,47 @@ impl PyMCTSEngine {
     fn init_root<'py>(
         &mut self,
         py: Python<'py>,
-    ) -> PyResult<Option<(Bound<'py, PyArray3<f32>>, i32, i32, Bound<'py, PyBytes>)>> {
-        let Some((tensor, oq, or_, legal)) = self.inner.init_root() else {
+    ) -> PyResult<
+        Option<(
+            Bound<'py, PyArray3<f32>>,
+            i32,
+            i32,
+            Bound<'py, PyBytes>,
+            u64,
+        )>,
+    > {
+        let Some(init) = self
+            .inner
+            .init_root_tokenized()
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?
+        else {
             self.root_snapshot = None;
             return Ok(None);
         };
         let arr = ndarray::Array3::from_shape_vec(
             (NUM_CHANNELS, BOARD_SIZE as usize, BOARD_SIZE as usize),
-            tensor,
+            init.tensor,
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray3::from_owned_array(py, arr);
-        let mut legal_buf: Vec<u8> = Vec::with_capacity(legal.len() * 8);
-        for h in &legal {
+        let mut legal_buf: Vec<u8> = Vec::with_capacity(init.legal_moves.len() * 8);
+        for h in &init.legal_moves {
             legal_buf.extend_from_slice(&h.q.to_le_bytes());
             legal_buf.extend_from_slice(&h.r.to_le_bytes());
         }
         self.root_snapshot = Some(RootSnapshot {
-            offset_q: oq,
-            offset_r: or_,
-            legal,
+            offset_q: init.offset_q,
+            offset_r: init.offset_r,
+            legal: init.legal_moves,
+            root_generation: init.root_generation,
         });
-        Ok(Some((arr, oq, or_, PyBytes::new(py, &legal_buf))))
+        Ok(Some((
+            arr,
+            init.offset_q,
+            init.offset_r,
+            PyBytes::new(py, &legal_buf),
+            init.root_generation,
+        )))
     }
 
     fn expand_root<'py>(
@@ -838,6 +884,7 @@ impl PyMCTSEngine {
         offset_q: i32,
         offset_r: i32,
         legal_bytes: &[u8],
+        root_generation: u64,
     ) -> PyResult<()> {
         let policy_slice = policy
             .as_slice()
@@ -855,9 +902,22 @@ impl PyMCTSEngine {
             ));
         }
         let legal = decode_legal_bytes(legal_bytes)?;
-        validate_root_snapshot(&self.root_snapshot, Some((offset_q, offset_r)), &legal)?;
+        validate_root_snapshot(
+            &self.root_snapshot,
+            Some((offset_q, offset_r)),
+            &legal,
+            root_generation,
+        )?;
         self.inner
-            .expand_root(policy_slice, value, offset_q, offset_r, &legal);
+            .try_expand_root(
+                root_generation,
+                policy_slice,
+                value,
+                offset_q,
+                offset_r,
+                &legal,
+            )
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.root_snapshot = None;
         Ok(())
     }
@@ -870,6 +930,7 @@ impl PyMCTSEngine {
         offset_q: i32,
         offset_r: i32,
         legal_bytes: &[u8],
+        root_generation: u64,
         sparse_qr: PyReadonlyArray2<'py, i32>,
         sparse_logits: PyReadonlyArray1<'py, f32>,
         stage: u8,
@@ -905,19 +966,27 @@ impl PyMCTSEngine {
             )));
         }
         let legal = decode_legal_bytes(legal_bytes)?;
-        validate_root_snapshot(&self.root_snapshot, Some((offset_q, offset_r)), &legal)?;
-        let sparse_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
-        self.inner.expand_root_with_sparse_priors(
-            policy_slice,
-            value,
-            offset_q,
-            offset_r,
+        validate_root_snapshot(
+            &self.root_snapshot,
+            Some((offset_q, offset_r)),
             &legal,
-            &sparse_actions,
-            sparse_logits_slice,
-            stage,
-            sparse_mix,
-        );
+            root_generation,
+        )?;
+        let sparse_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
+        self.inner
+            .try_expand_root_with_sparse_priors(
+                root_generation,
+                policy_slice,
+                value,
+                offset_q,
+                offset_r,
+                &legal,
+                &sparse_actions,
+                sparse_logits_slice,
+                stage,
+                sparse_mix,
+            )
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.root_snapshot = None;
         Ok(())
     }
@@ -925,6 +994,7 @@ impl PyMCTSEngine {
     fn expand_root_with_global_priors<'py>(
         &mut self,
         legal_bytes: &[u8],
+        root_generation: u64,
         global_qr: PyReadonlyArray2<'py, i32>,
         global_logits: PyReadonlyArray1<'py, f32>,
         value: f32,
@@ -944,10 +1014,16 @@ impl PyMCTSEngine {
             )));
         }
         let legal = decode_legal_bytes(legal_bytes)?;
-        validate_root_snapshot(&self.root_snapshot, None, &legal)?;
+        validate_root_snapshot(&self.root_snapshot, None, &legal, root_generation)?;
         let global_actions: Vec<(i32, i32)> = qr.outer_iter().map(|row| (row[0], row[1])).collect();
         self.inner
-            .expand_root_with_global_priors(&legal, &global_actions, logits, value)
+            .try_expand_root_with_global_priors(
+                root_generation,
+                &legal,
+                &global_actions,
+                logits,
+                value,
+            )
             .map_err(PyValueError::new_err)?;
         self.root_snapshot = None;
         Ok(())
@@ -1041,8 +1117,9 @@ impl PyMCTSEngine {
                 child_count
             )));
         }
-        self.inner.add_dirichlet_noise(noise_slice, noise_fraction);
-        Ok(())
+        self.inner
+            .add_dirichlet_noise(noise_slice, noise_fraction)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
 
     fn done(&self) -> bool {
@@ -1053,12 +1130,20 @@ impl PyMCTSEngine {
         &mut self,
         py: Python<'py>,
         batch_size: u32,
-    ) -> PyResult<(Bound<'py, PyArray4<f32>>, u32)> {
-        let (count, tensor_vec) = py.allow_threads(|| {
-            let (tensors, count) = self.inner.select_leaves(batch_size);
-            (count, tensors.to_vec())
-        });
+    ) -> PyResult<(Bound<'py, PyArray4<f32>>, u32, u64)> {
+        let (count, batch_generation, tensor_vec) = py
+            .allow_threads(|| {
+                self.inner.select_leaves_tokenized(batch_size).map(|batch| {
+                    (
+                        batch.non_terminal_count,
+                        batch.batch_generation,
+                        batch.tensors.to_vec(),
+                    )
+                })
+            })
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.last_non_terminal_count = count;
+        self.last_batch_generation = Some(batch_generation);
         let view = ndarray::ArrayView4::from_shape(
             (
                 count as usize,
@@ -1070,7 +1155,7 @@ impl PyMCTSEngine {
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let arr = PyArray4::from_array(py, &view);
-        Ok((arr, count))
+        Ok((arr, count, batch_generation))
     }
 
     fn pending_leaf_metadata<'py>(
@@ -1100,6 +1185,7 @@ impl PyMCTSEngine {
         &mut self,
         policies: PyReadonlyArray1<'py, f32>,
         values: PyReadonlyArray1<'py, f32>,
+        batch_generation: u64,
         py: Python<'py>,
     ) -> PyResult<()> {
         let policies_slice = policies
@@ -1129,10 +1215,16 @@ impl PyMCTSEngine {
         if p.iter().any(|value| !value.is_finite()) {
             return Err(PyValueError::new_err("policies contain non-finite values"));
         }
-        py.allow_threads(|| {
-            self.inner.expand_and_backprop(&p, &v);
-        });
+        if self.last_batch_generation != Some(batch_generation) {
+            return Err(PyValueError::new_err(format!(
+                "batch token mismatch: got {batch_generation}, expected {:?}",
+                self.last_batch_generation
+            )));
+        }
+        py.allow_threads(|| self.inner.try_expand_and_backprop(batch_generation, &p, &v))
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.last_non_terminal_count = 0;
+        self.last_batch_generation = None;
         Ok(())
     }
 
@@ -1141,6 +1233,7 @@ impl PyMCTSEngine {
         &mut self,
         policies: PyReadonlyArray1<'py, f32>,
         values: PyReadonlyArray1<'py, f32>,
+        batch_generation: u64,
         sparse_qr: PyReadonlyArray3<'py, i32>,
         sparse_logits: PyReadonlyArray2<'py, f32>,
         sparse_counts: PyReadonlyArray1<'py, u16>,
@@ -1205,17 +1298,26 @@ impl PyMCTSEngine {
         if p.iter().any(|value| !value.is_finite()) {
             return Err(PyValueError::new_err("policies contain non-finite values"));
         }
+        if self.last_batch_generation != Some(batch_generation) {
+            return Err(PyValueError::new_err(format!(
+                "batch token mismatch: got {batch_generation}, expected {:?}",
+                self.last_batch_generation
+            )));
+        }
         py.allow_threads(|| {
-            self.inner.expand_and_backprop_with_sparse(
+            self.inner.try_expand_and_backprop_with_sparse(
+                batch_generation,
                 &p,
                 &v,
                 &sparse_actions,
                 &sparse_values,
                 stage,
                 sparse_mix,
-            );
-        });
+            )
+        })
+        .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.last_non_terminal_count = 0;
+        self.last_batch_generation = None;
         Ok(())
     }
 
@@ -1224,6 +1326,7 @@ impl PyMCTSEngine {
         &mut self,
         policies: PyReadonlyArray1<'py, f32>,
         values: PyReadonlyArray1<'py, f32>,
+        batch_generation: u64,
         sparse_qr: PyReadonlyArray3<'py, i32>,
         sparse_logits: PyReadonlyArray2<'py, f32>,
         sparse_counts: PyReadonlyArray1<'py, u16>,
@@ -1299,8 +1402,15 @@ impl PyMCTSEngine {
         if p.iter().any(|value| !value.is_finite()) {
             return Err(PyValueError::new_err("policies contain non-finite values"));
         }
+        if self.last_batch_generation != Some(batch_generation) {
+            return Err(PyValueError::new_err(format!(
+                "batch token mismatch: got {batch_generation}, expected {:?}",
+                self.last_batch_generation
+            )));
+        }
         py.allow_threads(|| {
-            self.inner.expand_and_backprop_with_sparse_sources(
+            self.inner.try_expand_and_backprop_with_sparse_sources(
+                batch_generation,
                 &p,
                 &v,
                 &sparse_actions,
@@ -1308,9 +1418,11 @@ impl PyMCTSEngine {
                 &sparse_source_values,
                 stage,
                 sparse_mix,
-            );
-        });
+            )
+        })
+        .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.last_non_terminal_count = 0;
+        self.last_batch_generation = None;
         Ok(())
     }
 
@@ -1385,7 +1497,7 @@ impl PyMCTSEngine {
             .map(|history| {
                 history
                     .into_iter()
-                    .map(|(player, q, r)| (player as i32, q as i32, r as i32))
+                    .map(|(player, q, r)| (player as i32, q, r))
                     .collect()
             })
             .collect();
@@ -1401,7 +1513,7 @@ impl PyMCTSEngine {
     /// `rng_state` is used as XOR-shift state for deterministic sampling.
     /// Pass `None` (or omit) to use state `0`.
     #[pyo3(signature = (temperature, rng_state=None))]
-    fn sample_action(&mut self, temperature: f32, rng_state: Option<u64>) -> PyResult<(i16, i16)> {
+    fn sample_action(&mut self, temperature: f32, rng_state: Option<u64>) -> PyResult<(i32, i32)> {
         if self.inner.root_child_count() == 0 {
             return Err(PyValueError::new_err(
                 "sample_action requires an expanded root with at least one child",
@@ -1420,15 +1532,12 @@ impl PyMCTSEngine {
 
     #[pyo3(signature = (q, r, new_num_simulations))]
     fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> PyResult<()> {
-        let q =
-            i16::try_from(q).map_err(|_| PyValueError::new_err("q coordinate out of i16 range"))?;
-        let r =
-            i16::try_from(r).map_err(|_| PyValueError::new_err("r coordinate out of i16 range"))?;
         self.inner
             .re_root(q, r, new_num_simulations)
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         self.root_snapshot = None;
         self.last_non_terminal_count = 0;
+        self.last_batch_generation = None;
         Ok(())
     }
 }

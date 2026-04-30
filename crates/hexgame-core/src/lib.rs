@@ -24,13 +24,13 @@
 //!
 //! | Module | Responsibility |
 //! |--------|---------------|
-//! | [`core`] | Hex coordinates, distances, directions, [`Turn`], [`WindowKey`] |
-//! | [`eval`] | Pattern tables, incremental evaluation ([`EvalState`]), threat counts |
-//! | [`board`] | Game state, rules, placement/undo, win detection, legal moves |
-//! | [`threats`] | Threat detection, forced-move constraints ([`ThreatStatus`]) |
-//! | [`encoder`] | Unified 13-channel neural-network tensor encoder |
-//! | [`search`] | Turn-based alpha-beta search (classical engine) |
-//! | [`mcts`] | Neural MCTS with PUCT |
+//! | Facade | Responsibility |
+//! |--------|---------------|
+//! | crate root / [`rules`] | Hex coordinates, rules, turns, and game state |
+//! | [`encoding`] | Unified 13-channel neural-network tensor encoder |
+//! | [`tactics`] | Complete tactical status and compatibility threat status |
+//! | [`classical`] | Turn-based alpha-beta search |
+//! | crate root | Neural MCTS with PUCT |
 //!
 //! ## Dependency Graph
 //!
@@ -55,19 +55,48 @@
 //! (`proptest`) run this comparison over hundreds of randomly-generated game
 //! positions.
 
-pub mod board;
-pub mod core;
-pub mod encoder;
-pub mod eval;
-pub mod mcts;
-pub mod search;
-pub mod threats;
+mod board;
+mod core;
+mod encoder;
+mod eval;
+mod mcts;
+mod search;
+mod threats;
 
 #[cfg(test)]
 mod tests;
 
-// Re-exports for convenient access
-pub use board::{GameError, HexGameState};
-pub use core::{hex_distance, Hex, Turn, PLACEMENT_RADIUS, WIN_LENGTH};
+/// Stable rules and board-state facade.
+pub mod rules {
+    pub use crate::board::{GameError, HexGameState, MoveRecord};
+    pub use crate::core::{
+        hex_distance, Hex, Turn, WindowKey, HEX_DIRECTIONS, PLACEMENT_RADIUS, WIN_LENGTH,
+    };
+}
+
+/// Stable tensor-encoding facade.
+pub mod encoding {
+    pub use crate::encoder::{
+        encode_board, encode_board_into, extract_features, EncodedBoard, BOARD_AREA, BOARD_SIZE,
+        FEATURE_COUNT, HALF_BOARD, NUM_CHANNELS, TENSOR_SIZE, WIN_SCORE,
+    };
+}
+
+/// Stable tactical-analysis facade.
+pub mod tactics {
+    pub use crate::threats::{
+        live_cells, tactical_mask_cells, tactical_status, threat_status, turn_satisfies_status,
+        turn_satisfies_tactical, BlockConstraint, TacticalStatus, ThreatStatus,
+    };
+}
+
+/// Stable classical-search facade.
+pub mod classical {
+    pub use crate::search::{iterative_deepening, SearchResult};
+}
+
+// Re-exports for convenient access.
+pub use board::{GameError, HexGameState, MoveRecord};
+pub use core::{hex_distance, Hex, Turn, WindowKey, HEX_DIRECTIONS, PLACEMENT_RADIUS, WIN_LENGTH};
 pub use mcts::{MCTSEngine, MCTSError};
-pub use threats::{live_cells, threat_status, ThreatStatus};
+pub use threats::{live_cells, tactical_status, threat_status, TacticalStatus, ThreatStatus};

@@ -1,5 +1,6 @@
 use crate::board::HexGameState;
 use crate::core::{Hex, Turn};
+use crate::encoder::encode_board;
 use crate::threats::*;
 
 #[cfg(test)]
@@ -19,14 +20,12 @@ mod tests {
         )
         .unwrap();
 
-        match threat_status(&game) {
-            ThreatStatus::WinningTurn(t) => {
-                // With remaining=2 the first hot window is the 5-window at
-                // origin (0,0) whose only empty is (5,0).
-                assert_eq!(t.placements(), 1);
-                assert_eq!(t.first(), Hex::new(5, 0));
+        match tactical_status(&game) {
+            TacticalStatus::WinningTurns(turns) => {
+                assert!(turns.contains(&Turn::single(Hex::new(-1, 0))));
+                assert!(turns.contains(&Turn::single(Hex::new(5, 0))));
             }
-            other => panic!("expected WinningTurn, got {:?}", other),
+            other => panic!("expected WinningTurns, got {:?}", other),
         }
     }
 
@@ -37,14 +36,13 @@ mod tests {
         game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 2)
             .unwrap();
 
-        match threat_status(&game) {
-            ThreatStatus::WinningTurn(t) => {
-                // The first hot window is at origin (0,0) with empties (4,0),(5,0).
-                assert_eq!(t.placements(), 2);
-                assert_eq!(t.first(), Hex::new(4, 0));
-                assert_eq!(t.second(), Some(Hex::new(5, 0)));
+        match tactical_status(&game) {
+            TacticalStatus::WinningTurns(turns) => {
+                assert!(turns.contains(&Turn::pair(Hex::new(-2, 0), Hex::new(-1, 0))));
+                assert!(turns.contains(&Turn::pair(Hex::new(-1, 0), Hex::new(4, 0))));
+                assert!(turns.contains(&Turn::pair(Hex::new(4, 0), Hex::new(5, 0))));
             }
-            other => panic!("expected WinningTurn, got {:?}", other),
+            other => panic!("expected WinningTurns, got {:?}", other),
         }
     }
 
@@ -429,5 +427,163 @@ mod tests {
         live_cells(&game, 0, &mut cells);
         assert!(cells.contains(&Hex::new(-1, 0)));
         assert!(cells.contains(&Hex::new(5, 0)));
+    }
+
+    #[test]
+    fn tactical_status_retains_multiple_winning_singles_for_masks() {
+        let mut game = HexGameState::new();
+        game.set_position(
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
+            0,
+            2,
+        )
+        .unwrap();
+
+        let status = tactical_status(&game);
+        let TacticalStatus::WinningTurns(turns) = &status else {
+            panic!("expected complete winning turns, got {:?}", status);
+        };
+        assert!(turns.contains(&Turn::single(Hex::new(-1, 0))));
+        assert!(turns.contains(&Turn::single(Hex::new(5, 0))));
+
+        let encoded = encode_board(&game, 2, true);
+        assert!(encoded.legal_moves().contains(&Hex::new(-1, 0)));
+        assert!(encoded.legal_moves().contains(&Hex::new(5, 0)));
+    }
+
+    #[test]
+    fn far_grid_four_and_five_threats_use_sparse_scanner() {
+        let bridge = [(0, 0, 0), (8, 0, 0), (16, 0, 0), (24, 0, 0), (32, 0, 0)];
+
+        let mut four = HexGameState::new();
+        four.set_position(
+            &[
+                bridge[0],
+                bridge[1],
+                bridge[2],
+                bridge[3],
+                bridge[4],
+                (40, 0, 1),
+                (41, 0, 1),
+                (42, 0, 1),
+                (43, 0, 1),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            four.eval().hot_len(1),
+            0,
+            "fixture should be outside eval grid"
+        );
+        match tactical_status(&four) {
+            TacticalStatus::MustBlock(block) => {
+                assert!(block.pairs().contains(&(Hex::new(38, 0), Hex::new(44, 0))));
+                assert!(block.pairs().contains(&(Hex::new(39, 0), Hex::new(44, 0))));
+                assert!(block.pairs().contains(&(Hex::new(39, 0), Hex::new(45, 0))));
+            }
+            other => panic!("expected far-grid MustBlock for four, got {:?}", other),
+        }
+
+        let mut five = HexGameState::new();
+        five.set_position(
+            &[
+                bridge[0],
+                bridge[1],
+                bridge[2],
+                bridge[3],
+                bridge[4],
+                (39, 0, 0),
+                (40, 0, 1),
+                (41, 0, 1),
+                (42, 0, 1),
+                (43, 0, 1),
+                (44, 0, 1),
+            ],
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            five.eval().hot_len(1),
+            0,
+            "fixture should be outside eval grid"
+        );
+        match tactical_status(&five) {
+            TacticalStatus::MustBlock(block) => {
+                assert!(block.cells().contains(&Hex::new(45, 0)));
+            }
+            other => panic!("expected far-grid MustBlock for five, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn far_grid_six_is_terminal_before_tactical_filtering() {
+        let mut game = HexGameState::new();
+        game.set_position(
+            &[
+                (0, 0, 0),
+                (8, 0, 0),
+                (16, 0, 0),
+                (24, 0, 0),
+                (32, 0, 0),
+                (40, 0, 1),
+                (41, 0, 1),
+                (42, 0, 1),
+                (43, 0, 1),
+                (44, 0, 1),
+                (45, 0, 1),
+            ],
+            0,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(game.winner(), Some(1));
+        assert!(matches!(tactical_status(&game), TacticalStatus::Quiet));
+    }
+
+    #[test]
+    fn tactical_mask_cells_reports_complete_must_block_and_unblockable_semantics() {
+        let mut block = HexGameState::new();
+        block
+            .set_position(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 0, 2)
+            .unwrap();
+        let status = tactical_status(&block);
+        let mut cells = Vec::new();
+        assert!(tactical_mask_cells(&status, &mut cells));
+        for expected in [
+            Hex::new(-2, 0),
+            Hex::new(-1, 0),
+            Hex::new(4, 0),
+            Hex::new(5, 0),
+        ] {
+            assert!(cells.contains(&expected), "missing mask cell {expected}");
+        }
+
+        let mut unblockable = HexGameState::new();
+        unblockable
+            .set_position(
+                &[
+                    (0, 0, 1),
+                    (1, 0, 1),
+                    (2, 0, 1),
+                    (3, 0, 1),
+                    (4, 0, 1),
+                    (10, 0, 1),
+                    (11, 0, 1),
+                    (12, 0, 1),
+                    (13, 0, 1),
+                    (14, 0, 1),
+                ],
+                0,
+                1,
+            )
+            .unwrap();
+        let status = tactical_status(&unblockable);
+        assert!(matches!(status, TacticalStatus::Unblockable));
+        assert!(!tactical_mask_cells(&status, &mut cells));
+        assert!(cells.is_empty());
     }
 }

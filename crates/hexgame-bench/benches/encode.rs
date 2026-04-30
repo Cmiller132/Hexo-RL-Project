@@ -1,7 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use hexgame_core::board::HexGameState;
-use hexgame_core::core::{hex_distance, Hex, PLACEMENT_RADIUS};
-use hexgame_core::encoder;
+use hexgame_core::encoding;
+use hexgame_core::{hex_distance, Hex, HexGameState, PLACEMENT_RADIUS};
 use std::collections::HashSet;
 
 fn bench_encode_board(c: &mut Criterion) {
@@ -26,20 +25,20 @@ fn bench_encode_board(c: &mut Criterion) {
     }
 
     c.bench_function("encode_board_into", |b| {
-        let mut out = vec![0.0f32; encoder::TENSOR_SIZE];
+        let mut out = vec![0.0f32; encoding::TENSOR_SIZE];
         let mut hot_buf = Vec::new();
         let mut legal_out = Vec::new();
         b.iter(|| {
-            encoder::encode_board_into(&game, 2, false, &mut out, &mut hot_buf, &mut legal_out);
+            encoding::encode_board_into(&game, 2, false, &mut out, &mut hot_buf, &mut legal_out);
         });
     });
 
     c.bench_function("encode_board_into_radius8", |b| {
-        let mut out = vec![0.0f32; encoder::TENSOR_SIZE];
+        let mut out = vec![0.0f32; encoding::TENSOR_SIZE];
         let mut hot_buf = Vec::new();
         let mut legal_out = Vec::new();
         b.iter(|| {
-            encoder::encode_board_into(
+            encoding::encode_board_into(
                 &game,
                 PLACEMENT_RADIUS,
                 false,

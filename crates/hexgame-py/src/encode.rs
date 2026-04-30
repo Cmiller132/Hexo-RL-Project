@@ -1,4 +1,4 @@
-use hexgame_core::encoder::{self, BOARD_SIZE, NUM_CHANNELS, TENSOR_SIZE};
+use hexgame_core::encoding::{self as encoder, BOARD_SIZE, NUM_CHANNELS, TENSOR_SIZE};
 use hexgame_core::HexGameState;
 use numpy::{PyArray3, PyArray4, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
