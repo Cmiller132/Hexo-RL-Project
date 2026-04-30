@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hexorl.graph.batch import GRAPH_FEATURE_DIM, GraphTokenType
+from hexorl.graph.semantic_builder import GRAPH_FEATURE_DIM, GraphTokenType
 
 
 class RelationBiasedSelfAttention(nn.Module):

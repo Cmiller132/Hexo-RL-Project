@@ -11,13 +11,14 @@ from hexorl.graph import (
     RelationType,
     build_graph_batch_from_history as _build_graph_batch_from_history,
     collate_graph_batches,
-    graph_batch_with_reference_pair_rows,
     transform_history,
     transform_pair_policy_target,
     transform_policy_target,
     transform_qr,
 )
-from hexorl.graph.batch import graph_capacity_report, validate_graph_ipc_capacity
+from hexorl.contracts.candidates import CandidateContractBuilder
+from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
+from hexorl.graph.tensorize import graph_batch_with_pair_table, graph_capacity_report, validate_graph_ipc_capacity
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.model.network import build_model_from_config
@@ -43,6 +44,36 @@ def build_graph_batch_from_history(history, **kwargs):
         or bool(kwargs.get("allow_pair_truncation", False)),
     )
     return _build_graph_batch_from_history(history, **kwargs)
+
+
+def graph_batch_with_reference_pair_rows(graph, pair_policy_target):
+    legal_rows = [(int(q), int(r)) for q, r in graph.legal_qr.tolist()]
+    known_first = None
+    if int(graph.placements_remaining) == 1:
+        stone_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.STONE))
+        if stone_rows.size:
+            known_first = tuple(int(x) for x in graph.token_qr[int(stone_rows[-1])].tolist())
+    candidate_rows = ([known_first] if known_first is not None else []) + legal_rows
+    candidate_table = CandidateContractBuilder().build(
+        candidate_rows,
+        [],
+        offset_q=0,
+        offset_r=0,
+        budget=max(1, len(candidate_rows)),
+        storage_width=max(1, len(candidate_rows)),
+        critical_actions=candidate_rows,
+        source="rust:synthetic",
+    )
+    possible = len(legal_rows) if known_first is not None else len(legal_rows) * max(0, len(legal_rows) - 1) // 2
+    pair_table = PairActionTableBuilder().build(
+        candidate_table,
+        pair_policy_target,
+        strategy=PairStrategy(mode="full_capped", max_pairs=max(1, possible), allow_full=True),
+        legal_moves=legal_rows,
+        known_first=known_first,
+        source="rust:synthetic",
+    )
+    return graph_batch_with_pair_table(graph, pair_table)
 
 
 def test_global_graph_policy_logits_align_to_rust_legal_order():

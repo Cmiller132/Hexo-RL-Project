@@ -14,7 +14,7 @@ import torch.nn as nn
 from typing import Dict, Optional
 from pathlib import Path
 
-from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
+from hexorl.contracts.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.config import Config
 from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.model.network import HexNet, load_model_state

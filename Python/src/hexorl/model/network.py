@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
 
-from hexorl.action_contract.candidates import CANDIDATE_FEATURES
+from hexorl.contracts.candidates import CANDIDATE_FEATURES
 from hexorl.model.global_graph import GlobalHexGraphNet
 
 

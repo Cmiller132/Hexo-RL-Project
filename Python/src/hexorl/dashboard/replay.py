@@ -1,4 +1,4 @@
-"""Replay reconstruction and board-debug helpers for the dashboard."""
+﻿"""Replay reconstruction and board-debug helpers for the dashboard."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from hexorl.action_contract.candidates import (
+from hexorl.contracts.candidates import (
     CANDIDATE_FEATURE_NAMES,
     CANDIDATE_FEATURE_VERSION,
-    build_candidate_batch,
+    CandidateContractBuilder,
 )
 from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
 from hexorl.contracts.history import MoveHistory, encode_move_history as contract_encode_move_history
@@ -381,7 +381,7 @@ def _candidate_rows_debug(row: dict[str, Any], debug: dict[str, Any], limit: int
             offset_q=offset_q,
             offset_r=offset_r,
         )
-        candidates = build_candidate_batch(
+        candidates = CandidateContractBuilder().build(
             legal,
             policy_v2,
             offset_q=offset_q,

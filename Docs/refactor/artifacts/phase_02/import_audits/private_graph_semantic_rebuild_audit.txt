@@ -1,0 +1,4 @@
+Command: git grep -n "legal_moves_for_stones\|parse_history\|_target_for_pairs\|PAIR_ACTION" -- Python/src/hexorl
+Python/src/hexorl/action_contract/tactical_oracle.py:50:def parse_history_state(history_bytes: bytes) -> tuple[dict[tuple[int, int], int], int, int]:
+Python/src/hexorl/action_contract/tactical_oracle.py:96:    stones, current_player, _placements_remaining = parse_history_state(history_bytes)
+ExitCode=0

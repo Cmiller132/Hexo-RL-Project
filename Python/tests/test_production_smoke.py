@@ -1,7 +1,7 @@
-import torch
+﻿import torch
 from torch.utils.data import DataLoader
 
-from hexorl.action_contract.candidates import CANDIDATE_FEATURE_VERSION
+from hexorl.contracts.candidates import CANDIDATE_FEATURE_VERSION
 from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.config import Config

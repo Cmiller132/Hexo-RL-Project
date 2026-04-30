@@ -1,0 +1,2 @@
+Command: git grep -n "from hexorl.graph.batch\|graph_batch_with_reference_pair_rows" -- Python/src/hexorl
+ExitCode=1

@@ -1,4 +1,4 @@
-"""FastAPI dashboard application factory."""
+﻿"""FastAPI dashboard application factory."""
 
 from __future__ import annotations
 
@@ -16,12 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hexorl.axis_policy.core import AxisPolicyInput
-from hexorl.action_contract.candidates import (
+from hexorl.contracts.candidates import (
     CANDIDATE_FEATURE_NAMES,
     CANDIDATE_FEATURE_VERSION,
-    build_candidate_batch,
-    build_pair_candidate_batch,
+    CandidateContractBuilder,
 )
+from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.contracts.history import MoveHistory
 from hexorl.contracts.symmetry import (
     transform_history,
@@ -41,13 +41,15 @@ from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
 from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
 from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
-from hexorl.graph.batch import (
+from hexorl.graph.semantic_builder import (
     GRAPH_FEATURE_DIM,
     GRAPH_SCHEMA_VERSION,
     GRAPH_CAPACITY_STRATEGY,
     RELATION_SCHEMA_VERSION,
     GraphTokenType,
     RelationType,
+)
+from hexorl.graph.tensorize import (
     build_graph_batch_from_history,
     graph_capacity_report,
 )
@@ -1362,7 +1364,7 @@ def _d6_contract_payload(
     offset_q = int(position.get("encoding", {}).get("offset_q", -16))
     offset_r = int(position.get("encoding", {}).get("offset_r", -16))
     candidate_budget = min(max(len(legal_moves), 1), 512)
-    candidates = build_candidate_batch(
+    candidates = CandidateContractBuilder().build(
         legal_moves,
         policy_target or [],
         offset_q=offset_q,
@@ -1383,11 +1385,11 @@ def _d6_contract_payload(
     pair_target_mass = 0.0
     pair_missing_mass = 0.0
     if len(legal_moves) >= 2 and int(position.get("placements_remaining", 1)) >= 2:
-        pair = build_pair_candidate_batch(
-            candidates.qr,
+        pair_budget = min(512, len(legal_moves) * max(len(legal_moves) - 1, 0) // 2)
+        pair = PairActionTableBuilder().build(
+            candidates,
             pair_policy_target or [],
-            budget=min(512, len(legal_moves) * max(len(legal_moves) - 1, 0) // 2),
-            candidate_mask=candidates.mask,
+            strategy=PairStrategy(mode="capped_fill", max_pairs=max(1, pair_budget)),
             legal_moves=legal_moves,
         )
         pair_target_mass = float(pair.target.sum())
@@ -1412,7 +1414,7 @@ def _d6_contract_payload(
         known_first = _last_history_qr(history)
         if known_first is not None:
             storage_width = min(max(len(legal_moves) + 1, 1), 512)
-            pair_candidates = build_candidate_batch(
+            pair_candidates = CandidateContractBuilder().build(
                 [known_first] + legal_moves,
                 [],
                 offset_q=offset_q,
@@ -1420,14 +1422,15 @@ def _d6_contract_payload(
                 budget=storage_width,
                 storage_width=storage_width,
                 critical_actions=[known_first] + legal_moves,
+                source="rust:synthetic",
             )
-            pair = build_pair_candidate_batch(
-                pair_candidates.qr,
+            pair = PairActionTableBuilder().build(
+                pair_candidates,
                 pair_policy_target,
-                budget=min(max(len(legal_moves), 1), 512),
-                candidate_mask=pair_candidates.mask,
+                strategy=PairStrategy(mode="capped_fill", max_pairs=min(max(len(legal_moves), 1), 512)),
                 legal_moves=legal_moves,
                 known_first=known_first,
+                source="rust:synthetic",
             )
             pair_target_mass = float(pair.target.sum())
             pair_missing_mass = float(pair.missing_mass)

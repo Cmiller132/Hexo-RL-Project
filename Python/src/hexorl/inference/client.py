@@ -276,7 +276,7 @@ class InferenceClient:
             raise RuntimeError("InferenceClient not connected. Call connect() first.")
         if self._slot.req_mode is None:
             raise RuntimeError("inference queue does not expose graph IPC slots")
-        from hexorl.graph.batch import validate_graph_ipc_capacity
+        from hexorl.graph.tensorize import validate_graph_ipc_capacity
 
         validate_graph_ipc_capacity(graph_batch)
 

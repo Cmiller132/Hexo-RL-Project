@@ -1,4 +1,4 @@
-"""Self-play worker — plays games using MCTSEngine + InferenceClient.
+﻿"""Self-play worker â€” plays games using MCTSEngine + InferenceClient.
 
 Each worker is a separate multiprocessing.Process. It:
   1. Connects to the inference server via SharedMemory.
@@ -18,7 +18,7 @@ from dataclasses import replace
 from typing import Optional, List, Tuple
 
 from hexorl.config import Config
-from hexorl.action_contract.candidates import build_candidate_batch, build_pair_candidate_batch
+from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.action_contract.tactical_oracle import (
     scan_tactical_oracle_from_game,
     scan_tactical_oracle_from_history,
@@ -27,7 +27,8 @@ from hexorl.engine.legal import decode_legal_bytes
 from hexorl.engine.rust import engine_available, hex_game_class, mcts_engine_class
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
-from hexorl.graph.batch import GraphBatch, GraphTokenType, build_graph_batch_from_history
+from hexorl.graph.semantic_builder import GraphTokenType
+from hexorl.graph.tensorize import GraphBatch, build_graph_batch_from_history
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
@@ -220,7 +221,7 @@ def _candidate_forward_rows(
     offset_q: int,
     offset_r: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    cand = build_candidate_batch(
+    cand = CandidateContractBuilder().build(
         rows,
         [],
         offset_q=int(offset_q),
@@ -360,7 +361,7 @@ def _pair_logits_to_action_logits(pair_qr: np.ndarray, pair_logits: np.ndarray, 
     return out
 
 
-# ── Temperature Schedule ─────────────────────────────────────────────────────
+# â”€â”€ Temperature Schedule â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def get_temperature(
     move_index: int,
@@ -573,7 +574,7 @@ def _pair_policy_target_is_complete(
     return len(seen) == expected
 
 
-# ── Mock MCTS Engine ─────────────────────────────────────────────────────────
+# â”€â”€ Mock MCTS Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class MockMCTSEngine:
     """Plausible mock of the Rust MCTSEngine for pipeline testing.
@@ -879,7 +880,7 @@ class MockMCTSEngine:
         return self._is_over
 
 
-# ── Real MCTS Engine Wrapper ─────────────────────────────────────────────────
+# â”€â”€ Real MCTS Engine Wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class RealMCTSEngine:
     """Wrapper around the Rust PyMCTSEngine for type-compatible API."""
@@ -1161,7 +1162,7 @@ class RealMCTSEngine:
         return self._game.is_over
 
 
-# ── Worker ───────────────────────────────────────────────────────────────────
+# â”€â”€ Worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SelfPlayWorker:
     """A single self-play worker that plays games and pushes records."""
@@ -1245,7 +1246,7 @@ class SelfPlayWorker:
         }
 
     def run(self):
-        """Main worker loop — runs in a separate multiprocessing.Process."""
+        """Main worker loop â€” runs in a separate multiprocessing.Process."""
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         logger.info(
@@ -1500,7 +1501,7 @@ class SelfPlayWorker:
                             )
                             candidate_budget = self.candidate_budget
                             t_build = time.monotonic()
-                            cand = build_candidate_batch(
+                            cand = CandidateContractBuilder().build(
                                 [(int(q), int(r)) for q, r in legal],
                                 [],
                                 offset_q=int(offset_q),
@@ -1789,7 +1790,7 @@ class SelfPlayWorker:
                                         offset_q=int(leaf_oq),
                                         offset_r=int(leaf_or),
                                     )
-                                    cand = build_candidate_batch(
+                                    cand = CandidateContractBuilder().build(
                                         [(int(q), int(r)) for q, r in legal],
                                         [],
                                         offset_q=int(leaf_oq),
@@ -1995,7 +1996,7 @@ class SelfPlayWorker:
                 offset_q=int(offset_q),
                 offset_r=int(offset_r),
             )
-            candidate_probe = build_candidate_batch(
+            candidate_probe = CandidateContractBuilder().build(
                 legal_root.tolist(),
                 policy_v2,
                 offset_q=int(offset_q),

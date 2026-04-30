@@ -16,20 +16,23 @@ from hexorl.contracts.symmetry import (
     transform_qr,
 )
 from hexorl.contracts.targets import PairPolicyTarget, PolicyTarget
-from hexorl.contracts.candidates import CandidateDiagnostics, CandidateTable
-from hexorl.contracts.pairs import PairActionTable
+from hexorl.contracts.candidates import CandidateContractBuilder, CandidateDiagnostics, CandidateTable
+from hexorl.contracts.pairs import PairActionTable, PairActionTableBuilder, PairStrategy
 from hexorl.contracts.telemetry import ContractTrace
 from hexorl.contracts.validation import ContractValidationError
 
 __all__ = [
     "CandidateDiagnostics",
+    "CandidateContractBuilder",
     "CandidateTable",
     "ContractTrace",
     "ContractValidationError",
     "LegalActionTable",
     "MoveHistory",
     "PairActionTable",
+    "PairActionTableBuilder",
     "PairPolicyTarget",
+    "PairStrategy",
     "PolicyTarget",
     "apply_tensor_symmetry",
     "compose_symmetries",

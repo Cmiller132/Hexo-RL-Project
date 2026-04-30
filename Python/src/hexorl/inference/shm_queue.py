@@ -18,8 +18,8 @@ import logging
 from multiprocessing.shared_memory import SharedMemory
 from typing import List, Optional
 
-from hexorl.action_contract.candidates import CANDIDATE_FEATURES
-from hexorl.graph.batch import (
+from hexorl.contracts.candidates import CANDIDATE_FEATURES
+from hexorl.graph.semantic_builder import (
     GRAPH_FEATURE_DIM,
     GRAPH_SCHEMA_VERSION,
     RELATION_SCHEMA_VERSION,

@@ -1,0 +1,205 @@
+Command: git grep -n fallback -- Python/src/hexorl Python/tests
+Python/src/hexorl/axis_policy/core.py:161:    fallback_uniform: bool = True,
+Python/src/hexorl/axis_policy/core.py:171:    if fallback_uniform and total <= 0.0 and legal_moves:
+Python/src/hexorl/axis_policy/dual_strength.py:68:            fallback_uniform=False,
+Python/src/hexorl/axis_policy/experiments.py:126:            fallback_uniform=False,
+Python/src/hexorl/axis_policy/experiments.py:257:            fallback_uniform=False,
+Python/src/hexorl/axis_policy/experiments.py:324:        fallback_uniform=False,
+Python/src/hexorl/axis_policy/legacy_influence.py:82:            fallback_uniform=False,
+Python/src/hexorl/buffer/regret_buffer.py:170:    allow_root_value_fallback: bool = False,
+Python/src/hexorl/buffer/regret_buffer.py:193:    if missing and not allow_root_value_fallback:
+Python/src/hexorl/buffer/ring.py:294:        self._fallback_prior_use = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:295:        self._fallback_prior_use_top1 = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:296:        self._fallback_prior_use_top4 = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:297:        self._fallback_prior_use_top8 = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:303:        self._pair_fallback_prior_use = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:304:        self._pair_fallback_prior_use_top1 = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:305:        self._pair_fallback_prior_use_top4 = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:306:        self._pair_fallback_prior_use_top8 = _optional_array(diag, (self.capacity,), np.float32)
+Python/src/hexorl/buffer/ring.py:573:        self._fallback_prior_use[idx] = float(record.fallback_prior_use)
+Python/src/hexorl/buffer/ring.py:574:        self._fallback_prior_use_top1[idx] = float(record.fallback_prior_use_on_mcts_top1)
+Python/src/hexorl/buffer/ring.py:575:        self._fallback_prior_use_top4[idx] = float(record.fallback_prior_use_on_mcts_top4)
+Python/src/hexorl/buffer/ring.py:576:        self._fallback_prior_use_top8[idx] = float(record.fallback_prior_use_on_mcts_top8)
+Python/src/hexorl/buffer/ring.py:582:        self._pair_fallback_prior_use[idx] = float(record.pair_fallback_prior_use)
+Python/src/hexorl/buffer/ring.py:583:        self._pair_fallback_prior_use_top1[idx] = float(record.pair_fallback_prior_use_on_mcts_top1)
+Python/src/hexorl/buffer/ring.py:584:        self._pair_fallback_prior_use_top4[idx] = float(record.pair_fallback_prior_use_on_mcts_top4)
+Python/src/hexorl/buffer/ring.py:585:        self._pair_fallback_prior_use_top8[idx] = float(record.pair_fallback_prior_use_on_mcts_top8)
+Python/src/hexorl/buffer/ring.py:720:            fallback_prior_use=float(self._fallback_prior_use[idx]),
+Python/src/hexorl/buffer/ring.py:721:            fallback_prior_use_on_mcts_top1=float(self._fallback_prior_use_top1[idx]),
+Python/src/hexorl/buffer/ring.py:722:            fallback_prior_use_on_mcts_top4=float(self._fallback_prior_use_top4[idx]),
+Python/src/hexorl/buffer/ring.py:723:            fallback_prior_use_on_mcts_top8=float(self._fallback_prior_use_top8[idx]),
+Python/src/hexorl/buffer/ring.py:729:            pair_fallback_prior_use=float(self._pair_fallback_prior_use[idx]),
+Python/src/hexorl/buffer/ring.py:730:            pair_fallback_prior_use_on_mcts_top1=float(self._pair_fallback_prior_use_top1[idx]),
+Python/src/hexorl/buffer/ring.py:731:            pair_fallback_prior_use_on_mcts_top4=float(self._pair_fallback_prior_use_top4[idx]),
+Python/src/hexorl/buffer/ring.py:732:            pair_fallback_prior_use_on_mcts_top8=float(self._pair_fallback_prior_use_top8[idx]),
+Python/src/hexorl/buffer/ring.py:790:                "fallback_prior_use": mean(self._fallback_prior_use),
+Python/src/hexorl/buffer/ring.py:791:                "fallback_prior_use_on_mcts_top1": mean(self._fallback_prior_use_top1),
+Python/src/hexorl/buffer/ring.py:792:                "fallback_prior_use_on_mcts_top4": mean(self._fallback_prior_use_top4),
+Python/src/hexorl/buffer/ring.py:793:                "fallback_prior_use_on_mcts_top8": mean(self._fallback_prior_use_top8),
+Python/src/hexorl/buffer/ring.py:794:                "fallback_prior_use_on_mcts_topk": mean(self._fallback_prior_use_top4),
+Python/src/hexorl/buffer/ring.py:798:                "pair_fallback_prior_use": mean(self._pair_fallback_prior_use),
+Python/src/hexorl/buffer/ring.py:801:                "pair_fallback_prior_use_on_mcts_top1": mean(self._pair_fallback_prior_use_top1),
+Python/src/hexorl/buffer/ring.py:802:                "pair_fallback_prior_use_on_mcts_top4": mean(self._pair_fallback_prior_use_top4),
+Python/src/hexorl/buffer/ring.py:803:                "pair_fallback_prior_use_on_mcts_top8": mean(self._pair_fallback_prior_use_top8),
+Python/src/hexorl/buffer/ring.py:842:            self._fallback_prior_use.fill(0.0)
+Python/src/hexorl/buffer/ring.py:843:            self._fallback_prior_use_top1.fill(0.0)
+Python/src/hexorl/buffer/ring.py:844:            self._fallback_prior_use_top4.fill(0.0)
+Python/src/hexorl/buffer/ring.py:845:            self._fallback_prior_use_top8.fill(0.0)
+Python/src/hexorl/buffer/ring.py:851:            self._pair_fallback_prior_use.fill(0.0)
+Python/src/hexorl/buffer/ring.py:852:            self._pair_fallback_prior_use_top1.fill(0.0)
+Python/src/hexorl/buffer/ring.py:853:            self._pair_fallback_prior_use_top4.fill(0.0)
+Python/src/hexorl/buffer/ring.py:854:            self._pair_fallback_prior_use_top8.fill(0.0)
+Python/src/hexorl/buffer/sampler.py:527:                        "first-placement joint pair targets; no synthetic product fallback is allowed"
+Python/src/hexorl/buffer/sampler.py:567:                    lookahead_arrays[h_idx][i] = values[i]  # fallback
+Python/src/hexorl/contracts/validation.py:8:FORBIDDEN_SOURCES = frozenset({"fallback"})
+Python/src/hexorl/contracts/validation.py:24:        raise ContractValidationError("fallback source is not allowed", owner=owner, source=normalized)
+Python/src/hexorl/dashboard/fixtures.py:170:        return int(q), int(r), {"source": "fallback_random_legal", "nodes": 0, "depth": 0, "score": 0.0}
+Python/src/hexorl/dashboard/recorder.py:202:                        "fallback_prior_use": pos.fallback_prior_use,
+Python/src/hexorl/dashboard/recorder.py:203:                        "fallback_prior_use_on_mcts_top1": pos.fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/dashboard/recorder.py:204:                        "fallback_prior_use_on_mcts_top4": pos.fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/dashboard/recorder.py:205:                        "fallback_prior_use_on_mcts_top8": pos.fallback_prior_use_on_mcts_top8,
+Python/src/hexorl/dashboard/recorder.py:211:                        "pair_fallback_prior_use": pos.pair_fallback_prior_use,
+Python/src/hexorl/dashboard/recorder.py:212:                        "pair_fallback_prior_use_on_mcts_top1": pos.pair_fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/dashboard/recorder.py:213:                        "pair_fallback_prior_use_on_mcts_top4": pos.pair_fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/dashboard/recorder.py:214:                        "pair_fallback_prior_use_on_mcts_top8": pos.pair_fallback_prior_use_on_mcts_top8,
+Python/src/hexorl/dashboard/replay.py:136:        placements_remaining = int(getattr(game, "placements_remaining", _fallback_placements_remaining(moves)))
+Python/src/hexorl/dashboard/replay.py:167:def _fallback_placements_remaining(moves: list[Move]) -> int:
+Python/src/hexorl/dashboard/replay.py:334:            "fallback_prior_use",
+Python/src/hexorl/dashboard/replay.py:335:            "fallback_prior_use_on_mcts_top1",
+Python/src/hexorl/dashboard/replay.py:336:            "fallback_prior_use_on_mcts_top4",
+Python/src/hexorl/dashboard/replay.py:337:            "fallback_prior_use_on_mcts_top8",
+Python/src/hexorl/dashboard/replay.py:340:            "pair_fallback_prior_use",
+Python/src/hexorl/dashboard/replay.py:341:            "pair_fallback_prior_use_on_mcts_top1",
+Python/src/hexorl/dashboard/replay.py:342:            "pair_fallback_prior_use_on_mcts_top4",
+Python/src/hexorl/dashboard/replay.py:343:            "pair_fallback_prior_use_on_mcts_top8",
+Python/src/hexorl/epoch/pipeline.py:447:        outcome, terminal_reason = _make_fallback_bootstrap_game(
+Python/src/hexorl/epoch/pipeline.py:469:def _make_fallback_bootstrap_game(
+Python/src/hexorl/epoch/pipeline.py:482:        legal = _fallback_bootstrap_legal_moves(occupied, cfg.selfplay.near_radius)
+Python/src/hexorl/epoch/pipeline.py:517:def _fallback_bootstrap_legal_moves(
+Python/src/hexorl/eval/arena.py:224:        return _play_fallback_match(side_a_fn, side_b_fn, game_idx, a_is_black, sims, max_moves)
+Python/src/hexorl/eval/arena.py:285:def _play_fallback_match(
+Python/src/hexorl/eval/classical.py:80:            logger.warning(f"Classical search failed: {e}, using fallback")
+Python/src/hexorl/eval/players.py:60:            return self._fallback_move()
+Python/src/hexorl/eval/players.py:113:    def _fallback_move(self) -> tuple[int, int]:
+Python/src/hexorl/eval/scorecard.py:35:    "fallback_prior_use_on_mcts_topk": 0.10,
+Python/src/hexorl/eval/scorecard.py:36:    "pair_fallback_prior_use_on_mcts_topk": 0.10,
+Python/src/hexorl/eval/scorecard.py:71:    fallback_prior_baseline: float | None = None,
+Python/src/hexorl/eval/scorecard.py:75:    metrics = _with_prior_fallback_aliases(metrics)
+Python/src/hexorl/eval/scorecard.py:79:        fallback_prior_baseline=fallback_prior_baseline,
+Python/src/hexorl/eval/scorecard.py:124:    fallback_prior_baseline: float | None = None,
+Python/src/hexorl/eval/scorecard.py:143:    if fallback_prior_baseline is not None:
+Python/src/hexorl/eval/scorecard.py:144:        current = metrics.get("fallback_prior_use_on_mcts_topk", 0.0)
+Python/src/hexorl/eval/scorecard.py:145:        if current >= fallback_prior_baseline:
+Python/src/hexorl/eval/scorecard.py:146:            failures.append("fallback_prior_use_on_mcts_topk")
+Python/src/hexorl/eval/scorecard.py:175:def _with_prior_fallback_aliases(metrics: dict[str, float]) -> dict[str, float]:
+Python/src/hexorl/eval/scorecard.py:176:    """Normalize top-k fallback telemetry names used by replay and scorecards."""
+Python/src/hexorl/eval/scorecard.py:178:    if "fallback_prior_use_on_mcts_topk" not in out:
+Python/src/hexorl/eval/scorecard.py:180:            "fallback_prior_use_on_mcts_top4",
+Python/src/hexorl/eval/scorecard.py:181:            "fallback_prior_use_on_mcts_top8",
+Python/src/hexorl/eval/scorecard.py:182:            "fallback_prior_use_on_mcts_top1",
+Python/src/hexorl/eval/scorecard.py:183:            "fallback_prior_use",
+Python/src/hexorl/eval/scorecard.py:186:                out["fallback_prior_use_on_mcts_topk"] = out[key]
+Python/src/hexorl/eval/scorecard.py:188:    if "pair_fallback_prior_use_on_mcts_topk" not in out:
+Python/src/hexorl/eval/scorecard.py:190:            "pair_fallback_prior_use_on_mcts_top4",
+Python/src/hexorl/eval/scorecard.py:191:            "pair_fallback_prior_use_on_mcts_top8",
+Python/src/hexorl/eval/scorecard.py:192:            "pair_fallback_prior_use_on_mcts_top1",
+Python/src/hexorl/eval/scorecard.py:193:            "pair_fallback_prior_use",
+Python/src/hexorl/eval/scorecard.py:196:                out["pair_fallback_prior_use_on_mcts_topk"] = out[key]
+Python/src/hexorl/inference/client.py:273:        dense fallback throughput.
+Python/src/hexorl/selfplay/records.py:97:    fallback_prior_use: float = 0.0
+Python/src/hexorl/selfplay/records.py:98:    fallback_prior_use_on_mcts_top1: float = 0.0
+Python/src/hexorl/selfplay/records.py:99:    fallback_prior_use_on_mcts_top4: float = 0.0
+Python/src/hexorl/selfplay/records.py:100:    fallback_prior_use_on_mcts_top8: float = 0.0
+Python/src/hexorl/selfplay/records.py:106:    pair_fallback_prior_use: float = 0.0
+Python/src/hexorl/selfplay/records.py:107:    pair_fallback_prior_use_on_mcts_top1: float = 0.0
+Python/src/hexorl/selfplay/records.py:108:    pair_fallback_prior_use_on_mcts_top4: float = 0.0
+Python/src/hexorl/selfplay/records.py:109:    pair_fallback_prior_use_on_mcts_top8: float = 0.0
+Python/src/hexorl/selfplay/records.py:274:                float(pos.fallback_prior_use),
+Python/src/hexorl/selfplay/records.py:275:                float(pos.fallback_prior_use_on_mcts_top1),
+Python/src/hexorl/selfplay/records.py:276:                float(pos.fallback_prior_use_on_mcts_top4),
+Python/src/hexorl/selfplay/records.py:277:                float(pos.fallback_prior_use_on_mcts_top8),
+Python/src/hexorl/selfplay/records.py:283:                float(pos.pair_fallback_prior_use),
+Python/src/hexorl/selfplay/records.py:284:                float(pos.pair_fallback_prior_use_on_mcts_top1),
+Python/src/hexorl/selfplay/records.py:285:                float(pos.pair_fallback_prior_use_on_mcts_top4),
+Python/src/hexorl/selfplay/records.py:286:                float(pos.pair_fallback_prior_use_on_mcts_top8),
+Python/src/hexorl/selfplay/records.py:396:            fallback_prior_use = 0.0
+Python/src/hexorl/selfplay/records.py:397:            fallback_prior_use_on_mcts_top1 = 0.0
+Python/src/hexorl/selfplay/records.py:398:            fallback_prior_use_on_mcts_top4 = 0.0
+Python/src/hexorl/selfplay/records.py:399:            fallback_prior_use_on_mcts_top8 = 0.0
+Python/src/hexorl/selfplay/records.py:405:            pair_fallback_prior_use = 0.0
+Python/src/hexorl/selfplay/records.py:406:            pair_fallback_prior_use_on_mcts_top1 = 0.0
+Python/src/hexorl/selfplay/records.py:407:            pair_fallback_prior_use_on_mcts_top4 = 0.0
+Python/src/hexorl/selfplay/records.py:408:            pair_fallback_prior_use_on_mcts_top8 = 0.0
+Python/src/hexorl/selfplay/records.py:499:                        fallback_prior_use,
+Python/src/hexorl/selfplay/records.py:500:                        fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/selfplay/records.py:501:                        fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/selfplay/records.py:502:                        fallback_prior_use_on_mcts_top8,
+Python/src/hexorl/selfplay/records.py:508:                        pair_fallback_prior_use,
+Python/src/hexorl/selfplay/records.py:509:                        pair_fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/selfplay/records.py:510:                        pair_fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/selfplay/records.py:511:                        pair_fallback_prior_use_on_mcts_top8,
+Python/src/hexorl/selfplay/records.py:581:                fallback_prior_use=fallback_prior_use,
+Python/src/hexorl/selfplay/records.py:582:                fallback_prior_use_on_mcts_top1=fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/selfplay/records.py:583:                fallback_prior_use_on_mcts_top4=fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/selfplay/records.py:584:                fallback_prior_use_on_mcts_top8=fallback_prior_use_on_mcts_top8,
+Python/src/hexorl/selfplay/records.py:590:                pair_fallback_prior_use=pair_fallback_prior_use,
+Python/src/hexorl/selfplay/records.py:591:                pair_fallback_prior_use_on_mcts_top1=pair_fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/selfplay/records.py:592:                pair_fallback_prior_use_on_mcts_top4=pair_fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/selfplay/records.py:593:                pair_fallback_prior_use_on_mcts_top8=pair_fallback_prior_use_on_mcts_top8,
+Python/src/hexorl/selfplay/worker.py:419:def _fallback_use_on_topk(
+Python/src/hexorl/selfplay/worker.py:739:        """Mock leaf metadata; dense fallback remains valid for mock tests."""
+Python/src/hexorl/selfplay/worker.py:1896:            fallback_prior_use = 0.0
+Python/src/hexorl/selfplay/worker.py:1898:                fallback_prior_use = (
+Python/src/hexorl/selfplay/worker.py:2013:            pair_fallback_prior_use = (
+Python/src/hexorl/selfplay/worker.py:2018:            pair_fallback_prior_use_on_mcts_top1 = (
+Python/src/hexorl/selfplay/worker.py:2029:            pair_fallback_prior_use_on_mcts_top4 = (
+Python/src/hexorl/selfplay/worker.py:2040:            pair_fallback_prior_use_on_mcts_top8 = (
+Python/src/hexorl/selfplay/worker.py:2089:                    fallback_prior_use=fallback_prior_use,
+Python/src/hexorl/selfplay/worker.py:2090:                    fallback_prior_use_on_mcts_top1=_fallback_use_on_topk(
+Python/src/hexorl/selfplay/worker.py:2093:                    fallback_prior_use_on_mcts_top4=_fallback_use_on_topk(
+Python/src/hexorl/selfplay/worker.py:2096:                    fallback_prior_use_on_mcts_top8=_fallback_use_on_topk(
+Python/src/hexorl/selfplay/worker.py:2106:                    pair_fallback_prior_use=pair_fallback_prior_use,
+Python/src/hexorl/selfplay/worker.py:2107:                    pair_fallback_prior_use_on_mcts_top1=pair_fallback_prior_use_on_mcts_top1,
+Python/src/hexorl/selfplay/worker.py:2108:                    pair_fallback_prior_use_on_mcts_top4=pair_fallback_prior_use_on_mcts_top4,
+Python/src/hexorl/selfplay/worker.py:2109:                    pair_fallback_prior_use_on_mcts_top8=pair_fallback_prior_use_on_mcts_top8,
+Python/tests/contracts/test_phase01_contract_semantics.py:50:def test_move_history_rejects_fallback_source_and_requires_fixture_opt_in():
+Python/tests/contracts/test_phase01_contract_semantics.py:51:    with pytest.raises(ContractValidationError, match="fallback"):
+Python/tests/contracts/test_phase01_contract_semantics.py:52:        MoveHistory.decode(b"", source="fallback")
+Python/tests/contracts/test_phase01_contract_semantics.py:84:    with pytest.raises(ContractValidationError, match="fallback"):
+Python/tests/contracts/test_phase01_contract_semantics.py:85:        LegalActionTable.from_rows([(0, 0)], source="fallback")
+Python/tests/test_dashboard_foundation.py:315:def test_suite_dashboard_scores_and_stage_fallback(tmp_path):
+Python/tests/test_dashboard_replay_debug.py:48:                    "fallback_prior_use": 0.2,
+Python/tests/test_dashboard_replay_debug.py:49:                    "fallback_prior_use_on_mcts_top1": 0.0,
+Python/tests/test_dashboard_replay_debug.py:50:                    "fallback_prior_use_on_mcts_top4": 0.25,
+Python/tests/test_dashboard_replay_debug.py:51:                    "fallback_prior_use_on_mcts_top8": 0.125,
+Python/tests/test_dashboard_replay_debug.py:54:                    "pair_fallback_prior_use": 1.0,
+Python/tests/test_dashboard_replay_debug.py:77:    assert position["prior_sources"]["fallback_prior_use"] == pytest.approx(0.2)
+Python/tests/test_dashboard_replay_debug.py:78:    assert position["prior_sources"]["pair_fallback_prior_use"] == pytest.approx(1.0)
+Python/tests/test_production_smoke.py:126:    assert "pair_fallback_prior_use" in replay_buffer.stats
+Python/tests/test_production_smoke.py:127:    assert "fallback_prior_use_on_mcts_topk" in replay_buffer.stats
+Python/tests/test_production_smoke.py:146:        "fallback_prior_use",
+Python/tests/test_production_smoke.py:147:        "pair_fallback_prior_use",
+Python/tests/test_training_data_pipeline.py:492:        fallback_prior_use=0.125,
+Python/tests/test_training_data_pipeline.py:493:        fallback_prior_use_on_mcts_top4=0.25,
+Python/tests/test_training_data_pipeline.py:496:        pair_fallback_prior_use=1.0,
+Python/tests/test_training_data_pipeline.py:497:        pair_fallback_prior_use_on_mcts_top1=0.0,
+Python/tests/test_training_data_pipeline.py:498:        pair_fallback_prior_use_on_mcts_top8=0.25,
+Python/tests/test_training_data_pipeline.py:517:    assert out.fallback_prior_use == pytest.approx(0.125)
+Python/tests/test_training_data_pipeline.py:518:    assert out.fallback_prior_use_on_mcts_top4 == pytest.approx(0.25)
+Python/tests/test_training_data_pipeline.py:521:    assert out.pair_fallback_prior_use == pytest.approx(1.0)
+Python/tests/test_training_data_pipeline.py:522:    assert out.pair_fallback_prior_use_on_mcts_top1 == pytest.approx(0.0)
+Python/tests/test_training_data_pipeline.py:523:    assert out.pair_fallback_prior_use_on_mcts_top8 == pytest.approx(0.25)
+Python/tests/test_training_data_pipeline.py:524:    assert buffer.stats["fallback_prior_use_on_mcts_topk"] == pytest.approx(0.25)
+Python/tests/test_training_data_pipeline.py:527:    assert buffer.stats["pair_fallback_prior_use_on_mcts_top1"] == pytest.approx(0.0)
+Python/tests/test_training_data_pipeline.py:528:    assert buffer.stats["pair_fallback_prior_use_on_mcts_top8"] == pytest.approx(0.25)
+Python/tests/test_training_data_pipeline.py:591:        fallback_prior_use=0.125,
+Python/tests/test_training_data_pipeline.py:592:        fallback_prior_use_on_mcts_top1=1.0,
+Python/tests/test_training_data_pipeline.py:593:        fallback_prior_use_on_mcts_top4=0.5,
+Python/tests/test_training_data_pipeline.py:594:        fallback_prior_use_on_mcts_top8=0.25,
+Python/tests/test_training_data_pipeline.py:600:        pair_fallback_prior_use=1.0,
+Python/tests/test_training_data_pipeline.py:601:        pair_fallback_prior_use_on_mcts_top1=1.0,
+Python/tests/test_training_data_pipeline.py:602:        pair_fallback_prior_use_on_mcts_top4=1.0,
+Python/tests/test_training_data_pipeline.py:603:        pair_fallback_prior_use_on_mcts_top8=1.0,
+Python/tests/test_training_data_pipeline.py:622:    assert out.positions[0].fallback_prior_use_on_mcts_top1 == pytest.approx(1.0)
+Python/tests/test_training_data_pipeline.py:624:    assert out.positions[0].pair_fallback_prior_use_on_mcts_top8 == pytest.approx(1.0)
+ExitCode=0

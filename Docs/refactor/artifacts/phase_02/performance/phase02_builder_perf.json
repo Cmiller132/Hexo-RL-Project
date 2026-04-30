@@ -1,0 +1,7 @@
+{
+  "candidate_builder": 0.00016769999638199806,
+  "graph_collator_two_positions": 0.0003016000264324248,
+  "graph_semantic_builder": 0.2887676999962423,
+  "graph_tensorizer_with_pair_projection": 0.0006443000165745616,
+  "pair_builder": 0.00022119999630376697
+}

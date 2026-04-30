@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import json
 import struct
 
@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
+from hexorl.contracts.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint

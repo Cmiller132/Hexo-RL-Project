@@ -1,4 +1,4 @@
-"""Small in-process model cache for dashboard inference/debug routes."""
+﻿"""Small in-process model cache for dashboard inference/debug routes."""
 
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ import numpy as np
 import torch
 
 from hexorl.config import Config
-from hexorl.action_contract.candidates import (
+from hexorl.contracts.candidates import (
     CANDIDATE_FEATURE_NAMES,
     CANDIDATE_FEATURE_VERSION,
-    build_candidate_batch,
-    build_pair_candidate_batch,
+    CandidateContractBuilder,
 )
+from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
@@ -89,7 +89,7 @@ class ModelCache:
         candidate_payload: dict[str, Any] | None = None
         forward_kwargs: dict[str, torch.Tensor] = {}
         if (model_sparse or model_pair) and len(arr) > 0:
-            cand = build_candidate_batch(
+            cand = CandidateContractBuilder().build(
                 [(int(q), int(r)) for q, r in arr],
                 [],
                 offset_q=int(offset_q),
@@ -101,26 +101,25 @@ class ModelCache:
                 "mask": cand.mask,
             }
             forward_kwargs = {
-                "candidate_indices": torch.from_numpy(cand.indices.reshape(1, -1)).to(cached.device),
-                "candidate_features": torch.from_numpy(cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1])).to(cached.device),
-                "candidate_mask": torch.from_numpy(cand.mask.reshape(1, -1)).to(cached.device),
+                "candidate_indices": torch.from_numpy(cand.indices.reshape(1, -1).copy()).to(cached.device),
+                "candidate_features": torch.from_numpy(cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1]).copy()).to(cached.device),
+                "candidate_mask": torch.from_numpy(cand.mask.reshape(1, -1).copy()).to(cached.device),
             }
             if model_pair:
                 pair_budget = min(max((int(cand.mask.sum()) * max(int(cand.mask.sum()) - 1, 0)) // 2, 1), 512)
-                pair = build_pair_candidate_batch(
-                    cand.qr,
+                pair = PairActionTableBuilder().build(
+                    cand,
                     [],
-                    budget=pair_budget,
-                    candidate_mask=cand.mask,
+                    strategy=PairStrategy(mode="capped_fill", max_pairs=pair_budget),
                     legal_moves=[(int(q), int(r)) for q, r in arr],
                 )
                 candidate_payload["pair_indices"] = pair.pair_indices
                 candidate_payload["pair_mask"] = pair.mask
                 forward_kwargs["pair_candidate_indices"] = torch.from_numpy(
-                    pair.pair_indices.reshape(1, pair.pair_indices.shape[0], 2)
+                    pair.pair_indices.reshape(1, pair.pair_indices.shape[0], 2).copy()
                 ).to(cached.device)
                 forward_kwargs["pair_candidate_mask"] = torch.from_numpy(
-                    pair.mask.reshape(1, -1)
+                    pair.mask.reshape(1, -1).copy()
                 ).to(cached.device)
         with torch.no_grad():
             out = cached.model(x, **forward_kwargs) if forward_kwargs else cached.model(x)

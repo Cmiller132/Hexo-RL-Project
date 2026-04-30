@@ -1,0 +1,61 @@
+{
+  "candidate": {
+    "candidate_count": 4,
+    "contract": "CandidateTable",
+    "critical_count": 2,
+    "critical_overflow_count": 0,
+    "critical_overflow_examples": [],
+    "feature_version": 2,
+    "missing_mass": 0.0,
+    "schema_version": 2,
+    "source": "rust",
+    "storage_width": 4,
+    "table_hash": "f18a2d08c22c56e257a3c46d9f77d2d86f5657160b87d74330ae685e231f01fd",
+    "target_mass": 1.0
+  },
+  "graph": {
+    "legal_count": 216,
+    "pair_count": 6,
+    "relation_schema_version": 1,
+    "schema_version": 2,
+    "semantic_hash": "fa4751c7cc1863bb297966095b1f20611e093304cd11b905decac56f6ca5d352",
+    "tensor_shapes": {
+      "batch_token_features": [
+        2,
+        291,
+        48
+      ],
+      "relation_type": [
+        291,
+        291
+      ],
+      "token_features": [
+        291,
+        48
+      ]
+    },
+    "token_count": 291
+  },
+  "history_hex": "000000000000000000000000",
+  "pair": {
+    "candidate_table_hash": "f18a2d08c22c56e257a3c46d9f77d2d86f5657160b87d74330ae685e231f01fd",
+    "contract": "PairActionTable",
+    "generation_mode": "full_capped",
+    "known_first": null,
+    "missing_mass": 0.0,
+    "phase": "first_placement",
+    "possible_pair_count": 6,
+    "schema_version": 2,
+    "selected_pair_count": 6,
+    "source": "rust",
+    "table_hash": "69bc50cee8d5d66724eb1344ef8049378dd98a70e6d9987e502332bb21d930ca",
+    "target_mass": 1.0
+  },
+  "timings_seconds": {
+    "candidate_builder": 0.00016769999638199806,
+    "graph_collator_two_positions": 0.0003016000264324248,
+    "graph_semantic_builder": 0.2887676999962423,
+    "graph_tensorizer_with_pair_projection": 0.0006443000165745616,
+    "pair_builder": 0.00022119999630376697
+  }
+}

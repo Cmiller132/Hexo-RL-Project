@@ -1,4 +1,4 @@
-import struct
+﻿import struct
 
 import numpy as np
 import pytest
@@ -10,6 +10,8 @@ from hexorl.buffer.sampler import (
     ReplayDataset,
 )
 from hexorl.contracts.history import MoveHistory
+from hexorl.contracts.candidates import CandidateContractBuilder
+from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.contracts.symmetry import (
     apply_tensor_symmetry,
     transform_axis_label,
@@ -38,6 +40,52 @@ from hexorl.selfplay.records import (
     policy_v2_from_visits,
     sparsify_policy,
 )
+
+
+def build_candidate_batch(*args, **kwargs):
+    return CandidateContractBuilder().build(*args, source="fixture", allow_fixture=True, **kwargs)
+
+
+def build_pair_candidate_batch(
+    candidate_qr,
+    pair_policy_target_v2,
+    *,
+    budget,
+    candidate_mask=None,
+    legal_moves=None,
+    known_first=None,
+):
+    mask = np.ones(len(candidate_qr), dtype=np.bool_) if candidate_mask is None else np.asarray(candidate_mask, dtype=np.bool_)
+    candidate_table = CandidateContractBuilder().build(
+        [(int(q), int(r)) for q, r in candidate_qr],
+        [],
+        offset_q=0,
+        offset_r=0,
+        budget=max(1, len(candidate_qr)),
+        storage_width=max(1, len(candidate_qr)),
+        critical_actions=[(int(q), int(r)) for q, r in candidate_qr],
+        source="fixture",
+        allow_fixture=True,
+    )
+    candidate_table = type(candidate_table)(
+        rows=candidate_table.rows,
+        dense_indices=candidate_table.dense_indices,
+        features=candidate_table.features,
+        mask=mask,
+        target=candidate_table.target,
+        diagnostics=candidate_table.diagnostics,
+        source="fixture",
+        allow_fixture=True,
+    )
+    return PairActionTableBuilder().build(
+        candidate_table,
+        pair_policy_target_v2,
+        strategy=PairStrategy(mode="capped_fill", max_pairs=max(1, int(budget))),
+        legal_moves=legal_moves,
+        known_first=known_first,
+        source="fixture",
+        allow_fixture=True,
+    )
 from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
 from hexorl.model.network import HexNet
 
@@ -751,11 +799,7 @@ def test_regret_biased_sampling_ignores_zero_weight_regret_rows():
 
 
 def test_candidate_feature_names_match_tensor_width():
-    from hexorl.action_contract.candidates import (
-        CANDIDATE_FEATURE_NAMES,
-        CANDIDATE_FEATURE_VERSION,
-        CANDIDATE_FEATURES,
-    )
+    from hexorl.contracts.candidates import (CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION, CANDIDATE_FEATURES)
 
     assert CANDIDATE_FEATURE_VERSION == 2
     assert len(CANDIDATE_FEATURE_NAMES) == CANDIDATE_FEATURES
@@ -763,7 +807,7 @@ def test_candidate_feature_names_match_tensor_width():
 
 
 def test_checkpoint_reports_candidate_feature_version(tmp_path):
-    from hexorl.action_contract.candidates import CANDIDATE_FEATURE_VERSION
+    from hexorl.contracts.candidates import CANDIDATE_FEATURE_VERSION
     from hexorl.train.trainer import Trainer
 
     cfg = Config.model_validate(
@@ -989,7 +1033,6 @@ def test_graph_replay_can_emit_full_first_placement_pair_rows():
 
 
 def test_pair_policy_d6_bijection_preserves_pair_identity():
-    from hexorl.action_contract.candidates import build_pair_candidate_batch
 
     base_candidates = [(1, 0), (0, 1), (2, 0)]
     base_pair = [((1, 0), (0, 1), 1.0)]
@@ -1012,7 +1055,6 @@ def test_pair_policy_d6_bijection_preserves_pair_identity():
 
 
 def test_pair_policy_rejects_duplicate_and_illegal_pairs():
-    from hexorl.action_contract.candidates import build_pair_candidate_batch
 
     with pytest.raises(ValueError, match="duplicate coordinates"):
         build_pair_candidate_batch(
@@ -1041,7 +1083,6 @@ def test_pair_policy_rejects_duplicate_and_illegal_pairs():
 
 
 def test_pair_candidate_builder_ignores_padded_candidate_rows():
-    from hexorl.action_contract.candidates import build_pair_candidate_batch
 
     pair = build_pair_candidate_batch(
         [(1, 0), (0, 0), (0, 0)],
@@ -1055,7 +1096,6 @@ def test_pair_candidate_builder_ignores_padded_candidate_rows():
 
 
 def test_candidate_builder_accepts_list_legal_moves():
-    from hexorl.action_contract.candidates import build_candidate_batch
 
     cand = build_candidate_batch(
         [[0, 0], [1, 0]],
@@ -1070,7 +1110,6 @@ def test_candidate_builder_accepts_list_legal_moves():
 
 
 def test_candidate_builder_keeps_critical_actions_past_budget():
-    from hexorl.action_contract.candidates import build_candidate_batch
 
     cand = build_candidate_batch(
         [(0, 0), (1, 0), (2, 0), (3, 0)],
@@ -1091,7 +1130,6 @@ def test_candidate_builder_keeps_critical_actions_past_budget():
 
 
 def test_critical_actions_are_inserted_before_heuristic_candidates():
-    from hexorl.action_contract.candidates import build_candidate_batch
 
     cand = build_candidate_batch(
         [(0, 0), (1, 0), (2, 0), (3, 0)],
@@ -1107,7 +1145,6 @@ def test_critical_actions_are_inserted_before_heuristic_candidates():
 
 
 def test_candidate_recall_reports_protected_and_discovery_modes():
-    from hexorl.action_contract.candidates import build_candidate_batch
 
     cand = build_candidate_batch(
         [(0, 0), (1, 0), (2, 0)],
@@ -1122,7 +1159,6 @@ def test_candidate_recall_reports_protected_and_discovery_modes():
 
 
 def test_discovery_recall_does_not_include_target_only_actions():
-    from hexorl.action_contract.candidates import build_candidate_batch
 
     cand = build_candidate_batch(
         [(0, 0), (1, 0), (9, 0)],
@@ -1139,7 +1175,6 @@ def test_discovery_recall_does_not_include_target_only_actions():
 
 
 def test_candidate_features_do_not_include_policy_target_labels():
-    from hexorl.action_contract.candidates import build_candidate_batch
 
     kwargs = {
         "legal_moves": [(0, 0), (1, 0)],

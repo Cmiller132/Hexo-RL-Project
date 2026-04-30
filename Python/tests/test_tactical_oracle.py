@@ -1,6 +1,6 @@
-import pytest
+﻿import pytest
 
-from hexorl.action_contract.candidates import build_candidate_batch
+from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.action_contract.tactical_oracle import (
     TACTICAL_SCAN_RADIUS,
     scan_tactical_oracle,
@@ -45,7 +45,7 @@ def test_candidate_builder_includes_oracle_critical_cells_outside_crop():
     legal = [(29, 0), (35, 0), (0, 0)]
     oracle = scan_tactical_oracle(stones, 0, legal, offset_q=-16, offset_r=-16)
 
-    cand = build_candidate_batch(
+    cand = CandidateContractBuilder().build(
         legal,
         [],
         offset_q=-16,

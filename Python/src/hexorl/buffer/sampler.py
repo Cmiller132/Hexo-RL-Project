@@ -1,8 +1,8 @@
-"""Batch sampler — PyTorch IterableDataset for the ring buffer.
+﻿"""Batch sampler â€” PyTorch IterableDataset for the ring buffer.
 
 On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 
-§7.4 of SYSTEM_DESIGN.md.
+Â§7.4 of SYSTEM_DESIGN.md.
 """
 
 from collections import OrderedDict
@@ -24,20 +24,14 @@ from hexorl.selfplay.records import (
     action_to_board_index,
     dense_policy_from_v2,
 )
-from hexorl.action_contract.candidates import (
-    CANDIDATE_FEATURES,
-    build_candidate_batch,
-    build_pair_candidate_batch,
-)
+from hexorl.contracts.candidates import CANDIDATE_FEATURES, CandidateContractBuilder
+from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.action_contract.tactical_oracle import (
     TACTICAL_SCAN_RADIUS,
     scan_tactical_oracle_from_history,
 )
-from hexorl.graph.batch import (
-    build_graph_batch_from_history,
-    collate_graph_batches,
-    graph_batch_with_reference_pair_rows,
-)
+from hexorl.graph.collate import collate_graph_batches
+from hexorl.graph.tensorize import build_graph_batch_from_history, graph_batch_with_pair_table
 from hexorl.contracts.symmetry import (
     apply_tensor_symmetry,
     transform_axis_label,
@@ -398,7 +392,7 @@ class ReplayDataset(_IterableDataset):
                     offset_r=int(offset_r),
                     near_radius=TACTICAL_SCAN_RADIUS,
                 )
-                cand = build_candidate_batch(
+                cand = CandidateContractBuilder().build(
                     [(int(q), int(r)) for q, r in legal],
                     policy_v2,
                     offset_q=int(offset_q),
@@ -468,7 +462,7 @@ class ReplayDataset(_IterableDataset):
                             if len(second_rows) >= max(0, candidate_width - 1):
                                 break
                         pair_rows = [known_first] + second_rows[: max(0, candidate_width - 1)]
-                        pair_cand = build_candidate_batch(
+                        pair_cand = CandidateContractBuilder().build(
                             pair_rows,
                             [],
                             offset_q=int(offset_q),
@@ -476,51 +470,31 @@ class ReplayDataset(_IterableDataset):
                             budget=max(1, len(pair_rows)),
                             storage_width=candidate_width,
                             critical_actions=pair_rows,
+                            source="rust:synthetic",
                         )
                         aux_targets["pair_candidate_row_indices"][i, :candidate_width] = pair_cand.indices[:candidate_width]
                         aux_targets["pair_candidate_features"][i, :candidate_width] = pair_cand.features[:candidate_width]
                         aux_targets["pair_candidate_row_mask"][i, :candidate_width] = pair_cand.mask[:candidate_width]
-                        target_by_second: dict[tuple[int, int], float] = {}
-                        total_pair_mass = 0.0
-                        for second, prob in second_targets:
-                            qr = (int(second[0]), int(second[1]))
-                            target_by_second[qr] = target_by_second.get(qr, 0.0) + float(prob)
-                            total_pair_mass += float(prob)
-                        pair_indices = np.full((candidate_width, 2), -1, dtype=np.int64)
-                        pair_mask = np.zeros(candidate_width, dtype=np.bool_)
-                        pair_target = np.zeros(candidate_width, dtype=np.float32)
-                        represented_mass = 0.0
-                        row_by_qr = {
-                            (int(q), int(r)): row
-                            for row, (q, r) in enumerate(pair_cand.qr[:candidate_width])
-                            if bool(pair_cand.mask[row])
-                        }
-                        first_row = row_by_qr.get(known_first, -1)
-                        out_row = 0
-                        for second_qr, prob in target_by_second.items():
-                            second_row = row_by_qr.get(second_qr, -1)
-                            if first_row < 0 or second_row < 0 or out_row >= candidate_width:
-                                continue
-                            pair_indices[out_row] = (first_row, second_row)
-                            pair_mask[out_row] = True
-                            pair_target[out_row] = float(prob)
-                            represented_mass += float(prob)
-                            out_row += 1
-                        if represented_mass > 0.0:
-                            pair_target /= represented_mass
-                        pair_width = candidate_width
-                        aux_targets["pair_candidate_indices"][i, :pair_width] = pair_indices[:pair_width]
-                        aux_targets["pair_candidate_mask"][i, :pair_width] = pair_mask[:pair_width]
-                        aux_targets["pair_policy_target"][i, :pair_width] = pair_target[:pair_width]
-                        aux_targets["pair_candidate_missing_mass"][i] = max(0.0, total_pair_mass - represented_mass)
-                    else:
-                        pair = build_pair_candidate_batch(
-                            [(int(q), int(r)) for q, r in cand.qr[:width]],
+                        pair = PairActionTableBuilder().build(
+                            pair_cand,
                             pair_policy_v2,
-                            budget=candidate_width,
-                            candidate_mask=cand.mask[:width],
+                            strategy=PairStrategy(mode="capped_fill", max_pairs=candidate_width),
                             legal_moves=legal_list,
                             known_first=known_first,
+                            source="rust:synthetic",
+                        )
+                        pair_width = candidate_width
+                        aux_targets["pair_candidate_indices"][i, :pair_width] = pair.pair_indices[:pair_width]
+                        aux_targets["pair_candidate_mask"][i, :pair_width] = pair.mask[:pair_width]
+                        aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
+                        aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
+                    else:
+                        pair = PairActionTableBuilder().build(
+                            cand,
+                            pair_policy_v2,
+                            strategy=PairStrategy(mode="capped_fill", max_pairs=candidate_width),
+                            legal_moves=legal_list,
+                            known_first=None,
                         )
                         aux_targets["pair_candidate_row_indices"][i, :candidate_width] = aux_targets["candidate_indices"][i, :candidate_width]
                         aux_targets["pair_candidate_features"][i, :candidate_width] = aux_targets["candidate_features"][i, :candidate_width]
@@ -553,7 +527,33 @@ class ReplayDataset(_IterableDataset):
                         "first-placement joint pair targets; no synthetic product fallback is allowed"
                     )
                 if pair_policy_v2:
-                    graph = graph_batch_with_reference_pair_rows(graph, pair_policy_v2)
+                    graph_legal_rows = [(int(q), int(r)) for q, r in graph.legal_qr.tolist()]
+                    graph_known_first = _last_move_qr(sample_history) if int(graph.placements_remaining) == 1 else None
+                    graph_candidate_rows = ([graph_known_first] if graph_known_first is not None else []) + graph_legal_rows
+                    graph_candidate_table = CandidateContractBuilder().build(
+                        graph_candidate_rows,
+                        [],
+                        offset_q=0,
+                        offset_r=0,
+                        budget=max(1, len(graph_candidate_rows)),
+                        storage_width=max(1, len(graph_candidate_rows)),
+                        critical_actions=graph_candidate_rows,
+                        source="rust:synthetic",
+                    )
+                    possible_pairs = (
+                        len(graph_legal_rows)
+                        if graph_known_first is not None
+                        else len(graph_legal_rows) * max(0, len(graph_legal_rows) - 1) // 2
+                    )
+                    graph_pair_table = PairActionTableBuilder().build(
+                        graph_candidate_table,
+                        pair_policy_v2,
+                        strategy=PairStrategy(mode="full_capped", max_pairs=max(1, possible_pairs), allow_full=True),
+                        legal_moves=graph_legal_rows,
+                        known_first=graph_known_first,
+                        source="rust:synthetic",
+                    )
+                    graph = graph_batch_with_pair_table(graph, graph_pair_table)
                 graph_batch = aux_targets.setdefault("_graph_batches", [])
                 graph_batch.append(graph)
             if self.include_axis_delta_norm:
