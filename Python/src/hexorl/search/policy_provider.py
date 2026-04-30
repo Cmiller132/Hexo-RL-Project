@@ -75,17 +75,6 @@ class _BasePolicyProvider:
             fallback_reason=fallback,
         )
 
-    def _uniform_fallback(self, context: SearchContext, *, reason: str) -> SearchEvaluation:
-        width = int(context.legal_table.rows.shape[0])
-        return self._evaluation(
-            context,
-            logits=np.zeros(width, dtype=np.float32),
-            value=0.0,
-            source=self.source_label,
-            timing_ms=0.0,
-            fallback_reason=reason,
-        )
-
 
 class DensePolicyProvider(_BasePolicyProvider):
     source_label = PRIOR_SOURCE_DENSE
@@ -94,7 +83,7 @@ class DensePolicyProvider(_BasePolicyProvider):
         if not contexts:
             return []
         if self.client is None:
-            return [self._uniform_fallback(ctx, reason="no_inference_client") for ctx in contexts]
+            raise ContractValidationError("dense provider requires an inference client", owner=self.name)
         tensors = []
         for ctx in contexts:
             if ctx.tensor is None:
@@ -121,7 +110,7 @@ class DensePolicyProvider(_BasePolicyProvider):
         if context.tensor is None:
             raise ContractValidationError("dense provider requires tensor in SearchContext", owner=self.name)
         if self.client is None:
-            return self._uniform_fallback(context, reason="no_inference_client")
+            raise ContractValidationError("dense provider requires an inference client", owner=self.name)
         t0 = time.monotonic()
         policy, value = self.client.evaluate_dense(context.tensor.reshape(1, 13, 33, 33), 1)
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -148,8 +137,10 @@ class GraphHybridPolicyProvider(_BasePolicyProvider):
         if context.tensor is None or context.candidate_table is None:
             return DensePolicyProvider(client=self.client, model_spec=self.model_spec)._evaluate_one(context)
         active = np.flatnonzero(context.candidate_table.mask)
-        if active.shape[0] == 0 or self.client is None:
-            return self._uniform_fallback(context, reason="empty_candidate_table")
+        if active.shape[0] == 0:
+            raise ContractValidationError("graph hybrid provider requires active candidate rows", owner=self.name)
+        if self.client is None:
+            raise ContractValidationError("graph hybrid provider requires an inference client", owner=self.name)
         candidate_rows = context.candidate_table.rows[active]
         legal_index = {(int(q), int(r)): idx for idx, (q, r) in enumerate(context.legal_table.rows.tolist())}
         candidate_to_legal = np.asarray(
@@ -191,7 +182,7 @@ class GlobalGraphPolicyProvider(_BasePolicyProvider):
         if context.graph_batch is None:
             raise ContractValidationError("global graph provider requires graph_batch in SearchContext", owner=self.name)
         if self.client is None:
-            return self._uniform_fallback(context, reason="no_inference_client")
+            raise ContractValidationError("global graph provider requires an inference client", owner=self.name)
         t0 = time.monotonic()
         out = self.client.evaluate_global_graph(context.graph_batch)
         elapsed = (time.monotonic() - t0) * 1000.0

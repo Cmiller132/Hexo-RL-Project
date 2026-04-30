@@ -1,0 +1,29 @@
+{
+  "git_sha": "79ee6bc9fdfa7026a40f8182e832893f9baeed73",
+  "command": "python -m pytest Python\\tests\\selfplay Python\\tests\\search\\test_pair_strategy_selfplay_integration.py -q",
+  "exit_code": 0,
+  "host_profile": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0",
+    "processor": "AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD"
+  },
+  "runner_profile": "local_cpu",
+  "workload": "Phase 06 deterministic self-play runner, telemetry, record-writer, and pair-strategy tests",
+  "throughput_metrics": {
+    "tests_per_second": 6.311911966567152
+  },
+  "latency_metrics": {
+    "elapsed_ms": 2218.0283999769017
+  },
+  "queue_backpressure_metrics": {
+    "bounded_backpressure_tested": true
+  },
+  "cpu_gpu_utilization": {
+    "gpu_available": false,
+    "proxy_timing": true
+  },
+  "comparison_baseline": "phase_00 local baseline not directly comparable; Phase 06 smoke is deterministic contract workload",
+  "accepted_regressions": [],
+  "stdout_tail": "..............                                                           [100%]\n14 passed in 0.06s\n",
+  "stderr_tail": ""
+}

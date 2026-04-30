@@ -6,6 +6,11 @@ def _worker_source() -> str:
     return (root / "src" / "hexorl" / "selfplay" / "worker.py").read_text(encoding="utf-8")
 
 
+def _runner_source() -> str:
+    root = Path(__file__).resolve().parents[2]
+    return (root / "src" / "hexorl" / "selfplay" / "game_runner.py").read_text(encoding="utf-8")
+
+
 def test_selfplay_worker_contains_no_architecture_string_checks():
     source = _worker_source()
     assert "architecture.startswith" not in source
@@ -31,7 +36,7 @@ def test_worker_does_not_score_pair_chunks_directly():
 
 
 def test_evaluation_uses_policy_provider_path():
-    source = _worker_source()
+    source = _runner_source()
     assert "create_policy_provider" in source
     assert "SearchEvaluation" in source
     assert "commit_root(engine, evaluation, pair_eval)" in source

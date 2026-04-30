@@ -152,7 +152,7 @@ class SelfPlayOrchestrator:
         worker = SelfPlayWorker(
             worker_id=worker_id,
             cfg=self.cfg,
-            record_queue=self._record_queue,
+            output_queue=self._record_queue,
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
             stop_event=self._stop_event,
@@ -173,7 +173,7 @@ class SelfPlayOrchestrator:
         worker = SelfPlayWorker(
             worker_id=worker_id,
             cfg=self.cfg,
-            record_queue=self._record_queue,
+            output_queue=self._record_queue,
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
             stop_event=self._stop_event,

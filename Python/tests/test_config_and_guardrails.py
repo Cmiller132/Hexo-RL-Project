@@ -7,6 +7,7 @@ from hexorl.buffer import RingBuffer
 from hexorl.config import Config
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
 from hexorl.search.pair_strategy import PairStrategySpec
+from hexorl.selfplay.game_runner import create_default_game_runner
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.train.ema import ModelEMA
 from hexorl.train.losses import compute_losses
@@ -118,10 +119,10 @@ def test_model_ema_decay_keeps_most_shadow_weight():
 
 def test_selfplay_worker_game_ids_are_unique_across_workers():
     cfg = Config()
-    worker0 = SelfPlayWorker(0, cfg, record_queue=None)
-    worker1 = SelfPlayWorker(1, cfg, record_queue=None)
+    worker0 = SelfPlayWorker(0, cfg, output_queue=None)
+    worker1 = SelfPlayWorker(1, cfg, output_queue=None)
 
-    assert worker0._game_id() != worker1._game_id()
+    assert worker0._next_request().game_id != worker1._next_request().game_id
 
 
 def test_autotune_train_batch_avoids_memory_cliff_for_production_model():
@@ -379,11 +380,18 @@ def test_global_xattn_pair_strategy_defaults_to_none():
     )
     queue = mp.Queue()
     try:
-        worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
-        assert worker.uses_global_policy is True
-        assert worker.pair_strategy == "none"
-        assert worker.pair_policy_enabled is False
-        assert worker.pair_strategy_summary()["pair_rows_scored"] == 0
+        runner = create_default_game_runner(
+            cfg=cfg,
+            worker_id=0,
+            output_queue=queue,
+            client=None,
+            num_workers=1,
+            max_batch_size=1,
+        )
+        assert runner.uses_global_policy is True
+        assert runner.pair_strategy == "none"
+        assert runner.pair_policy_enabled is False
+        assert runner.pair_strategy_summary()["pair_rows_scored"] == 0
     finally:
         queue.close()
 
@@ -404,9 +412,16 @@ def test_global_xattn_pair_heads_do_not_enable_pair_scoring_without_strategy():
     )
     queue = mp.Queue()
     try:
-        worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
-        assert worker.pair_policy_enabled is False
-        assert worker.pair_strategy_summary(pair_rows_possible=100)["pair_rows_scored"] == 0
+        runner = create_default_game_runner(
+            cfg=cfg,
+            worker_id=0,
+            output_queue=queue,
+            client=None,
+            num_workers=1,
+            max_batch_size=1,
+        )
+        assert runner.pair_policy_enabled is False
+        assert runner.pair_strategy_summary(pair_rows_possible=100)["pair_rows_scored"] == 0
     finally:
         queue.close()
 
@@ -443,9 +458,16 @@ def test_pair_scoring_requires_explicit_diagnostic_strategy_and_cap():
     )
     queue = mp.Queue()
     try:
-        worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
-        assert worker.pair_policy_enabled is True
-        assert worker.pair_strategy_max_pairs == 32
+        runner = create_default_game_runner(
+            cfg=cfg,
+            worker_id=0,
+            output_queue=queue,
+            client=None,
+            num_workers=1,
+            max_batch_size=1,
+        )
+        assert runner.pair_policy_enabled is True
+        assert runner.pair_strategy_max_pairs == 32
     finally:
         queue.close()
 

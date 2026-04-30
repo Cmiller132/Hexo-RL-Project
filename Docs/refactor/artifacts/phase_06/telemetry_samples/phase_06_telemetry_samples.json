@@ -1,0 +1,53 @@
+{
+  "events": [
+    {
+      "event": "selfplay_worker_heartbeat",
+      "worker_id": 0,
+      "process_id": 123,
+      "run_id": "selfplay-worker-0",
+      "game_id": 1,
+      "current_phase": "request_forwarded",
+      "move_index": 0,
+      "positions_completed_since_last_heartbeat": 0,
+      "last_successful_inference_request_id": "",
+      "last_engine_operation": "",
+      "legal_count": 0,
+      "candidate_count": 0,
+      "pair_count": 0,
+      "token_count": 0,
+      "relation_count": 0,
+      "active_model_family": "dense_cnn",
+      "recipe_id": "default",
+      "policy_provider": "FakePolicyProvider",
+      "pair_strategy": "none",
+      "pair_rows_possible": 0,
+      "pair_rows_scored": 0,
+      "forbidden_fallback_attempted": false
+    },
+    {
+      "event": "policy_eval_timing",
+      "trace_id": "fixture",
+      "phase": "root",
+      "request_kind": "policy",
+      "provider_name": "FakePolicyProvider",
+      "model_family": "dense_cnn",
+      "protocol_version": "fake",
+      "model_forward_ms": 0.0,
+      "legal_row_coverage": 2
+    },
+    {
+      "event": "pair_strategy_summary",
+      "pair_strategy_name": "none",
+      "enabled_disabled_reason": "no_pair_rows_scored",
+      "total_possible_pairs": 0,
+      "selected_rows": 0,
+      "scored_rows": 0
+    },
+    {
+      "event": "selfplay_backpressure",
+      "source": "record_writer",
+      "bounded": true,
+      "backpressure_events": 1
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "owner_subsystem": "policy provider row mapping",
+  "run_id": "r",
+  "game_id": 1,
+  "move_index": 0,
+  "seed": 7,
+  "phase": "root",
+  "sections": {
+    "engine": {"legal_hash": "l"},
+    "contract": {"trace_id": "t"},
+    "d6": {"transform": "identity"},
+    "model_input": {"shape": [1, 13, 33, 33]},
+    "raw_output": {"finite": true},
+    "policy": {"rows": 2},
+    "pair": {"rows": 0},
+    "mcts": {"selected": [0, 0]},
+    "replay": {"schema_version": 9}
+  }
+}
