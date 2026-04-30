@@ -1,0 +1,41 @@
+{
+  "git_sha": "50a4a3a40feb9231b0339742d9b7f892d7753bf8",
+  "families": [
+    {
+      "family": "dense_cnn",
+      "provider": "PolicyProvider",
+      "recipe_id": "dense_cnn:default",
+      "config_hash": "da44555a4aeb31f794ae875278c91909c7fe728e80a47066f6a5fc1632868bc1"
+    },
+    {
+      "family": "global_line_window",
+      "provider": "PolicyProvider",
+      "recipe_id": "global_line_window:default",
+      "config_hash": "d4bb7efc005268735b581a338972ce9cbe49910910019fc57a5c09e154e3e663"
+    },
+    {
+      "family": "global_relation_graph",
+      "provider": "PolicyProvider",
+      "recipe_id": "global_relation_graph:default",
+      "config_hash": "aa56a77c04a1947db68c4a9bd7d48d8129ce944f0e35f84420c8dc461d754c6d"
+    },
+    {
+      "family": "global_xattn",
+      "provider": "PolicyProvider",
+      "recipe_id": "global_xattn:default",
+      "config_hash": "ae444a3c0b15a0a2062fda791ec054018f836d5d1b96fb77428e6a353f8736e9"
+    },
+    {
+      "family": "graph_hybrid",
+      "provider": "PolicyProvider",
+      "recipe_id": "graph_hybrid:default",
+      "config_hash": "14a11d9a439e42c6d6c118d68c4675c687c6a5d3cacb41547d7f406725ddfae6"
+    },
+    {
+      "family": "restnet",
+      "provider": "PolicyProvider",
+      "recipe_id": "restnet:default",
+      "config_hash": "c38fd517998c9451532ce3019f3fff895bca9511e791a18b7d819d046392e266"
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "git_sha": "50a4a3a40feb9231b0339742d9b7f892d7753bf8",
+  "runtime_spec": {
+    "selfplay_workers": 4,
+    "rust_threads": 16,
+    "torch_threads": 8,
+    "dataloader_workers": 4,
+    "inference_max_batch": 32,
+    "microbatch_wait_ms": 2.0,
+    "leaf_batch_size": 16,
+    "record_queue_capacity": 64,
+    "replay_prefetch": 4,
+    "train_batch_size": 64,
+    "compile_model": false,
+    "memory_fraction": 0.75,
+    "watchdogs": {
+      "selfplay_progress_s": 30.0,
+      "inference_response_s": 5.0,
+      "training_batch_s": 20.0,
+      "evaluation_progress_s": 20.0,
+      "artifact_write_s": 10.0
+    }
+  },
+  "watchdog_outcomes": [
+    {
+      "event": "watchdog_abort",
+      "subsystem": "selfplay",
+      "threshold_s": 30.0,
+      "trace_id": "phase08-selfplay",
+      "likely_owner": "selfplay worker/game runner",
+      "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter"
+    },
+    {
+      "event": "watchdog_abort",
+      "subsystem": "inference",
+      "threshold_s": 5.0,
+      "trace_id": "phase08-inference",
+      "likely_owner": "inference adapter/transport",
+      "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter"
+    },
+    {
+      "event": "watchdog_abort",
+      "subsystem": "training",
+      "threshold_s": 20.0,
+      "trace_id": "phase08-training",
+      "likely_owner": "train adapter/dataloader",
+      "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter"
+    },
+    {
+      "event": "watchdog_abort",
+      "subsystem": "evaluation",
+      "threshold_s": 20.0,
+      "trace_id": "phase08-evaluation",
+      "likely_owner": "eval arena/policy provider",
+      "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter"
+    },
+    {
+      "event": "watchdog_abort",
+      "subsystem": "artifact",
+      "threshold_s": 10.0,
+      "trace_id": "phase08-artifact",
+      "likely_owner": "autotune reporting/manifests",
+      "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter"
+    }
+  ]
+}

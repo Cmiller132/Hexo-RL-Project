@@ -9,12 +9,6 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from hexorl.contracts.candidates import (
-    CANDIDATE_FEATURE_NAMES,
-    CANDIDATE_FEATURE_VERSION,
-    CandidateContractBuilder,
-)
-from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
 from hexorl.contracts.history import MoveHistory, encode_move_history as contract_encode_move_history
 from hexorl.engine.encoding import encode_board_and_legal
 from hexorl.engine.history import game_from_history
@@ -371,69 +365,27 @@ def _candidate_rows_debug(row: dict[str, Any], debug: dict[str, Any], limit: int
     history = row.get("move_history_b64") or b""
     policy_v2 = _policy_v2_from_debug(debug.get("policy_target_v2", []))
     try:
-        position = get_replay_position(history, constrain_threats=False)
-        legal = [(int(move["q"]), int(move["r"])) for move in position.legal_moves]
-        offset_q = int(position.encoding.get("offset_q", -BOARD_SIZE // 2))
-        offset_r = int(position.encoding.get("offset_r", -BOARD_SIZE // 2))
-        oracle = scan_tactical_oracle_from_history(
-            history,
-            legal,
-            offset_q=offset_q,
-            offset_r=offset_r,
-        )
-        candidates = CandidateContractBuilder().build(
-            legal,
-            policy_v2,
-            offset_q=offset_q,
-            offset_r=offset_r,
-            budget=min(max(len(legal), 1), 512),
-            winning_moves=oracle.win_now_cells,
-            forced_block_moves=oracle.forced_block_cells,
-            cover_cells=oracle.cover_cells,
-            open_four_cells=oracle.open_four_cells,
-            open_five_cells=oracle.open_five_cells,
+        from hexorl.dashboard.contract_inspector import ContractInspector
+
+        payload = ContractInspector().inspect(
+            "candidates",
+            history=history,
+            policy_target=tuple(policy_v2),
         )
     except Exception as exc:
         return {
             "available": False,
             "error": str(exc),
-            "feature_version": CANDIDATE_FEATURE_VERSION,
-            "feature_names": list(CANDIDATE_FEATURE_NAMES),
+            "feature_version": 0,
+            "feature_names": [],
             "rows": [],
         }
-
-    rows = []
-    active = np.flatnonzero(candidates.mask)
-    feature_names = list(CANDIDATE_FEATURE_NAMES)
-    for row_idx in active[:limit]:
-        row_i = int(row_idx)
-        rows.append(
-            {
-                "row": row_i,
-                "q": int(candidates.qr[row_i, 0]),
-                "r": int(candidates.qr[row_i, 1]),
-                "dense_index": int(candidates.indices[row_i]),
-                "target_prob": float(candidates.target[row_i]),
-                "features": {
-                    name: float(candidates.features[row_i, col])
-                    for col, name in enumerate(feature_names)
-                },
-            }
-        )
+    payload["available"] = True
+    payload["rows"] = list(payload.get("rows", []))[:limit]
     return {
         "available": True,
-        "feature_version": CANDIDATE_FEATURE_VERSION,
-        "feature_names": feature_names,
-        "candidate_count": int(active.shape[0]),
-        "shown": len(rows),
-        "missing_mass": float(candidates.missing_mass),
-        "recall_top1": float(candidates.recall_top1),
-        "recall_top4": float(candidates.recall_top4),
-        "recall_top8": float(candidates.recall_top8),
-        "recall_winning_move": float(candidates.recall_winning_move),
-        "recall_forced_block": float(candidates.recall_forced_block),
-        "recall_two_placement_cover": float(candidates.recall_two_placement_cover),
-        "rows": rows,
+        **payload,
+        "shown": len(payload.get("rows", [])),
     }
 
 

@@ -6,20 +6,17 @@ Each side uses its own inference server or classical engine.
 
 import time
 import logging
-import numpy as np
 import torch
 from collections import Counter
 from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
 from hexorl.config import Config
-from hexorl.engine.history import game_from_history
-from hexorl.engine.legal import decode_legal_bytes
 from hexorl.engine.rust import engine_available, hex_game_class
 from hexorl.models.checkpoint import CheckpointManager
 from hexorl.models.factory import build_model
-from hexorl.models.network import HexNet
-from hexorl.eval.players import model_input_dtype, noisy_model_player
+from hexorl.models.specs import ModelSpec
+from hexorl.eval.players import noisy_model_player
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +127,11 @@ def run_arena(
 
 
 def model_move_fn(
-    model: HexNet,
+    model: torch.nn.Module,
     *,
     device: Optional[torch.device] = None,
+    cfg: Config | None = None,
+    model_spec: ModelSpec | None = None,
     temperature: float = 0.35,
     top_p: float = 0.98,
     seed: int = 0,
@@ -144,57 +143,17 @@ def model_move_fn(
     Eval intentionally samples from the legal-masked policy by default so games
     are varied.  Use temperature near zero for legacy greedy behavior.
     """
-    if temperature > 1e-4 or top_p < 1.0:
-        return noisy_model_player(
-            model,
-            device=device,
-            temperature=temperature,
-            top_p=top_p,
-            near_radius=near_radius,
-            constrain_threats=constrain_threats,
-            seed=seed,
-        )
-
-    if device is None:
-        device = next(model.parameters()).device
-    dtype = model_input_dtype(model)
-    model.eval()
-
-    def _fn(move_history, time_ms_override, player):
-        if HAS_ENGINE:
-            game = game_from_history(bytes().join(
-                int(v).to_bytes(4, "little", signed=True)
-                for row in move_history
-                for v in row
-            ))
-            encoded = game.encode_board_and_legal(near_radius, constrain_threats)
-            tensor_3d, offset_q, offset_r, legal_bytes = encoded
-            legal = decode_legal_bytes(legal_bytes)
-            if len(legal) == 0:
-                return None, None
-            tensor = (
-                torch.from_numpy(np.array(tensor_3d, dtype=np.float32))
-                .unsqueeze(0)
-                .to(device=device, dtype=dtype)
-            )
-            with torch.no_grad():
-                policy = model(tensor)["policy"][0].detach().cpu().numpy()
-            best = max(
-                legal,
-                key=lambda qr: policy[(int(qr[0]) - offset_q) * 33 + (int(qr[1]) - offset_r)]
-                if 0 <= int(qr[0]) - offset_q < 33 and 0 <= int(qr[1]) - offset_r < 33
-                else -np.inf,
-            )
-            return int(best[0]), int(best[1])
-
-        # Fallback for environments without _engine: choose the strongest centered action.
-        with torch.no_grad():
-            tensor = torch.zeros(1, 13, 33, 33, device=device, dtype=dtype)
-            policy = model(tensor)["policy"][0].detach().cpu().numpy()
-        idx = int(policy.argmax())
-        return idx // 33 - 16, idx % 33 - 16
-
-    return _fn
+    return noisy_model_player(
+        model,
+        device=device,
+        cfg=cfg,
+        model_spec=model_spec,
+        temperature=temperature,
+        top_p=top_p,
+        near_radius=near_radius,
+        constrain_threats=constrain_threats,
+        seed=seed,
+    )
 
 
 def load_checkpoint_model(
@@ -203,7 +162,7 @@ def load_checkpoint_model(
     device: Optional[torch.device] = None,
     *,
     allow_partial: bool = False,
-) -> HexNet:
+) -> torch.nn.Module:
     """Load a HexNet checkpoint for arena evaluation."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaded = CheckpointManager().load(checkpoint_path, purpose="eval", device=device)

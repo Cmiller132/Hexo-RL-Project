@@ -1,0 +1,416 @@
+{
+  "git_sha": "50a4a3a40feb9231b0339742d9b7f892d7753bf8",
+  "host_profile": {
+    "cpu_count": 32,
+    "memory_gb": 8.0,
+    "gpu_name": "none",
+    "os": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0"
+  },
+  "families": [
+    {
+      "family": "dense_cnn",
+      "valid_recipe": {
+        "recipe_id": "dense_cnn:default",
+        "model_family": "dense_cnn",
+        "channels": 16,
+        "blocks": 1,
+        "heads": [
+          "policy",
+          "value"
+        ],
+        "graph_layers": 1,
+        "graph_token_budget": 256,
+        "candidate_budget": 128,
+        "pair_strategy": "none",
+        "pair_strategy_max_pairs": 0,
+        "inference_protocol_version": 1,
+        "model_spec_version": 1,
+        "seed": 17,
+        "config_hash": "da44555a4aeb31f794ae875278c91909c7fe728e80a47066f6a5fc1632868bc1"
+      },
+      "validation": [
+        {
+          "ok": true,
+          "check": "family_capability",
+          "owner": "registry",
+          "message": "dense_cnn is registered"
+        },
+        {
+          "ok": true,
+          "check": "head_loss",
+          "owner": "train adapter",
+          "message": "loss plan is descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "input_output_action_contract",
+          "owner": "inference adapter",
+          "message": "contracts are descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "inference_protocol",
+          "owner": "inference protocol",
+          "message": "v1"
+        },
+        {
+          "ok": true,
+          "check": "checkpoint_manifest",
+          "owner": "checkpoint manifest",
+          "message": "manifest provider is registered"
+        },
+        {
+          "ok": true,
+          "check": "pair_strategy",
+          "owner": "pair strategy",
+          "message": "none"
+        },
+        {
+          "ok": true,
+          "check": "runtime_budget",
+          "owner": "runtime_sweep",
+          "message": "runtime spec fits host profile"
+        }
+      ],
+      "rejected_recipe_error": "pair_strategy_max_pairs must be zero when pair_strategy is none"
+    },
+    {
+      "family": "global_line_window",
+      "valid_recipe": {
+        "recipe_id": "global_line_window:default",
+        "model_family": "global_line_window",
+        "channels": 16,
+        "blocks": 1,
+        "heads": [
+          "policy_place",
+          "value"
+        ],
+        "graph_layers": 1,
+        "graph_token_budget": 256,
+        "candidate_budget": 128,
+        "pair_strategy": "none",
+        "pair_strategy_max_pairs": 0,
+        "inference_protocol_version": 1,
+        "model_spec_version": 1,
+        "seed": 17,
+        "config_hash": "d4bb7efc005268735b581a338972ce9cbe49910910019fc57a5c09e154e3e663"
+      },
+      "validation": [
+        {
+          "ok": true,
+          "check": "family_capability",
+          "owner": "registry",
+          "message": "global_line_window is registered"
+        },
+        {
+          "ok": true,
+          "check": "head_loss",
+          "owner": "train adapter",
+          "message": "loss plan is descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "input_output_action_contract",
+          "owner": "inference adapter",
+          "message": "contracts are descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "inference_protocol",
+          "owner": "inference protocol",
+          "message": "v1"
+        },
+        {
+          "ok": true,
+          "check": "checkpoint_manifest",
+          "owner": "checkpoint manifest",
+          "message": "manifest provider is registered"
+        },
+        {
+          "ok": true,
+          "check": "pair_strategy",
+          "owner": "pair strategy",
+          "message": "none"
+        },
+        {
+          "ok": true,
+          "check": "runtime_budget",
+          "owner": "runtime_sweep",
+          "message": "runtime spec fits host profile"
+        }
+      ],
+      "rejected_recipe_error": "pair_strategy_max_pairs must be zero when pair_strategy is none"
+    },
+    {
+      "family": "global_relation_graph",
+      "valid_recipe": {
+        "recipe_id": "global_relation_graph:default",
+        "model_family": "global_relation_graph",
+        "channels": 16,
+        "blocks": 1,
+        "heads": [
+          "policy_place",
+          "value"
+        ],
+        "graph_layers": 1,
+        "graph_token_budget": 256,
+        "candidate_budget": 128,
+        "pair_strategy": "none",
+        "pair_strategy_max_pairs": 0,
+        "inference_protocol_version": 1,
+        "model_spec_version": 1,
+        "seed": 17,
+        "config_hash": "aa56a77c04a1947db68c4a9bd7d48d8129ce944f0e35f84420c8dc461d754c6d"
+      },
+      "validation": [
+        {
+          "ok": true,
+          "check": "family_capability",
+          "owner": "registry",
+          "message": "global_relation_graph is registered"
+        },
+        {
+          "ok": true,
+          "check": "head_loss",
+          "owner": "train adapter",
+          "message": "loss plan is descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "input_output_action_contract",
+          "owner": "inference adapter",
+          "message": "contracts are descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "inference_protocol",
+          "owner": "inference protocol",
+          "message": "v1"
+        },
+        {
+          "ok": true,
+          "check": "checkpoint_manifest",
+          "owner": "checkpoint manifest",
+          "message": "manifest provider is registered"
+        },
+        {
+          "ok": true,
+          "check": "pair_strategy",
+          "owner": "pair strategy",
+          "message": "none"
+        },
+        {
+          "ok": true,
+          "check": "runtime_budget",
+          "owner": "runtime_sweep",
+          "message": "runtime spec fits host profile"
+        }
+      ],
+      "rejected_recipe_error": "pair_strategy_max_pairs must be zero when pair_strategy is none"
+    },
+    {
+      "family": "global_xattn",
+      "valid_recipe": {
+        "recipe_id": "global_xattn:default",
+        "model_family": "global_xattn",
+        "channels": 16,
+        "blocks": 1,
+        "heads": [
+          "policy_place",
+          "value"
+        ],
+        "graph_layers": 1,
+        "graph_token_budget": 256,
+        "candidate_budget": 128,
+        "pair_strategy": "none",
+        "pair_strategy_max_pairs": 0,
+        "inference_protocol_version": 1,
+        "model_spec_version": 1,
+        "seed": 17,
+        "config_hash": "ae444a3c0b15a0a2062fda791ec054018f836d5d1b96fb77428e6a353f8736e9"
+      },
+      "validation": [
+        {
+          "ok": true,
+          "check": "family_capability",
+          "owner": "registry",
+          "message": "global_xattn is registered"
+        },
+        {
+          "ok": true,
+          "check": "head_loss",
+          "owner": "train adapter",
+          "message": "loss plan is descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "input_output_action_contract",
+          "owner": "inference adapter",
+          "message": "contracts are descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "inference_protocol",
+          "owner": "inference protocol",
+          "message": "v1"
+        },
+        {
+          "ok": true,
+          "check": "checkpoint_manifest",
+          "owner": "checkpoint manifest",
+          "message": "manifest provider is registered"
+        },
+        {
+          "ok": true,
+          "check": "pair_strategy",
+          "owner": "pair strategy",
+          "message": "none"
+        },
+        {
+          "ok": true,
+          "check": "runtime_budget",
+          "owner": "runtime_sweep",
+          "message": "runtime spec fits host profile"
+        }
+      ],
+      "rejected_recipe_error": "pair_strategy_max_pairs must be zero when pair_strategy is none"
+    },
+    {
+      "family": "graph_hybrid",
+      "valid_recipe": {
+        "recipe_id": "graph_hybrid:default",
+        "model_family": "graph_hybrid",
+        "channels": 16,
+        "blocks": 1,
+        "heads": [
+          "policy",
+          "sparse_policy",
+          "pair_policy",
+          "value"
+        ],
+        "graph_layers": 1,
+        "graph_token_budget": 256,
+        "candidate_budget": 128,
+        "pair_strategy": "none",
+        "pair_strategy_max_pairs": 0,
+        "inference_protocol_version": 1,
+        "model_spec_version": 1,
+        "seed": 17,
+        "config_hash": "14a11d9a439e42c6d6c118d68c4675c687c6a5d3cacb41547d7f406725ddfae6"
+      },
+      "validation": [
+        {
+          "ok": true,
+          "check": "family_capability",
+          "owner": "registry",
+          "message": "graph_hybrid is registered"
+        },
+        {
+          "ok": true,
+          "check": "head_loss",
+          "owner": "train adapter",
+          "message": "loss plan is descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "input_output_action_contract",
+          "owner": "inference adapter",
+          "message": "contracts are descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "inference_protocol",
+          "owner": "inference protocol",
+          "message": "v1"
+        },
+        {
+          "ok": true,
+          "check": "checkpoint_manifest",
+          "owner": "checkpoint manifest",
+          "message": "manifest provider is registered"
+        },
+        {
+          "ok": true,
+          "check": "pair_strategy",
+          "owner": "pair strategy",
+          "message": "none"
+        },
+        {
+          "ok": true,
+          "check": "runtime_budget",
+          "owner": "runtime_sweep",
+          "message": "runtime spec fits host profile"
+        }
+      ],
+      "rejected_recipe_error": "pair_strategy_max_pairs must be zero when pair_strategy is none"
+    },
+    {
+      "family": "restnet",
+      "valid_recipe": {
+        "recipe_id": "restnet:default",
+        "model_family": "restnet",
+        "channels": 16,
+        "blocks": 1,
+        "heads": [
+          "policy",
+          "value"
+        ],
+        "graph_layers": 1,
+        "graph_token_budget": 256,
+        "candidate_budget": 128,
+        "pair_strategy": "none",
+        "pair_strategy_max_pairs": 0,
+        "inference_protocol_version": 1,
+        "model_spec_version": 1,
+        "seed": 17,
+        "config_hash": "c38fd517998c9451532ce3019f3fff895bca9511e791a18b7d819d046392e266"
+      },
+      "validation": [
+        {
+          "ok": true,
+          "check": "family_capability",
+          "owner": "registry",
+          "message": "restnet is registered"
+        },
+        {
+          "ok": true,
+          "check": "head_loss",
+          "owner": "train adapter",
+          "message": "loss plan is descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "input_output_action_contract",
+          "owner": "inference adapter",
+          "message": "contracts are descriptor-owned"
+        },
+        {
+          "ok": true,
+          "check": "inference_protocol",
+          "owner": "inference protocol",
+          "message": "v1"
+        },
+        {
+          "ok": true,
+          "check": "checkpoint_manifest",
+          "owner": "checkpoint manifest",
+          "message": "manifest provider is registered"
+        },
+        {
+          "ok": true,
+          "check": "pair_strategy",
+          "owner": "pair strategy",
+          "message": "none"
+        },
+        {
+          "ok": true,
+          "check": "runtime_budget",
+          "owner": "runtime_sweep",
+          "message": "runtime spec fits host profile"
+        }
+      ],
+      "rejected_recipe_error": "pair_strategy_max_pairs must be zero when pair_strategy is none"
+    }
+  ]
+}

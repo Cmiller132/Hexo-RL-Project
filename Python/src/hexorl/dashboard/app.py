@@ -16,21 +16,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hexorl.axis_policy.core import AxisPolicyInput
-from hexorl.contracts.candidates import (
-    CANDIDATE_FEATURE_NAMES,
-    CANDIDATE_FEATURE_VERSION,
-    CandidateContractBuilder,
-)
-from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.contracts.history import MoveHistory
-from hexorl.contracts.symmetry import (
-    transform_history,
-    transform_pair_policy_target,
-    transform_policy_target,
-)
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
 from hexorl.dashboard.checkpoints import scan_checkpoints
+from hexorl.dashboard.contract_inspector import (
+    ContractInspector,
+    contract_catalog,
+    required_view_names,
+)
 from hexorl.dashboard.db import DashboardStore, decode_bytes
 from hexorl.dashboard.fixtures import (
     ClassicalFixtureConfig,
@@ -41,18 +35,6 @@ from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
 from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
 from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
-from hexorl.graph.semantic_builder import (
-    GRAPH_FEATURE_DIM,
-    GRAPH_SCHEMA_VERSION,
-    GRAPH_CAPACITY_STRATEGY,
-    RELATION_SCHEMA_VERSION,
-    GraphTokenType,
-    RelationType,
-)
-from hexorl.graph.tensorize import (
-    build_graph_batch_from_history,
-    graph_capacity_report,
-)
 from hexorl.selfplay.records import BOARD_SIZE
 
 
@@ -150,11 +132,13 @@ def create_app(
     suite_root = Path(run_root).expanduser().resolve() if run_root else None
     model_cache = ModelCache()
     arena_manager = ArenaManager(store)
+    contract_inspector = ContractInspector()
     app = FastAPI(title="Hexo-RL Dashboard", version="0.1.0")
     app.state.store = store
     app.state.suite_root = suite_root
     app.state.model_cache = model_cache
     app.state.arena = arena_manager
+    app.state.contract_inspector = contract_inspector
 
     app.add_middleware(
         CORSMiddleware,
@@ -467,75 +451,44 @@ def create_app(
 
     @app.get("/api/debug/contracts")
     def debug_contracts() -> dict[str, Any]:
-        return {
-            "candidate": {
-                "feature_version": CANDIDATE_FEATURE_VERSION,
-                "feature_names": list(CANDIDATE_FEATURE_NAMES),
-                "feature_width": len(CANDIDATE_FEATURE_NAMES),
-            },
-            "graph": {
-                "schema_version": GRAPH_SCHEMA_VERSION,
-                "relation_schema_version": RELATION_SCHEMA_VERSION,
-                "feature_dim": GRAPH_FEATURE_DIM,
-                "capacity_strategy": GRAPH_CAPACITY_STRATEGY,
-                "token_types": {token.name: int(token) for token in GraphTokenType},
-                "relation_types": {relation.name: int(relation) for relation in RelationType},
-            },
-        }
+        return contract_catalog()
+
+    @app.get("/api/inspect/views")
+    def inspect_views() -> dict[str, Any]:
+        return {"required": list(required_view_names()), "registered": list(contract_inspector.views())}
+
+    @app.post("/api/inspect/{view_name}")
+    def inspect_contract_view(view_name: str, req: InferRequest) -> dict[str, Any]:
+        try:
+            return contract_inspector.inspect(
+                view_name,
+                history=decode_bytes(req.history_b64),
+                policy_target=tuple(_parse_policy_target_v2(req.policy_target_v2)),
+                pair_policy_target=tuple(_parse_pair_policy_target_v2(req.pair_policy_target_v2)),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.post("/api/debug/graph")
     def debug_graph(req: InferRequest) -> dict[str, Any]:
         history = decode_bytes(req.history_b64)
         policy_target = _parse_policy_target_v2(req.policy_target_v2)
         pair_target = _parse_pair_policy_target_v2(req.pair_policy_target_v2)
-        return _graph_debug_payload(history, policy_target=policy_target, pair_policy_target=pair_target)
+        return contract_inspector.inspect(
+            "graph",
+            history=history,
+            policy_target=tuple(policy_target),
+            pair_policy_target=tuple(pair_target),
+        )
 
     @app.post("/api/debug/d6")
     def debug_d6(req: InferRequest) -> dict[str, Any]:
-        history = decode_bytes(req.history_b64)
-        base_policy_target = _parse_policy_target_v2(req.policy_target_v2)
-        base_pair_target = _parse_pair_policy_target_v2(req.pair_policy_target_v2)
-        transforms = []
-        for sym_idx in range(12):
-            transformed = transform_history(history, sym_idx)
-            policy_target = transform_policy_target(base_policy_target, sym_idx)
-            pair_target = transform_pair_policy_target(base_pair_target, sym_idx)
-            graph = _graph_debug_payload(
-                transformed,
-                policy_target=policy_target,
-                pair_policy_target=pair_target,
-            )
-            position = position_payload(get_replay_position(transformed, constrain_threats=False))
-            model_logits = {}
-            for model_id in req.model_ids:
-                try:
-                    model_logits[model_id] = model_cache.infer_history(model_id, transformed)
-                except KeyError as exc:
-                    raise HTTPException(404, f"Model not loaded: {model_id}") from exc
-            transforms.append(
-                {
-                    "symmetry_index": sym_idx,
-                    "history_b64": base64.b64encode(transformed).decode("ascii"),
-                    "current_player": position["current_player"],
-                    "placements_remaining": position["placements_remaining"],
-                    "legal_count": len(position["legal_moves"]),
-                    "graph": graph,
-                    "contracts": _d6_contract_payload(
-                        transformed,
-                        position,
-                        graph,
-                        policy_target=policy_target,
-                        pair_policy_target=pair_target,
-                    ),
-                    "model_logits": model_logits,
-                }
-            )
-        return {
-            "symmetry_count": 12,
-            "source_history_b64": base64.b64encode(history).decode("ascii"),
-            "target_checks": _d6_target_checks(transforms),
-            "transforms": transforms,
-        }
+        return contract_inspector.inspect(
+            "d6",
+            history=decode_bytes(req.history_b64),
+            policy_target=tuple(_parse_policy_target_v2(req.policy_target_v2)),
+            pair_policy_target=tuple(_parse_pair_policy_target_v2(req.pair_policy_target_v2)),
+        )
 
     @app.post("/api/arena/start")
     def arena_start(req: ArenaStartRequest) -> dict[str, Any]:
@@ -1288,65 +1241,12 @@ def _graph_debug_payload(
     policy_target: list[tuple[int, int, float]] | None = None,
     pair_policy_target: list[tuple[tuple[int, int], tuple[int, int], float]] | None = None,
 ) -> dict[str, Any]:
-    graph = build_graph_batch_from_history(
-        history,
-        policy_target=policy_target or [],
-        pair_policy_target=pair_policy_target or [],
+    return ContractInspector().inspect(
+        "graph",
+        history=history,
+        policy_target=tuple(policy_target or []),
+        pair_policy_target=tuple(pair_policy_target or []),
     )
-    capacity = graph_capacity_report(graph)
-    token_counts = {
-        token.name: int((graph.token_type == int(token)).sum())
-        for token in GraphTokenType
-    }
-    relation_counts = {
-        relation.name: int((graph.relation_type == int(relation)).sum())
-        for relation in RelationType
-        if int((graph.relation_type == int(relation)).sum()) > 0
-    }
-    pair_examples = []
-    token_qr = graph.token_qr
-    for row in range(min(16, int(graph.pair_token_indices.shape[0]))):
-        first = int(graph.pair_first_indices[row])
-        second = int(graph.pair_second_indices[row])
-        pair_examples.append(
-            {
-                "first": {"q": int(token_qr[first, 0]), "r": int(token_qr[first, 1])},
-                "second": {"q": int(token_qr[second, 0]), "r": int(token_qr[second, 1])},
-            }
-        )
-    return {
-        "schema_version": graph.schema_version,
-        "relation_schema_version": graph.relation_schema_version,
-        "feature_dim": int(graph.token_features.shape[-1]),
-        "capacity": {
-            "fits_ipc": capacity.fits_ipc,
-            "strategy": capacity.strategy,
-            "failures": list(capacity.failures()),
-            "max_tokens": capacity.max_tokens,
-            "max_actions": capacity.max_actions,
-            "max_pairs": capacity.max_pairs,
-        },
-        "token_count": int(graph.token_features.shape[0]),
-        "token_counts": token_counts,
-        "legal_count": int(graph.legal_qr.shape[0]),
-        "legal_qr": [
-            {"q": int(q), "r": int(r)}
-            for q, r in graph.legal_qr[: min(64, int(graph.legal_qr.shape[0]))]
-        ],
-        "opp_legal_count": int(graph.opp_legal_qr.shape[0]),
-        "pair_count": int(graph.pair_token_indices.shape[0]),
-        "pair_examples": pair_examples,
-        "relation_counts": relation_counts,
-        "relation_bias_shape": [int(dim) for dim in graph.relation_bias.shape],
-        "placements_remaining": int(graph.placements_remaining),
-        "current_player": int(graph.current_player),
-        "target_masses": {
-            "policy": float(graph.policy_target.sum()),
-            "pair": float(graph.pair_policy_target.sum()),
-            "pair_first": float(graph.pair_first_policy_target.sum()),
-            "opp_policy": float(graph.opp_policy_target.sum()),
-        },
-    }
 
 
 def _d6_contract_payload(
@@ -1357,105 +1257,12 @@ def _d6_contract_payload(
     policy_target: list[tuple[int, int, float]] | None = None,
     pair_policy_target: list[tuple[tuple[int, int], tuple[int, int], float]] | None = None,
 ) -> dict[str, Any]:
-    legal_moves = [
-        (int(row["q"]), int(row["r"]))
-        for row in position.get("legal_moves", [])
-    ]
-    offset_q = int(position.get("encoding", {}).get("offset_q", -16))
-    offset_r = int(position.get("encoding", {}).get("offset_r", -16))
-    candidate_budget = min(max(len(legal_moves), 1), 512)
-    candidates = CandidateContractBuilder().build(
-        legal_moves,
-        policy_target or [],
-        offset_q=offset_q,
-        offset_r=offset_r,
-        budget=candidate_budget,
-        storage_width=candidate_budget,
-    )
-    candidate_rows = [
-        {
-            "q": int(candidates.qr[row, 0]),
-            "r": int(candidates.qr[row, 1]),
-            "dense_index": int(candidates.indices[row]),
-        }
-        for row, active in enumerate(candidates.mask)
-        if bool(active)
-    ][:64]
-    pair_rows: list[dict[str, Any]] = []
-    pair_target_mass = 0.0
-    pair_missing_mass = 0.0
-    if len(legal_moves) >= 2 and int(position.get("placements_remaining", 1)) >= 2:
-        pair_budget = min(512, len(legal_moves) * max(len(legal_moves) - 1, 0) // 2)
-        pair = PairActionTableBuilder().build(
-            candidates,
-            pair_policy_target or [],
-            strategy=PairStrategy(mode="capped_fill", max_pairs=max(1, pair_budget)),
-            legal_moves=legal_moves,
-        )
-        pair_target_mass = float(pair.target.sum())
-        pair_missing_mass = float(pair.missing_mass)
-        for row, active in enumerate(pair.mask):
-            if not bool(active) or len(pair_rows) >= 64:
-                continue
-            first_idx, second_idx = pair.pair_indices[row]
-            pair_rows.append(
-                {
-                    "first": {
-                        "q": int(candidates.qr[int(first_idx), 0]),
-                        "r": int(candidates.qr[int(first_idx), 1]),
-                    },
-                    "second": {
-                        "q": int(candidates.qr[int(second_idx), 0]),
-                        "r": int(candidates.qr[int(second_idx), 1]),
-                    },
-                }
-            )
-    elif int(position.get("placements_remaining", 1)) == 1 and pair_policy_target:
-        known_first = _last_history_qr(history)
-        if known_first is not None:
-            storage_width = min(max(len(legal_moves) + 1, 1), 512)
-            pair_candidates = CandidateContractBuilder().build(
-                [known_first] + legal_moves,
-                [],
-                offset_q=offset_q,
-                offset_r=offset_r,
-                budget=storage_width,
-                storage_width=storage_width,
-                critical_actions=[known_first] + legal_moves,
-                source="rust:synthetic",
-            )
-            pair = PairActionTableBuilder().build(
-                pair_candidates,
-                pair_policy_target,
-                strategy=PairStrategy(mode="capped_fill", max_pairs=min(max(len(legal_moves), 1), 512)),
-                legal_moves=legal_moves,
-                known_first=known_first,
-                source="rust:synthetic",
-            )
-            pair_target_mass = float(pair.target.sum())
-            pair_missing_mass = float(pair.missing_mass)
-            for row, active in enumerate(pair.mask):
-                if not bool(active) or len(pair_rows) >= 64:
-                    continue
-                first_idx, second_idx = pair.pair_indices[row]
-                pair_rows.append(
-                    {
-                        "first": {
-                            "q": int(pair_candidates.qr[int(first_idx), 0]),
-                            "r": int(pair_candidates.qr[int(first_idx), 1]),
-                        },
-                        "second": {
-                            "q": int(pair_candidates.qr[int(second_idx), 0]),
-                            "r": int(pair_candidates.qr[int(second_idx), 1]),
-                        },
-                    }
-                )
     axis_input = AxisPolicyInput(
         stones=list(position.get("stones", [])),
         legal_moves=list(position.get("legal_moves", [])),
         current_player=int(position.get("current_player", 0)),
-        offset_q=offset_q,
-        offset_r=offset_r,
+        offset_q=int(position.get("encoding", {}).get("offset_q", -16)),
+        offset_r=int(position.get("encoding", {}).get("offset_r", -16)),
         metadata={
             "source": "dashboard_d6_debug",
             "placements_remaining": int(position.get("placements_remaining", 1)),
@@ -1463,27 +1270,23 @@ def _d6_contract_payload(
         },
     )
     axis_results = evaluate_all(axis_input, {})
+    inspector = ContractInspector()
+    candidates = inspector.inspect("candidates", history=history, policy_target=tuple(policy_target or []))
+    pairs = inspector.inspect(
+        "pairs",
+        history=history,
+        policy_target=tuple(policy_target or []),
+        pair_policy_target=tuple(pair_policy_target or []),
+    )
     return {
         "dense_legal_mask": {
-            "offset_q": offset_q,
-            "offset_r": offset_r,
+            "offset_q": int(position.get("encoding", {}).get("offset_q", -16)),
+            "offset_r": int(position.get("encoding", {}).get("offset_r", -16)),
             "legal_indices": list(position.get("encoding", {}).get("legal_mask", []))[:128],
-            "legal_count": len(legal_moves),
+            "legal_count": len(position.get("legal_moves", [])),
         },
-        "sparse_candidates": {
-            "feature_version": CANDIDATE_FEATURE_VERSION,
-            "feature_names": list(CANDIDATE_FEATURE_NAMES),
-            "candidate_count": int(candidates.mask.sum()),
-            "target_mass": float(candidates.target.sum()),
-            "missing_mass": float(candidates.missing_mass),
-            "rows": candidate_rows,
-        },
-        "pair_rows": {
-            "available": bool(pair_rows),
-            "target_mass": pair_target_mass,
-            "missing_mass": pair_missing_mass,
-            "rows": pair_rows,
-        },
+        "sparse_candidates": candidates,
+        "pair_rows": pairs,
         "axis": {
             "prototype_count": len(axis_results),
             "results": axis_results[:8],

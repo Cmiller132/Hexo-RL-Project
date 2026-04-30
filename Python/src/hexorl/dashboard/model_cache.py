@@ -11,24 +11,17 @@ import numpy as np
 import torch
 
 from hexorl.config import Config
-from hexorl.contracts.candidates import (
-    CANDIDATE_FEATURE_NAMES,
-    CANDIDATE_FEATURE_VERSION,
-    CandidateContractBuilder,
-)
-from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
+from hexorl.dashboard.contract_inspector import build_dashboard_model_inputs, contract_catalog
 from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
-from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
-from hexorl.engine.legal import decode_legal_bytes
-from hexorl.models.network import HexNet
+from hexorl.dashboard.replay import policy_debug
 
 
 @dataclass
 class CachedModel:
     model_id: str
     path: Path
-    model: HexNet
+    model: torch.nn.Module
     device: torch.device
 
 
@@ -68,8 +61,11 @@ class ModelCache:
 
     def infer_history(self, model_id: str, history: bytes) -> dict[str, Any]:
         cached = self._models[model_id]
-        tensor, offset_q, offset_r, legal_bytes = encode_tensor_for_history(history)
-        arr = decode_legal_bytes(legal_bytes)
+        inputs = build_dashboard_model_inputs(history, include_pair_rows=True)
+        tensor = inputs.tensor.reshape(13, 33, 33)
+        arr = inputs.legal_table.rows
+        offset_q = inputs.offset_q
+        offset_r = inputs.offset_r
         legal_mask = []
         outside_legal = []
         for q, r in arr:
@@ -88,14 +84,8 @@ class ModelCache:
         model_pair = getattr(cached.model, "pair_policy_head", None) is not None
         candidate_payload: dict[str, Any] | None = None
         forward_kwargs: dict[str, torch.Tensor] = {}
-        if (model_sparse or model_pair) and len(arr) > 0:
-            cand = CandidateContractBuilder().build(
-                [(int(q), int(r)) for q, r in arr],
-                [],
-                offset_q=int(offset_q),
-                offset_r=int(offset_r),
-                budget=min(max(len(arr), 1), 512),
-            )
+        if (model_sparse or model_pair) and len(arr) > 0 and inputs.candidate_table is not None:
+            cand = inputs.candidate_table
             candidate_payload = {
                 "qr": cand.qr,
                 "mask": cand.mask,
@@ -105,14 +95,8 @@ class ModelCache:
                 "candidate_features": torch.from_numpy(cand.features.reshape(1, cand.features.shape[0], cand.features.shape[1]).copy()).to(cached.device),
                 "candidate_mask": torch.from_numpy(cand.mask.reshape(1, -1).copy()).to(cached.device),
             }
-            if model_pair:
-                pair_budget = min(max((int(cand.mask.sum()) * max(int(cand.mask.sum()) - 1, 0)) // 2, 1), 512)
-                pair = PairActionTableBuilder().build(
-                    cand,
-                    [],
-                    strategy=PairStrategy(mode="capped_fill", max_pairs=pair_budget),
-                    legal_moves=[(int(q), int(r)) for q, r in arr],
-                )
+            if model_pair and inputs.pair_table is not None:
+                pair = inputs.pair_table
                 candidate_payload["pair_indices"] = pair.pair_indices
                 candidate_payload["pair_mask"] = pair.mask
                 forward_kwargs["pair_candidate_indices"] = torch.from_numpy(
@@ -128,10 +112,7 @@ class ModelCache:
             "legal_moves": [{"q": int(q), "r": int(r)} for q, r in arr],
             "outside_window_legal_count": len(outside_legal),
             "outside_window_legal_moves": outside_legal[:32],
-            "candidate_contract": {
-                "feature_version": CANDIDATE_FEATURE_VERSION,
-                "feature_names": list(CANDIDATE_FEATURE_NAMES),
-            },
+            "candidate_contract": contract_catalog()["candidate"],
             "heads": {},
         }
         if "policy" in out:

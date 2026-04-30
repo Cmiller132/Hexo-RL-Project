@@ -1,0 +1,22 @@
+{
+  "eval_policy_trace": {
+    "trace_id": "unit-trace",
+    "model_family": "dense_cnn",
+    "provider_type": "UnitPolicyProvider",
+    "input_contract": "crop_tensor_v1",
+    "output_contract": "row_mapped_policy_value_v1",
+    "legal_row_count": 1088,
+    "pair_rows_scored": 0,
+    "inference_protocol": "unit"
+  },
+  "dashboard_mismatch": {
+    "field": "legal_table_hash",
+    "likely_owner": "engine/legal"
+  },
+  "autotune_watchdog": {
+    "event": "watchdog_abort",
+    "subsystem": "inference",
+    "likely_owner": "inference adapter/transport",
+    "action": "inspect trace ids, queue depth, scheduler decision, and last progress counter"
+  }
+}
