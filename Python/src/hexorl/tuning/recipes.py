@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.contracts.identity import stable_digest
 from hexorl.models.factory import get_model_registry
 from hexorl.models.specs import MODEL_SPEC_VERSION, model_spec_from_config
@@ -51,16 +52,15 @@ class ModelRecipe:
             raise ValueError("recipe graph_token_budget must be in [16, 768]")
         if not 1 <= self.candidate_budget <= 512:
             raise ValueError("recipe candidate_budget must be in [1, 512]")
-        if self.pair_strategy not in {"none", "diagnostic_full_pair"}:
-            raise ValueError("recipe pair_strategy must be typed and registered")
+        pair_descriptor = PAIR_STRATEGY_REGISTRY.resolve(self.pair_strategy)
+        object.__setattr__(self, "pair_strategy", pair_descriptor.name)
         if self.sparse_prior_stage not in {0, 1, 2}:
             raise ValueError("recipe sparse_prior_stage must be 0, 1, or 2")
         if not 0.0 <= self.sparse_prior_mix <= 1.0:
             raise ValueError("recipe sparse_prior_mix must be in [0, 1]")
         if ("sparse_policy" in self.heads or "pair_policy" in self.heads) and not self.sparse_policy:
             raise ValueError("recipe sparse heads require sparse_policy=True")
-        if self.pair_strategy == "none" and self.pair_strategy_max_pairs != 0:
-            raise ValueError("pair_strategy_max_pairs must be zero when pair_strategy is none")
+        pair_descriptor.validate_config(max_pairs=self.pair_strategy_max_pairs, pair_prior_mix=1.0)
         if self.inference_protocol_version != 1:
             raise ValueError("unsupported inference protocol version")
 

@@ -16,13 +16,13 @@ from hexorl.config import Config
 from hexorl.contracts.candidates import CandidateContractBuilder
 from hexorl.contracts.identity import stable_digest
 from hexorl.contracts.legal import LegalActionTable
-from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy as PairTableStrategy
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
+from hexorl.contracts.pairs import PairActionTableBuilder
 from hexorl.engine.tactical import (
     scan_tactical_oracle_from_game,
     scan_tactical_oracle_from_history,
 )
 from hexorl.engine.legal import decode_legal_bytes
-from hexorl.inference.shm_queue import MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
 from hexorl.models.specs import model_spec_from_config
 from hexorl.graph.tensorize import GraphBatch, build_graph_batch_from_history
 from hexorl.search.context import SearchContext
@@ -61,8 +61,6 @@ logger = logging.getLogger(__name__)
 PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
 PRIOR_SOURCE_PAIR = 4
-PAIR_STRATEGY_NONE = "none"
-PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR = "diagnostic_full_pair"
 
 
 @dataclass(frozen=True)
@@ -345,6 +343,7 @@ class GameRunner:
         model_spec,
         game_factory: Callable[[], object] | None = None,
         rgsc_service: RGSCRestartService | None = None,
+        pair_strategy_registry=PAIR_STRATEGY_REGISTRY,
     ):
         self.policy_provider = policy_provider
         self.pair_strategy_impl = pair_strategy
@@ -378,9 +377,11 @@ class GameRunner:
         if self.uses_global_policy:
             self.near_radius = 8
             self.constrain_threats = False
-        self.pair_strategy = str(runner_config.pair_strategy_name).lower()
+        self.pair_strategy_registry = pair_strategy_registry
+        self.pair_strategy_descriptor = self.pair_strategy_registry.resolve(runner_config.pair_strategy_name)
+        self.pair_strategy = self.pair_strategy_descriptor.name
         self.pair_strategy_max_pairs = int(runner_config.pair_strategy_max_pairs)
-        self.pair_policy_enabled = self.pair_strategy != PAIR_STRATEGY_NONE
+        self.pair_policy_enabled = self.pair_strategy_descriptor.scoring_enabled
         self.candidate_budget = max(int(runner_config.candidate_budget), int(runner_config.policy_target_top_k))
 
     def pair_strategy_summary(
@@ -431,34 +432,7 @@ class GameRunner:
         )
 
     def _pair_strategy_spec(self) -> PairStrategySpec:
-        if self.pair_strategy == PAIR_STRATEGY_NONE:
-            return PairStrategySpec()
-        if self.pair_strategy in {"two_stage_root_only", "two_stage_root"}:
-            return PairStrategySpec(
-                name="two_stage_root_only",
-                root_enabled=True,
-                leaf_enabled=False,
-                max_root_pair_rows=self.pair_strategy_max_pairs,
-                chunk_size=0 if self.pair_strategy_max_pairs <= 0 else min(self.pair_strategy_max_pairs, MAX_GRAPH_PAIRS),
-            )
-        if self.pair_strategy in {"tactical_only", "tactical"}:
-            return PairStrategySpec(
-                name="tactical_only",
-                root_enabled=True,
-                leaf_enabled=False,
-                max_root_pair_rows=self.pair_strategy_max_pairs,
-                chunk_size=0 if self.pair_strategy_max_pairs <= 0 else min(self.pair_strategy_max_pairs, MAX_PAIR_CANDIDATES),
-            )
-        if self.pair_strategy in {PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR, "diagnostic_full_root"}:
-            return PairStrategySpec(
-                name="diagnostic_full_root",
-                diagnostic=True,
-                root_enabled=True,
-                leaf_enabled=False,
-                max_full_pair_rows=self.pair_strategy_max_pairs,
-                chunk_size=0 if self.pair_strategy_max_pairs <= 0 else min(self.pair_strategy_max_pairs, MAX_GRAPH_PAIRS),
-            )
-        raise ValueError(f"unsupported explicit pair strategy {self.pair_strategy!r}")
+        return self.pair_strategy_descriptor.build_spec(max_pairs=self.pair_strategy_max_pairs)
 
     def _legal_table_from_bytes(
         self,
@@ -525,19 +499,7 @@ class GameRunner:
             return None
         if candidate_table is None:
             raise ValueError("pair scoring requires candidate_table construction before PairStrategy")
-        if self.pair_strategy in {"two_stage_root_only", "two_stage_root", "tactical_only", "tactical"}:
-            table_strategy = PairTableStrategy(
-                mode="capped_fill",
-                max_pairs=self.pair_strategy_max_pairs,
-            )
-        elif self.pair_strategy in {PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR, "diagnostic_full_root"}:
-            table_strategy = PairTableStrategy(
-                mode="full_capped",
-                max_pairs=self.pair_strategy_max_pairs,
-                allow_full=True,
-            )
-        else:
-            raise ValueError(f"unsupported explicit pair strategy {self.pair_strategy!r}")
+        table_strategy = self.pair_strategy_descriptor.build_table_strategy(max_pairs=self.pair_strategy_max_pairs)
         return self.contract_builders.pair_table_builder_factory().build(
             candidate_table,
             [],
@@ -1493,7 +1455,7 @@ def create_default_game_runner(
         sparse_policy_enabled=bool(getattr(cfg.model, "sparse_policy", False)),
         candidate_budget=max(int(getattr(cfg.model, "candidate_budget", 256)), int(sp.policy_target_top_k)),
         subtree_reuse=bool(getattr(sp, "subtree_reuse", False)),
-        pair_strategy_name=str(getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)).lower(),
+        pair_strategy_name=str(getattr(cfg.model, "pair_strategy", "none")).lower(),
         pair_strategy_max_pairs=int(getattr(cfg.model, "pair_strategy_max_pairs", 0)),
         configured_heads=tuple(str(item) for item in getattr(cfg.model, "heads", ())),
     )
@@ -1543,33 +1505,7 @@ def create_default_game_runner(
 
 
 def _pair_strategy_spec_from_config(config: GameRunnerConfig) -> PairStrategySpec:
-    pair_strategy = str(config.pair_strategy_name).lower()
-    max_pairs = int(config.pair_strategy_max_pairs)
-    if pair_strategy == PAIR_STRATEGY_NONE:
-        return PairStrategySpec()
-    if pair_strategy in {"two_stage_root_only", "two_stage_root"}:
-        return PairStrategySpec(
-            name="two_stage_root_only",
-            root_enabled=True,
-            leaf_enabled=False,
-            max_root_pair_rows=max_pairs,
-            chunk_size=0 if max_pairs <= 0 else min(max_pairs, MAX_GRAPH_PAIRS),
-        )
-    if pair_strategy in {"tactical_only", "tactical"}:
-        return PairStrategySpec(
-            name="tactical_only",
-            root_enabled=True,
-            leaf_enabled=False,
-            max_root_pair_rows=max_pairs,
-            chunk_size=0 if max_pairs <= 0 else min(max_pairs, MAX_PAIR_CANDIDATES),
-        )
-    if pair_strategy in {PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR, "diagnostic_full_root"}:
-        return PairStrategySpec(
-            name="diagnostic_full_root",
-            diagnostic=True,
-            root_enabled=True,
-            leaf_enabled=False,
-            max_full_pair_rows=max_pairs,
-            chunk_size=0 if max_pairs <= 0 else min(max_pairs, MAX_GRAPH_PAIRS),
-        )
-    raise ValueError(f"unsupported explicit pair strategy {pair_strategy!r}")
+    return PAIR_STRATEGY_REGISTRY.build_spec(
+        str(config.pair_strategy_name).lower(),
+        max_pairs=int(config.pair_strategy_max_pairs),
+    )

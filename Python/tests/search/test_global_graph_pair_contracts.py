@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from hexorl.contracts.candidates import CandidateContractBuilder
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.contracts.pairs import PairActionTable, PairActionTableBuilder, PairStrategy
 from hexorl.contracts.validation import ContractValidationError
 from hexorl.graph.batch import build_graph_batch_from_history
@@ -10,7 +11,7 @@ from hexorl.models.specs import ModelSpec
 from hexorl.models.inference_contracts import OP_GRAPH_PLACE_VALUE
 from hexorl.search.context import SearchContext
 from hexorl.search.engine_adapter import create_engine_adapter
-from hexorl.search.pair_strategy import PairEvaluation, PairStrategySpec, create_pair_strategy
+from hexorl.search.pair_strategy import PairEvaluation, create_pair_strategy
 from hexorl.search.policy_provider import GlobalGraphPolicyProvider
 from hexorl.search.priors import SearchEvaluation
 
@@ -32,7 +33,7 @@ def _pair_table(*, known_first=None, mode="capped_fill", max_pairs=3):
     return PairActionTableBuilder().build(
         _candidate_table(),
         [((0, 0), (1, 0), 1.0)],
-        strategy=PairStrategy(mode=mode, max_pairs=max_pairs, allow_full=mode == "full_capped"),
+        strategy=PairStrategy(generation_mode=mode, max_pairs=max_pairs, allow_full=mode == "full_capped"),
         legal_moves=[(0, 0), (1, 0), (0, 1)],
         known_first=known_first,
         source="fixture",
@@ -125,7 +126,7 @@ def test_pair_action_rows_from_canonical_pair_action_table():
 
 def test_opening_position_has_no_pair_prior_or_pair_loss(legal_table):
     ctx = SearchContext.create(phase="root", legal_table=legal_table, model_family="global_xattn")
-    pair_eval = create_pair_strategy(PairStrategySpec()).score_root(ctx, _base_eval(ctx))
+    pair_eval = create_pair_strategy(PAIR_STRATEGY_REGISTRY.build_spec("none", max_pairs=0)).score_root(ctx, _base_eval(ctx))
     assert pair_eval.scored_pair_rows == 0
     assert pair_eval.pair_priors.shape == (0,)
 

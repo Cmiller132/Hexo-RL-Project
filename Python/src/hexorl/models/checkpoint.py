@@ -11,6 +11,7 @@ import zipfile
 import torch
 import torch.nn as nn
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.models.factory import REGISTRY, inference_manifest
 from hexorl.models.specs import model_spec_from_config
 
@@ -160,7 +161,7 @@ def _manifest_from_cfg(cfg: Any, created_by: dict[str, Any]) -> CheckpointManife
         action_contract=infer["action_contract"],
         inference_protocol={"protocol_version": 1, "model_inference_contract": infer},
         heads=list(descriptor.components.heads),
-        pair_strategy_used=str(getattr(cfg.model, "pair_strategy", "none")),
+        pair_strategy_used=PAIR_STRATEGY_REGISTRY.normalize_name(str(getattr(cfg.model, "pair_strategy", "none"))),
         created_by={
             "git_sha": str(created_by.get("git_sha", "unknown")),
             "command": str(created_by.get("command", "unknown")),

@@ -6,7 +6,7 @@ import torch
 from hexorl.config import Config
 from hexorl.replay.storage import ReplayStorage
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
-from hexorl.search.pair_strategy import PairStrategySpec
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY, PairStrategySpec
 from hexorl.selfplay.game_runner import create_default_game_runner
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.train.ema import ModelEMA
@@ -467,8 +467,24 @@ def test_pair_scoring_requires_explicit_diagnostic_strategy_and_cap():
     finally:
         queue.close()
 
-    with pytest.raises(ValueError, match="max_full_pair_rows"):
-        PairStrategySpec(name="diagnostic_full_root", diagnostic=True, root_enabled=True, max_full_pair_rows=0)
+    with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
+        Config.model_validate(
+            {
+                "model": {
+                    "architecture": "global_xattn_0",
+                    "channels": 16,
+                    "attention_heads": 4,
+                    "graph_layers": 1,
+                    "heads": ["value", "policy_place", "policy_pair_joint"],
+                    "pair_strategy": "diagnostic_full_root",
+                },
+                "inference": {"fp16": False},
+            }
+        )
+    with pytest.raises(Exception, match="max_full_pair_rows"):
+        PAIR_STRATEGY_REGISTRY.validate_spec(
+            PairStrategySpec(name="diagnostic_full_root", diagnostic=True, root_enabled=True, max_full_pair_rows=0)
+        )
 
 
 def test_restnet_config_rejects_invalid_attention_position():

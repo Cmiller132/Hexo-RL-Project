@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.models.factory import get_model_registry
 from hexorl.models.specs import GLOBAL_MODEL_KINDS
 from hexorl.tuning.recipes import ModelRecipe, RecipeTransform
@@ -69,7 +70,11 @@ def family_space(family: str) -> FamilySpace:
         graph_layer_choices=(1, 2) if is_global else (1,),
         graph_token_budget_choices=(256, 512) if is_global else (256,),
         candidate_budget_choices=(128, 256, 512) if is_graph_hybrid else (128, 256),
-        pair_strategy_choices=("none", "diagnostic_full_pair") if is_global or is_graph_hybrid else ("none",),
+        pair_strategy_choices=PAIR_STRATEGY_REGISTRY.recipe_names_for_family(
+            family=descriptor.name,
+            is_global=is_global,
+            is_graph_hybrid=is_graph_hybrid,
+        ),
     )
 
 

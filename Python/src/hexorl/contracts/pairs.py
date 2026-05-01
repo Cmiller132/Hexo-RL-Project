@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal, Sequence, get_args
 
 import numpy as np
 
@@ -15,6 +15,7 @@ from hexorl.contracts.validation import ContractValidationError, validate_source
 PAIR_SCHEMA_VERSION = 2
 PairPhase = Literal["empty", "first_placement", "second_placement_known_first"]
 PairGenerationMode = Literal["none", "selected", "capped_fill", "full_capped"]
+_VALID_MODES: frozenset[PairGenerationMode] = frozenset(get_args(PairGenerationMode))
 
 
 @dataclass(frozen=True)
@@ -26,20 +27,20 @@ class PairStrategy:
     enumeration in candidate, graph, and replay projections.
     """
 
-    mode: PairGenerationMode = "capped_fill"
+    generation_mode: PairGenerationMode = "capped_fill"
     max_pairs: int = 0
     allow_full: bool = False
 
     def __post_init__(self) -> None:
-        if self.mode not in {"none", "selected", "capped_fill", "full_capped"}:
-            raise ContractValidationError(f"unsupported pair generation mode: {self.mode!r}", owner="PairStrategy")
+        if self.generation_mode not in _VALID_MODES:
+            raise ContractValidationError(f"unsupported pair generation mode: {self.generation_mode!r}", owner="PairStrategy")
         object.__setattr__(self, "max_pairs", int(self.max_pairs))
         object.__setattr__(self, "allow_full", bool(self.allow_full))
-        if self.mode == "none" and self.max_pairs != 0:
+        if self.generation_mode == "none" and self.max_pairs != 0:
             raise ContractValidationError("no-pair strategy must have max_pairs=0", owner="PairStrategy")
-        if self.mode != "none" and self.max_pairs <= 0:
+        if self.generation_mode != "none" and self.max_pairs <= 0:
             raise ContractValidationError("pair strategy requires a positive max_pairs cap", owner="PairStrategy")
-        if self.mode == "full_capped" and not self.allow_full:
+        if self.generation_mode == "full_capped" and not self.allow_full:
             raise ContractValidationError("full pair generation requires allow_full=True", owner="PairStrategy")
 
 
@@ -78,7 +79,7 @@ class PairActionTable:
             raise ContractValidationError("pair rows, refs, mask, and target length mismatch", owner="PairActionTable", source=source)
         if self.phase not in {"empty", "first_placement", "second_placement_known_first"}:
             raise ContractValidationError(f"unsupported pair phase: {self.phase!r}", owner="PairActionTable", source=source)
-        if self.generation_mode not in {"none", "selected", "capped_fill", "full_capped"}:
+        if self.generation_mode not in _VALID_MODES:
             raise ContractValidationError(f"unsupported pair generation mode: {self.generation_mode!r}", owner="PairActionTable", source=source)
         if self.phase == "second_placement_known_first" and self.known_first is None:
             raise ContractValidationError("second-placement pair table requires known_first", owner="PairActionTable", source=source)
@@ -184,7 +185,7 @@ class PairActionTableBuilder:
         source_value = candidate_table.source if source is None else source
         allow_fixture_value = candidate_table.allow_fixture if allow_fixture is None else bool(allow_fixture)
         source_value = validate_source(source_value, allow_fixture=allow_fixture_value, owner="PairActionTableBuilder")
-        if strategy.mode == "none":
+        if strategy.generation_mode == "none":
             return self._empty(candidate_table, source=source_value, allow_fixture=allow_fixture_value, generation_mode="none")
         active_rows = [
             (idx, (int(q), int(r)))
@@ -227,17 +228,17 @@ class PairActionTableBuilder:
         protected = list(dict.fromkeys(protected))
         fill = self._fill_pairs(active_rows, phase=phase, known_first=known, target_map=target_map)
         possible = self._possible_pair_count(active_rows, phase=phase, known_first=known)
-        if strategy.mode == "full_capped":
+        if strategy.generation_mode == "full_capped":
             if strategy.max_pairs < possible:
                 raise ContractValidationError("full pair strategy cap is smaller than possible pair count", owner="PairActionTableBuilder", source=source_value)
             selected_pairs = protected + [pair for pair in fill if pair not in set(protected)]
-        elif strategy.mode == "selected":
+        elif strategy.generation_mode == "selected":
             selected_pairs = protected
         else:
             protected_set = set(protected)
             selected_pairs = protected + [pair for pair in fill if pair not in protected_set]
         if len(selected_pairs) > strategy.max_pairs:
-            if strategy.mode == "selected":
+            if strategy.generation_mode == "selected":
                 raise ContractValidationError("selected pair targets exceed pair strategy cap", owner="PairActionTableBuilder", source=source_value)
             selected_pairs = selected_pairs[: strategy.max_pairs]
         width = max(strategy.max_pairs, len(selected_pairs), 1)
@@ -272,7 +273,7 @@ class PairActionTableBuilder:
             phase=phase,
             source=source_value,
             known_first=known,
-            generation_mode=strategy.mode,
+            generation_mode=strategy.generation_mode,
             possible_pair_count=possible,
             selected_pair_count=int(np.count_nonzero(mask)),
             missing_mass=max(0.0, total_target_mass - represented_mass),

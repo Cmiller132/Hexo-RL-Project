@@ -95,7 +95,7 @@ def build_position_contracts(
                 candidate_table,
                 list(pair_policy_target),
                 strategy=PairStrategy(
-                    mode="capped_fill",
+                    generation_mode="capped_fill",
                     max_pairs=min(512, max(1, len(rows) * (len(rows) - 1) // 2)),
                 ),
                 legal_moves=rows,

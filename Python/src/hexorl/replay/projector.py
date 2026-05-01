@@ -272,7 +272,7 @@ def _project_pair_targets(
     pair = builder.build(
         candidate,
         pair_policy_v2,
-        strategy=PairStrategy(mode="capped_fill", max_pairs=candidate_width),
+        strategy=PairStrategy(generation_mode="capped_fill", max_pairs=candidate_width),
         legal_moves=legal_list,
         known_first=known_first,
         source="rust:legal",
@@ -305,7 +305,7 @@ def _graph_with_pair_targets(graph, pair_policy_v2, sample_history: bytes):
     pair_table = PairActionTableBuilder().build(
         candidate,
         pair_policy_v2,
-        strategy=PairStrategy(mode="full_capped", max_pairs=max(1, possible), allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=max(1, possible), allow_full=True),
         legal_moves=graph_legal_rows,
         known_first=known_first,
         source="rust:legal",

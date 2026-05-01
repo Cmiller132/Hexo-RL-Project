@@ -4,6 +4,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List
 import warnings
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
+
 
 class RunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -101,29 +103,12 @@ class ModelConfig(BaseModel):
             raise ValueError("model.sparse_prior_mix must be in [0, 1]")
         if not 0.0 <= self.pair_prior_mix <= 1.0:
             raise ValueError("model.pair_prior_mix must be in [0, 1]")
-        self.pair_strategy = self.pair_strategy.lower()
-        valid_pair_strategies = {"none", "diagnostic_full_pair"}
-        if self.pair_strategy not in valid_pair_strategies:
-            raise ValueError(
-                "model.pair_strategy must be one of "
-                f"{sorted(valid_pair_strategies)}"
-            )
-        if self.pair_strategy == "none":
-            if self.pair_strategy_max_pairs != 0:
-                raise ValueError(
-                    "model.pair_strategy_max_pairs must be 0 when "
-                    "model.pair_strategy='none'"
-                )
-        else:
-            if self.pair_prior_mix <= 0.0:
-                raise ValueError(
-                    "non-none model.pair_strategy requires model.pair_prior_mix > 0"
-                )
-            if self.pair_strategy_max_pairs <= 0:
-                raise ValueError(
-                    "non-none model.pair_strategy requires "
-                    "model.pair_strategy_max_pairs > 0"
-                )
+        pair_descriptor = PAIR_STRATEGY_REGISTRY.resolve(self.pair_strategy)
+        self.pair_strategy = pair_descriptor.name
+        pair_descriptor.validate_config(
+            max_pairs=self.pair_strategy_max_pairs,
+            pair_prior_mix=self.pair_prior_mix,
+        )
         invalid_positions = [
             pos for pos in self.attention_positions if pos < 1 or pos > self.blocks
         ]
@@ -247,7 +232,7 @@ class Config(BaseModel):
                 "the config is not auto-mutated"
             )
         if (
-            self.model.pair_strategy != "none"
+            PAIR_STRATEGY_REGISTRY.resolve(self.model.pair_strategy).requires_pair_head
             and not (
                 {"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"}
                 & set(self.model.heads)

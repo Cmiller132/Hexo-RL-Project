@@ -108,7 +108,7 @@ def graph_batch_with_test_pair_rows(graph, pair_policy_target):
     pair_table = PairActionTableBuilder().build(
         candidate_table,
         pair_policy_target,
-        strategy=PairStrategy(mode="full_capped", max_pairs=max(1, possible), allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=max(1, possible), allow_full=True),
         legal_moves=legal_rows,
         known_first=known_first,
         source="rust:synthetic",

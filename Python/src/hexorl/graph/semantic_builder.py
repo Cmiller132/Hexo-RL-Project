@@ -686,7 +686,7 @@ def build_graph_semantic_from_history(
             )
         pair_mode = "capped_fill" if allow_pair_truncation else "full_capped"
         pair_strategy = PairStrategy(
-            mode=pair_mode,
+            generation_mode=pair_mode,
             max_pairs=max(1, pair_cap),
             allow_full=not allow_pair_truncation,
         )

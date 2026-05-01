@@ -1,9 +1,10 @@
 import numpy as np
 
 from hexorl.contracts.candidates import CandidateContractBuilder
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.contracts.pairs import PairActionTableBuilder, PairStrategy
 from hexorl.search.context import SearchContext
-from hexorl.search.pair_strategy import PairStrategySpec, create_pair_strategy
+from hexorl.search.pair_strategy import create_pair_strategy
 from hexorl.search.priors import PRIOR_SOURCE_DENSE, SearchEvaluation
 
 
@@ -43,7 +44,7 @@ def _evaluation(legal_table, pair_table=None):
 
 def test_default_pair_strategy_scores_zero_rows(legal_table):
     context, evaluation = _evaluation(legal_table)
-    pair_eval = create_pair_strategy(PairStrategySpec()).score_root(context, evaluation)
+    pair_eval = create_pair_strategy(PAIR_STRATEGY_REGISTRY.build_spec("none", max_pairs=0)).score_root(context, evaluation)
 
     assert pair_eval.strategy_name == "none"
     assert pair_eval.scored_pair_rows == 0
@@ -62,7 +63,7 @@ def test_pair_scoring_occurs_only_through_explicit_strategy(legal_table):
     table = PairActionTableBuilder().build(
         candidate_table,
         [((0, 0), (1, 0), 1.0)],
-        strategy=PairStrategy(mode="full_capped", max_pairs=1, allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=1, allow_full=True),
         legal_moves=legal_table.rows.tolist(),
         source="fixture",
         allow_fixture=True,
@@ -70,12 +71,7 @@ def test_pair_scoring_occurs_only_through_explicit_strategy(legal_table):
     context, evaluation = _evaluation(legal_table, pair_table=table)
     scorer = FakePairScorer()
     pair_eval = create_pair_strategy(
-        PairStrategySpec(
-            name="diagnostic_full_root",
-            diagnostic=True,
-            root_enabled=True,
-            max_full_pair_rows=1,
-        ),
+        PAIR_STRATEGY_REGISTRY.build_spec("diagnostic_full_root", max_pairs=1),
         pair_scorer=scorer,
     ).score_root(context, evaluation)
 

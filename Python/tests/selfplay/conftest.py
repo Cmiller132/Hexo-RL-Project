@@ -7,7 +7,8 @@ import pytest
 
 from hexorl.contracts.legal import LegalActionTable
 from hexorl.search.context import SearchContext
-from hexorl.search.pair_strategy import PairStrategySpec, create_pair_strategy
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
+from hexorl.search.pair_strategy import create_pair_strategy
 from hexorl.search.priors import PRIOR_SOURCE_DENSE, SearchEvaluation
 from hexorl.selfplay.game_runner import (
     GameRunner,
@@ -140,6 +141,7 @@ def runner_factory():
         pair_strategy_name: str = "none",
         pair_strategy_max_pairs: int = 0,
         pair_scorer=None,
+        pair_strategy_registry=PAIR_STRATEGY_REGISTRY,
     ):
         telemetry = InMemorySelfPlayTelemetrySink()
         writer = InMemorySelfPlayRecordWriter(telemetry_sink=telemetry)
@@ -186,14 +188,9 @@ def runner_factory():
         runner = GameRunner(
             policy_provider=FakePolicyProvider(model_family),
             pair_strategy=create_pair_strategy(
-                PairStrategySpec()
-                if pair_strategy_name == "none"
-                else PairStrategySpec(
-                    name="two_stage_root_only",
-                    root_enabled=True,
-                    max_root_pair_rows=pair_strategy_max_pairs,
-                ),
+                pair_strategy_registry.build_spec(pair_strategy_name, max_pairs=pair_strategy_max_pairs),
                 pair_scorer=pair_scorer,
+                registry=pair_strategy_registry,
             ),
             engine_adapter_factory=lambda **kwargs: FakeEngineAdapter(),
             record_writer=writer,
@@ -202,6 +199,7 @@ def runner_factory():
             runtime_spec=runtime,
             runner_config=config,
             model_spec=model_spec,
+            pair_strategy_registry=pair_strategy_registry,
         )
         return runner, telemetry, writer
 

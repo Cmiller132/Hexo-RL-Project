@@ -5,61 +5,17 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, Mapping, Protocol
+from typing import Mapping, Protocol
 
 import numpy as np
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY, PairStrategyRegistry, PairStrategySpec
 from hexorl.contracts.pairs import PairActionTable
 from hexorl.contracts.validation import ContractValidationError
 from hexorl.inference.evaluator import Evaluator
 from hexorl.models.inference_contracts import OP_PAIR_POLICY
 from hexorl.search.context import SearchContext
 from hexorl.search.priors import PRIOR_SOURCE_PAIR, SearchEvaluation, priors_from_logits
-
-PairStrategyName = Literal["none", "two_stage_root_only", "tactical_only", "diagnostic_full_root"]
-
-
-@dataclass(frozen=True)
-class PairStrategySpec:
-    name: PairStrategyName = "none"
-    enabled_sources: tuple[str, ...] = ()
-    root_enabled: bool = False
-    leaf_enabled: bool = False
-    max_root_pair_rows: int = 0
-    max_leaf_pair_rows: int = 0
-    max_full_pair_rows: int = 0
-    chunk_size: int = 0
-    phase_eligibility: tuple[str, ...] = ("root",)
-    known_first_required: bool = False
-    diagnostic: bool = False
-    telemetry_level: str = "summary"
-
-    def __post_init__(self) -> None:
-        name = str(self.name)
-        object.__setattr__(self, "name", name)
-        for attr in ("max_root_pair_rows", "max_leaf_pair_rows", "max_full_pair_rows", "chunk_size"):
-            object.__setattr__(self, attr, int(getattr(self, attr)))
-        object.__setattr__(self, "root_enabled", bool(self.root_enabled))
-        object.__setattr__(self, "leaf_enabled", bool(self.leaf_enabled))
-        object.__setattr__(self, "diagnostic", bool(self.diagnostic))
-        if name == "none":
-            if self.root_enabled or self.leaf_enabled or self.max_root_pair_rows or self.max_leaf_pair_rows or self.max_full_pair_rows:
-                raise ContractValidationError("none pair strategy must not enable or cap scoring", owner="PairStrategySpec")
-        elif name == "two_stage_root_only":
-            if not self.root_enabled or self.leaf_enabled or self.max_root_pair_rows <= 0:
-                raise ContractValidationError("two_stage_root_only requires root cap and no leaf scoring", owner="PairStrategySpec")
-        elif name == "tactical_only":
-            if not (self.root_enabled or self.leaf_enabled):
-                raise ContractValidationError("tactical_only must declare an enabled scope", owner="PairStrategySpec")
-            if self.root_enabled and self.max_root_pair_rows <= 0:
-                raise ContractValidationError("tactical_only root scoring requires root cap", owner="PairStrategySpec")
-            if self.leaf_enabled and self.max_leaf_pair_rows <= 0:
-                raise ContractValidationError("tactical_only leaf scoring requires leaf cap", owner="PairStrategySpec")
-        elif name == "diagnostic_full_root":
-            if not self.diagnostic or not self.root_enabled or self.leaf_enabled or self.max_full_pair_rows <= 0:
-                raise ContractValidationError("diagnostic_full_root must be diagnostic root-only with max_full_pair_rows", owner="PairStrategySpec")
-        else:
-            raise ContractValidationError(f"unknown pair strategy {name!r}", owner="PairStrategySpec")
 
 
 @dataclass(frozen=True)
@@ -195,9 +151,7 @@ class ExplicitPairStrategy:
         return [self._score(ctx, ev, cap=self.spec.max_leaf_pair_rows) for ctx, ev in zip(contexts, base_evals)]
 
     def _root_cap(self) -> int:
-        if self.spec.name == "diagnostic_full_root":
-            return self.spec.max_full_pair_rows
-        return self.spec.max_root_pair_rows
+        return self.spec.root_pair_row_cap
 
     def _score(self, context: SearchContext, base_eval: SearchEvaluation, *, cap: int) -> PairEvaluation:
         t0 = time.monotonic()
@@ -237,9 +191,15 @@ class ExplicitPairStrategy:
         )
 
 
-def create_pair_strategy(spec: PairStrategySpec | None = None, *, pair_scorer: PairScoringProvider | None = None) -> PairStrategy:
-    spec = spec or PairStrategySpec()
-    if spec.name == "none":
+def create_pair_strategy(
+    spec: PairStrategySpec | None = None,
+    *,
+    pair_scorer: PairScoringProvider | None = None,
+    registry: PairStrategyRegistry = PAIR_STRATEGY_REGISTRY,
+) -> PairStrategy:
+    spec = registry.build_spec("none", max_pairs=0) if spec is None else registry.validate_spec(spec)
+    descriptor = registry.resolve(spec)
+    if not descriptor.scoring_enabled:
         return NoPairStrategy()
     return ExplicitPairStrategy(spec, pair_scorer=pair_scorer)
 

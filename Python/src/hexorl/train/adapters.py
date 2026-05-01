@@ -8,6 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.models.specs import ModelSpec
 from hexorl.models.inputs import CropInputs, GraphInputs
 from hexorl.train.losses import compute_losses
@@ -177,7 +178,8 @@ class TrainAdapter:
                     raise ValueError(f"train adapter owner: pair target requires canonical {name}")
             _require_shape_match("pair_policy_target", targets["pair_policy_target"], targets["pair_token_indices"])
             _validate_graph_pair_semantics(targets)
-            if bool(getattr(self.cfg.model, "pair_strategy", "none") != "none") and not torch.any(targets["pair_token_indices"] >= 0):
+            pair_descriptor = PAIR_STRATEGY_REGISTRY.resolve(getattr(self.cfg.model, "pair_strategy", "none"))
+            if pair_descriptor.scoring_enabled and not torch.any(targets["pair_token_indices"] >= 0):
                 raise ValueError("train adapter owner: pair loss is invalid on opening positions without pair rows")
         for name in ("policy_target", "pair_policy_target", "legal_mask", "token_features", "relation_bias"):
             if name in targets:

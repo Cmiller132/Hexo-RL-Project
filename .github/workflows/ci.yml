@@ -176,6 +176,18 @@ jobs:
         working-directory: Python/dashboard_frontend
         run: npm run build
 
+      - name: Test dashboard frontend
+        working-directory: Python/dashboard_frontend
+        run: npm run test
+
+      - name: Install Playwright Chromium
+        working-directory: Python/dashboard_frontend
+        run: npx playwright install chromium
+
+      - name: Run dashboard E2E smoke
+        working-directory: Python/dashboard_frontend
+        run: npm run e2e
+
   final-v2-smoke:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

@@ -53,7 +53,7 @@ def test_pair_action_table_builder_is_phase_aware_cap_aware_and_projection_only(
     table = PairActionTableBuilder().build(
         candidates,
         [((1, 0), (0, 0), 1.0)],
-        strategy=PairStrategy(mode="full_capped", max_pairs=3, allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=3, allow_full=True),
         legal_moves=[(0, 0), (1, 0), (0, 1)],
     )
 
@@ -66,7 +66,7 @@ def test_pair_action_table_builder_is_phase_aware_cap_aware_and_projection_only(
         PairActionTableBuilder().build(
             candidates,
             [],
-            strategy=PairStrategy(mode="full_capped", max_pairs=1, allow_full=True),
+            strategy=PairStrategy(generation_mode="full_capped", max_pairs=1, allow_full=True),
             legal_moves=[(0, 0), (1, 0), (0, 1)],
         )
 
@@ -85,7 +85,7 @@ def test_second_placement_pair_table_validates_known_first():
     table = PairActionTableBuilder().build(
         candidates,
         [((9, 9), (1, 0), 1.0)],
-        strategy=PairStrategy(mode="full_capped", max_pairs=2, allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=2, allow_full=True),
         legal_moves=[(0, 0), (1, 0)],
         known_first=(9, 9),
         source="rust:synthetic",
@@ -98,11 +98,34 @@ def test_second_placement_pair_table_validates_known_first():
         PairActionTableBuilder().build(
             candidates,
             [((8, 8), (1, 0), 1.0)],
-            strategy=PairStrategy(mode="selected", max_pairs=1),
+            strategy=PairStrategy(generation_mode="selected", max_pairs=1),
             legal_moves=[(0, 0), (1, 0)],
             known_first=(9, 9),
             source="rust:synthetic",
         )
+
+
+def test_selected_pair_generation_mode_materializes_only_target_pairs():
+    candidates = CandidateContractBuilder().build(
+        [(0, 0), (1, 0), (0, 1)],
+        [],
+        offset_q=-16,
+        offset_r=-16,
+        budget=3,
+        storage_width=3,
+    )
+    table = PairActionTableBuilder().build(
+        candidates,
+        [((0, 0), (1, 0), 1.0)],
+        strategy=PairStrategy(generation_mode="selected", max_pairs=1),
+        legal_moves=[(0, 0), (1, 0), (0, 1)],
+    )
+
+    assert table.generation_mode == "selected"
+    assert table.possible_pair_count == 3
+    assert table.selected_pair_count == 1
+    assert table.mask.tolist() == [True]
+    assert table.rows.tolist() == [[0, 0, 1, 0]]
 
 
 def test_graph_semantic_builder_tensorizer_and_collator_are_split_and_mutation_safe():
@@ -134,7 +157,7 @@ def test_graph_pair_projection_derives_from_pair_action_table():
     pair_table = PairActionTableBuilder().build(
         candidates,
         [(legal_rows[1], legal_rows[0], 1.0)],
-        strategy=PairStrategy(mode="full_capped", max_pairs=3, allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=3, allow_full=True),
         legal_moves=legal_rows,
     )
     projected = graph_batch_with_pair_table(graph, pair_table)
@@ -160,7 +183,7 @@ def test_graph_pair_projection_rejects_stale_pair_table_references():
     good = PairActionTableBuilder().build(
         candidates,
         [(legal_rows[0], legal_rows[1], 1.0)],
-        strategy=PairStrategy(mode="full_capped", max_pairs=3, allow_full=True),
+        strategy=PairStrategy(generation_mode="full_capped", max_pairs=3, allow_full=True),
         legal_moves=legal_rows,
     )
     bad_refs = np.asarray(good.first_candidate_rows, dtype=np.int64).copy()

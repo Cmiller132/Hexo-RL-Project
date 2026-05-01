@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from hexorl.contracts.pair_strategy import PAIR_STRATEGY_REGISTRY
 from hexorl.models.factory import get_model_registry
 from hexorl.models.specs import GLOBAL_MODEL_KINDS
 from hexorl.tuning.recipes import ModelRecipe
@@ -23,8 +24,13 @@ def dry_run_validate_recipe(recipe: ModelRecipe, runtime: RuntimeSpec, host: Hos
         results.append(_fail("family_capability", "model registry", "global graph families require graph_layers"))
     if recipe.model_family not in GLOBAL_MODEL_KINDS and "policy_place" in recipe.heads:
         results.append(_fail("head_loss", "train adapter", "crop families cannot use global policy_place head"))
-    if recipe.pair_strategy == "diagnostic_full_pair" and recipe.pair_strategy_max_pairs <= 0:
-        results.append(_fail("pair_strategy", "pair strategy", "diagnostic_full_pair requires a positive cap"))
+    try:
+        PAIR_STRATEGY_REGISTRY.resolve(recipe.pair_strategy).validate_config(
+            max_pairs=recipe.pair_strategy_max_pairs,
+            pair_prior_mix=1.0,
+        )
+    except ValueError as exc:
+        results.append(_fail("pair_strategy", "pair strategy", str(exc)))
     else:
         results.append(_ok("pair_strategy", "pair strategy", recipe.pair_strategy))
     for failure in runtime.validate(host):
