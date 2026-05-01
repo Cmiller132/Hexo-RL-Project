@@ -11,7 +11,8 @@ import numpy as np
 
 from hexorl.contracts.pairs import PairActionTable
 from hexorl.contracts.validation import ContractValidationError
-from hexorl.inference.client import InferenceClient
+from hexorl.inference.evaluator import Evaluator
+from hexorl.models.inference_contracts import OP_PAIR_POLICY
 from hexorl.search.context import SearchContext
 from hexorl.search.priors import PRIOR_SOURCE_PAIR, SearchEvaluation, priors_from_logits
 
@@ -135,7 +136,7 @@ class PairScoringProvider(Protocol):
 class InferencePairScoringProvider:
     name = "inference_pair_scoring"
 
-    def __init__(self, client: InferenceClient):
+    def __init__(self, client: Evaluator):
         self.client = client
 
     def score_pairs(self, context: SearchContext, table: PairActionTable, active_rows: np.ndarray) -> np.ndarray:
@@ -147,15 +148,18 @@ class InferencePairScoringProvider:
         if active.shape[0] == 0:
             return np.zeros(0, dtype=np.float32)
         candidate_table = context.candidate_table
-        _policy, _value, _sparse, pair_logits = self.client.evaluate_pair_scoring(
-            context.tensor.reshape(1, 13, 33, 33),
-            1,
-            candidate_table.dense_indices.reshape(1, -1),
-            candidate_table.features.reshape(1, candidate_table.features.shape[0], candidate_table.features.shape[1]),
-            candidate_table.mask.reshape(1, -1),
-            table.pair_indices[active].reshape(1, active.shape[0], 2),
-            table.mask[active].reshape(1, -1),
+        response = self.client.evaluate(
+            OP_PAIR_POLICY,
+            {
+                "tensor": context.tensor.reshape(1, 13, 33, 33),
+                "candidate_indices": candidate_table.dense_indices.reshape(1, -1),
+                "candidate_features": candidate_table.features.reshape(1, candidate_table.features.shape[0], candidate_table.features.shape[1]),
+                "candidate_mask": candidate_table.mask.reshape(1, -1),
+                "pair_candidate_indices": table.pair_indices[active].reshape(1, active.shape[0], 2),
+                "pair_candidate_mask": table.mask[active].reshape(1, -1),
+            },
         )
+        pair_logits = response.head_outputs["pair_policy"]
         logits = np.asarray(pair_logits, dtype=np.float32).reshape(1, -1)[0, : active.shape[0]]
         if logits.shape[0] != active.shape[0]:
             raise ContractValidationError("pair-scoring output length does not match selected pair rows", owner=self.name)

@@ -149,17 +149,17 @@ class CheckpointManager:
 def _manifest_from_cfg(cfg: Any, created_by: dict[str, Any]) -> CheckpointManifest:
     spec = model_spec_from_config(cfg)
     descriptor = REGISTRY.resolve(spec)
-    infer = inference_manifest(cfg).to_dict()
+    infer = inference_manifest(cfg).canonical_dict()
     return CheckpointManifest(
         checkpoint_schema_version=1,
         model_family=descriptor.name,
         model_spec_version=1,
         model_spec=spec.manifest(),
         input_contract=infer["input_contract"],
-        output_contract=infer["output_contract"],
+        output_contract="model_inference_contract_v3",
         action_contract=infer["action_contract"],
-        inference_protocol=infer,
-        heads=list(getattr(cfg.model, "heads", [])),
+        inference_protocol={"protocol_version": 1, "model_inference_contract": infer},
+        heads=list(descriptor.components.heads),
         pair_strategy_used=str(getattr(cfg.model, "pair_strategy", "none")),
         created_by={
             "git_sha": str(created_by.get("git_sha", "unknown")),

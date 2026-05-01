@@ -32,17 +32,17 @@ def would_exceed_batch(total: int, count: int, max_batch_size: int) -> bool:
 class ReadyRequest:
     worker_id: int
     count: int
-    request_kind_code: int
+    operation_code: int
     protocol_version: int = 1
     request_schema_version: int = 1
-    adapter_capability: str = ""
+    layout_hash: str = ""
     enqueued_monotonic_s: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True)
 class SelectedBatch:
     worker_ids: list[int]
-    request_kind_code: int
+    operation_code: int
     total_positions: int
     queue_depth: int
     high_watermark_hit: bool
@@ -77,10 +77,10 @@ class BatchingPolicy:
         groups: dict[tuple[int, int, int, str], list[ReadyRequest]] = {}
         for request in ready:
             key = (
-                int(request.request_kind_code),
+                int(request.operation_code),
                 int(request.protocol_version),
                 int(request.request_schema_version),
-                str(request.adapter_capability),
+                str(request.layout_hash),
             )
             groups.setdefault(key, []).append(request)
         selected_group = min(
@@ -107,7 +107,7 @@ class BatchingPolicy:
         fill_rate = total / float(self.max_batch_size)
         return SelectedBatch(
             worker_ids=[item.worker_id for item in selected],
-            request_kind_code=int(selected[0].request_kind_code) if selected else 0,
+            operation_code=int(selected[0].operation_code) if selected else 0,
             total_positions=int(total),
             queue_depth=sum(int(item.count) for item in ready if int(item.count) > 0),
             high_watermark_hit=fill_rate >= self.high_watermark,

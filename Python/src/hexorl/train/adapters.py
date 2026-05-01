@@ -9,12 +9,13 @@ import torch
 import torch.nn as nn
 
 from hexorl.models.specs import ModelSpec
+from hexorl.models.inputs import CropInputs, GraphInputs
 from hexorl.train.losses import compute_losses
 
 
 @dataclass
 class ProjectedTrainingBatch:
-    inputs: tuple[Any, ...]
+    inputs: CropInputs | GraphInputs
     kwargs: dict[str, torch.Tensor]
     targets: dict[str, torch.Tensor]
 
@@ -93,22 +94,20 @@ class TrainAdapter:
                 "relation_type": targets["relation_type"],
                 "relation_bias": targets["relation_bias"],
             }
-            return ProjectedTrainingBatch(inputs=(), kwargs={k: v for k, v in kwargs.items() if v is not None}, targets=targets)
+            return ProjectedTrainingBatch(inputs=GraphInputs(**{k: v for k, v in kwargs.items() if v is not None}), kwargs={}, targets=targets)
 
         self.validate_crop_targets(targets)
         kwargs = {
             "candidate_features": targets.get("candidate_features"),
             "candidate_indices": targets.get("candidate_indices"),
             "candidate_mask": targets.get("candidate_mask"),
-            "pair_candidate_features": targets.get("pair_candidate_features"),
-            "pair_candidate_row_indices": targets.get("pair_candidate_row_indices"),
             "pair_candidate_indices": targets.get("pair_candidate_indices"),
             "pair_candidate_mask": targets.get("pair_candidate_mask"),
         }
-        return ProjectedTrainingBatch(inputs=(tensors,), kwargs={k: v for k, v in kwargs.items() if v is not None}, targets=targets)
+        return ProjectedTrainingBatch(inputs=CropInputs(tensor=tensors, **{k: v for k, v in kwargs.items() if v is not None}), kwargs={}, targets=targets)
 
     def forward(self, projected: ProjectedTrainingBatch) -> dict[str, torch.Tensor]:
-        outputs = self.model(*projected.inputs, **projected.kwargs)
+        outputs = self.model(projected.inputs)
         self.validate_outputs(outputs, projected.targets)
         return outputs
 
@@ -129,7 +128,7 @@ class TrainAdapter:
         *,
         trace_id: str,
     ) -> TrainingDebugBundle:
-        tensors = {**projected.targets, **projected.kwargs}
+        tensors = {**projected.targets, **projected.inputs.__dict__}
         return TrainingDebugBundle(
             trace_id=trace_id,
             owner="train_adapter",

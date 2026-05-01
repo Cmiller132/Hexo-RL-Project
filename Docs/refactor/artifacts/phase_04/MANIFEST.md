@@ -19,6 +19,7 @@
 | `phase_04_inference_debug_bundle.md` | debug sample | manifest/request/response diagnostics |
 | `phase_04_mutation_corruption_report.md` | adversarial validation | negative corruption coverage |
 | `package_split_20260430.md` | package split evidence | client/server packages own runtime logic; flat modules deleted |
+| `model_owned_dynamic_arena_20260430.md` | contract/arena cutover evidence | model-owned operation contracts and typed dynamic shared-memory arenas replace semantic request kinds/fixed slots |
 | `command_transcripts.md` | command evidence | command transcripts with exit codes |
 | `deletion_manifest.md` | cleanup proof | old runtime path deletion/disconnection |
 | `agent_completion_packet.md` | completion packet | phase completion summary |

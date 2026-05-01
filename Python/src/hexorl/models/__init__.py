@@ -12,7 +12,7 @@ from hexorl.models.capabilities import (
     SPARSE_PLACE_POLICY,
     CapabilitySet,
 )
-from hexorl.models.crop_network import HexNet
+from hexorl.models.composers import CropModel, GlobalModel
 from hexorl.models.factory import (
     REGISTRY,
     build_inference_model,
@@ -37,7 +37,8 @@ __all__ = [
     "REGRET_HEAD",
     "SPARSE_PLACE_POLICY",
     "CapabilitySet",
-    "HexNet",
+    "CropModel",
+    "GlobalModel",
     "ModelSpec",
     "REGISTRY",
     "build_inference_model",

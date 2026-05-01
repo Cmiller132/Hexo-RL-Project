@@ -8,7 +8,7 @@ import signal
 from typing import Optional
 
 from hexorl.config import Config
-from hexorl.inference.protocol import default_protocol_manifest, publish_server_manifest, remove_server_manifest
+from hexorl.inference.protocol import protocol_manifest_from_contract, publish_server_manifest, remove_server_manifest
 from hexorl.inference.server.batching import BatchingPolicy
 from hexorl.inference.server.collation import ServerCollator
 from hexorl.inference.server.execution import ServerExecutor
@@ -16,8 +16,8 @@ from hexorl.inference.server.metrics import ServerMetrics
 from hexorl.inference.server.runtime import apply_latest_weight_update, initialize_runtime, state_to_cpu
 from hexorl.inference.server.scatter import ServerScatterer
 from hexorl.inference.server.scheduler import InferenceScheduler
-from hexorl.inference.shm_queue import create_inference_queue, connect_inference_queue
-from hexorl.models.factory import model_uses_global_graph
+from hexorl.inference.arena import create_inference_queue, connect_inference_queue
+from hexorl.models.factory import inference_contract, model_uses_global_graph
 from hexorl.models.specs import model_spec_from_config
 
 
@@ -44,13 +44,10 @@ class InferenceServer:
         self.max_batch = int(cfg.inference.max_batch_size)
         self.max_wait_us = int(cfg.inference.max_wait_us)
         self.fp16 = bool(cfg.inference.fp16)
-        self.manifest = default_protocol_manifest(
-            max_batch_size=self.max_batch,
+        self.model_contract = inference_contract(cfg)
+        self.manifest = protocol_manifest_from_contract(
+            self.model_contract,
             timeout_ms=float(getattr(cfg.inference, "timeout_ms", 30000.0)),
-            heads=tuple(str(head) for head in cfg.model.heads),
-            adapter_name="hexorl-shm-server",
-            model_family=model_spec.kind,
-            model_spec_version=str(model_spec.version),
             config_hash=str(getattr(cfg.run, "name", "server")),
         )
         self._batching_policy = BatchingPolicy(
@@ -76,7 +73,7 @@ class InferenceServer:
         if self._process is not None:
             raise RuntimeError("Server already running")
 
-        self._owned_queue = create_inference_queue(self.num_workers, self.max_batch)
+        self._owned_queue = create_inference_queue(self.num_workers, self.max_batch, self.manifest)
         publish_server_manifest(
             self.manifest,
             num_workers=self.num_workers,
@@ -132,7 +129,7 @@ class InferenceServer:
     def _run(self) -> None:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         runtime = initialize_runtime(self.cfg, self._initial_state_dict)
-        queue = connect_inference_queue(self.num_workers, self.max_batch)
+        queue = connect_inference_queue(self.num_workers, self.max_batch, self.manifest)
         metrics = ServerMetrics()
         try:
             collator = ServerCollator(
@@ -140,7 +137,7 @@ class InferenceServer:
                 queue=queue,
                 device=runtime.device,
                 max_batch=self.max_batch,
-                global_graph_kind=self._global_graph_kind,
+                manifest=self.manifest,
             )
             executor = ServerExecutor(
                 model=runtime.model,
@@ -148,8 +145,9 @@ class InferenceServer:
                 forward_stream=runtime.forward_stream,
                 fp16=self.fp16,
                 metrics=metrics,
+                manifest=self.manifest,
             )
-            scatterer = ServerScatterer(queue=queue)
+            scatterer = ServerScatterer(queue=queue, manifest=self.manifest)
             scheduler = InferenceScheduler(
                 queue=queue,
                 num_workers=self.num_workers,
@@ -168,6 +166,7 @@ class InferenceServer:
                 ),
                 device=runtime.device,
                 fp16=self.fp16,
+                manifest=self.manifest,
             )
             self._ready_event.set()
             asyncio.run(scheduler.run())

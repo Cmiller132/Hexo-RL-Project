@@ -7,6 +7,7 @@ from hexorl.contracts.validation import ContractValidationError
 from hexorl.graph.batch import build_graph_batch_from_history
 from hexorl.graph.tensorize import graph_batch_with_pair_table
 from hexorl.models.specs import ModelSpec
+from hexorl.models.inference_contracts import OP_GRAPH_PLACE_VALUE
 from hexorl.search.context import SearchContext
 from hexorl.search.engine_adapter import create_engine_adapter
 from hexorl.search.pair_strategy import PairEvaluation, PairStrategySpec, create_pair_strategy
@@ -66,8 +67,8 @@ def test_policy_place_one_logit_per_legal_row(legal_table, fake_client):
 def test_policy_pair_first_one_logit_per_legal_first_row(legal_table, fake_client):
     graph = build_graph_batch_from_history(b"", include_pair_rows=False)
     graph = graph.__class__(**{**graph.__dict__, "legal_qr": legal_table.rows, "legal_mask": np.ones(3, dtype=np.bool_)})
-    response = fake_client.evaluate_global_graph(graph)
-    assert response["policy_pair_first"].shape == (legal_table.rows.shape[0],)
+    response = fake_client.evaluate(OP_GRAPH_PLACE_VALUE, {"graph_batch": graph})
+    assert response.head_outputs["policy_pair_first"].shape == (legal_table.rows.shape[0],)
 
 
 def test_policy_pair_second_requires_known_first():

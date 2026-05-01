@@ -45,10 +45,6 @@ class ModelConfig(BaseModel):
             "global_graph_option1",
             "global_xattn_0",
             "global_line_window_0",
-            "global_pair_twostage_0",
-            "global_graph_full_0",
-            "global_hybrid_action_0",
-            "global_graph768_champion",
         }
         if arch == "graph":
             warnings.warn(
@@ -290,10 +286,6 @@ class Config(BaseModel):
             "global_graph_option1",
             "global_xattn_0",
             "global_line_window_0",
-            "global_pair_twostage_0",
-            "global_graph_full_0",
-            "global_hybrid_action_0",
-            "global_graph768_champion",
         }
         if self.model.architecture in global_architectures:
             graph_defaults = {

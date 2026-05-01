@@ -45,22 +45,28 @@ class _Manifest:
 class _InferenceClient:
     manifest = _Manifest()
 
-    def evaluate_dense(self, tensor, count):
-        return np.ones((count, 1089), dtype=np.float32), np.zeros((count,), dtype=np.float32)
-
-    def evaluate_sparse(self, tensor, count, candidate_indices, candidate_features, candidate_mask):
-        dense = np.ones((count, 1089), dtype=np.float32)
-        sparse = np.ones(np.asarray(candidate_indices).shape, dtype=np.float32)
-        return dense, np.zeros((count,), dtype=np.float32), sparse
-
-    def evaluate_global_graph(self, graph_batch):
-        legal_qr = np.asarray(graph_batch.legal_qr, dtype=np.int32)
-        return {
-            "metadata": {"legal_qr": legal_qr},
-            "policy_place": np.ones((legal_qr.shape[0],), dtype=np.float32),
-            "value": np.zeros((1,), dtype=np.float32),
-            "policy_pair_first": np.zeros((0,), dtype=np.float32),
-        }
+    def evaluate(self, operation_name, payload):
+        if operation_name == "place_value":
+            count = int(np.asarray(payload["tensor"]).shape[0])
+            heads = {"policy": np.ones((count, 1089), dtype=np.float32), "value": np.zeros((count,), dtype=np.float32)}
+        elif operation_name == "sparse_place_value":
+            count = int(np.asarray(payload["tensor"]).shape[0])
+            candidate_indices = payload["candidate_indices"]
+            heads = {
+                "policy": np.ones((count, 1089), dtype=np.float32),
+                "value": np.zeros((count,), dtype=np.float32),
+                "sparse_policy": np.ones(np.asarray(candidate_indices).shape, dtype=np.float32),
+            }
+        elif operation_name == "graph_place_value":
+            legal_count = int(np.asarray(payload["legal_mask"]).shape[0])
+            heads = {
+                "policy_place": np.ones((legal_count,), dtype=np.float32),
+                "value": np.zeros((1,), dtype=np.float32),
+                "policy_pair_first": np.zeros((0,), dtype=np.float32),
+            }
+        else:
+            raise ValueError(operation_name)
+        return type("Response", (), {"head_outputs": heads, "telemetry": {"wait_ms": 0.0}})()
 
 
 def test_arena_policy_player_covers_every_registered_family_through_provider():

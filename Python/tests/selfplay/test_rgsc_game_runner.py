@@ -5,11 +5,14 @@ from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 
 
 class _RGSCFakeClient:
-    def evaluate_regret_heads(self, tensor, count):
+    def evaluate(self, operation_name, payload):
+        tensor = payload["tensor"]
+        count = int(payload["count"])
         markers = np.asarray(tensor, dtype=np.float32)[:count, 0, 0, 0]
         rank = markers * 10.0
         regret_value = markers + 0.25
-        return rank.astype(np.float32), regret_value.astype(np.float32)
+        heads = {"regret_rank": rank.astype(np.float32), "regret_value": regret_value.astype(np.float32)}
+        return type("Response", (), {"head_outputs": heads, "telemetry": {"wait_ms": 0.0}})()
 
 
 class _RGSCFakePolicyProvider:

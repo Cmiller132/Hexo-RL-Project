@@ -1,13 +1,7 @@
-"""Typed inference adapters."""
+"""Inference adapter namespace.
 
-from hexorl.inference.adapters.dense import DensePolicyValueAdapter
-from hexorl.inference.adapters.global_graph import GlobalGraphPolicyValueAdapter
-from hexorl.inference.adapters.pair_scoring import PairScoringAdapter
-from hexorl.inference.adapters.sparse import SparsePolicyValueAdapter
+Semantic inference adapters were removed in favor of model-owned operation
+contracts plus generic dynamic-arena transport.
+"""
 
-__all__ = [
-    "DensePolicyValueAdapter",
-    "GlobalGraphPolicyValueAdapter",
-    "PairScoringAdapter",
-    "SparsePolicyValueAdapter",
-]
+__all__: list[str] = []

@@ -1,4 +1,4 @@
-"""Shared-memory transport for typed inference requests."""
+"""Client-side contract-walking shared-memory transport."""
 
 from __future__ import annotations
 
@@ -8,20 +8,22 @@ from typing import Any
 
 import numpy as np
 
-from hexorl.inference.adapters.base import InferenceAdapter
-from hexorl.inference.protocol import (
-    InferenceRequest,
-    InferenceRequestKind,
-    InferenceResponse,
-    REQUEST_KIND_TO_CODE,
+from hexorl.inference.control import (
+    CTL_CONTRACT_HASH,
+    CTL_DEADLINE_NS,
+    CTL_ENQUEUED_NS,
+    CTL_GENERATION,
+    CTL_LAYOUT_HASH,
+    CTL_OPCODE,
+    CTL_STATUS,
+    STATUS_DRAINING,
+    STATUS_OK,
+    STATUS_READY,
+    hash_word,
+    read_all_dyn_dims,
+    write_dyn_dims,
 )
-from hexorl.inference.shm_queue import (
-    MAX_CANDIDATES,
-    MAX_GRAPH_ACTIONS,
-    MAX_GRAPH_PAIRS,
-    MAX_GRAPH_TOKENS,
-    MAX_PAIR_CANDIDATES,
-)
+from hexorl.inference.protocol import InferenceOutputValidationError, InferenceRequest, InferenceResponse
 from hexorl.inference.telemetry import InferenceTelemetry, timeout_message
 
 
@@ -35,14 +37,13 @@ class TransportState(str, Enum):
 
 
 class ShmTransport:
-    """Single lifecycle owner for request packing, signaling, wait, and decode."""
-
-    def __init__(self, *, worker_id: int, slot: Any, timeout_ms: float):
+    def __init__(self, *, worker_id: int, slot: Any, timeout_ms: float, manifest: Any):
         self.worker_id = int(worker_id)
         self.slot = slot
         self.timeout_ms = float(timeout_ms)
+        self.manifest = manifest
         self.state = TransportState.CREATED
-        self.generation = 0
+        self.generation = int(self.slot.control[CTL_GENERATION])
         self.last_heartbeat_monotonic_s = time.monotonic()
 
     def mark_ready(self) -> None:
@@ -54,212 +55,158 @@ class ShmTransport:
     def close(self) -> None:
         self.state = TransportState.CLOSED
 
-    def round_trip(self, request: InferenceRequest, adapter: InferenceAdapter) -> InferenceResponse:
-        adapter.validate_request(request)
+    def round_trip(self, request: InferenceRequest) -> InferenceResponse:
         if self.state not in (TransportState.READY, TransportState.HANDSHAKING):
             raise RuntimeError(f"inference transport is not ready: {self.state.value}")
+        operation = self.manifest.model_contract.operation(request.operation_name)
+        self._validate_payload(operation, request.payload)
         self.state = TransportState.DRAINING
         t0 = time.monotonic()
-        self._write_request(request)
+        dims = self._write_request(request, operation)
         self.slot.req_ready.set()
         if not self.slot.res_ready.wait(timeout=max(self.timeout_ms, 1.0) / 1000.0):
             self.state = TransportState.FAILED
-            heartbeat_age = (time.monotonic() - self.last_heartbeat_monotonic_s) * 1000.0
-            raise TimeoutError(
-                timeout_message(
-                    request_id=request.request_id,
-                    trace_id=request.trace_id,
-                    request_kind=request.request_kind.value,
-                    queue_depth=int(self.slot.req_count[0]),
-                    heartbeat_age_ms=heartbeat_age,
-                    transport_state=self.state.value,
-                    timeout_ms=self.timeout_ms,
-                )
-            )
+            raise TimeoutError(self._timeout_text(request, dims))
         wait_ms = (time.monotonic() - t0) * 1000.0
         self.last_heartbeat_monotonic_s = time.monotonic()
         self.slot.res_ready.clear()
-        response = self._read_response(request, wait_ms=wait_ms, adapter=adapter)
-        adapter.assert_response(response)
+        response = self._read_response(request, operation, wait_ms=wait_ms)
+        response.require_ok()
         self.state = TransportState.READY
         self.generation += 1
         return response
 
-    def _write_request(self, request: InferenceRequest) -> None:
-        self.slot.res_ready.clear()
-        self.slot.req_kind[0] = REQUEST_KIND_TO_CODE[request.request_kind]
-        if request.request_kind in (
-            InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE,
-            InferenceRequestKind.GRAPH_PAIR_POLICY_VALUE,
-        ):
-            self._write_graph(request.payload["graph_batch"])
-            return
-        payload = request.payload
-        count = int(payload["count"])
-        tensor = np.asarray(payload["tensor"], dtype=np.float32).reshape(count, 13, 33, 33)
-        np.copyto(self.slot.req_tensor[:count], tensor)
-        self.slot.req_count[0] = count
-        self.slot.req_candidate_count[:count] = 0
-        self.slot.req_pair_count[:count] = 0
-        if request.request_kind in (
-            InferenceRequestKind.SPARSE_POLICY_VALUE,
-            InferenceRequestKind.PAIR_SCORING,
-            InferenceRequestKind.SPARSE_PAIR_POLICY_VALUE,
-        ):
-            self._write_sparse(payload, count)
-        if request.request_kind in (InferenceRequestKind.PAIR_SCORING, InferenceRequestKind.SPARSE_PAIR_POLICY_VALUE):
-            self._write_pairs(payload, count)
+    def _validate_payload(self, operation: Any, payload: MappingLike) -> None:
+        missing = sorted(set(operation.required_inputs) - set(payload.keys()))
+        if missing:
+            raise ValueError(f"inference payload missing required tensors for {operation.name}: {missing}")
 
-    def _write_sparse(self, payload: Any, count: int) -> None:
-        candidate_indices = np.asarray(payload["candidate_indices"], dtype=np.int64)
-        candidate_features = np.asarray(payload["candidate_features"], dtype=np.float32)
-        candidate_mask = np.asarray(payload["candidate_mask"], dtype=np.uint8)
-        k = int(candidate_indices.shape[1])
-        if k > MAX_CANDIDATES:
-            raise ValueError(f"candidate count {k} exceeds MAX_CANDIDATES {MAX_CANDIDATES}")
-        self.slot.req_candidate_count[:count] = k
-        self.slot.req_candidate_indices[:count, :k] = candidate_indices[:count, :k]
-        self.slot.req_candidate_features[:count, :k] = candidate_features[:count, :k]
-        self.slot.req_candidate_mask[:count, :k] = candidate_mask[:count, :k]
-        if k < MAX_CANDIDATES:
-            self.slot.req_candidate_mask[:count, k:] = 0
+    def _write_request(self, request: InferenceRequest, operation: Any) -> dict[str, int]:
+        slot = self.slot
+        slot.clear_response_payload()
+        slot.clear_request_payload()
+        dims: dict[str, int] = {}
+        for spec in operation.layout.input_tensors:
+            arr = np.asarray(request.payload[spec.name])
+            arr = _normalize_request_array(arr, spec)
+            _merge_dims(dims, _dims_from_shape(spec, arr.shape))
+            _copy_into(slot.request_tensor(spec.name), arr, spec, dims)
+        dims.setdefault("B", 1)
+        slot.control[CTL_GENERATION] = self.generation + 1
+        slot.control[CTL_OPCODE] = int(request.operation_code)
+        slot.control[CTL_STATUS] = STATUS_DRAINING
+        slot.control[CTL_LAYOUT_HASH] = hash_word(operation.layout_hash)
+        slot.control[CTL_CONTRACT_HASH] = hash_word(request.model_contract_hash)
+        slot.control[CTL_ENQUEUED_NS] = time.monotonic_ns()
+        slot.control[CTL_DEADLINE_NS] = int(request.deadline_monotonic_s * 1_000_000_000)
+        write_dyn_dims(slot.control, dims)
+        slot.control[CTL_STATUS] = STATUS_READY
+        return dims
 
-    def _write_pairs(self, payload: Any, count: int) -> None:
-        pair_indices = np.asarray(payload["pair_candidate_indices"], dtype=np.int64)
-        pair_mask = np.asarray(payload["pair_candidate_mask"], dtype=np.uint8)
-        p = int(pair_indices.shape[1])
-        if p > MAX_PAIR_CANDIDATES:
-            raise ValueError(f"pair count {p} exceeds MAX_PAIR_CANDIDATES {MAX_PAIR_CANDIDATES}")
-        self.slot.req_pair_count[:count] = p
-        self.slot.req_pair_indices[:count, :p] = pair_indices[:count, :p]
-        self.slot.req_pair_mask[:count, :p] = pair_mask[:count, :p]
-        if p < MAX_PAIR_CANDIDATES:
-            self.slot.req_pair_mask[:count, p:] = 0
-
-    def _write_graph(self, graph_batch: Any) -> None:
-        from hexorl.graph.tensorize import validate_graph_ipc_capacity
-
-        validate_graph_ipc_capacity(graph_batch)
-        token_count = int(np.asarray(graph_batch.token_features).shape[0])
-        legal_count = int(np.asarray(graph_batch.legal_qr).shape[0])
-        opp_count = int(np.asarray(graph_batch.opp_legal_qr).shape[0])
-        pair_count = int(np.asarray(graph_batch.pair_token_indices).shape[0])
-        if token_count > MAX_GRAPH_TOKENS:
-            raise ValueError(f"graph token count {token_count} exceeds MAX_GRAPH_TOKENS {MAX_GRAPH_TOKENS}")
-        if legal_count > MAX_GRAPH_ACTIONS or opp_count > MAX_GRAPH_ACTIONS:
-            raise ValueError("graph action count exceeds shared-memory capacity")
-        if pair_count > MAX_GRAPH_PAIRS:
-            raise ValueError(f"graph pair row count {pair_count} exceeds MAX_GRAPH_PAIRS {MAX_GRAPH_PAIRS}")
-        self.slot.req_count[0] = 1
-        self.slot.req_candidate_count[:1] = 0
-        self.slot.req_pair_count[:1] = 0
-        self.slot.req_graph_meta[:] = (
-            int(graph_batch.schema_version),
-            int(graph_batch.relation_schema_version),
-            token_count,
-            legal_count,
-            opp_count,
-            pair_count,
-            MAX_GRAPH_TOKENS,
-            MAX_GRAPH_ACTIONS,
-        )
-        self.slot.req_graph_token_features.fill(0.0)
-        self.slot.req_graph_token_type.fill(0)
-        self.slot.req_graph_token_qr.fill(0)
-        self.slot.req_graph_token_mask.fill(0)
-        self.slot.req_graph_legal_token_indices.fill(-1)
-        self.slot.req_graph_legal_qr.fill(0)
-        self.slot.req_graph_legal_mask.fill(0)
-        self.slot.req_graph_opp_legal_qr.fill(0)
-        self.slot.req_graph_opp_legal_mask.fill(0)
-        self.slot.req_graph_pair_token_indices.fill(-1)
-        self.slot.req_graph_pair_first_indices.fill(-1)
-        self.slot.req_graph_pair_second_indices.fill(-1)
-        self.slot.req_graph_relation_type.fill(0)
-        self.slot.req_graph_relation_bias.fill(0.0)
-        self.slot.req_graph_token_features[:token_count] = np.asarray(graph_batch.token_features, dtype=np.float32)
-        self.slot.req_graph_token_type[:token_count] = np.asarray(graph_batch.token_type, dtype=np.int16)
-        self.slot.req_graph_token_qr[:token_count] = np.asarray(graph_batch.token_qr, dtype=np.int32)
-        self.slot.req_graph_token_mask[:token_count] = np.asarray(graph_batch.token_mask, dtype=np.uint8)
-        self.slot.req_graph_legal_token_indices[:legal_count] = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
-        self.slot.req_graph_legal_qr[:legal_count] = np.asarray(graph_batch.legal_qr, dtype=np.int32)
-        self.slot.req_graph_legal_mask[:legal_count] = np.asarray(graph_batch.legal_mask, dtype=np.uint8)
-        if opp_count:
-            self.slot.req_graph_opp_legal_qr[:opp_count] = np.asarray(graph_batch.opp_legal_qr, dtype=np.int32)
-            self.slot.req_graph_opp_legal_mask[:opp_count] = np.asarray(graph_batch.opp_legal_mask, dtype=np.uint8)
-        if pair_count:
-            self.slot.req_graph_pair_token_indices[:pair_count] = np.asarray(graph_batch.pair_token_indices, dtype=np.int64)
-            self.slot.req_graph_pair_first_indices[:pair_count] = np.asarray(graph_batch.pair_first_indices, dtype=np.int64)
-            self.slot.req_graph_pair_second_indices[:pair_count] = np.asarray(graph_batch.pair_second_indices, dtype=np.int64)
-        self.slot.req_graph_relation_type[:token_count, :token_count] = np.asarray(graph_batch.relation_type, dtype=np.int16)
-        self.slot.req_graph_relation_bias[:, :token_count, :token_count] = np.asarray(graph_batch.relation_bias, dtype=np.float32)
-
-    def _read_response(self, request: InferenceRequest, *, wait_ms: float, adapter: InferenceAdapter) -> InferenceResponse:
-        count = int(self.slot.req_count[0])
-        heads: dict[str, Any] = {}
-        if request.request_kind in (
-            InferenceRequestKind.GLOBAL_GRAPH_POLICY_VALUE,
-            InferenceRequestKind.GRAPH_PAIR_POLICY_VALUE,
-        ):
-            legal_count = int(self.slot.res_graph_meta[2])
-            opp_count = int(self.slot.res_graph_meta[3])
-            pair_count = int(self.slot.res_graph_meta[4])
-            heads = {
-                "policy_place": np.array(self.slot.res_graph_place_logits[:legal_count], copy=True),
-                "opp_policy": np.array(self.slot.res_graph_opp_logits[:opp_count], copy=True),
-                "policy_pair_first": np.array(self.slot.res_graph_pair_first_logits[:legal_count], copy=True),
-                "policy_pair_joint": np.array(self.slot.res_graph_pair_logits[:pair_count], copy=True),
-                "policy_pair_second": np.array(self.slot.res_graph_pair_second_logits[:pair_count], copy=True),
-                "regret_rank": np.array(self.slot.res_graph_regret_rank[:1], copy=True),
-                "value": np.array(self.slot.res_value[:1], copy=True),
-                "metadata": {
-                    "schema_version": int(self.slot.res_graph_meta[0]),
-                    "relation_schema_version": int(self.slot.res_graph_meta[1]),
-                    "legal_count": legal_count,
-                    "opp_legal_count": opp_count,
-                    "pair_count": pair_count,
-                    "prior_source": "global_graph",
-                    "legal_qr": np.array(self.slot.req_graph_legal_qr[:legal_count], copy=True),
-                    "legal_mask": np.array(self.slot.req_graph_legal_mask[:legal_count].astype(bool), copy=True),
-                },
-            }
-            if getattr(self.slot, "res_graph_regret_value", None) is not None:
-                heads["regret_value"] = np.array(self.slot.res_graph_regret_value[:1], copy=True)
-        else:
-            k = int(np.max(self.slot.req_candidate_count[:count])) if count else 0
-            p = int(np.max(self.slot.req_pair_count[:count])) if count else 0
-            heads = {
-                "policy": np.array(self.slot.res_policy[:count], copy=True).ravel(),
-                "value": np.array(self.slot.res_value[:count], copy=True),
-            }
-            if k:
-                heads["sparse_policy"] = np.array(self.slot.res_sparse_logits[:count, :k], copy=True)
-            if p:
-                heads["pair_policy"] = np.array(self.slot.res_pair_logits[:count, :p], copy=True)
-            if request.request_kind == InferenceRequestKind.REGRET_RANK_POLICY_VALUE:
-                heads["regret_rank"] = np.array(self.slot.res_regret_rank[:count], copy=True)
-                heads["regret_value"] = np.array(self.slot.res_regret_value[:count], copy=True)
+    def _read_response(self, request: InferenceRequest, operation: Any, *, wait_ms: float) -> InferenceResponse:
+        slot = self.slot
+        if int(slot.control[CTL_STATUS]) != STATUS_OK:
+            raise InferenceOutputValidationError(f"inference operation failed in server: {request.operation_name}")
+        dims = read_all_dyn_dims(slot.control, _operation_dims(operation, self.manifest.model_contract))
+        heads = {}
+        for head_name in operation.output_heads:
+            if slot.has_response_tensor(head_name):
+                head = self.manifest.model_contract.head(head_name)
+                heads[head_name] = np.array(_slice_view(slot.response_tensor(head_name), head.tensor, dims), copy=True)
         telemetry = InferenceTelemetry(
             request_id=request.request_id,
             trace_id=request.trace_id,
-            request_kind=request.request_kind.value,
+            operation_name=request.operation_name,
             transport_state=self.state.value,
-            queue_depth=count,
-            batch_size=count,
+            queue_depth=int(dims.get("B", 1)),
+            batch_size=int(dims.get("B", 1)),
             wait_ms=wait_ms,
             heartbeat_age_ms=0.0,
-            adapter_name=adapter.name,
+            adapter_name="contract_arena",
         ).to_dict()
+        telemetry["operation_code"] = int(request.operation_code)
+        telemetry["layout_hash"] = operation.layout_hash
+        telemetry["model_contract_hash"] = request.model_contract_hash
         return InferenceResponse(
             request_id=request.request_id,
             trace_id=request.trace_id,
             protocol_version=request.protocol_version,
-            request_kind=request.request_kind,
+            operation_name=request.operation_name,
+            operation_code=request.operation_code,
             response_schema_version=request.response_schema_version,
+            model_contract_hash=request.model_contract_hash,
             manifest_hash=request.manifest_hash,
             status="ok",
-            response_generation=self.generation + 1,
-            output_contract=request.output_contract,
+            response_generation=int(slot.control[CTL_GENERATION]),
             head_outputs=heads,
             telemetry=telemetry,
         )
+
+    def _timeout_text(self, request: InferenceRequest, dims: dict[str, int]) -> str:
+        heartbeat_age = (time.monotonic() - self.last_heartbeat_monotonic_s) * 1000.0
+        return timeout_message(
+            request_id=request.request_id,
+            trace_id=request.trace_id,
+            operation_name=request.operation_name,
+            queue_depth=int(dims.get("B", 1)),
+            heartbeat_age_ms=heartbeat_age,
+            transport_state=self.state.value,
+            timeout_ms=self.timeout_ms,
+        )
+
+
+MappingLike = dict[str, Any]
+
+
+def _normalize_request_array(arr: np.ndarray, spec: Any) -> np.ndarray:
+    if spec.batching == "stack_over_b" and arr.ndim == len(spec.shape) - 1:
+        arr = arr.reshape((1, *arr.shape))
+    return np.ascontiguousarray(arr)
+
+
+def _dims_from_shape(spec: Any, shape: tuple[int, ...]) -> dict[str, int]:
+    if len(shape) != len(spec.shape):
+        raise ValueError(f"tensor {spec.name} rank mismatch: expected {spec.shape} got {shape}")
+    dims: dict[str, int] = {}
+    for declared, actual in zip(spec.shape, shape):
+        if isinstance(declared, str):
+            if declared in dims and dims[declared] != int(actual):
+                raise ValueError(f"dimension {declared} has conflicting values")
+            dims[declared] = int(actual)
+        elif int(declared) != int(actual):
+            raise ValueError(f"tensor {spec.name} dimension mismatch: expected {declared} got {actual}")
+    return dims
+
+
+def _merge_dims(target: dict[str, int], incoming: dict[str, int]) -> None:
+    for name, value in incoming.items():
+        if name in target and target[name] != int(value):
+            raise ValueError(f"dimension {name} has conflicting values")
+        target[name] = int(value)
+
+
+def _copy_into(view: np.ndarray, arr: np.ndarray, spec: Any, dims: dict[str, int]) -> None:
+    view[_slices_for(spec, dims)] = arr.astype(view.dtype, copy=False)
+
+
+def _slice_view(view: np.ndarray, spec: Any, dims: dict[str, int]) -> np.ndarray:
+    return view[_slices_for(spec, dims)]
+
+
+def _slices_for(spec: Any, dims: dict[str, int]) -> tuple[slice, ...]:
+    out = []
+    for dim in spec.shape:
+        out.append(slice(0, dims.get(dim, 0) if isinstance(dim, str) else int(dim)))
+    return tuple(out)
+
+
+def _operation_dims(operation: Any, contract: Any) -> tuple[str, ...]:
+    names: list[str] = []
+    for spec in operation.layout.input_tensors:
+        names.extend(spec.dynamic_dims())
+    for head_name in operation.output_heads:
+        names.extend(contract.head(head_name).tensor.dynamic_dims())
+    return tuple(dict.fromkeys(names))
+
+
+__all__ = ["ShmTransport", "TransportState"]

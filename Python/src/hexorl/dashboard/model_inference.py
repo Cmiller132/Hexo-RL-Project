@@ -10,8 +10,10 @@ import torch
 
 from hexorl.config import Config
 from hexorl.dashboard.contract_inspector import contract_catalog
-from hexorl.eval.players import LocalModelInferenceClient
 from hexorl.eval.position_services import build_search_context
+from hexorl.inference.local import LocalEvaluator
+from hexorl.inference.protocol import protocol_manifest_from_contract
+from hexorl.models.factory import inference_contract
 from hexorl.models.specs import ModelSpec, model_spec_from_config
 from hexorl.search.policy_provider import create_policy_provider
 
@@ -24,7 +26,8 @@ class DashboardModelInferenceService:
     model_spec: ModelSpec
 
     def infer_history(self, model_id: str, history: bytes) -> dict[str, Any]:
-        client = LocalModelInferenceClient(self.model, device=self.device)
+        manifest = protocol_manifest_from_contract(inference_contract(self.cfg), timeout_ms=float(getattr(self.cfg.inference, "timeout_ms", 1000.0)))
+        client = LocalEvaluator(self.model, manifest=manifest, device=self.device)
         provider = create_policy_provider(model_spec=self.model_spec, client=client)
         context = build_search_context(
             history,

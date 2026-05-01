@@ -13,7 +13,8 @@ from hexorl.models.heads.pair_policy import CROP_PAIR_HEAD
 from hexorl.models.heads.sparse_policy import GRAPH_HYBRID_POLICY_HEADS
 from hexorl.models.heads.value import VALUE_HEAD
 from hexorl.models.registry import FamilyComponents, ModelFamilyDescriptor
-from hexorl.models.trunks.graph_hybrid import GRAPH_HYBRID_TRUNK, build_graph_hybrid_model
+from hexorl.models.specs import GraphHybridParams
+from hexorl.models.trunks.crop_graph_hybrid import GRAPH_HYBRID_TRUNK, build_graph_hybrid_model
 
 FAMILY_NAME = "graph_hybrid"
 ALIASES = ("graph", "graph_hybrid_0")
@@ -22,7 +23,7 @@ CAPABILITIES = CapabilitySet.of(
 )
 COMPONENTS = FamilyComponents(
     trunk=GRAPH_HYBRID_TRUNK,
-    heads=(*GRAPH_HYBRID_POLICY_HEADS, CROP_PAIR_HEAD, VALUE_HEAD),
+    heads=(*GRAPH_HYBRID_POLICY_HEADS, CROP_PAIR_HEAD, VALUE_HEAD, "opp_policy", "regret_rank", "regret_value", "axis", "axis_delta_norm", "moves_left", "lookahead_4", "lookahead_12", "lookahead_36"),
 )
 REQUIRED_HEADS = ("policy", VALUE_HEAD)
 
@@ -34,6 +35,7 @@ def descriptor() -> ModelFamilyDescriptor:
         capabilities=CAPABILITIES,
         builder=build_graph_hybrid_model,
         components=COMPONENTS,
+        params_schema=GraphHybridParams,
         required_heads=REQUIRED_HEADS,
         graph=False,
     )

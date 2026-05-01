@@ -1,100 +1,55 @@
-"""Server-side shared-memory response scattering."""
+"""Server-side contract-walking response scatter."""
 
 from __future__ import annotations
 
-from hexorl.inference.server.outputs import DenseForwardOutputs, GraphForwardOutputs
-from hexorl.inference.shm_queue import (
-    GRAPH_SCHEMA_VERSION,
-    MAX_GRAPH_ACTIONS,
-    MAX_GRAPH_TOKENS,
-    RELATION_SCHEMA_VERSION,
+import numpy as np
+
+from hexorl.inference.control import (
+    CTL_CONTRACT_HASH,
+    CTL_GENERATION,
+    CTL_LAYOUT_HASH,
+    CTL_STATUS,
+    STATUS_OK,
+    hash_word,
+    write_dyn_dims,
 )
 
 
 class ServerScatterer:
-    def __init__(self, *, queue):
+    def __init__(self, *, queue, manifest):
         self.queue = queue
+        self.manifest = manifest
 
-    def scatter_dense(
-        self,
-        *,
-        ready_workers: list[int],
-        per_worker_counts: list[int],
-        outputs: DenseForwardOutputs,
-    ) -> None:
+    def scatter(self, *, collated, outputs: dict[str, object]) -> None:
         offset = 0
-        for worker_id, count in zip(ready_workers, per_worker_counts):
+        for row, (worker_id, dims) in enumerate(zip(collated.ready_workers, collated.per_worker_dims)):
             slot = self.queue.get_slot(worker_id)
-            slot.res_policy[:count] = outputs.policies[offset:offset + count]
-            slot.res_value[:count] = outputs.values[offset:offset + count]
-            if getattr(slot, "res_regret_rank", None) is not None:
-                slot.res_regret_rank[:count] = 0.0
-                if outputs.regret_rank is not None:
-                    slot.res_regret_rank[:count] = outputs.regret_rank[offset:offset + count]
-            if getattr(slot, "res_regret_value", None) is not None:
-                slot.res_regret_value[:count] = 0.0
-                if outputs.regret_value is not None:
-                    slot.res_regret_value[:count] = outputs.regret_value[offset:offset + count]
-            if outputs.sparse_logits is not None:
-                k = outputs.sparse_logits.shape[1]
-                slot.res_sparse_logits[:count, :k] = outputs.sparse_logits[offset:offset + count]
-            if outputs.pair_logits is not None:
-                p = outputs.pair_logits.shape[1]
-                slot.res_pair_logits[:count, :p] = outputs.pair_logits[offset:offset + count]
-            slot.req_kind[0] = 0
-            offset += count
+            slot.clear_response_payload()
+            slot.control[CTL_LAYOUT_HASH] = hash_word(collated.operation.layout_hash)
+            slot.control[CTL_CONTRACT_HASH] = hash_word(self.manifest.model_contract_hash)
+            slot.control[CTL_GENERATION] = int(slot.control[CTL_GENERATION]) + 1
+            write_dyn_dims(slot.control, dims)
+            for head_name in collated.operation.output_heads:
+                if head_name in outputs and slot.has_response_tensor(head_name):
+                    head = self.manifest.model_contract.head(head_name)
+                    data = np.asarray(outputs[head_name])
+                    slot.response_tensor(head_name)[_target_slices(head.tensor, dims)] = _source_slice(data, head.tensor, dims, row=row, offset=offset)
+            slot.control[CTL_STATUS] = STATUS_OK
+            offset += max(1, dims.get("B", 1))
 
-    def scatter_graph(
-        self,
-        *,
-        ready_workers: list[int],
-        outputs: GraphForwardOutputs,
-    ) -> None:
-        for row, worker_id in enumerate(ready_workers):
-            slot = self.queue.get_slot(worker_id)
-            token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
-            if legal_count > outputs.place_logits.shape[1]:
-                raise ValueError("graph place logits shorter than legal row table")
-            if pair_count and (outputs.pair_joint_logits is None or outputs.pair_second_logits is None):
-                raise ValueError("graph model did not return joint/second pair logits for a pair request")
-            slot.res_value[0] = float(outputs.values[row])
-            slot.res_graph_meta[:] = (
-                GRAPH_SCHEMA_VERSION,
-                RELATION_SCHEMA_VERSION,
-                legal_count,
-                opp_count,
-                pair_count,
-                token_count,
-                MAX_GRAPH_TOKENS,
-                MAX_GRAPH_ACTIONS,
-            )
-            slot.res_graph_place_logits.fill(0.0)
-            slot.res_graph_opp_logits.fill(0.0)
-            slot.res_graph_pair_first_logits.fill(0.0)
-            slot.res_graph_pair_logits.fill(0.0)
-            slot.res_graph_pair_second_logits.fill(0.0)
-            if getattr(slot, "res_graph_regret_rank", None) is not None:
-                slot.res_graph_regret_rank[0] = (
-                    float(outputs.regret_rank[row])
-                    if outputs.regret_rank is not None and row < len(outputs.regret_rank)
-                    else 0.0
-                )
-            if getattr(slot, "res_graph_regret_value", None) is not None:
-                slot.res_graph_regret_value[0] = (
-                    float(outputs.regret_value[row])
-                    if outputs.regret_value is not None and row < len(outputs.regret_value)
-                    else 0.0
-                )
-            slot.res_graph_place_logits[:legal_count] = outputs.place_logits[row, :legal_count]
-            if opp_count and outputs.opp_logits is not None:
-                slot.res_graph_opp_logits[:opp_count] = outputs.opp_logits[row, :opp_count]
-            if legal_count and outputs.pair_first_logits is not None:
-                slot.res_graph_pair_first_logits[:legal_count] = outputs.pair_first_logits[row, :legal_count]
-            if pair_count and outputs.pair_joint_logits is not None:
-                slot.res_graph_pair_logits[:pair_count] = outputs.pair_joint_logits[row, :pair_count]
-            if pair_count and outputs.pair_second_logits is not None:
-                slot.res_graph_pair_second_logits[:pair_count] = outputs.pair_second_logits[row, :pair_count]
-            slot.req_kind[0] = 0
+
+def _target_slices(spec, dims: dict[str, int]) -> tuple[slice, ...]:
+    return tuple(slice(0, dims.get(dim, 0) if isinstance(dim, str) else int(dim)) for dim in spec.shape)
+
+
+def _source_slice(data: np.ndarray, spec, dims: dict[str, int], *, row: int, offset: int) -> np.ndarray:
+    if "B" in spec.dynamic_dims():
+        b = max(1, dims.get("B", 1))
+        return data[offset:offset + b]
+    slices = [slice(row, row + 1)]
+    for dim in spec.shape:
+        slices.append(slice(0, dims.get(dim, 0) if isinstance(dim, str) else int(dim)))
+    return np.asarray(data[tuple(slices)]).reshape(tuple(s.stop for s in _target_slices(spec, dims)))
 
 
 __all__ = ["ServerScatterer"]

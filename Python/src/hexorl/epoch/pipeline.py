@@ -23,7 +23,6 @@ from torch.utils.data import DataLoader
 from hexorl.config import Config
 from hexorl.engine.rust import hex_game_class
 from hexorl.models.factory import build_model, model_uses_global_graph
-from hexorl.models.crop_network import HexNet
 from hexorl.replay.codec import ReplayGameRecord, replay_game_from_selfplay
 from hexorl.replay.sampler import ReplayDataset
 from hexorl.replay.storage import ReplayStorage
@@ -61,7 +60,7 @@ class EpochResult:
 def run_epoch(
     cfg: Config,
     *,
-    model: Optional[HexNet] = None,
+    model: Optional[torch.nn.Module] = None,
     trainer: Optional[Trainer] = None,
     buffer: Optional[ReplayStorage] = None,
     output_dir: Optional[Path] = None,

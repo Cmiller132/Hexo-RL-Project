@@ -17,7 +17,6 @@ from pathlib import Path
 from hexorl.config import Config
 from hexorl.models.checkpoint import CheckpointBundle, CheckpointManager
 from hexorl.models.factory import train_adapter_for
-from hexorl.models.crop_network import HexNet
 from hexorl.train.ema import ModelEMA
 
 logger = logging.getLogger(__name__)
@@ -28,7 +27,7 @@ class Trainer:
 
     def __init__(
         self,
-        model: HexNet,
+        model: nn.Module,
         cfg: Config,
         dataloader,
         ema: Optional[ModelEMA] = None,

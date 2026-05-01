@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable, Protocol
 import torch.nn as nn
 
 from hexorl.models.capabilities import CapabilitySet
-from hexorl.models.specs import ModelSpec
+from hexorl.models.specs import ModelParams, ModelSpec
 
 
 class ModelBuilder(Protocol):
@@ -21,6 +21,10 @@ class TrainAdapterFactory(Protocol):
 
 class InferenceAdapterFactory(Protocol):
     def __call__(self, spec: ModelSpec, cfg: Any, model: nn.Module) -> Any: ...
+
+
+class InferenceContractFactory(Protocol):
+    def __call__(self, spec: ModelSpec, cfg: Any) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -39,17 +43,20 @@ class ModelFamilyDescriptor:
     model_builder: ModelBuilder
     train_adapter_factory: TrainAdapterFactory
     inference_adapter_factory: InferenceAdapterFactory
+    inference_contract_factory: InferenceContractFactory
     policy_provider_factory: Callable[[ModelSpec, Any, nn.Module], Any]
     loss_plan_provider: Callable[[ModelSpec, Any], Any]
     recipe_provider: Callable[[Any], dict[str, Any]]
     tune_space_provider: Callable[[Any], dict[str, Any]]
     checkpoint_manifest_provider: Callable[[ModelSpec, Any], dict[str, Any]]
+    params_schema: type[ModelParams] = ModelParams
 
     def validate_complete(self) -> None:
         required = (
             self.model_builder,
             self.train_adapter_factory,
             self.inference_adapter_factory,
+            self.inference_contract_factory,
             self.policy_provider_factory,
             self.loss_plan_provider,
             self.recipe_provider,
@@ -71,12 +78,13 @@ class ModelFamilyRegistry:
             raise ValueError(f"model family already registered: {descriptor.name}")
         self._families[descriptor.name] = descriptor
         for alias in descriptor.aliases:
-            if alias in self._aliases:
+            key = alias.lower()
+            if key in self._aliases:
                 raise ValueError(f"model family alias already registered: {alias}")
-            self._aliases[alias] = descriptor.name
+            self._aliases[key] = descriptor.name
 
     def resolve(self, spec_or_name: ModelSpec | str) -> ModelFamilyDescriptor:
-        name = spec_or_name.kind if isinstance(spec_or_name, ModelSpec) else str(spec_or_name)
+        name = spec_or_name.kind if isinstance(spec_or_name, ModelSpec) else str(spec_or_name).lower()
         canonical = self._aliases.get(name, name)
         try:
             return self._families[canonical]

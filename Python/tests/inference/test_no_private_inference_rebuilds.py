@@ -7,7 +7,10 @@ INFERENCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "hexorl" / "infer
 def test_no_mode_specific_inference_submit_methods_remain():
     assert not (INFERENCE_ROOT / "client.py").exists()
     client_text = (INFERENCE_ROOT / "client" / "api.py").read_text()
-    banned = ("def submit_sparse", "def submit_sparse_pair", "def submit_graph", "def submit_regret_rank")
+    banned = (
+        "def submit",
+        "def evaluate_",
+    )
     assert [name for name in banned if name in client_text] == []
 
 
@@ -21,9 +24,14 @@ def test_runtime_imports_use_client_server_packages():
     banned = (
         "hexorl.inference.batching",
         "hexorl.inference.shm_transport",
+        "InferenceRequestKind",
+        "REQUEST_KIND_TO_CODE",
+        "REQUEST_CODE_TO_KIND",
     )
     hits = []
     for path in root.rglob("*.py"):
+        if path.name == Path(__file__).name:
+            continue
         text = path.read_text()
         for needle in banned:
             if needle in text:

@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import math
 import torch
 import torch.nn as nn
 
 from hexorl.models.constants import BOARD_AREA, BOARD_SIZE
-from hexorl.models.specs import ModelSpec
-from hexorl.models.trunks.dense_cnn import build_crop_trunk_model
+from hexorl.models.inputs import CropInputs
+from hexorl.models.trunks.crop_cnn import CropCnnTrunk, build_crop_model
 
 GRAPH_HYBRID_TRUNK = "graph_hybrid"
 
@@ -166,14 +164,40 @@ class SparseHexGraphHybrid0Encoder(nn.Module):
         return torch.relu(self.out_norm(out))
 
 
-def build_graph_hybrid_model(
-    spec: ModelSpec,
-    cfg: Any,
-    *,
-    device: torch.device | None = None,
-    inference: bool = False,
-) -> nn.Module:
-    return build_crop_trunk_model(spec, cfg, family_kind=GRAPH_HYBRID_TRUNK, device=device, inference=inference)
+class CropGraphHybridTrunk(CropCnnTrunk):
+    def __init__(self, *, channels: int, blocks: int, graph_token_budget: int, graph_token_set: str, attention_heads: int, graph_layers: int, attention_mlp_ratio: float, attention_dropout: float, dropout: float):
+        local_blocks = max(1, min(blocks, max(2, blocks // 4)))
+        super().__init__(channels=channels, blocks=local_blocks, dropout=dropout)
+        self.graph_encoder = SparseHexGraphHybrid0Encoder(
+            channels,
+            token_budget=graph_token_budget,
+            token_set=graph_token_set,
+            heads=attention_heads,
+            layers=graph_layers,
+            mlp_ratio=attention_mlp_ratio,
+            dropout=dropout,
+            attention_dropout=attention_dropout,
+        )
+
+    def forward(self, inputs: CropInputs) -> torch.Tensor:
+        features = super().forward(inputs)
+        return self.graph_encoder(features, inputs.tensor)
 
 
-__all__ = ["GRAPH_HYBRID_TRUNK", "SparseHexGraphHybrid0Encoder", "build_graph_hybrid_model"]
+def build_graph_hybrid_model(spec, cfg, *, device: torch.device | None = None, inference: bool = False) -> nn.Module:
+    params = spec.params
+    trunk = CropGraphHybridTrunk(
+        channels=params.channels,
+        blocks=params.blocks,
+        graph_token_budget=params.graph_token_budget,
+        graph_token_set=params.graph_token_set,
+        attention_heads=params.attention_heads,
+        graph_layers=params.graph_layers,
+        attention_mlp_ratio=params.attention_mlp_ratio,
+        attention_dropout=params.attention_dropout,
+        dropout=params.dropout,
+    )
+    return build_crop_model(trunk, spec, cfg, device=device, inference=inference)
+
+
+__all__ = ["GRAPH_HYBRID_TRUNK", "CropGraphHybridTrunk", "SparseHexGraphHybrid0Encoder", "build_graph_hybrid_model"]

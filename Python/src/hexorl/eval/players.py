@@ -13,6 +13,9 @@ from hexorl.config import Config
 from hexorl.contracts.history import encode_move_history
 from hexorl.engine.rust import engine_available
 from hexorl.eval.position_services import build_search_context
+from hexorl.inference.local import LocalEvaluator
+from hexorl.inference.protocol import protocol_manifest_from_contract
+from hexorl.models.factory import inference_contract
 from hexorl.models.specs import ModelSpec, model_spec_from_config
 from hexorl.search.context import SearchContext
 from hexorl.search.policy_provider import PolicyProvider, create_policy_provider
@@ -58,97 +61,6 @@ class EvalPolicyTrace:
             "warnings": list(self.warnings),
             "timings_ms": dict(self.timings_ms),
         }
-
-
-class LocalModelInferenceClient:
-    """Small in-process client used by eval to feed the public PolicyProvider."""
-
-    def __init__(self, model: torch.nn.Module, *, device: torch.device | None = None):
-        self.model = model
-        self.device = device or next(model.parameters()).device
-        self.manifest = _EvalManifest("local_model_eval_v1")
-        self.model.eval()
-
-    def evaluate_dense(self, tensor: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
-        x = torch.from_numpy(np.asarray(tensor[:count], dtype=np.float32)).to(
-            device=self.device,
-            dtype=model_input_dtype(self.model),
-        )
-        with torch.no_grad():
-            out = self.model(x)
-        policy = out["policy"].detach().float().cpu().numpy()
-        value_head = out.get("value")
-        if value_head is None:
-            value = np.zeros((count,), dtype=np.float32)
-        else:
-            value = _value_from_output(self.model, value_head).detach().float().cpu().numpy()
-        return policy, value
-
-    def evaluate_sparse(
-        self,
-        tensor: np.ndarray,
-        count: int,
-        candidate_indices: np.ndarray,
-        candidate_features: np.ndarray,
-        candidate_mask: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        x = torch.from_numpy(np.asarray(tensor[:count], dtype=np.float32)).to(
-            device=self.device,
-            dtype=model_input_dtype(self.model),
-        )
-        indices = torch.from_numpy(np.asarray(candidate_indices[:count], dtype=np.int64)).to(self.device)
-        features = torch.from_numpy(np.asarray(candidate_features[:count], dtype=np.float32)).to(self.device)
-        mask = torch.from_numpy(np.asarray(candidate_mask[:count], dtype=np.bool_)).to(self.device)
-        with torch.no_grad():
-            out = self.model(
-                x,
-                candidate_indices=indices,
-                candidate_features=features,
-                candidate_mask=mask,
-            )
-        dense = out["policy"].detach().float().cpu().numpy()
-        if "sparse_policy" in out:
-            sparse = out["sparse_policy"].detach().float().cpu().numpy()
-        else:
-            rows = np.asarray(candidate_indices[:count], dtype=np.int64)
-            sparse = np.take_along_axis(dense, rows.clip(0, dense.shape[1] - 1), axis=1)
-            sparse = np.where(np.asarray(candidate_mask[:count], dtype=np.bool_), sparse, -80.0)
-        value_head = out.get("value")
-        if value_head is None:
-            value = np.zeros((count,), dtype=np.float32)
-        else:
-            value = _value_from_output(self.model, value_head).detach().float().cpu().numpy()
-        return dense, value, sparse
-
-    def evaluate_global_graph(self, graph_batch) -> dict[str, np.ndarray | dict[str, object]]:
-        kwargs = {
-            "token_features": _batched_tensor(graph_batch.token_features, self.device, torch.float32),
-            "token_type": _batched_tensor(graph_batch.token_type, self.device, torch.long),
-            "token_qr": _batched_tensor(graph_batch.token_qr, self.device, torch.float32),
-            "token_mask": _batched_tensor(graph_batch.token_mask, self.device, torch.bool),
-            "legal_token_indices": _batched_tensor(graph_batch.legal_token_indices, self.device, torch.long),
-            "legal_mask": _batched_tensor(graph_batch.legal_mask, self.device, torch.bool),
-            "opp_legal_qr": _batched_tensor(graph_batch.opp_legal_qr, self.device, torch.float32),
-            "opp_legal_mask": _batched_tensor(graph_batch.opp_legal_mask, self.device, torch.bool),
-            "pair_first_indices": _batched_tensor(graph_batch.pair_first_indices, self.device, torch.long),
-            "pair_second_indices": _batched_tensor(graph_batch.pair_second_indices, self.device, torch.long),
-            "pair_token_indices": _batched_tensor(graph_batch.pair_token_indices, self.device, torch.long),
-            "relation_type": _batched_tensor(graph_batch.relation_type, self.device, torch.long),
-            "relation_bias": torch.from_numpy(np.asarray(graph_batch.relation_bias, dtype=np.float32))
-            .unsqueeze(0)
-            .to(self.device),
-        }
-        with torch.no_grad():
-            out = self.model(**kwargs)
-        result: dict[str, np.ndarray | dict[str, object]] = {
-            "metadata": {"legal_qr": np.asarray(graph_batch.legal_qr, dtype=np.int32)}
-        }
-        for key, value in out.items():
-            if key == "value":
-                result[key] = _value_from_output(self.model, value).detach().float().cpu().numpy()
-            else:
-                result[key] = value.detach().float().cpu().numpy().reshape(-1)
-        return result
 
 
 class PolicyPlayer:
@@ -221,7 +133,8 @@ class NoisyModelPlayer(PolicyPlayer):
     ):
         cfg = cfg or Config()
         spec = model_spec or model_spec_from_config(cfg)
-        client = LocalModelInferenceClient(model, device=device)
+        manifest = protocol_manifest_from_contract(inference_contract(cfg), timeout_ms=float(getattr(cfg.inference, "timeout_ms", 1000.0)))
+        client = LocalEvaluator(model, manifest=manifest, device=device)
         super().__init__(
             create_policy_provider(model_spec=spec, client=client),
             model_spec=spec,
@@ -302,14 +215,6 @@ def greedy_model_player(
     )
 
 
-def model_input_dtype(model: torch.nn.Module) -> torch.dtype:
-    try:
-        dtype = next(model.parameters()).dtype
-    except StopIteration:
-        return torch.float32
-    return dtype if dtype.is_floating_point else torch.float32
-
-
 def _sample_row(
     priors: np.ndarray,
     *,
@@ -364,17 +269,3 @@ def _trace_from_evaluation(
         timings_ms={"provider_call_ms": float(elapsed_ms), **dict(evaluation.timings)},
     )
 
-
-def _value_from_output(model: torch.nn.Module, value: torch.Tensor) -> torch.Tensor:
-    if value.ndim > 1 and value.shape[-1] > 1 and hasattr(model, "bins_to_value"):
-        return model.bins_to_value(value)
-    return value.reshape(value.shape[0], -1)[:, 0]
-
-
-def _batched_tensor(value: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return torch.from_numpy(np.asarray(value)).unsqueeze(0).to(device=device, dtype=dtype)
-
-
-@dataclass(frozen=True)
-class _EvalManifest:
-    transport: str

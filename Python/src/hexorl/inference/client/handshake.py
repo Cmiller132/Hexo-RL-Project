@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-from hexorl.inference.protocol import (
-    InferenceProtocolManifest,
-    InferenceRequestKind,
-    load_server_manifest,
-    negotiate_protocol,
-)
+from hexorl.inference.protocol import InferenceProtocolManifest, load_server_manifest, negotiate_protocol
 
 
 def load_declared_server_manifest(
@@ -21,41 +16,19 @@ def load_declared_server_manifest(
     return load_server_manifest(num_workers=num_workers, max_batch_size=max_batch_size)
 
 
-def select_request_kind(
-    *,
-    client_manifest: InferenceProtocolManifest,
-    server_manifest: InferenceProtocolManifest,
-) -> InferenceRequestKind:
-    client_kinds = [InferenceRequestKind(kind) for kind in client_manifest.request_kind]
-    server_kinds = set(server_manifest.request_kind)
-    for kind in client_kinds:
-        if kind.value in server_kinds:
-            return kind
-    raise RuntimeError(
-        "no compatible inference request kind between client and server: "
-        f"client={list(client_manifest.request_kind)} server={list(server_manifest.request_kind)}"
-    )
-
-
 def negotiate_client_handshake(
     *,
     client_manifest: InferenceProtocolManifest,
     server_manifest: InferenceProtocolManifest,
+    operation_name: str | None = None,
 ):
-    selected_kind = select_request_kind(
-        client_manifest=client_manifest,
-        server_manifest=server_manifest,
-    )
+    operation = operation_name or next(iter(server_manifest.operations), "")
     return negotiate_protocol(
         client_manifest=client_manifest,
         server_manifest=server_manifest,
-        request_kind=selected_kind,
-        required_heads=tuple(client_manifest.heads),
+        operation_name=operation,
+        required_heads=tuple(server_manifest.model_contract.operation(operation).required_heads),
     )
 
 
-__all__ = [
-    "load_declared_server_manifest",
-    "negotiate_client_handshake",
-    "select_request_kind",
-]
+__all__ = ["load_declared_server_manifest", "negotiate_client_handshake"]

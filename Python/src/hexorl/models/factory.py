@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 
 from hexorl.models.capabilities import CapabilitySet
-from hexorl.models.facets import InferenceAdapter, InferenceManifest, LossPlan, PolicyProvider
+from hexorl.models.facets import InferenceAdapter, LossPlan, PolicyProvider
+from hexorl.models.inference_contracts import ModelInferenceContract
 from hexorl.models.families import builtin_descriptors
 from hexorl.models.registry import ModelFamilyRegistry
 from hexorl.models.specs import REQUIRED_MODEL_KINDS, model_spec_from_config
@@ -43,10 +44,16 @@ def train_adapter_for(model: nn.Module, cfg: Any, *, device: torch.device):
     return descriptor.train_adapter_factory(spec, cfg, model, device=device)
 
 
-def inference_manifest(cfg: Any) -> InferenceManifest:
+def inference_manifest(cfg: Any) -> ModelInferenceContract:
     spec = model_spec_from_config(cfg)
     descriptor = REGISTRY.resolve(spec)
-    return descriptor.inference_adapter_factory(spec, cfg, torch.nn.Identity()).manifest
+    return descriptor.inference_adapter_factory(spec, cfg, torch.nn.Identity()).contract
+
+
+def inference_contract(cfg: Any) -> ModelInferenceContract:
+    spec = model_spec_from_config(cfg)
+    descriptor = REGISTRY.resolve(spec)
+    return descriptor.inference_contract_factory(spec, cfg)
 
 
 def model_capabilities(cfg: Any) -> CapabilitySet:
@@ -63,7 +70,6 @@ def model_uses_crop(cfg: Any) -> bool:
 
 __all__ = [
     "InferenceAdapter",
-    "InferenceManifest",
     "LossPlan",
     "PolicyProvider",
     "REQUIRED_MODEL_KINDS",
@@ -72,6 +78,7 @@ __all__ = [
     "build_model",
     "default_registry",
     "get_model_registry",
+    "inference_contract",
     "inference_manifest",
     "model_capabilities",
     "model_spec_from_config",

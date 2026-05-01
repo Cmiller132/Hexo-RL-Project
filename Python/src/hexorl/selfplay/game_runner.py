@@ -33,7 +33,8 @@ from hexorl.search.pair_strategy import (
     PairStrategySpec,
     create_pair_strategy,
 )
-from hexorl.search.policy_provider import PolicyProvider, create_policy_provider
+from hexorl.search.policy_provider import PolicyProvider, _flat_graph_payload, create_policy_provider
+from hexorl.models.inference_contracts import OP_GRAPH_PLACE_VALUE, OP_REGRET
 from hexorl.search.priors import PRIOR_SOURCE_DEFAULT, SearchEvaluation
 from hexorl.search.mcts_runner import choose_leaf_batch, commit_leaf_batch, commit_root, start_root
 from hexorl.selfplay.regret_buffer import compute_regret
@@ -659,7 +660,7 @@ class GameRunner:
                 "history_hash": context.history_hash,
                 "move_index": int(len(context.history_bytes) // 12),
                 "phase": context.phase,
-                "request_kind": "policy",
+                "operation_name": "policy",
                 "provider_name": self.policy_provider.name,
                 "model_family": self.model_spec.kind,
                 "protocol_version": evaluation.inference_protocol,
@@ -820,7 +821,7 @@ class GameRunner:
                         max_pair_rows=0,
                         include_pair_rows=False,
                     )
-                    out = client.evaluate_global_graph(graph_batch)
+                    out = client.evaluate(OP_GRAPH_PLACE_VALUE, _flat_graph_payload(graph_batch)).head_outputs
                     rank = float(np.asarray(out["regret_rank"], dtype=np.float32).reshape(-1)[0])
                     value = float(np.asarray(out["regret_value"], dtype=np.float32).reshape(-1)[0])
                 except Exception as exc:
@@ -865,7 +866,9 @@ class GameRunner:
     @staticmethod
     def _submit_rgsc_tensor_batch(client, histories: list[bytes], tensors: list[np.ndarray]) -> dict[bytes, tuple[float, float]]:
         tensor_batch = np.asarray(tensors, dtype=np.float32)
-        rank_values, regret_values = client.evaluate_regret_heads(tensor_batch, len(tensors))
+        response = client.evaluate(OP_REGRET, {"tensor": tensor_batch, "count": len(tensors)})
+        rank_values = response.head_outputs["regret_rank"]
+        regret_values = response.head_outputs["regret_value"]
         ranks = np.asarray(rank_values, dtype=np.float32).reshape(-1)
         regrets = np.asarray(regret_values, dtype=np.float32).reshape(-1)
         scored: dict[bytes, tuple[float, float]] = {}

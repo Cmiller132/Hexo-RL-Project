@@ -8,7 +8,7 @@ from typing import Callable, Protocol
 import numpy as np
 
 from hexorl.contracts.validation import ContractValidationError
-from hexorl.inference.client import InferenceClient
+from hexorl.inference.evaluator import Evaluator
 from hexorl.models.capabilities import (
     CROP_INPUT,
     DENSE_PLACE_POLICY,
@@ -17,6 +17,7 @@ from hexorl.models.capabilities import (
     SPARSE_PLACE_POLICY,
 )
 from hexorl.models.factory import get_model_registry
+from hexorl.models.inference_contracts import OP_GRAPH_PLACE_VALUE, OP_PLACE_VALUE, OP_SPARSE_PLACE_VALUE
 from hexorl.models.specs import ModelSpec
 from hexorl.search.context import SearchContext
 from hexorl.search.priors import (
@@ -57,7 +58,7 @@ def register_model_family_policy_provider(model_family: str, provider_cls: type[
 class _BasePolicyProvider:
     source_label = PRIOR_SOURCE_DENSE
 
-    def __init__(self, *, client: InferenceClient | None, model_spec: ModelSpec):
+    def __init__(self, *, client: Evaluator | None, model_spec: ModelSpec):
         self.client = client
         self.model_spec = model_spec
         self.name = self.__class__.__name__
@@ -116,7 +117,12 @@ class DensePolicyProvider(_BasePolicyProvider):
                 raise ContractValidationError("dense provider requires tensor in SearchContext", owner=self.name)
             tensors.append(ctx.tensor.reshape(13, 33, 33))
         t0 = time.monotonic()
-        policies, values = self.client.evaluate_dense(np.asarray(tensors, dtype=np.float32), len(contexts))
+        response = self.client.evaluate(
+            OP_PLACE_VALUE,
+            {"tensor": np.asarray(tensors, dtype=np.float32)},
+        )
+        policies = response.head_outputs["policy"]
+        values = response.head_outputs["value"]
         elapsed = (time.monotonic() - t0) * 1000.0
         dense = np.asarray(policies, dtype=np.float32).reshape(len(contexts), -1)
         value_arr = np.asarray(values, dtype=np.float32).reshape(-1)
@@ -138,7 +144,12 @@ class DensePolicyProvider(_BasePolicyProvider):
         if self.client is None:
             raise ContractValidationError("dense provider requires an inference client", owner=self.name)
         t0 = time.monotonic()
-        policy, value = self.client.evaluate_dense(context.tensor.reshape(1, 13, 33, 33), 1)
+        response = self.client.evaluate(
+            OP_PLACE_VALUE,
+            {"tensor": context.tensor.reshape(1, 13, 33, 33)},
+        )
+        policy = response.head_outputs["policy"]
+        value = response.head_outputs["value"]
         elapsed = (time.monotonic() - t0) * 1000.0
         dense = np.asarray(policy, dtype=np.float32).reshape(-1)
         logits = dense[context.legal_table.dense_indices]
@@ -178,13 +189,18 @@ class GraphHybridPolicyProvider(_BasePolicyProvider):
         if np.any(candidate_to_legal < 0):
             raise ContractValidationError("candidate rows are not traceable to legal rows", owner=self.name)
         t0 = time.monotonic()
-        dense_policy, value, sparse = self.client.evaluate_sparse(
-            context.tensor.reshape(1, 13, 33, 33),
-            1,
-            context.candidate_table.dense_indices[active].reshape(1, -1),
-            context.candidate_table.features[active].reshape(1, active.shape[0], context.candidate_table.features.shape[1]),
-            context.candidate_table.mask[active].reshape(1, -1),
+        response = self.client.evaluate(
+            OP_SPARSE_PLACE_VALUE,
+            {
+                "tensor": context.tensor.reshape(1, 13, 33, 33),
+                "candidate_indices": context.candidate_table.dense_indices[active].reshape(1, -1),
+                "candidate_features": context.candidate_table.features[active].reshape(1, active.shape[0], context.candidate_table.features.shape[1]),
+                "candidate_mask": context.candidate_table.mask[active].reshape(1, -1),
+            },
         )
+        dense_policy = response.head_outputs["policy"]
+        value = response.head_outputs["value"]
+        sparse = response.head_outputs["sparse_policy"]
         elapsed = (time.monotonic() - t0) * 1000.0
         logits = np.full(context.legal_table.rows.shape[0], -80.0, dtype=np.float32)
         logits[candidate_to_legal] = np.asarray(sparse, dtype=np.float32).reshape(1, -1)[0, : active.shape[0]]
@@ -212,9 +228,10 @@ class GlobalGraphPolicyProvider(_BasePolicyProvider):
         if self.client is None:
             raise ContractValidationError("global graph provider requires an inference client", owner=self.name)
         t0 = time.monotonic()
-        out = self.client.evaluate_global_graph(context.graph_batch)
+        response = self.client.evaluate(OP_GRAPH_PLACE_VALUE, _flat_graph_payload(context.graph_batch))
+        out = response.head_outputs
         elapsed = (time.monotonic() - t0) * 1000.0
-        graph_legal = np.asarray(out["metadata"]["legal_qr"], dtype=np.int32).reshape(-1, 2)
+        graph_legal = np.asarray(context.graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2)
         logits = np.asarray(out["policy_place"], dtype=np.float32).reshape(-1)
         legal = context.legal_table.rows
         if graph_legal.shape != legal.shape:
@@ -240,7 +257,7 @@ class GlobalGraphPolicyProvider(_BasePolicyProvider):
         )
 
 
-def create_policy_provider(*, model_spec: ModelSpec, client: InferenceClient | None) -> PolicyProvider:
+def create_policy_provider(*, model_spec: ModelSpec, client: Evaluator | None) -> PolicyProvider:
     descriptor = get_model_registry().resolve(model_spec)
     family_cls = _MODEL_FAMILY_PROVIDER_FACTORIES.get(descriptor.name)
     if family_cls is not None:
@@ -263,3 +280,21 @@ register_policy_provider({GLOBAL_GRAPH_INPUT, GLOBAL_PLACE_POLICY}, GlobalGraphP
 register_policy_provider({CROP_INPUT, SPARSE_PLACE_POLICY}, GraphHybridPolicyProvider)
 register_policy_provider({CROP_INPUT, DENSE_PLACE_POLICY}, DensePolicyProvider)
 register_model_family_policy_provider("restnet", RestNetPolicyProvider)
+
+
+def _flat_graph_payload(graph_batch) -> dict[str, np.ndarray]:
+    return {
+        "token_features": np.asarray(graph_batch.token_features, dtype=np.float32),
+        "token_type": np.asarray(graph_batch.token_type, dtype=np.int64),
+        "token_qr": np.asarray(graph_batch.token_qr, dtype=np.int32),
+        "token_mask": np.asarray(graph_batch.token_mask, dtype=np.uint8),
+        "legal_token_indices": np.asarray(graph_batch.legal_token_indices, dtype=np.int64),
+        "legal_mask": np.asarray(graph_batch.legal_mask, dtype=np.uint8),
+        "opp_legal_qr": np.asarray(graph_batch.opp_legal_qr, dtype=np.int32),
+        "opp_legal_mask": np.asarray(graph_batch.opp_legal_mask, dtype=np.uint8),
+        "pair_token_indices": np.asarray(graph_batch.pair_token_indices, dtype=np.int64),
+        "pair_first_indices": np.asarray(graph_batch.pair_first_indices, dtype=np.int64),
+        "pair_second_indices": np.asarray(graph_batch.pair_second_indices, dtype=np.int64),
+        "relation_type": np.asarray(graph_batch.relation_type, dtype=np.int64),
+        "relation_bias": np.asarray(graph_batch.relation_bias, dtype=np.float32),
+    }

@@ -8,11 +8,15 @@ import numpy as np
 class StaticResponse:
     def __init__(self, heads: dict[str, np.ndarray]):
         self.head_outputs = heads
+        self.telemetry = {"wait_ms": 0.0}
+
+    def require_ok(self) -> None:
+        return
 
 
-def zero_count_response(kind: str, count: int = 0) -> StaticResponse:
+def zero_count_response(operation_name: str, count: int = 0) -> StaticResponse:
     empty = np.empty(0, dtype=np.float32)
-    if kind == "sparse_policy_value":
+    if operation_name == "sparse_place_value":
         return StaticResponse(
             {
                 "policy": empty,
@@ -20,7 +24,7 @@ def zero_count_response(kind: str, count: int = 0) -> StaticResponse:
                 "sparse_policy": np.empty((count, 0), dtype=np.float32),
             }
         )
-    if kind == "pair_scoring":
+    if operation_name == "pair_policy":
         return StaticResponse(
             {
                 "policy": empty,
