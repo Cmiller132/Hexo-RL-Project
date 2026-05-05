@@ -95,17 +95,6 @@ This mechanic fundamentally shapes every aspect of play:
   zero development — the opponent builds freely while you tread water.
 
 
-### Axis forking
-
-Every cell sits on exactly 3 lines (one per hex axis). A well-placed stone
-contributes to windows on all three axes simultaneously. Strong play means
-choosing cells at **axis intersections** where one placement extends or starts
-lines on multiple axes.
-
-Multi-axis development is the foundation of stacking threats. Building 3-windows
-on 2+ axes before launching a forcing chain creates the geometric conditions
-for unblockable forks. Single-axis development is weak — easily blocked with
-1 placement because all block cells overlap.
 
 ### Game balance
 
@@ -114,11 +103,6 @@ with 1 stone and Player 1 responds with 2, but this does not create a
 meaningful structural advantage for either side. The model receives a
 player-color channel (channel 6) so it can learn any subtle positional
 differences between going first and second.
-
-## Why this isn't Go
-
-Many pipeline choices look unusual if you're familiar with AlphaZero or Go
-engines. The differences fall out of fundamental game properties.
 
 ### Hex grid → masked convolutions and D6 symmetry
 

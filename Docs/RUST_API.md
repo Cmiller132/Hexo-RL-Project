@@ -1,60 +1,213 @@
-# Rust Engine API Reference
+﻿# Rust Engine API Reference
 
-## hexgame-core
+This document summarizes the current Rust-facing API exposed to Python through the `_engine` PyO3 module.
 
-### Stable Facades
-- `hexgame_core::rules` — coordinates, turns, board state, move records, rule constants, and rule errors.
-- `hexgame_core::encoding` — canonical 13-channel tensor encoding and shape constants.
-- `hexgame_core::tactics` — complete tactical classification, blocking constraints, and tactical mask/filter helpers.
-- `hexgame_core::classical` — classical alpha-beta search.
+## Crates
 
-### Rules Types
-- `rules::Hex` — axial coordinate (q, r)
-- `rules::Turn` — 1 or 2 placements
-- `rules::HexGameState` — board state, place/unplace, win detection
-- `rules::GameError` — rule error type
+### `hexgame-core`
 
-### Tactics Types
-- `tactics::TacticalStatus` — complete tactical classification
-- `tactics::BlockConstraint` — exact cells/pairs that satisfy mandatory blocks
+Core Rust crate for game rules, encoding, tactics, classical search, and MCTS.
 
-### Encoder Constants
-- `encoding::BOARD_SIZE = 33` — tensor width/height
-- `encoding::NUM_CHANNELS = 13` — feature channels
-- `encoding::BOARD_AREA = 33 * 33 = 1089` — policy output size
-- `encoding::TENSOR_SIZE = 13 * 33 * 33 = 14157`
+Important public areas:
 
-### Active Implementation Module
-- `hexgame_core::mcts::MCTSEngine` and `hexgame_core::mcts::MCTSError` remain public for the Python FFI crate. They are not re-exported from the crate root.
+- `hexgame_core::rules`: axial coordinates, turn placement rules, board state, game errors, and rule constants.
+- `hexgame_core::encoding`: canonical 13-channel board encoding and shape constants.
+- `hexgame_core::tactics`: tactical classification, blocking constraints, masks, and tactical filters.
+- `hexgame_core::classical`: classical alpha-beta / iterative deepening search.
+- `hexgame_core::mcts`: MCTS engine and MCTS error types used by the Python FFI crate.
 
-## hexgame-py (FFI)
+Important constants:
 
-### PyHexGame
-Python wrapper around HexGameState. Methods:
-- `place(q, r)`, `unplace()`, `is_over`, `winner`, `current_player`
-- `legal_moves()`, `legal_moves_near(radius)`
-- `encode_board_and_legal(near_radius, constrain_threats)` → (tensor, offset_q, offset_r, legal_bytes)
-- `classical_search(time_ms, max_depth, near_radius, noise_level)` → (q, r, score, depth, nodes)
+| Constant | Meaning |
+|---|---|
+| `BOARD_SIZE = 33` | Board tensor width/height. |
+| `NUM_CHANNELS = 13` | Encoder channel count. |
+| `BOARD_AREA = 1089` | Dense policy size. |
+| `TENSOR_SIZE = 14157` | `13 * 33 * 33`. |
+| `PLACEMENT_RADIUS = 8` | Canonical global legal-row radius. |
 
-### PyMCTSEngine
-- `new(game, num_simulations, c_puct, near_radius, c_puct_init, constrain_threats, arena_sim_hint, seed)`
-- `init_root()` → (tensor_3d, offset_q, offset_r, legal_bytes, root_generation) or None
-- `expand_root(policy, value, offset_q, offset_r, legal_bytes, root_generation)` and `expand_root_with_sparse_priors` / `expand_root_with_global_priors` validate the current root token, row identity, finite priors, and policy shape before expansion.
-- `select_leaves(batch_size)` → (tensor_4d, count, batch_generation)
-- `pending_leaf_metadata()` → legal rows and compact histories for the currently selected pending leaves; callers must pair this metadata with the returned `batch_generation`
-- `expand_and_backprop(policies, values, batch_generation)` and sparse/source variants reject stale batch tokens, wrong lengths, non-finite values, and malformed sparse metadata.
-- root pair-prior methods accept only canonical pair rows and fail on stale root tokens or invalid pair identities.
-- `sample_action(temperature, rng_state)` → (q, r)
-- `should_resign(threshold)` → bool
-- `re_root(q, r, new_num_simulations)` → PyResult
-- `get_results()` → (moves_q, moves_r, visits, root_value)
-- `root_child_priors()`, `root_child_q_values()`
-- `extract_tree_node_states(min_visits)` → (tensors, histories, count)
+### `hexgame-py`
 
-### Standalone Functions
-- `encode_compact_record(history_bytes, near_radius)` → ndarray (N, 13, 33, 33)
-- `apply_d6_symmetry(tensor, sym_idx)` → ndarray (13, 33, 33)
-- `classical_self_play(num_games, time_ms, max_depth, near_radius, max_moves)` → list of (features, outcome, board_snap)
+PyO3 crate that exposes `_engine` to Python.
 
-### Module Constants
-- `FEATURE_COUNT`, `WIN_LENGTH`, `PLACEMENT_RADIUS`, `BOARD_SIZE`, `NUM_CHANNELS`, `TENSOR_SIZE`
+The active production pipeline uses `HexGame`, `MCTSEngine`, encoding helpers, D6 transforms, and classical bootstrap helpers.
+
+## Python Module Constants
+
+The `_engine` module exports:
+
+```text
+FEATURE_COUNT
+WIN_LENGTH
+PLACEMENT_RADIUS
+BOARD_SIZE
+NUM_CHANNELS
+TENSOR_SIZE
+```
+
+## `HexGame`
+
+Python wrapper around Rust `HexGameState`.
+
+Common methods:
+
+- `place(q, r)`
+- `unplace()`
+- `is_over`
+- `winner`
+- `current_player`
+- `placements_remaining`
+- `legal_moves()`
+- `legal_moves_near(radius)`
+- `encode_board_and_legal(near_radius, constrain_threats)`
+- `classical_search(time_ms, max_depth, near_radius, noise_level)`
+
+## `MCTSEngine`
+
+Python wrapper around Rust `hexgame_core::mcts::MCTSEngine`.
+
+Constructor:
+
+```text
+MCTSEngine(
+    game,
+    num_simulations,
+    c_puct=1.4,
+    near_radius=8,
+    c_puct_init=19652.0,
+    constrain_threats=true,
+    arena_sim_hint=None,
+    seed=0,
+)
+```
+
+### Root Initialization
+
+```text
+init_root() -> None | (tensor_3d, offset_q, offset_r, legal_bytes, root_generation)
+```
+
+- Returns `None` for terminal roots.
+- Returns a 13-channel tensor and the exact legal rows for root expansion.
+- `root_generation` is a stale-token guard. Root expansion APIs reject stale generations.
+
+### Root Expansion APIs
+
+Dense root expansion:
+
+```text
+expand_root(policy, value, offset_q, offset_r, legal_bytes, root_generation)
+```
+
+Sparse prior expansion:
+
+```text
+expand_root_with_sparse_priors(
+    policy,
+    value,
+    offset_q,
+    offset_r,
+    legal_bytes,
+    root_generation,
+    sparse_qr,
+    sparse_logits,
+    stage,
+    sparse_mix,
+)
+```
+
+Global graph prior expansion:
+
+```text
+expand_root_with_global_priors(
+    legal_bytes,
+    root_generation,
+    global_qr,
+    global_logits,
+    value,
+)
+```
+
+Validation performed by these APIs includes:
+
+- policy/logit arrays are contiguous where required
+- dense policy length is `BOARD_AREA`
+- logits/values are finite
+- `legal_bytes` decode correctly
+- root generation matches the initialized root
+- global and sparse row arrays have expected shapes
+- global logits have at least one logit per global row
+- global rows are validated by the Rust MCTS core against legal rows
+
+### Root Pair-Prior APIs
+
+First-placement unordered pair prior expansion:
+
+```text
+apply_root_pair_priors(pair_qr, pair_logits, pair_mix)
+```
+
+First-action prior expansion from `policy_pair_first`:
+
+```text
+apply_root_pair_first_priors(action_logits, pair_mix)
+```
+
+Second-placement known-first pair prior expansion:
+
+```text
+apply_root_pair_second_priors(pair_qr, pair_logits, pair_mix)
+```
+
+Pair APIs validate pair row shape and delegate legality/identity checks to the Rust MCTS core. Illegal pairs, duplicate cells, reversed duplicate unordered pairs, and wrong known-first rows are rejected by Rust tests.
+
+### Leaf Selection And Backprop
+
+Common leaf APIs:
+
+```text
+select_leaves(batch_size) -> (tensor_4d, count, batch_generation)
+pending_leaf_metadata() -> metadata for selected pending leaves
+expand_and_backprop(policies, values, batch_generation)
+```
+
+Important behavior:
+
+- `batch_generation` guards selected leaves against stale expansion.
+- Global graph leaf expansion uses `pending_leaf_metadata()` to rebuild graph batches in Python from compact histories and legal rows.
+- Expansion APIs reject stale batch tokens, wrong lengths, non-finite values, and malformed sparse/global metadata.
+
+### Search Results And Tree Utilities
+
+Common methods:
+
+- `add_dirichlet_noise(noise, noise_fraction)`
+- `sample_action(temperature, rng_state)`
+- `should_resign(threshold)`
+- `re_root(q, r, new_num_simulations)`
+- `get_results() -> (moves_q, moves_r, visits, root_value)`
+- `root_child_priors()`
+- `root_child_q_values()`
+- `root_child_prior_sources()`
+- `prior_source_summary()`
+- `root_pair_visit_targets()`
+- `extract_tree_node_histories(min_visits)`
+- `extract_tree_node_states(min_visits)`
+
+The Python self-play worker uses these methods for replay targets, RGSC candidate extraction, pair-policy targets, and telemetry.
+
+## Standalone Functions
+
+Common module-level helpers:
+
+- `encode_compact_record(history_bytes, near_radius)` -> encoded tensor batch
+- `apply_d6_symmetry(tensor, sym_idx)` -> transformed `(13, 33, 33)` tensor
+- `classical_self_play(num_games, time_ms, max_depth, near_radius, max_moves)` -> classical bootstrap records
+
+## Current Integration Notes
+
+- Rust remains the canonical rules and MCTS boundary.
+- Python owns model inference, batching, training, replay orchestration, dashboards, and config.
+- Dense, sparse, and global graph roots use different expansion APIs but all validate legal-row identity before MCTS consumes priors.
+- Pair priors are only valid at root today and are gated by Python `pair_strategy` configuration.
+- The planned modular model refactor should move Python-side interpretation of model outputs behind policy providers and pair strategies, but the Rust APIs above remain the current validated boundary.
