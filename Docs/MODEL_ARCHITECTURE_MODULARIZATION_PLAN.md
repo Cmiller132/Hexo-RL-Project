@@ -106,415 +106,120 @@ pair strategies
 
 Contracts are not required for ordinary internal tensors, attention blocks, MLPs, or tiny projections unless those tensors cross one of these boundaries. A model implementation may be a cohesive family class if that is the clearest way to run experiments.
 
-### ArchitectureSpec
+### Implementation Guidance
 
-`ArchitectureSpec` is the source of truth for a model family.
+This plan should guide a strong implementation agent without forcing a predetermined class layout. The invariants below are required; exact dataclass fields, helper names, module splits, and adapter internals are implementation decisions.
 
-```python
-@dataclass(frozen=True)
-class SearchCapability:
-    policy_output_contract: str
-    policy_row_table: str
-    engine_alignment_contract: str
-    value_output_contract: str
-    value_decoder: str
-    value_range: tuple[float, float]
-    value_perspective: str
+Use the smallest structure that satisfies the invariants, makes the tests clear, and leaves future architectures easy to add. Add explicit contracts only at boundaries where a wrong assumption can silently corrupt training, inference, or search.
 
+### Architecture Authority
 
-@dataclass(frozen=True)
-class PairOutputSpec:
-    name: str
-    output_contract: str
-    row_table: str
-    semantic_phase: str
-    required_input_contracts: tuple[str, ...]
-    search_application: str
-
-
-@dataclass(frozen=True)
-class PairCapability:
-    outputs: tuple[PairOutputSpec, ...]
-    supported_pair_strategies: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ArchitectureSpec:
-    name: str
-    version: str
-    family: str
-    input_contract: str
-    recipe: str
-    default_heads: tuple[str, ...]
-    supported_optional_heads: tuple[str, ...]
-    head_families: tuple[str, ...]
-    required_selfplay_outputs: tuple[str, ...]
-    search: SearchCapability
-    pair: PairCapability | None
-    target_adapter: str
-    training_adapter: str
-    inference_adapter: str
-    policy_provider: str
-    config_schema: str
-    telemetry_contract: str
-```
-
-A spec defines what the architecture is allowed to do and which default heads it should build. It does not directly decide whether pair outputs affect MCTS. That remains the job of `PairStrategySpec`.
-
-All current and future self-play architectures must resolve a `SearchCapability`. A dense model may use `policy` over `dense_board_rows`; a global graph model may use `policy_place` over `legal_action_rows`; a future model may use a scalar or binned value contract. The search pipeline consumes output contracts, row-table instances, and value decoders, not raw head names.
-
-Config may enable or disable supported optional heads, but it may not disable `required_selfplay_outputs` when self-play is enabled. Disabling the value output or search policy output is a hard configuration error.
-
-### HeadSpec
-
-`HeadSpec` defines one output head.
-
-```python
-@dataclass(frozen=True)
-class HeadSpec:
-    name: str
-    implementation: str | None
-    input_slot: str
-    output_name: str
-    output_contract: str
-    roles: frozenset[str]
-    trainable: bool
-    target_contract: str | None
-    mask_contract: str | None
-    loss: str | None
-    weight_key: str | None
-    semantic_phase: str
-    runtime_consumers: tuple[str, ...]
-    required_input_contracts: tuple[str, ...]
-    output_presence_policy: str
-    missing_target_policy: str
-```
-
-`implementation` is optional because research models may implement a head inline inside a cohesive family class. `HeadSpec` primarily owns semantics: output contract, row table, target, loss, phase, and runtime consumers.
-
-Allowed `roles` values:
+Registered architecture metadata is the source of truth for a model family. It should answer these questions:
 
 ```text
-trainable
-runtime_consumed
-diagnostic
-internal_debug
+what architecture id is being built
+what model family or recipe owns construction
+what input contracts are required
+what outputs are default, optional, diagnostic, or forbidden
+what outputs are required for self-play
+what target, training, inference, and search adapters are used
+what pair capabilities exist, if any
+what config overrides are valid
 ```
 
-Roles are a set because a head may be both trainable and runtime-consumed. A declared output may also be conditional, but the condition must be represented by `output_presence_policy`, not by scattered runtime checks.
+A spec defines what an architecture is allowed to do. It must not decide whether pair outputs affect MCTS; that remains the job of the pair strategy.
 
-Allowed `output_presence_policy` values:
+All self-play architectures must resolve a search policy capability and a value capability. Config may enable or disable supported optional outputs, but it may not disable outputs required for self-play. Disabling the value output or search policy output is a hard configuration error.
+
+### Output And Head Semantics
+
+Every output returned by `model.forward` must be declared somewhere discoverable by assembly, training, inference, and search. The implementation agent may choose the exact representation, but the resolved metadata must make these distinctions clear:
 
 ```text
-required
-optional_if_requested
-diagnostic_only
-forbidden_unless_enabled
+trainable output
+runtime-consumed output
+diagnostic output
+internal debug output
+required output
+optional output
+conditional output
+non-trainable output
 ```
 
-Every output returned from `model.forward` must be declared. Diagnostic outputs are allowed, but they cannot affect losses, inference, search, or pair strategies unless promoted to a trainable or runtime-consumed head.
+Diagnostic outputs are allowed, but they cannot affect losses, inference, search, or pair strategies unless promoted to a trainable or runtime-consumed output.
 
-Allowed `missing_target_policy` values:
-
-```text
-error
-skip_optional
-not_trainable
-```
-
-Default for trainable heads is `error`. Current silent skips should be removed unless a head is explicitly optional and non-required for that architecture.
-
-### HeadFamilySpec
-
-`HeadFamilySpec` covers parameterized heads whose semantics are identical except for an explicit parameter. The immediate known case is `lookahead_*`.
-
-```python
-@dataclass(frozen=True)
-class HeadFamilySpec:
-    family: str
-    name_pattern: str
-    head_template: HeadSpec
-    parameter_name: str
-    params_from_config: str
-    target_contract_pattern: str
-    weight_key_pattern: str | None
-    output_contract_pattern: str
-```
-
-Head families are expanded during architecture resolution. After resolution, training, inference, tests, and audits see concrete heads such as:
-
-```text
-lookahead_4
-lookahead_12
-lookahead_36
-```
-
-Head families should be used only when the output, loss, target, and mask semantics are the same except for the named parameter. Other experimental heads should be explicit.
+Parameterized output families such as `lookahead_*` should be represented as a family during spec resolution and concrete outputs afterward. The current default examples to preserve are `lookahead_4`, `lookahead_12`, and `lookahead_36`; the implementation may choose how to represent the expansion.
 
 ### Recipes And Components
 
-Architecture recipes are readable Python assembly functions. They may build a cohesive family class, compose shared components, or mix both approaches.
+Architecture recipes should be readable Python assembly code. They may build cohesive family classes, compose reusable components, or mix both approaches.
 
-Reusable components are optional. Add them when they remove real duplication or make a family easier to modify. Do not require every architecture to be decomposed into a fixed trunk/head hierarchy.
+Reusable components are optional. Add them when they remove real duplication, clarify experimentation, or isolate a cross-boundary semantic concern. Do not split every attention block, MLP, or projection just because a contract exists somewhere nearby.
 
-```python
-@dataclass(frozen=True)
-class ComponentSpec:
-    name: str
-    implementation: str
-    input_contract: str | None
-    output_slots: tuple[str, ...]
-    required_features: tuple[str, ...]
-```
+### Row Identity
 
-Example output slots when a component boundary is useful:
+Row identity is the main correctness boundary.
 
-```text
-board_features
-state_embedding
-candidate_embeddings
-legal_embeddings
-pair_embeddings
-token_embeddings
-```
+Policy and pair outputs consumed outside `model.forward` must carry row identity. A row count alone is not enough. Same-count row tables with different order, payload, or backing token mapping must be rejected before loss computation or MCTS consumption.
 
-### Row Table Contracts
+The implementation should support the row families needed by current dense, sparse/candidate, graph, opponent, pair-first, pair-joint, pair-second, and graph-token workflows. Exact object names are less important than making row identity stable, hashable, testable, and visible at training/inference/search boundaries.
 
-Row tables are in scope for this refactor. They are needed because the highest-risk failures are row/logit mismatches.
+### Output Contracts
 
-```python
-@dataclass(frozen=True)
-class RowTableDefinition:
-    name: str
-    schema_version: int
-    row_kind: str
-    payload_schema: str
-    semantic_phase: str
-    owner: str
+Model outputs need enough metadata to prevent consumers from guessing semantics by head name, tensor shape, or shared-memory flag.
 
+Policy and pair outputs must identify their row identity and mask semantics. Value outputs must identify decoder, range, and perspective. Auxiliary outputs must be declared and either consumed by an explicit contract or treated as diagnostic.
 
-@dataclass(frozen=True)
-class RowTableInstance:
-    definition: RowTableDefinition
-    active_count: int
-    capacity_count: int
-    row_hash: str
-    row_payload_name: str
-    mask_name: str | None
-    backing_token_table: str | None
-    backing_token_indices_name: str | None
-```
+This removes the current assumptions that value decoding can be hard-coded by model class or that pair tensors can be interpreted from head flags alone.
 
-Required row table families:
+### Target Contracts
+
+Targets are training contracts, not model internals. The implementation should make target builders strict enough to catch:
 
 ```text
-dense_board_rows
-candidate_action_rows
-legal_action_rows
-opponent_legal_rows
-first_placement_pair_rows
-known_first_second_rows
-graph_legal_token_rows
+stale or mismatched row identity
+illegal target rows
+duplicate pair rows
+unexpected zero target mass
+missing trainable target, mask, weight, or phase
+pair-second targets outside known-first phase
+configured lookahead heads without configured horizon targets
 ```
 
-Every runtime-consumed policy or pair output must reference a row table instance, not only a row count. Raw logits without row identity are invalid outside the model forward pass. Same-count row tables with different row order, row payload, or backing token mapping must be rejected.
-
-### OutputContract
-
-Outputs are the shared language between model forward, loss computation, inference, and search. They are stricter than head names.
-
-```python
-@dataclass(frozen=True)
-class OutputContract:
-    name: str
-    output_name: str
-    dtype: str
-    shape: str
-    row_table: str | None
-    mask_contract: str | None
-    semantic_phase: str
-    finite_policy: str
-    value_decoder: str | None
-    value_range: tuple[float, float] | None
-    value_perspective: str | None
-    runtime_consumers: tuple[str, ...]
-```
-
-Policy and pair outputs must declare a row table. Value outputs must declare a decoder, range, and perspective. This removes the current assumption that value decoding can be hard-coded by model class or that pair tensors can be interpreted from head flags alone.
-
-### TargetContract
-
-Targets are not model implementation details. They are training contracts.
-
-```python
-@dataclass(frozen=True)
-class TargetContract:
-    name: str
-    row_table: str
-    semantic_phase: str
-    tensor_name: str
-    mask_name: str
-    weight_name: str | None
-    probability_mass: str
-    required_phase: str
-    duplicate_policy: str
-    zero_mass_policy: str
-    builder: str
-    negative_tests: tuple[str, ...]
-```
-
-Target builders may be rewritten. Current behavior must be inventoried, then intentionally kept, replaced, simplified, or deleted. The rules below are the target behavior unless Stage 1 explicitly classifies a different behavior as safer and adds tests for it.
-
-Important target rules:
-
-```text
-legal policy targets map to legal rows
-sparse policy targets map to candidate rows
-pair first targets map to legal first-placement rows
-pair joint targets map to unordered first-placement pair rows
-pair second targets map to known-first legal second rows
-opponent policy targets map to independent opponent legal rows
-configured lookahead targets require the configured horizon count and horizon identity
-invalid duplicate pair rows fail
-illegal pair rows fail
-stale or mismatched row identity fails
-missing trainable target, mask, weight, or phase fails
-zero target mass is explicit and follows zero_mass_policy
-```
+Current behavior must be inventoried, then intentionally kept, replaced, simplified, or deleted. Do not preserve silent skips or synthetic fallback targets unless Stage 1 explicitly classifies them as intentional non-trainable behavior and adds tests for that choice.
 
 Stage 1 must resolve one pair-target semantic decision before implementation: if a pair target is unordered, `policy_pair_first` either trains on a marginal over both cells or becomes diagnostic/non-trainable. If first-position order is intended, the target must be represented as ordered and not described as unordered joint-pair data.
 
-### LossPlan
+### Loss Planning
 
-Loss behavior should be generated from architecture and head specs.
+The trainer should not route losses through a broad raw head-name switch. It should ask a resolved loss plan, loss registry, or equivalent mechanism that knows:
 
-```python
-@dataclass(frozen=True)
-class LossPlanEntry:
-    head: str
-    prediction: str
-    target: str
-    mask: str | None
-    loss: str
-    weight_key: str | None
-    semantic_phase: str
-    missing_target_policy: str
+```text
+which prediction is being trained
+which target, mask, weight, and phase are required
+what loss applies
+what behavior is allowed when optional data is absent
 ```
 
-The trainer should not branch on raw head names. It should ask the resolved `LossPlan`.
+Trainable outputs default to hard errors when required training data is missing.
 
 ### Inference Protocol
 
-The refactor should improve inference, not merely wrap the current shared-memory arrays.
+Inference should improve the current shared-memory flow, not merely wrap it.
 
-Separate protocol from transport:
+Separate model-output semantics from transport mechanics. The protocol should carry enough information for clients, providers, and search to validate requested outputs, row identity, value decoding, pair phase, and schema compatibility. Shared memory should remain optimized, but it should pack and unpack protocol facts rather than define what heads mean.
 
-```text
-InferenceRequest
-InferenceResponse
-InferenceAdapter
-SharedMemoryTransport
-```
+### Policy Providers And Pair Strategies
 
-`InferenceRequest` owns:
+Policy providers convert decoded model outputs into search evaluations. Pair strategies own pair-specific runtime behavior.
 
-```text
-request id
-architecture id
-input contract
-requested outputs
-schema versions
-row-table definitions and instances
-tensor payload metadata
-```
+Pair-capable architecture specs may declare that pair outputs exist. Only an explicit pair strategy may decide whether pair rows are generated, pair outputs are requested, pair logits are scored, or pair priors influence MCTS.
 
-`InferenceResponse` owns:
+Runtime search behavior should depend on resolved capabilities and output contracts, not raw head-name presence.
 
-```text
-request id
-architecture id
-output contracts
-policy outputs with row-table instances
-pair outputs with row-table instances and semantic phase
-value outputs with decoder, range, and perspective
-auxiliary outputs
-telemetry
-warnings
-```
+## Suggested Package Shape
 
-Policy, pair, and value outputs should be explicit protocol objects:
-
-```python
-@dataclass(frozen=True)
-class PolicyOutput:
-    output_contract: str
-    row_table_instance: RowTableInstance
-    logits_name: str
-    mask_name: str | None
-    requested_by: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class PairOutput:
-    output_contract: str
-    row_table_instance: RowTableInstance
-    semantic_phase: str
-    logits_name: str
-    mask_name: str | None
-
-
-@dataclass(frozen=True)
-class ValueOutput:
-    output_contract: str
-    raw_name: str
-    decoded_scalar_name: str
-    decoder: str
-    value_range: tuple[float, float]
-    perspective: str
-```
-
-Shared memory remains a high-performance transport. It should pack and unpack protocol fields, but it should not define what heads mean.
-
-### PolicyProvider
-
-Policy providers convert decoded model policy outputs into search evaluations.
-
-Required providers:
-
-```text
-DensePolicyProvider
-SparseCandidatePolicyProvider
-GraphHybridPolicyProvider
-GlobalGraphPolicyProvider
-```
-
-Each provider returns a row-mapped `SearchEvaluation`.
-
-### PairStrategySpec
-
-Pair strategies are executable runtime logic, not just metadata.
-
-```python
-@dataclass(frozen=True)
-class PairStrategySpec:
-    name: str
-    requested_pair_outputs: tuple[str, ...]
-    required_output_contracts: tuple[str, ...]
-    row_builder: str
-    root_enabled: bool
-    leaf_enabled: bool
-    phases: tuple[str, ...]
-    max_root_rows: int
-    max_leaf_rows: int
-    max_full_rows: int
-    blend_policy: str
-    fallback_policy: str
-    diagnostic: bool
-```
-
-Architecture specs may declare pair output capability. Only pair strategies decide whether pair rows are generated, pair heads are requested, or pair logits influence MCTS. Head names may appear in specs, tests, and adapter implementation details, but runtime search behavior must depend on resolved output contracts and pair strategy declarations.
-
-## Proposed Package Layout
+This layout is a starting point, not an implementation mandate. Keep the ownership boundaries, but let the implementation agent adjust exact file names and module splits if a simpler shape satisfies the same tests and deletion evidence.
 
 ```text
 Python/src/hexorl/models/
@@ -576,7 +281,7 @@ Python/src/hexorl/replay/
   training_batch.py
 ```
 
-This layout is intentionally lean. `families/` contains cohesive PyTorch implementations. `components/` contains shared blocks only when reuse is real. `recipes/` contains readable Python assembly for each architecture family. Boilerplate in specs is acceptable when it makes an experiment easy to audit.
+The intended ownership is stable: `models/` owns model assembly and architecture metadata, `contracts/` owns boundary semantics, `replay/` owns target projection, `inference/` owns protocol and transport mapping, and `search/` owns providers, pair strategies, and engine boundaries.
 
 ## Current Behavior Inventory Required Before Cutover
 
@@ -637,7 +342,7 @@ semantic phase
 runtime consumers
 runtime output contracts
 new decision: keep, replace, simplify, delete
-new HeadSpec
+new resolved head/output metadata
 ```
 
 Fallback target aliases should be removed unless they are explicitly justified.
@@ -658,7 +363,7 @@ duplicate behavior
 zero-mass behavior
 required weight and phase behavior
 negative tests
-new TargetContract
+new resolved target metadata
 ```
 
 Stage 1 must explicitly classify lookahead target fallback behavior. Synthetic fallback from missing lookahead targets to value targets should be deleted unless the inventory proves a non-trainable diagnostic use and tests lock that down.
@@ -678,7 +383,7 @@ head flags
 row-table identity carried or lost
 value decoding behavior
 runtime consumers
-new protocol object
+new protocol responsibility
 new adapter
 ```
 
@@ -828,7 +533,7 @@ Create the exact implementation blueprint and proof harness needed to rewrite cl
 9. Define search policy/value capabilities for every self-play architecture.
 10. Define loss plan entries for all trainable heads and mark silent skip behavior for removal unless explicitly optional.
 11. Define inference protocol fields and shared-memory transport mapping, including row hashes and value decoding.
-12. Define `PairStrategySpec` entries for `none`, current diagnostic behavior, and planned pair strategy variants.
+12. Define pair strategy behavior for `none`, current diagnostic behavior, and planned pair strategy variants.
 13. Decide which current behavior is deleted instead of migrated.
 14. Classify existing tests as `golden`, `rewrite`, or `delete`.
 
@@ -842,7 +547,7 @@ Implement `hexorl/models/` as the single architecture authority and make model a
 
 - `hexorl/models/` is the architecture authority.
 - `build_model_from_config` delegates to `hexorl.models.assembly` or is replaced by it.
-- Model construction uses registered `ArchitectureSpec` and returns `ModelBundle`.
+- Model construction uses registered architecture metadata and returns the model with enough resolved metadata for training, inference, and search.
 - Architecture specs own default heads, supported optional heads, head families, self-play required outputs, and adapter selections.
 - Config can enable or disable supported optional heads, but cannot disable required self-play outputs.
 - `lookahead_*` and future dynamic head families are expanded to concrete heads during architecture resolution.
@@ -882,12 +587,12 @@ Move replay projection, target construction, training adapters, and loss computa
 
 ### Success Criteria
 
-- Trainer uses `TrainingAdapter` and `LossPlan`, not raw head-name loss routing.
-- Target construction uses `TargetContract` and row-table instances.
+- Trainer uses an adapter/loss-plan boundary, not raw head-name loss routing.
+- Target construction uses explicit target metadata and row-table instances.
 - Trainable heads fail loudly when required targets, masks, weights, or phases are missing.
 - Silent loss skips and fallback aliases are deleted unless explicitly represented as optional non-trainable behavior.
 - Dense, sparse, graph hybrid, and global graph batches train through the same public trainer flow.
-- `TrainingBatch` carries per-sample or per-head semantic phase data needed by phase-sensitive losses.
+- The prepared training batch carries per-sample or per-head semantic phase data needed by phase-sensitive losses.
 - Pair-second loss is gated by explicit known-first phase metadata, not inferred from zero target mass.
 - Lookahead trainable heads require exact configured horizon targets and do not fall back to value targets.
 - Global graph training cannot accidentally consume dense policy fields.
@@ -923,7 +628,7 @@ Move inference and search runtime behavior to protocol/adapters/providers/strate
 ### Success Criteria
 
 - Inference uses protocol/adapters and treats shared memory as transport.
-- Self-play and evaluation use `PolicyProvider`, `PairStrategy`, and `EngineAdapter` boundaries.
+- Self-play and evaluation use provider, pair-strategy, and engine-adapter boundaries.
 - Pair behavior is impossible without an explicit pair strategy.
 - Pair strategy owns pair row generation, scoring caps, phases, blending, and fallback behavior.
 - Inference responses carry output contracts and row-table instances so same-count row reorderings cannot pass validation.
@@ -964,27 +669,16 @@ These work breakdown sections are decomposition notes. Every executable assignme
 
 ### 1.1 Contracts And Test Trust Audit
 
-Produce Stage 1 design artifacts for future `hexorl/contracts/` modules. Do not create importable runtime modules in Stage 1.
+Produce Stage 1 design artifacts for future boundary contracts. Do not create importable runtime modules in Stage 1.
 
-Required modules:
-
-```text
-rows.py
-targets.py
-outputs.py
-hashes.py
-phases.py
-```
-
-Implement:
+Design outputs should cover:
 
 ```text
-RowTableDefinition
-RowTableInstance
-TargetContract
-OutputContract
-stable row hash helpers
-semantic phase constants
+row identity and stable hashing
+target validity rules
+output semantics
+semantic phases
+value decoding
 test trust audit artifact
 ```
 
@@ -1000,37 +694,17 @@ existing tests are classified as golden, rewrite, or delete before they are used
 
 ### 2.1 Model Specs And Assembly
 
-Create `hexorl/models/`.
-
-Required modules:
+Create the new model authority under `hexorl/models/`. The implementation agent may choose exact modules and class names, but the boundary must support:
 
 ```text
-registry.py
-specs.py
-assembly.py
-bundles.py
-validation.py
-recipes/
-families/
-components/
-```
-
-Implement:
-
-```text
-ArchitectureSpec
-HeadSpec
-HeadFamilySpec
-OutputContract
-SearchCapability
-PairCapability
-PairOutputSpec
-ModelBundle
-ArchitectureRegistry
-build_model_bundle
-validate_architecture_request
-resolve_head_overrides
-expand_head_families
+registered architecture metadata
+model assembly from config
+resolved default and optional outputs
+dynamic head-family expansion
+self-play required-output validation
+adapter/provider selection
+bundle metadata returned with the model
+clear errors for invalid architecture/head combinations
 ```
 
 Initial assembly can instantiate retained implementation modules, but architecture authority must come from `hexorl/models/`.
@@ -1066,8 +740,8 @@ Preferred end state:
 ```text
 families own cohesive PyTorch model implementations
 components own shared blocks only when reuse is real
-HeadSpec owns semantics
-ArchitectureSpec owns composition
+resolved architecture metadata owns semantics
+recipes or assembly code own composition
 ```
 
 Acceptance criteria:
@@ -1093,7 +767,7 @@ type validation
 obvious local invariants
 ```
 
-Architecture registry should own:
+Resolved architecture metadata should own:
 
 ```text
 architecture membership
@@ -1116,7 +790,7 @@ architecture spec default heads
 -> config disable_head overrides
 -> head family expansion
 -> self-play capability validation
--> resolved ModelBundle
+-> resolved model bundle or equivalent metadata package
 ```
 
 Config may enable or disable supported optional heads. It may not invent new architecture behavior, request unsupported heads, or disable outputs required by the self-play capability. Disabling the value output or search policy output for a self-play architecture is a hard error.
@@ -1132,17 +806,7 @@ invalid self-play capability overrides fail during spec resolution with clear er
 
 ### 3.1 Targets And Replay Projection
 
-Create `hexorl/replay/` modules for projection and training batch conversion.
-
-Required modules:
-
-```text
-projection.py
-target_builders.py
-training_batch.py
-```
-
-Implement clean target builders using contracts.
+Create the replay projection and training-batch boundary in the location that best fits the codebase. The exact module split is flexible, but target construction must become contract-driven and phase-aware.
 
 Important: this is allowed to rewrite target construction, but it must be test-driven against Stage 1 golden rules. Do not preserve old code shape just because it exists.
 
@@ -1160,37 +824,26 @@ global graph training does not accidentally consume dense policy fields
 
 ### 3.2 Training Adapter And Loss Plan
 
-Create `hexorl/models/training/`.
-
-Required modules:
+Create the training boundary needed to remove raw head-name loss routing. Exact class names are flexible, but the implementation should cover:
 
 ```text
-adapters.py
-loss_plan.py
-losses.py
-metrics.py
+batch preparation
+model input conversion
+loss planning
+loss-plan validation
+loss computation
+metric reporting
 ```
 
-Implement:
-
-```text
-TrainingBatch
-TrainingAdapter
-LossPlan
-LossPlanValidator
-LossRegistry
-MetricRegistry
-```
-
-The trainer flow becomes:
+The trainer flow should be equivalent to:
 
 ```text
 raw replay batch
--> TrainingAdapter.prepare_batch
+-> prepare batch
 -> model inputs
 -> model forward
--> LossPlanValidator.validate
--> LossRegistry.compute
+-> validate loss plan
+-> compute losses
 -> metrics
 ```
 
@@ -1206,34 +859,20 @@ pair-second loss only runs in explicit known-first phase metadata
 
 ### 4.1 Inference Protocol And Adapters
 
-Create protocol and adapters under `hexorl/inference/`.
+Create the inference protocol and adapter boundary. Keep shared memory fast, but make it a transport for semantic metadata rather than the source of output meaning.
 
-Required modules:
-
-```text
-protocol.py
-transport_shm.py
-adapters/dense.py
-adapters/sparse.py
-adapters/graph_hybrid.py
-adapters/global_graph.py
-adapters/pair_outputs.py
-```
-
-Implement:
+The implementation should provide the equivalent responsibilities for:
 
 ```text
-InferenceRequest
-InferenceResponse
-PolicyOutput
-PairOutput
-ValueOutput
-AuxiliaryOutput
-InferenceAdapter
-SharedMemoryTransport
+request metadata
+response metadata
+policy output decoding
+pair output decoding
+value output decoding
+auxiliary output handling
+model-specific input/output adapters
+shared-memory transport mapping
 ```
-
-Shared memory should remain optimized but become transport-only.
 
 Acceptance criteria:
 
@@ -1247,27 +886,18 @@ existing shm arrays are either preserved with contract metadata or replaced with
 
 ### 4.2 Policy Providers, Pair Strategies, Engine Adapter
 
-Create `hexorl/search/`.
+Create the search boundary that separates decoded model outputs from Rust MCTS calls and pair-runtime behavior.
 
-Required modules:
-
-```text
-context.py
-policy_provider.py
-pair_strategy.py
-engine_adapter.py
-```
-
-Implement:
+The implementation should provide the equivalent responsibilities for:
 
 ```text
-SearchContext
-SearchEvaluation
-PairEvaluation
-PolicyProvider
-PairStrategy
-PairStrategySpec
-EngineAdapter
+search context
+search evaluation
+pair evaluation
+policy provider
+pair strategy
+pair strategy metadata
+engine adapter
 ```
 
 Acceptance criteria:
@@ -1306,114 +936,76 @@ runtime quarantine is forbidden; non-runtime migration/test quarantine has an ow
 
 ## Required Test Plan
 
-### Contract Tests
+The exact test names and file layout are implementation decisions. The required coverage is not optional.
+
+### Contract Coverage
+
+Required coverage:
 
 ```text
-test_row_table_contract_hashes_legal_rows
-test_row_table_contract_rejects_mismatched_pair_rows
-test_target_contract_requires_matching_row_hash
-test_output_contract_requires_row_table_instance_for_policy
-test_output_contract_requires_value_decoder_for_value
-test_row_table_instance_rejects_same_count_reordered_rows
-test_semantic_phase_first_vs_second_pair_rows
+stable row identity for legal, graph, and pair rows
+row-hash mismatch rejection
+same-count reordered-row rejection
+policy and pair outputs require row identity
+value outputs require decoder, range, and perspective
+semantic phase separation for first-placement and known-first pair phases
 ```
 
-### Architecture Tests
+### Architecture And Assembly Coverage
+
+Required coverage:
 
 ```text
-test_every_current_architecture_resolves_to_spec
-test_every_supported_head_declares_output_contract
-test_every_trainable_head_declares_target_mask_loss_phase
-test_head_spec_supports_multiple_roles
-test_conditional_head_presence_policy_is_declared
-test_invalid_head_for_architecture_fails_spec_resolution
-test_pair_capable_architecture_does_not_enable_pair_strategy
-test_config_can_enable_supported_optional_head
-test_config_can_disable_supported_optional_head
-test_config_cannot_disable_selfplay_policy_or_value_output
-test_lookahead_head_family_expands_current_default_horizons_4_12_36
-test_diagnostic_output_must_be_declared
+all supported current architecture ids resolve through the new authority
+deprecated aliases are deleted or explicitly mapped during transition
+unsupported architecture/head combinations fail clearly
+config may enable/disable only supported optional outputs
+config cannot disable self-play policy or value outputs
+lookahead family expansion preserves configured horizons
+diagnostic outputs are declared and cannot affect runtime behavior accidentally
+dense, graph hybrid, and global graph bundles build through the same public assembly path
 ```
 
-### Assembly Tests
+### Target And Loss Coverage
 
 ```text
-test_dense_bundle_builds_from_registry
-test_graph_hybrid_bundle_builds_from_registry
-test_global_graph_bundle_builds_from_registry
-test_build_model_from_config_delegates_to_models_assembly
+dense, sparse/candidate, graph, opponent, pair-first, pair-joint, pair-second, value, tactical, regret, and lookahead targets map to the intended row identity
+pair ordering semantics are explicitly tested after the Stage 1 decision
+illegal rows and duplicate rows fail before training
+zero-mass behavior is explicit and tested
+missing required target, mask, weight, or phase fails for trainable outputs
+optional non-trainable skips are explicit
+pair-second loss requires explicit known-first phase metadata
+pair-second phase is not inferred from zero target mass
+global graph batches cannot accidentally consume dense policy targets
 ```
 
-### Target Tests
+### Inference Coverage
 
 ```text
-test_dense_policy_target_maps_to_dense_rows
-test_sparse_policy_target_maps_to_candidate_rows
-test_graph_policy_target_maps_to_legal_rows
-test_pair_joint_target_unordered_first_placement
-test_pair_first_target_ordering_contract_is_explicit
-test_pair_second_target_known_first_only
-test_pair_targets_reject_duplicates_and_illegal_rows
-test_duplicate_target_rows_follow_duplicate_policy
-test_zero_mass_target_rows_follow_zero_mass_policy
-test_target_contract_fails_missing_required_weight
-test_target_contract_fails_missing_required_phase
-test_lookahead_target_requires_configured_horizons
-test_global_graph_training_does_not_consume_dense_policy_target
+dense and global graph inference round-trip through adapters
+policy outputs carry row identity through client/server boundaries
+same-count row hash mismatches are rejected
+pair outputs require pair row identity and phase
+binned and scalar value outputs decode through declared contracts
+shared-memory transport preserves required semantic metadata or is replaced with measured equivalent transport
 ```
 
-### Loss Tests
+### Runtime Coverage
 
 ```text
-test_loss_plan_fails_missing_required_target
-test_loss_plan_fails_missing_required_mask
-test_loss_plan_fails_missing_required_weight
-test_loss_plan_fails_missing_required_phase
-test_optional_head_skip_is_explicit
-test_pair_second_loss_requires_known_first_phase
-test_pair_second_loss_does_not_infer_phase_from_zero_mass
-test_loss_weights_resolve_from_architecture_loss_plan
-```
-
-### Inference Tests
-
-```text
-test_dense_inference_adapter_decodes_policy_value
-test_global_graph_inference_adapter_decodes_policy_place
-test_global_graph_adapter_rejects_legal_row_count_mismatch
-test_inference_policy_output_carries_row_table_instance
-test_inference_rejects_same_count_row_hash_mismatch
-test_pair_output_requires_pair_row_contract
-test_value_output_decodes_binned_and_scalar_contracts
-test_shared_memory_transport_preserves_contract_metadata
-```
-
-### Runtime Tests
-
-```text
-test_policy_provider_maps_dense_policy_to_legal_rows
-test_global_graph_provider_maps_logits_to_rust_legal_rows
-test_selfplay_architecture_requires_search_policy_and_value_capabilities
-test_pair_strategy_none_scores_zero_pairs
-test_pair_head_presence_does_not_enable_pair_scoring
-test_pair_strategy_declares_required_output_contracts_and_caps
-test_worker_does_not_directly_consume_pair_head_names
-test_engine_adapter_rejects_unmapped_policy_output
-test_engine_adapter_rejects_wrong_generation
-test_engine_adapter_rejects_wrong_legal_row_order
-test_engine_adapter_rejects_dense_offset_out_of_window
-test_engine_adapter_rejects_pair_output_wrong_phase
-test_eval_uses_policy_provider_boundary
+policy providers map dense and graph outputs to legal Rust rows
+self-play requires policy and value capabilities
+pair head presence alone does not enable pair scoring
+pair strategy owns pair output requests, caps, phases, and blending
+worker no longer consumes pair head names directly
+engine adapter rejects unmapped policy/value outputs, wrong generation, wrong legal order, invalid dense offsets, and wrong pair phase
+evaluation uses the same provider boundary or is explicitly quarantined from runtime acceptance
 ```
 
 ### Test Trust Audit
 
-```text
-test_existing_global_graph_tests_are_classified
-test_existing_training_tests_are_classified
-test_existing_inference_tests_are_classified
-test_existing_selfplay_tests_are_classified
-```
+Existing model, graph, replay, training, inference, and self-play tests must be classified as `golden`, `rewrite`, or `delete` before they are used as acceptance evidence.
 
 ### Audit Commands
 
