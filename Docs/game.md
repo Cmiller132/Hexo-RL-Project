@@ -83,8 +83,6 @@ becomes **unblockable** when no pair of placements can hit every hot window.
 | 2 threats with disjoint block cells | Depends on geometry |
 | 3+ threats with no common block cells | **No — game is won** |
 
-The real strategic endgame: accumulating non-overlapping hot windows across
-different axes until no pair of blocking placements can cover them all.
 
 ### Two placements per turn
 
@@ -95,12 +93,7 @@ This mechanic fundamentally shapes every aspect of play:
   4-window is an immediate win on your turn — not true in 1-placement games.
 - **Defensive**: blocking consumes placements. Spending both on defense means
   zero development — the opponent builds freely while you tread water.
-- **Block + counterattack**: the optimal defensive pattern uses 1 placement to
-  block and 1 to develop, maintaining pressure while defending.
-- **Forcing chains**: each threat you create forces the opponent to spend
-  blocking resources. A sequence of forcing moves that culminates in 3+
-  independent threats before the opponent can catch up produces an unblockable
-  win.
+
 
 ### Axis forking
 
@@ -127,14 +120,6 @@ differences between going first and second.
 Many pipeline choices look unusual if you're familiar with AlphaZero or Go
 engines. The differences fall out of fundamental game properties.
 
-### Infinite board → dynamic bounding box
-
-Go has a fixed 19×19 grid; policy output maps directly to board positions. This
-game has no board boundary. The network operates on a **33×33 window centered
-on the piece centroid**, recomputed every inference call. Coordinates are
-relative, not absolute. The model never learns edge or corner patterns — there
-are none.
-
 ### Hex grid → masked convolutions and D6 symmetry
 
 A square grid has D4 symmetry (8 transforms). A hex grid has **D6 symmetry
@@ -143,38 +128,4 @@ lookup tables for all 12 D6 transforms. The 3 hex axes **permute** under
 rotation, so axis-related targets must be reindexed alongside spatial
 coordinates.
 
-Standard 3×3 convolutions include two corner positions `(dq=-1, dr=-1)` and
-`(dq=+1, dr=+1)` that are hex-distance 2 (not neighbors). `HexConv2d` zeros
-those kernel weights after each optimizer step so the network respects hex
-topology.
 
-### Two placements per turn → auto-regressive MCTS
-
-In Go, one MCTS search produces one move. Here, each turn is two placements.
-MCTS handles this **auto-regressively**: each tree action is a single
-placement, but the second placement stays within the same player's subtree.
-
-The classical alpha-beta engine takes the opposite approach: it treats the
-**pair** as the atomic unit, with a pair-sum branching constraint to keep the
-branching factor manageable.
-
-### No captures, no territory → purely structural evaluation
-
-Go has captures, ko, life-and-death, and territory scoring. This game is purely
-additive: stones are never removed, and the only goal is forming a line. The
-classical evaluator uses a **ternary window encoding** (each 6-cell window →
-one of 729 base-3 patterns) with CMA-ES-optimized heuristic weights, maintained
-incrementally in O(18) per placement.
-
-### Auxiliary heads beyond policy + value
-
-AlphaZero uses two heads (policy, value). HexNet uses **six**:
-
-| Head | Purpose | Why it exists |
-|------|---------|---------------|
-| **Policy** | MCTS visit distribution target | Standard AlphaZero |
-| **Value** | Game outcome prediction | Standard AlphaZero |
-| **Axis influence** | Per-axis line pressure at each cell | Teaches spatial threat awareness along the 3 hex axes — no analog in Go |
-| **Opponent policy** | Predict opponent's next move | Teaches the model to anticipate opponent responses |
-| **Regret rank** | RGSC position ranking | Identifies high-learning-potential positions for restart |
-| **Regret value** | RGSC absolute regret estimate | Estimates prediction error magnitude for prioritized replay |

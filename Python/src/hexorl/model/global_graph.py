@@ -8,7 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hexorl.graph.batch import GRAPH_FEATURE_DIM, GraphTokenType
+from hexorl.graph.batch import (
+    GRAPH_FEATURE_DIM,
+    GRAPH_FEATURE_PLACEMENTS_REMAINING,
+    GraphTokenType,
+)
 
 
 class RelationBiasedSelfAttention(nn.Module):
@@ -144,6 +148,11 @@ class GlobalHexGraphNet(nn.Module):
         "global_graph_full_0",
         "global_graph768_champion",
     }
+
+    @classmethod
+    def is_global_graph_architecture(cls, architecture: object) -> bool:
+        """Return whether a config architecture names a registered global graph family."""
+        return str(architecture).lower() in cls.ARCHITECTURES
 
     def __init__(
         self,
@@ -315,8 +324,13 @@ class GlobalHexGraphNet(nn.Module):
                 pair_first_vec = pair_first_vec + self.pair_first_refine(
                     torch.cat([pair_first_vec, state_action], dim=-1)
                 )
+            first_pair_phase = token_features[:, 0, GRAPH_FEATURE_PLACEMENTS_REMAINING].to(
+                device=x.device,
+                dtype=x.dtype,
+            ) > 0.75
+            pair_first_mask = legal_mask_bool & first_pair_phase.unsqueeze(-1)
             out["policy_pair_first"] = self.policy_pair_first(pair_first_vec).squeeze(-1).masked_fill(
-                ~legal_mask_bool,
+                ~pair_first_mask,
                 -80.0,
             )
         if self._wants("value"):
@@ -375,17 +389,35 @@ class GlobalHexGraphNet(nn.Module):
                 & (second_raw < x.shape[1])
                 & (first_raw != second_raw)
             )
+            first = first_raw.clamp(0, max(x.shape[1] - 1, 0))
+            second = second_raw.clamp(0, max(x.shape[1] - 1, 0))
+            token_type_device = token_type.to(device=x.device)
+            first_type = token_type_device.gather(1, first)
+            second_type = token_type_device.gather(1, second)
+            first_active = mask.gather(1, first)
+            second_active = mask.gather(1, second)
+            legal_type = int(GraphTokenType.LEGAL)
+            stone_type = int(GraphTokenType.STONE)
+            pair_action_type = int(GraphTokenType.PAIR_ACTION)
+            pair_mask = pair_mask & first_active & second_active
+            pair_mask = pair_mask & (second_type == legal_type)
+            pair_mask = pair_mask & ((first_type == legal_type) | (first_type == stone_type))
             if pair_token_indices is not None:
                 pair_token_raw = pair_token_indices.to(device=x.device, dtype=torch.long)
                 if pair_token_raw.shape != pair_first_indices.shape:
                     raise ValueError("pair_token_indices must match pair_first_indices shape")
                 materialized_pair_token = pair_token_raw >= 0
+                pair_token = pair_token_raw.clamp(0, max(x.shape[1] - 1, 0))
+                pair_token_type = token_type_device.gather(1, pair_token)
+                pair_token_active = mask.gather(1, pair_token)
                 pair_mask = pair_mask & (
                     (~materialized_pair_token)
-                    | (pair_token_raw < x.shape[1])
+                    | (
+                        (pair_token_raw < x.shape[1])
+                        & pair_token_active
+                        & (pair_token_type == pair_action_type)
+                    )
                 )
-            first = first_raw.clamp(0, max(x.shape[1] - 1, 0))
-            second = second_raw.clamp(0, max(x.shape[1] - 1, 0))
             first_vec = x.gather(1, first.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             second_vec = x.gather(1, second.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             state_pair = state.unsqueeze(1).expand_as(first_vec)

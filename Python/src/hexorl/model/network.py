@@ -854,8 +854,7 @@ def build_model_from_config(
     model_cfg = cfg.model
     inference_cfg = cfg.inference
     arch = getattr(model_cfg, "architecture", "cnn").lower()
-    global_architectures = GlobalHexGraphNet.ARCHITECTURES
-    if arch in global_architectures:
+    if GlobalHexGraphNet.is_global_graph_architecture(arch):
         graph_heads = set(getattr(model_cfg, "heads", []))
         graph_heads.update(f"lookahead_{h}" for h in getattr(getattr(cfg, "buffer", object()), "lookahead_horizons", []))
         model = GlobalHexGraphNet(

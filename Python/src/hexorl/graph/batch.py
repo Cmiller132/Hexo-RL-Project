@@ -20,6 +20,7 @@ from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_his
 
 GRAPH_SCHEMA_VERSION = 2
 GRAPH_FEATURE_DIM = 48
+GRAPH_FEATURE_PLACEMENTS_REMAINING = 6
 RELATION_SCHEMA_VERSION = 1
 PAIR_CHUNK_LIMIT = 4096
 GRAPH_IPC_TOKEN_CAPACITY = 4096

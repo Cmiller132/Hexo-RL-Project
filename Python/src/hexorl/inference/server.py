@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 from hexorl.config import Config
 from hexorl.model.network import from_config, HexNet, load_model_state
+from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
@@ -68,7 +69,7 @@ class InferenceServer:
     ):
         self.cfg = cfg
         architecture = str(getattr(cfg.model, "architecture", "")).lower()
-        self._global_graph_mode = architecture.startswith("global_")
+        self._global_graph_mode = GlobalHexGraphNet.is_global_graph_architecture(architecture)
         required_heads = {"value"} if self._global_graph_mode else {"policy", "value"}
         missing_heads = sorted(required_heads - set(cfg.model.heads))
         if self._global_graph_mode and not ({"policy", "policy_place"} & set(cfg.model.heads)):

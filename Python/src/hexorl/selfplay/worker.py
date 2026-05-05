@@ -33,6 +33,7 @@ from hexorl.action_contract.tactical_oracle import (
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
 from hexorl.graph.batch import GraphBatch, GraphTokenType, build_graph_batch_from_history
+from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
@@ -66,7 +67,7 @@ def _align_global_logits_to_rust_legal(
     logits = np.asarray(logits, dtype=np.float32).reshape(-1)
     if logits.shape[0] < graph_legal.shape[0]:
         raise ValueError(
-            f"{context}: policy_place has {logits.shape[0]} rows for "
+            f"{context}: logits have {logits.shape[0]} rows for "
             f"{graph_legal.shape[0]} graph legal moves"
         )
     if graph_legal.shape != rust_legal.shape:
@@ -1178,7 +1179,9 @@ class SelfPlayWorker:
         self.sparse_prior_stage = int(getattr(cfg.model, "sparse_prior_stage", 0))
         self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
         self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
-        self.global_graph_enabled = str(getattr(cfg.model, "architecture", "")).lower().startswith("global_")
+        self.global_graph_enabled = GlobalHexGraphNet.is_global_graph_architecture(
+            getattr(cfg.model, "architecture", "")
+        )
         if self.global_graph_enabled:
             self.near_radius = 8
             self.constrain_threats = False
@@ -1387,7 +1390,7 @@ class SelfPlayWorker:
                             include_pair_rows=False,
                         )
                         graph_out = client.submit_graph(graph_batch)
-                        graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
+                        raw_graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
                         rust_legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
                         policy_place = np.asarray(graph_out["policy_place"], dtype=np.float32)
                         graph_value = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
@@ -1409,7 +1412,7 @@ class SelfPlayWorker:
                             pair_qr = np.zeros((0, 4), dtype=np.int32)
                             pair_logits = np.zeros(0, dtype=np.float32)
                         graph_legal, policy_place = _align_global_logits_to_rust_legal(
-                            graph_legal,
+                            raw_graph_legal,
                             rust_legal,
                             policy_place,
                             context="graph root inference",
@@ -1426,8 +1429,14 @@ class SelfPlayWorker:
                             and root_placements_remaining >= 2
                             and "policy_pair_first" in graph_out
                         ):
-                            engine.apply_root_pair_first_priors(
+                            _, pair_first_logits = _align_global_logits_to_rust_legal(
+                                raw_graph_legal,
+                                rust_legal,
                                 np.asarray(graph_out["policy_pair_first"], dtype=np.float32),
+                                context="graph root pair-first inference",
+                            )
+                            engine.apply_root_pair_first_priors(
+                                pair_first_logits,
                                 self.pair_prior_mix,
                             )
                         if self.pair_policy_enabled and pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
