@@ -306,4 +306,4 @@ Docs/refactor/PERFORMANCE_STRATEGY.md
 - Python remains canonical for model training/inference orchestration.
 - Shared memory remains the inference transport for now.
 - Global graph is a first-class model family, but pair-head runtime use requires explicit pair strategy.
-- The modular model architecture refactor should be done as a clean two-stage rewrite, not a long compatibility-wrapper migration.
+- The modular model architecture refactor should follow the four-stage clean rewrite in `Docs/MODEL_ARCHITECTURE_MODULARIZATION_PLAN.md`, not a long compatibility-wrapper migration.
