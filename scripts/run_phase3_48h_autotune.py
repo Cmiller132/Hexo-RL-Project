@@ -1777,7 +1777,7 @@ class Phase3Supervisor:
         return bool(self.host.cuda_available and self.host.cuda_memory_gb < 16.0 and (constrained_ram or constrained_cpu))
 
     def _asha_resources(self) -> list[int]:
-        raw = str(getattr(self.args, "asha_resources", "2,5,10") or "2,5,10")
+        raw = str(getattr(self.args, "asha_resources", "10,20,30") or "10,20,30")
         resources: list[int] = []
         for part in raw.replace(",", " ").split():
             value = int(part)
@@ -2819,7 +2819,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-states-per-epoch", type=int, default=1536)
     parser.add_argument("--min-states-per-epoch", type=int, default=256)
     parser.add_argument("--max-states-per-epoch", type=int, default=8192)
-    parser.add_argument("--max-game-moves", type=int, default=192)
+    parser.add_argument("--max-game-moves", type=int, default=500)
     parser.add_argument(
         "--runtime-sweep-states",
         type=int,
@@ -2839,17 +2839,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train-batches", type=int, default=100)
     parser.add_argument("--max-active-trials", type=int, default=6)
-    parser.add_argument("--asha-resources", default="8,12,14")
+    parser.add_argument("--asha-resources", default="10,20,30")
     parser.add_argument("--asha-promote-fraction", type=float, default=0.5)
     parser.add_argument("--bohb-random-fraction", type=float, default=0.25)
     parser.add_argument("--schedule-method", choices=["pb2", "pbt"], default="pb2")
     parser.add_argument("--pb2-candidates", type=int, default=64)
     parser.add_argument("--pb2-uncertainty-weight", type=float, default=0.25)
     parser.add_argument("--pbt-population", type=int, default=8)
-    parser.add_argument("--perturb-interval", type=int, default=5)
+    parser.add_argument("--perturb-interval", type=int, default=10)
     parser.add_argument("--pbt-generations", type=int, default=6)
     parser.add_argument("--champion-min-epochs", type=int, default=20)
-    parser.add_argument("--strategy-score-min-epochs", type=int, default=8)
+    parser.add_argument("--strategy-score-min-epochs", type=int, default=10)
     parser.add_argument("--classical-score-min-epochs", type=int, default=12)
     parser.add_argument("--eval-every-epochs", type=int, default=2)
     parser.add_argument("--eval-games", type=int, default=4)
