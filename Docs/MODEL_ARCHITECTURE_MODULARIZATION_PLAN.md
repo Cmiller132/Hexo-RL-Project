@@ -508,6 +508,7 @@ Create the exact implementation blueprint and proof harness needed to rewrite cl
 - `Docs/artifacts/model_architecture/inference_inventory.md`
 - `Docs/artifacts/model_architecture/runtime_inventory.md`
 - `Docs/artifacts/model_architecture/test_trust_audit.md`
+- Baseline command report capturing current import/test health, known failures, and which failures are expected WIP state.
 - Contract draft files or design notes for row tables, outputs, targets, inference protocol, and pair strategies.
 - Design examples showing row-table definitions, row-table instances, output contracts, value decoding contracts, and pair output specs.
 - Golden test list with exact existing tests to keep, existing tests to rewrite, existing tests to delete, and new tests to add.
@@ -523,19 +524,20 @@ Create the exact implementation blueprint and proof harness needed to rewrite cl
 ### Stage 1 Work Items
 
 1. Create model architecture inventories under `Docs/artifacts/model_architecture/`.
-2. Define semantic phases in Stage 1 design notes for future `contracts/phases.py`.
-3. Define row-table definitions and row-table instances for dense, candidate, legal, opponent legal, pair joint, known-first, and graph token rows.
-4. Define output contracts for policy, pair, value, and auxiliary outputs, including value decoder/range/perspective.
-5. Define target contracts for dense policy, sparse policy, graph policy, pair first, pair joint, pair second, opponent policy, value, tactical, regret, and lookahead.
-6. Define architecture specs for `cnn`, `restnet`, `graph_hybrid_0`, `global_graph_option1`, `global_xattn_0`, `global_line_window_0`, `global_pair_twostage_0`, `global_graph_full_0`, `global_hybrid_action_0`, `global_graph768_champion`, and the deprecated `graph` alias decision.
-7. Define head specs for all current heads that remain supported.
-8. Define `HeadFamilySpec` expansion for `lookahead_*` from configured horizons.
-9. Define search policy/value capabilities for every self-play architecture.
-10. Define loss plan entries for all trainable heads and mark silent skip behavior for removal unless explicitly optional.
-11. Define inference protocol fields and shared-memory transport mapping, including row hashes and value decoding.
-12. Define pair strategy behavior for `none`, current diagnostic behavior, and planned pair strategy variants.
-13. Decide which current behavior is deleted instead of migrated.
-14. Classify existing tests as `golden`, `rewrite`, or `delete`.
+2. Capture baseline import/test command results so later stages can distinguish regressions from existing WIP failures.
+3. Define semantic phases in Stage 1 design notes.
+4. Define row-table definitions and row-table instances for dense, candidate, legal, opponent legal, pair joint, known-first, and graph token rows.
+5. Define output contracts for policy, pair, value, and auxiliary outputs, including value decoder/range/perspective.
+6. Define target contracts for dense policy, sparse policy, graph policy, pair first, pair joint, pair second, opponent policy, value, tactical, regret, and lookahead.
+7. Define architecture metadata for `cnn`, `restnet`, `graph_hybrid_0`, `global_graph_option1`, `global_xattn_0`, `global_line_window_0`, `global_pair_twostage_0`, `global_graph_full_0`, `global_hybrid_action_0`, `global_graph768_champion`, and the deprecated `graph` alias decision.
+8. Define head/output metadata for all current heads that remain supported.
+9. Define resolved `lookahead_*` family expansion from configured horizons.
+10. Define search policy/value capabilities for every self-play architecture.
+11. Define loss plan entries for all trainable heads and mark silent skip behavior for removal unless explicitly optional.
+12. Define inference protocol fields and shared-memory transport mapping, including row hashes and value decoding.
+13. Define pair strategy behavior for `none`, current diagnostic behavior, and planned pair strategy variants.
+14. Decide which current behavior is deleted instead of migrated.
+15. Classify existing tests as `golden`, `rewrite`, or `delete`.
 
 ## Stage 2: Architecture Authority And Model Assembly Cutover
 
@@ -611,6 +613,7 @@ Move replay projection, target construction, training adapters, and loss computa
 - Integration tests for dense, sparse, graph hybrid, and global graph training batches.
 - Code search proving the broad raw head-name loss switch is gone from trainer/runtime code.
 - Negative tests for missing required target, mask, weight, phase, duplicate rows, zero-mass policy, and pair-second wrong phase.
+- Performance smoke/profile evidence for replay projection, batch preparation, and loss computation if those hot paths materially change.
 
 ### Stop Rules
 
@@ -718,7 +721,7 @@ config can enable or disable only supported optional heads
 self-play required policy/value outputs cannot be disabled
 lookahead head families expand to concrete heads from configured horizons
 architecture defaults are resolved without mutating Config in scattered validators
-build_model_bundle returns model plus spec metadata
+model assembly returns model plus resolved metadata
 dense and global graph build through the same public assembly API
 retained hexorl/model implementation is imported only from approved recipes during cutover
 ```
@@ -1076,7 +1079,9 @@ Stop if any runtime-consumed output cannot identify its row table.
 
 ## Ready-To-Implement Decision
 
-This plan is ready to implement only after Stage 1 inventories, test trust audit, and contract decisions are complete and reviewed.
+This plan is ready to start Stage 1 now.
+
+It is not ready to start Stage 2-4 runtime cutover until Stage 1 inventories, baseline command report, test trust audit, and contract decisions are complete and reviewed.
 
 The design itself is ready as the target direction because it matches verified current seams:
 
