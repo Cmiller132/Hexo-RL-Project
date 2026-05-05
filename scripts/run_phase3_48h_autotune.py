@@ -74,6 +74,7 @@ GLOBAL_GRAPH_ARCHITECTURES = {
     "global_graph768_champion",
 }
 GLOBAL_GRAPH_PAIR_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
+LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS = 128
 
 
 HEAD_BUNDLES: dict[str, list[str]] = {
@@ -1603,7 +1604,8 @@ class Phase3Supervisor:
         )
 
     def _static_recipe_from_bohb_config(self, family: FamilySpec, config: dict[str, Any]) -> StaticRecipe:
-        full_sims = int(config.get("full_sims", 384 if family.global_graph else 256 if family.graph else 800))
+        default_global_sims = LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS if self._low_memory_cuda_host() else 384
+        full_sims = int(config.get("full_sims", default_global_sims if family.global_graph else 256 if family.graph else 800))
         full_sims = self._host_safe_full_sims(family, full_sims)
         graph_budget = int(config.get("graph_token_budget", 256))
         graph_layers = int(config.get("graph_layers", 1))
@@ -1674,9 +1676,11 @@ class Phase3Supervisor:
             if family.architecture == "global_graph_full_0":
                 token_budget = 512
                 token_set = "graph512_turn_pair_prior"
+            requested_sims = LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS if self._low_memory_cuda_host() else 384
+            full_sims = self._host_safe_full_sims(family, requested_sims)
             return StaticRecipe(
-                full_sims=self._host_safe_full_sims(family, 384),
-                pcr_low_sims=128,
+                full_sims=full_sims,
+                pcr_low_sims=self._pcr_low_sims_for_full_sims(full_sims),
                 policy_top_k=96,
                 candidate_budget=min(token_budget, 512),
                 head_bundle="graph_tactical" if pair_scout else "structural",
@@ -1733,7 +1737,7 @@ class Phase3Supervisor:
         if family.architecture == "restnet":
             return min(full_sims, 512)
         if family.global_graph:
-            return min(full_sims, 512)
+            return min(full_sims, LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS)
         return full_sims
 
     def _host_safe_train_batch_size(self, family: FamilySpec, requested: int) -> int:
@@ -1759,6 +1763,12 @@ class Phase3Supervisor:
 
     @staticmethod
     def _pcr_low_sims_for_full_sims(full_sims: int) -> int:
+        if full_sims <= 64:
+            return min(32, max(1, full_sims))
+        if full_sims <= 128:
+            return 64
+        if full_sims <= 256:
+            return 96
         if full_sims <= 512:
             return 128
         if full_sims <= 800:
