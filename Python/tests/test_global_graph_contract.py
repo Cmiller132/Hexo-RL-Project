@@ -89,8 +89,8 @@ def test_global_graph_builder_preserves_all_legal_rows():
 
 
 def test_global_graph_ipc_capacity_allows_full_legal_scout_requests():
-    assert MAX_GRAPH_TOKENS >= 1024
-    assert MAX_GRAPH_ACTIONS >= 1024
+    assert MAX_GRAPH_TOKENS >= 4096
+    assert MAX_GRAPH_ACTIONS >= 4096
 
 
 def test_global_graph_rejects_sub_rust_legal_radius():

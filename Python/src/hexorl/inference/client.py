@@ -316,21 +316,8 @@ class InferenceClient:
             MAX_GRAPH_ACTIONS,
         )
 
-        self._slot.req_graph_token_features.fill(0.0)
-        self._slot.req_graph_token_type.fill(0)
-        self._slot.req_graph_token_qr.fill(0)
-        self._slot.req_graph_token_mask.fill(0)
-        self._slot.req_graph_legal_token_indices.fill(-1)
-        self._slot.req_graph_legal_qr.fill(0)
-        self._slot.req_graph_legal_mask.fill(0)
-        self._slot.req_graph_opp_legal_qr.fill(0)
-        self._slot.req_graph_opp_legal_mask.fill(0)
-        self._slot.req_graph_pair_token_indices.fill(-1)
-        self._slot.req_graph_pair_first_indices.fill(-1)
-        self._slot.req_graph_pair_second_indices.fill(-1)
-        self._slot.req_graph_relation_type.fill(0)
-        self._slot.req_graph_relation_bias.fill(0.0)
-
+        # The server reads only the active prefixes described by req_graph_meta.
+        # Avoid clearing the full relation-capacity slot on every graph request.
         self._slot.req_graph_token_features[:token_count] = np.asarray(graph_batch.token_features, dtype=np.float32)
         self._slot.req_graph_token_type[:token_count] = np.asarray(graph_batch.token_type, dtype=np.int16)
         self._slot.req_graph_token_qr[:token_count] = np.asarray(graph_batch.token_qr, dtype=np.int32)
