@@ -30,6 +30,7 @@ STRATEGY_SCORE_MIN_EPOCHS="${STRATEGY_SCORE_MIN_EPOCHS:-8}"
 CLASSICAL_SCORE_MIN_EPOCHS="${CLASSICAL_SCORE_MIN_EPOCHS:-12}"
 EVAL_GAMES="${EVAL_GAMES:-4}"
 FINAL_EVAL_GAMES="${FINAL_EVAL_GAMES:-12}"
+FAMILY_FILTER="${FAMILY_FILTER:-}"
 
 mkdir -p "${RUN_ROOT}"
 
@@ -94,6 +95,10 @@ args=(
     --eval-games "${EVAL_GAMES}"
     --final-eval-games "${FINAL_EVAL_GAMES}"
 )
+
+if [[ -n "${FAMILY_FILTER}" ]]; then
+    args+=(--family-filter "${FAMILY_FILTER}")
+fi
 
 default_reference="runs/restnet_sparse_stage0_epoch10_stable_20260428/epoch_0010.pt"
 if [[ -f "${default_reference}" ]]; then

@@ -973,6 +973,7 @@ def test_graph_replay_can_emit_full_first_placement_pair_rows():
     assert aux["legal_qr"].shape[1] == 216
     assert aux["pair_token_indices"].shape[1] == 216 * 215 // 2
     assert aux["pair_policy_target"][0].sum() == pytest.approx(1.0)
+    assert aux["pair_second_policy_target"][0].sum() == pytest.approx(0.0)
     legal_qr = np.asarray(aux["legal_qr"][0])
     legal_mask = np.asarray(aux["legal_mask"][0], dtype=bool)
     first_row = {

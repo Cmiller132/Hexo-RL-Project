@@ -31,6 +31,13 @@ from hexorl.inference.shm_queue import (
 )
 
 
+GRAPH_HEAD_OPP = 1 << 0
+GRAPH_HEAD_PAIR_FIRST = 1 << 1
+GRAPH_HEAD_PAIR_JOINT = 1 << 2
+GRAPH_HEAD_PAIR_SECOND = 1 << 3
+GRAPH_HEAD_REGRET = 1 << 4
+
+
 def _graph_pair_request_is_second_placement(graph_inputs: dict[str, torch.Tensor]) -> bool:
     first = graph_inputs.get("pair_first_indices")
     legal = graph_inputs.get("legal_token_indices")
@@ -64,6 +71,8 @@ class InferenceServer:
         self._global_graph_mode = architecture.startswith("global_")
         required_heads = {"value"} if self._global_graph_mode else {"policy", "value"}
         missing_heads = sorted(required_heads - set(cfg.model.heads))
+        if self._global_graph_mode and not ({"policy", "policy_place"} & set(cfg.model.heads)):
+            missing_heads.append("policy_place")
         if missing_heads:
             raise ValueError(
                 "InferenceServer requires model heads for self-play inference: "
@@ -673,7 +682,15 @@ class InferenceServer:
     def _forward_graph(
         self,
         graph_inputs: dict[str, torch.Tensor],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+    ]:
         """Run the global graph model and return keyed graph logits."""
         t0 = time.monotonic()
         model_t0 = time.monotonic()
@@ -813,10 +830,19 @@ class InferenceServer:
             token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
             if legal_count > place_logits.shape[1]:
                 raise ValueError("graph place logits shorter than legal row table")
-            if legal_count and pair_first_logits is None:
-                raise ValueError("graph model did not return policy_pair_first for legal rows")
-            if pair_count and (pair_joint_logits is None or pair_second_logits is None):
-                raise ValueError("graph model did not return joint/second pair logits for a pair request")
+            if pair_count and pair_joint_logits is None and pair_second_logits is None:
+                raise ValueError("graph model did not return any pair logits for a pair request")
+            head_flags = 0
+            if opp_logits is not None:
+                head_flags |= GRAPH_HEAD_OPP
+            if pair_first_logits is not None:
+                head_flags |= GRAPH_HEAD_PAIR_FIRST
+            if pair_joint_logits is not None:
+                head_flags |= GRAPH_HEAD_PAIR_JOINT
+            if pair_second_logits is not None:
+                head_flags |= GRAPH_HEAD_PAIR_SECOND
+            if regret_rank is not None:
+                head_flags |= GRAPH_HEAD_REGRET
             slot.res_value[0] = float(values[row])
             slot.res_graph_meta[:] = (
                 GRAPH_SCHEMA_VERSION,
@@ -826,7 +852,7 @@ class InferenceServer:
                 pair_count,
                 token_count,
                 MAX_GRAPH_TOKENS,
-                MAX_GRAPH_ACTIONS,
+                head_flags,
             )
             slot.res_graph_place_logits.fill(0.0)
             slot.res_graph_opp_logits.fill(0.0)

@@ -19,6 +19,13 @@ from hexorl.inference.shm_queue import (
 )
 
 
+GRAPH_HEAD_OPP = 1 << 0
+GRAPH_HEAD_PAIR_FIRST = 1 << 1
+GRAPH_HEAD_PAIR_JOINT = 1 << 2
+GRAPH_HEAD_PAIR_SECOND = 1 << 3
+GRAPH_HEAD_REGRET = 1 << 4
+
+
 class InferenceClient:
     """Worker-side inference client.
 
@@ -365,23 +372,31 @@ class InferenceClient:
             "legal_count": int(self._slot.res_graph_meta[2]),
             "opp_legal_count": int(self._slot.res_graph_meta[3]),
             "pair_count": int(self._slot.res_graph_meta[4]),
+            "head_flags": int(self._slot.res_graph_meta[7]),
             "prior_source": "global_graph",
             "legal_qr": np.array(self._slot.req_graph_legal_qr[:legal_count], copy=True),
             "legal_mask": np.array(self._slot.req_graph_legal_mask[:legal_count].astype(bool), copy=True),
         }
-        return {
+        result: dict[str, np.ndarray | dict[str, object]] = {
             "policy_place": np.array(self._slot.res_graph_place_logits[:legal_count], copy=True),
-            "opp_policy": np.array(self._slot.res_graph_opp_logits[:opp_count], copy=True),
-            "policy_pair_first": np.array(self._slot.res_graph_pair_first_logits[:legal_count], copy=True),
-            "policy_pair_joint": np.array(self._slot.res_graph_pair_logits[:pair_count], copy=True),
-            "policy_pair_second": np.array(self._slot.res_graph_pair_second_logits[:pair_count], copy=True),
-            "regret_rank": np.array(
-                getattr(self._slot, "res_graph_regret_rank", np.zeros(1, dtype=np.float32))[:1],
-                copy=True,
-            ),
             "value": np.array(self._slot.res_value[:1], copy=True),
             "metadata": meta,
         }
+        head_flags = int(meta["head_flags"])
+        if head_flags & GRAPH_HEAD_OPP:
+            result["opp_policy"] = np.array(self._slot.res_graph_opp_logits[:opp_count], copy=True)
+        if head_flags & GRAPH_HEAD_PAIR_FIRST:
+            result["policy_pair_first"] = np.array(self._slot.res_graph_pair_first_logits[:legal_count], copy=True)
+        if head_flags & GRAPH_HEAD_PAIR_JOINT:
+            result["policy_pair_joint"] = np.array(self._slot.res_graph_pair_logits[:pair_count], copy=True)
+        if head_flags & GRAPH_HEAD_PAIR_SECOND:
+            result["policy_pair_second"] = np.array(self._slot.res_graph_pair_second_logits[:pair_count], copy=True)
+        if head_flags & GRAPH_HEAD_REGRET:
+            result["regret_rank"] = np.array(
+                getattr(self._slot, "res_graph_regret_rank", np.zeros(1, dtype=np.float32))[:1],
+                copy=True,
+            )
+        return result
 
     @property
     def avg_wait_ms(self) -> float:

@@ -162,6 +162,7 @@ class GlobalHexGraphNet(nn.Module):
         self.architecture = architecture
         self.channels = channels
         self.n_bins = n_bins
+        self._all_heads = output_heads is None
         self.head_names = set(output_heads or [])
         self.lookahead_heads = sorted(name for name in self.head_names if name.startswith("lookahead_"))
         self.input = nn.Linear(GRAPH_FEATURE_DIM, channels)
@@ -191,6 +192,19 @@ class GlobalHexGraphNet(nn.Module):
         self.policy_place = nn.Linear(channels, 1)
         self.policy_pair_first = nn.Linear(channels, 1)
         self.policy_opp = nn.Linear(channels, 1)
+        self.pair_first_refine: Optional[nn.Module] = None
+        self.pair_second_refine: Optional[nn.Module] = None
+        if architecture == "global_pair_twostage_0":
+            self.pair_first_refine = nn.Sequential(
+                nn.Linear(channels * 2, channels),
+                nn.SiLU(),
+                nn.Linear(channels, channels),
+            )
+            self.pair_second_refine = nn.Sequential(
+                nn.Linear(channels * 3, channels),
+                nn.SiLU(),
+                nn.Linear(channels, channels),
+            )
         self.pair_joint = nn.Sequential(
             nn.Linear(channels * 4, channels),
             nn.SiLU(),
@@ -217,6 +231,9 @@ class GlobalHexGraphNet(nn.Module):
             nn.Linear(channels, 6 * 33 * 33),
         )
         self.legal_token_quality = nn.Linear(channels, 1)
+
+    def _wants(self, *names: str) -> bool:
+        return self._all_heads or any(name in self.head_names for name in names)
 
     def forward(
         self,
@@ -285,31 +302,45 @@ class GlobalHexGraphNet(nn.Module):
             if crop_tensor is not None:
                 crop_context = crop_tensor.to(device=x.device, dtype=x.dtype).mean(dim=(-1, -2))
                 legal_vec = legal_vec + self.crop_context(crop_context).unsqueeze(1)
-        policy_place = self.policy_place(legal_vec).squeeze(-1).masked_fill(
-            ~legal_mask_bool,
-            -80.0,
-        )
-        out: Dict[str, torch.Tensor] = {
-            "policy_place": policy_place,
-            "policy_pair_first": self.policy_pair_first(legal_vec).squeeze(-1).masked_fill(
+        out: Dict[str, torch.Tensor] = {}
+        if self._wants("policy_place", "policy"):
+            out["policy_place"] = self.policy_place(legal_vec).squeeze(-1).masked_fill(
                 ~legal_mask_bool,
                 -80.0,
-            ),
-            "value": self.value(state),
-            "regret_rank": self.regret_rank(state),
-            "regret_value": self.regret_value(state),
-            "moves_left": self.moves_left(state),
-            "tactical": self.tactical(state),
-            "axis": self.axis(state),
-            "axis_delta_norm": self.axis_delta_norm(state).reshape(state.shape[0], 6, 33, 33),
-            "legal_token_quality": self.legal_token_quality(legal_vec).squeeze(-1).masked_fill(
+            )
+        if self._wants("policy_pair_first", "pair_policy"):
+            pair_first_vec = legal_vec
+            if self.pair_first_refine is not None:
+                state_action = state.unsqueeze(1).expand_as(legal_vec)
+                pair_first_vec = pair_first_vec + self.pair_first_refine(
+                    torch.cat([pair_first_vec, state_action], dim=-1)
+                )
+            out["policy_pair_first"] = self.policy_pair_first(pair_first_vec).squeeze(-1).masked_fill(
                 ~legal_mask_bool,
                 -80.0,
-            ),
-        }
+            )
+        if self._wants("value"):
+            out["value"] = self.value(state)
+        if self._wants("regret_rank"):
+            out["regret_rank"] = self.regret_rank(state)
+        if self._wants("regret_value"):
+            out["regret_value"] = self.regret_value(state)
+        if self._wants("moves_left"):
+            out["moves_left"] = self.moves_left(state)
+        if self._wants("tactical"):
+            out["tactical"] = self.tactical(state)
+        if self._wants("axis"):
+            out["axis"] = self.axis(state)
+        if self._wants("axis_delta_norm"):
+            out["axis_delta_norm"] = self.axis_delta_norm(state).reshape(state.shape[0], 6, 33, 33)
+        if self._wants("legal_token_quality"):
+            out["legal_token_quality"] = self.legal_token_quality(legal_vec).squeeze(-1).masked_fill(
+                ~legal_mask_bool,
+                -80.0,
+            )
         for name, head in self.lookahead.items():
             out[name] = head(state)
-        if opp_legal_qr is not None and opp_legal_mask is not None:
+        if self._wants("opp_policy") and opp_legal_qr is not None and opp_legal_mask is not None:
             if opp_legal_qr.ndim != 3 or opp_legal_qr.shape[-1] != 2:
                 raise ValueError("opp_legal_qr must have shape (B, A_opp, 2)")
             if opp_legal_mask.shape != opp_legal_qr.shape[:2]:
@@ -330,7 +361,9 @@ class GlobalHexGraphNet(nn.Module):
             )
             opp_mask = opp_legal_mask.to(device=x.device, dtype=torch.bool)
             out["opp_policy"] = self.policy_opp(opp_vec).squeeze(-1).masked_fill(~opp_mask, -80.0)
-        if pair_first_indices is not None and pair_second_indices is not None:
+        wants_joint = self._wants("policy_pair_joint", "pair_policy")
+        wants_second = self._wants("policy_pair_second", "pair_policy")
+        if (wants_joint or wants_second) and pair_first_indices is not None and pair_second_indices is not None:
             if pair_first_indices.shape != pair_second_indices.shape:
                 raise ValueError("pair_first_indices and pair_second_indices must have matching shape")
             first_raw = pair_first_indices.to(device=x.device, dtype=torch.long)
@@ -343,22 +376,55 @@ class GlobalHexGraphNet(nn.Module):
                 & (first_raw != second_raw)
             )
             if pair_token_indices is not None:
-                pair_mask = pair_mask & (pair_token_indices.to(device=x.device, dtype=torch.long) >= 0)
+                pair_token_raw = pair_token_indices.to(device=x.device, dtype=torch.long)
+                if pair_token_raw.shape != pair_first_indices.shape:
+                    raise ValueError("pair_token_indices must match pair_first_indices shape")
+                materialized_pair_token = pair_token_raw >= 0
+                pair_mask = pair_mask & (
+                    (~materialized_pair_token)
+                    | (pair_token_raw < x.shape[1])
+                )
             first = first_raw.clamp(0, max(x.shape[1] - 1, 0))
             second = second_raw.clamp(0, max(x.shape[1] - 1, 0))
             first_vec = x.gather(1, first.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             second_vec = x.gather(1, second.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             state_pair = state.unsqueeze(1).expand_as(first_vec)
-            pair_features = torch.cat(
-                [state_pair, first_vec, second_vec, (first_vec - second_vec).abs()],
-                dim=-1,
-            )
-            joint = self.pair_joint(pair_features).squeeze(-1)
-            joint = joint.masked_fill(~pair_mask, -80.0)
-            second_logits = self.pair_second(pair_features).squeeze(-1)
-            second_logits = second_logits.masked_fill(~pair_mask, -80.0)
-            out["policy_pair_joint"] = joint
-            out["policy_pair_second"] = second_logits
+            if self.pair_first_refine is not None:
+                first_joint_vec = first_vec + self.pair_first_refine(torch.cat([first_vec, state_pair], dim=-1))
+                second_joint_vec = second_vec + self.pair_first_refine(torch.cat([second_vec, state_pair], dim=-1))
+            else:
+                first_joint_vec = first_vec
+                second_joint_vec = second_vec
+            first_cond_vec = first_joint_vec
+            second_cond_vec = second_vec
+            if self.pair_second_refine is not None:
+                second_cond_vec = second_cond_vec + self.pair_second_refine(
+                    torch.cat([second_cond_vec, first_cond_vec, state_pair], dim=-1)
+                )
+            if wants_joint:
+                joint_features = torch.cat(
+                    [
+                        state_pair,
+                        first_joint_vec + second_joint_vec,
+                        (first_joint_vec - second_joint_vec).abs(),
+                        first_joint_vec * second_joint_vec,
+                    ],
+                    dim=-1,
+                )
+                joint = self.pair_joint(joint_features).squeeze(-1)
+                out["policy_pair_joint"] = joint.masked_fill(~pair_mask, -80.0)
+            if wants_second:
+                second_features = torch.cat(
+                    [
+                        state_pair,
+                        first_cond_vec,
+                        second_cond_vec,
+                        (first_cond_vec - second_cond_vec).abs(),
+                    ],
+                    dim=-1,
+                )
+                second_logits = self.pair_second(second_features).squeeze(-1)
+                out["policy_pair_second"] = second_logits.masked_fill(~pair_mask, -80.0)
         return out
 
     @staticmethod

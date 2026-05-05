@@ -911,6 +911,7 @@ class ReplayDataset(_IterableDataset):
                 "opp_policy_target": graph_batch.opp_policy_target,
                 "pair_first_policy_target": graph_batch.pair_first_policy_target,
                 "pair_policy_target": graph_batch.pair_policy_target,
+                "pair_second_policy_target": graph_batch.pair_second_policy_target,
                 "tactical_target": graph_batch.tactical_target,
             })
         return tensors, policies, values, lookahead_arrays, aux_targets

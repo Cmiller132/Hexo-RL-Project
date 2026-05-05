@@ -104,10 +104,11 @@ def _graph_batch_with_pair_rows(
     pair_count = int(pair_first_indices.shape[0])
     return replace(
         graph_batch,
-        pair_token_indices=np.zeros(pair_count, dtype=np.int64),
+        pair_token_indices=np.full(pair_count, -1, dtype=np.int64),
         pair_first_indices=np.asarray(pair_first_indices, dtype=np.int64),
         pair_second_indices=np.asarray(pair_second_indices, dtype=np.int64),
         pair_policy_target=np.zeros(pair_count, dtype=np.float32),
+        pair_second_policy_target=np.zeros(pair_count, dtype=np.float32),
     )
 
 
@@ -160,7 +161,9 @@ def _score_graph_pair_chunks(
             pair_second = legal_tokens[start:stop]
             chunk = _graph_batch_with_pair_rows(graph_batch, pair_first, pair_second)
             out = client.submit_graph(chunk)
-            logits = np.asarray(out.get("policy_pair_second", out.get("policy_pair_joint", [])), dtype=np.float32)[:width]
+            if "policy_pair_second" not in out:
+                raise ValueError("second-placement graph pair scoring requires policy_pair_second output")
+            logits = np.asarray(out["policy_pair_second"], dtype=np.float32)[:width]
             pair_qr = np.column_stack([
                 np.full(width, int(first[0]), dtype=np.int32),
                 np.full(width, int(first[1]), dtype=np.int32),
@@ -197,7 +200,9 @@ def _score_graph_pair_chunks(
                         np.asarray(second_rows, dtype=np.int64),
                     )
                     out = client.submit_graph(chunk)
-                    logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
+                    if "policy_pair_joint" not in out:
+                        raise ValueError("first-placement graph pair scoring requires policy_pair_joint output")
+                    logit_chunks.append(np.asarray(out["policy_pair_joint"], dtype=np.float32)[: len(first_rows)])
                     pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
                     first_rows.clear()
                     second_rows.clear()
@@ -209,7 +214,9 @@ def _score_graph_pair_chunks(
                 np.asarray(second_rows, dtype=np.int64),
             )
             out = client.submit_graph(chunk)
-            logit_chunks.append(np.asarray(out.get("policy_pair_joint", []), dtype=np.float32)[: len(first_rows)])
+            if "policy_pair_joint" not in out:
+                raise ValueError("first-placement graph pair scoring requires policy_pair_joint output")
+            logit_chunks.append(np.asarray(out["policy_pair_joint"], dtype=np.float32)[: len(first_rows)])
             pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
 
     if not pair_qr_chunks:

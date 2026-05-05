@@ -166,12 +166,10 @@ class TestInferenceServer(unittest.TestCase):
         self.assertTrue(np.isfinite(place).all())
         self.assertTrue(np.isfinite(values).all())
         self.assertIsNotNone(opp)
-        self.assertIsNotNone(pair_first)
-        self.assertEqual(pair_first.shape, graph.legal_mask.shape)
+        self.assertIsNone(pair_first)
         self.assertIsNotNone(pair_joint)
-        self.assertIsNotNone(pair_second)
-        self.assertIsNotNone(regret)
-        self.assertEqual(regret.shape, (1,))
+        self.assertIsNone(pair_second)
+        self.assertIsNone(regret)
 
     def test_adaptive_batching_two_clients(self):
         """Two clients submitting simultaneously get correct results."""

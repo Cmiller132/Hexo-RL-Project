@@ -437,13 +437,44 @@ def compute_losses(
                 targets["legal_mask"],
                 targets.get("pair_policy_weight", targets.get("policy_weight")),
             )
-        elif head_name in {"policy_pair_second", "policy_pair_joint"}:
-            if "pair_policy_target" not in targets or "pair_token_indices" not in targets:
+        elif head_name == "policy_pair_joint":
+            if "pair_policy_target" not in targets:
                 continue
-            pair_mask = targets["pair_token_indices"] >= 0
+            if "pair_first_indices" in targets and "pair_second_indices" in targets:
+                first = targets["pair_first_indices"]
+                second = targets["pair_second_indices"]
+                pair_mask = (first >= 0) & (second >= 0) & (first != second)
+            elif "pair_token_indices" in targets:
+                pair_mask = targets["pair_token_indices"] >= 0
+            else:
+                continue
             loss = graph_policy_loss(
                 pred,
                 targets["pair_policy_target"],
+                pair_mask,
+                targets.get("pair_policy_weight", targets.get("policy_weight")),
+            )
+        elif head_name == "policy_pair_second":
+            if "pair_second_policy_target" not in targets:
+                continue
+            if "pair_first_indices" in targets and "pair_second_indices" in targets:
+                first = targets["pair_first_indices"]
+                second = targets["pair_second_indices"]
+                pair_mask = (first >= 0) & (second >= 0) & (first != second)
+            elif "pair_token_indices" in targets:
+                pair_mask = targets["pair_token_indices"] >= 0
+            else:
+                continue
+            pair_second_target = targets["pair_second_policy_target"]
+            target_mass = (
+                pair_second_target
+                * pair_mask.to(device=pair_second_target.device, dtype=pair_second_target.dtype)
+            ).sum(dim=-1)
+            if not torch.any(target_mass > 0):
+                continue
+            loss = graph_policy_loss(
+                pred,
+                pair_second_target,
                 pair_mask,
                 targets.get("pair_policy_weight", targets.get("policy_weight")),
             )
