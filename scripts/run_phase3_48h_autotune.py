@@ -24,6 +24,7 @@ import math
 import os
 import random
 import shutil
+import signal
 import statistics
 import subprocess
 import threading
@@ -75,6 +76,11 @@ GLOBAL_GRAPH_ARCHITECTURES = {
 }
 GLOBAL_GRAPH_PAIR_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
 LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS = 128
+LOW_MEMORY_GLOBAL_GRAPH_RUNTIME_SWEEP_TIMEOUT_S = 240.0
+
+
+class RuntimeSweepTimeout(TimeoutError):
+    pass
 
 
 HEAD_BUNDLES: dict[str, list[str]] = {
@@ -1148,6 +1154,18 @@ class Phase3Supervisor:
             _append_jsonl(self.output_root / "runtime_sweep_results.jsonl", {"trial_id": trial.trial_id, "stage": stage, **row})
             if self._runtime_sweep_memory_unsafe(row):
                 memory_unsafe_worker_floor = min(memory_unsafe_worker_floor or workers, workers)
+            if self._runtime_sweep_zero_progress_timeout(row):
+                self.log.write(
+                    "runtime_sweep_remaining_candidates_skipped",
+                    {
+                        "trial_id": trial.trial_id,
+                        "stage": stage,
+                        "candidate_index": idx,
+                        "reason": "zero_progress_timeout",
+                        "skipped": max(0, len(candidates) - idx - 1),
+                    },
+                )
+                break
 
         valid = [
             row
@@ -1235,7 +1253,19 @@ class Phase3Supervisor:
         memory_thread = threading.Thread(target=poll_memory, daemon=True)
         memory_thread.start()
         started = time.monotonic()
+        timeout_s = self._runtime_sweep_timeout_s(trial, sweep_states, candidate)
+        old_alarm_handler = None
+        alarm_armed = False
+
+        def _runtime_sweep_timeout(_signum, _frame) -> None:
+            raise RuntimeSweepTimeout(f"runtime sweep exceeded {timeout_s:.0f}s")
+
         try:
+            if timeout_s > 0 and threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGALRM"):
+                old_alarm_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, _runtime_sweep_timeout)
+                signal.setitimer(signal.ITIMER_REAL, timeout_s)
+                alarm_armed = True
             result = run_epoch(
                 probe_cfg,
                 model=model,
@@ -1269,6 +1299,28 @@ class Phase3Supervisor:
                 "replay_memory": self._replay_memory_estimate(probe_buffer, trial.family),
                 "selfplay": selfplay,
             }
+        except RuntimeSweepTimeout as exc:
+            elapsed_s = time.monotonic() - started
+            gpu_after = self._nvidia_smi_snapshot()
+            mem_after = self._system_memory_snapshot()
+            memory = self._summarize_runtime_memory(mem_before, mem_after, mem_samples)
+            selfplay = _latest_metric(probe_dir / "events.jsonl", "selfplay")
+            positions = int(selfplay.get("positions_done") or 0)
+            positions_per_min = float(selfplay.get("positions_per_min") or (positions / max(elapsed_s, 1e-6) * 60.0))
+            return {
+                "ok": False,
+                "candidate": candidate,
+                "elapsed_s": elapsed_s,
+                "positions": positions,
+                "positions_per_min": positions_per_min,
+                "score": 0.0,
+                "error": f"runtime_sweep_timeout:{timeout_s:.0f}s:{exc}",
+                "gpu_before": gpu_before,
+                "gpu_after": gpu_after,
+                "memory": memory,
+                "replay_memory": self._replay_memory_estimate(probe_buffer, trial.family),
+                "selfplay": selfplay,
+            }
         except Exception as exc:
             return {
                 "ok": False,
@@ -1281,6 +1333,9 @@ class Phase3Supervisor:
                 "replay_memory": self._replay_memory_estimate(probe_buffer, trial.family),
             }
         finally:
+            if alarm_armed:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.signal(signal.SIGALRM, old_alarm_handler)
             stop_memory_poll.set()
             memory_thread.join(timeout=2.0)
             self._cleanup_shared_memory()
@@ -1354,6 +1409,14 @@ class Phase3Supervisor:
             add(max_workers, max(base_wait, 800))
         return candidates[: max(1, int(self.args.runtime_sweep_max_candidates))]
 
+    def _runtime_sweep_timeout_s(self, trial: TrialState, sweep_states: int, candidate: dict[str, int]) -> float:
+        if not (trial.family.global_graph and self._low_memory_cuda_host()):
+            return 0.0
+        worker_scale = max(1.0, float(candidate.get("workers", 1) or 1))
+        state_scale = max(1.0, float(sweep_states) / 384.0)
+        timeout_s = LOW_MEMORY_GLOBAL_GRAPH_RUNTIME_SWEEP_TIMEOUT_S * state_scale / min(worker_scale, 2.0)
+        return max(90.0, min(timeout_s, LOW_MEMORY_GLOBAL_GRAPH_RUNTIME_SWEEP_TIMEOUT_S))
+
     def _apply_runtime_candidate(self, cfg: Config, candidate: dict[str, int]) -> None:
         cfg.selfplay.num_workers = max(1, int(candidate["workers"]))
         cfg.selfplay.batch_size_per_worker = max(1, int(candidate["batch_size_per_worker"]))
@@ -1408,6 +1471,11 @@ class Phase3Supervisor:
         if not isinstance(memory, dict):
             return False
         return bool(memory.get("unsafe"))
+
+    @staticmethod
+    def _runtime_sweep_zero_progress_timeout(row: dict[str, Any]) -> bool:
+        error = str(row.get("error") or "")
+        return error.startswith("runtime_sweep_timeout:") and int(row.get("positions") or 0) <= 0
 
     def _system_memory_snapshot(self) -> dict[str, float]:
         try:
@@ -1826,6 +1894,10 @@ class Phase3Supervisor:
                     reason = "host_guard:non_graph_sparse_timeout_risk_when_graph_available_on_12gb"
                     self.blocked_families[family.name] = reason
                     object.__setattr__(family, "available", False)
+                elif family.architecture == "global_xattn_0":
+                    reason = "host_guard:global_xattn_zero_progress_calibration_on_12gb_16core"
+                    self.blocked_families[family.name] = reason
+                    object.__setattr__(family, "available", False)
 
     def _exclude_slow_latency_families_after_calibration(self, stage: str) -> None:
         rates: dict[str, float] = {}
@@ -1867,6 +1939,9 @@ class Phase3Supervisor:
             "decisive_candidate_discovery_below_gate",
             "non_finite_train_metric",
             "illegal_or_crash_rate",
+            "runtime_sweep_failed",
+            "runtime_sweep_timeout",
+            "host_guard:",
         )
         if not any(reason.startswith(prefix) for prefix in hard_reasons):
             self.log.write(
