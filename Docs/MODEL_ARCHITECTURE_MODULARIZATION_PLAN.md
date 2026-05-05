@@ -2,9 +2,11 @@
 
 ## Purpose
 
-This document is the implementation plan for replacing the fragmented model architecture logic with a clean, contract-first system under `Python/src/hexorl/models/`.
+This document is the implementation plan for replacing the fragmented model architecture logic with a clean, contract-first research system under `Python/src/hexorl/models/`.
 
-The plan is intentionally not a long wrapper migration. Current behavior will be inventoried so we know what exists, but the rewrite will intentionally keep, replace, simplify, or delete each behavior. The target is a clean two-stage cutover with no permanent old/new runtime paths.
+The plan is intentionally not a legacy-support migration. Current behavior will be inventoried so we know what exists, but the rewrite will intentionally keep, replace, simplify, or delete each behavior. Legacy checkpoint/API compatibility is out of scope. Old and dead code should be removed, not preserved.
+
+The target is a clean rewrite in four bounded stages, with temporary transition adapters allowed only when they directly support cutover evidence and are deleted before final acceptance.
 
 ## Rechecked Codebase Claims
 
@@ -26,6 +28,8 @@ The plan below was checked against the current source layout and these claims ar
 
 This is a clean rewrite, not a compatibility wrapper project.
 
+The project is an experimental RL research environment whose primary operators are the maintainer and orchestration agents. The design should optimize for research iteration, throughput, stability, readability, and easy deletion of failed experiments. It should not optimize for end-user configuration ergonomics or legacy compatibility.
+
 Inventory exists to make the rewrite intentional. It does not mean preserving every current behavior. Each current behavior must be classified as one of:
 
 ```text
@@ -42,19 +46,25 @@ The new architecture authority lives under:
 Python/src/hexorl/models/
 ```
 
-The old package remains only as temporary implementation source during the cutover:
+The old package may remain only as temporary implementation source during the cutover:
 
 ```text
 Python/src/hexorl/model/
 ```
 
-After cutover, runtime-facing code must not use `hexorl.model` as an architecture authority. It may import implementation modules only if they have been deliberately retained as low-level components.
+After cutover, `hexorl/model/` should be deleted or its retained implementation pieces should be moved into the cohesive `hexorl/models/` structure. Runtime-facing code must not use `hexorl.model` as an architecture authority.
 
 ## Design Goals
 
 - Define each architecture from one registered spec.
-- Make heads, trunks, targets, losses, masks, adapters, providers, and pair capabilities explicit.
+- Make heads, targets, losses, masks, adapters, providers, and pair capabilities explicit at semantic boundaries.
 - Make row identity first-class everywhere logits or targets are trained or consumed.
+- Require every self-play architecture to resolve a search policy capability and search value capability.
+- Forbid config overrides that disable heads required for self-play, including the value head used by MCTS.
+- Let architecture specs own default heads and supported optional heads; config may only apply explicit enable/disable overrides.
+- Support dynamic head families for parameterized heads such as `lookahead_*`, but expand them to concrete heads during spec resolution.
+- Allow cohesive model-family implementations and inline heads when that is clearer than splitting tiny modules.
+- Copy readable recipes first; extract reusable components only after repetition or coupling is real.
 - Remove raw head-name loss routing from the trainer.
 - Remove model-class and architecture-prefix runtime selection.
 - Remove pair scoring from worker branches and move it into executable pair strategies.
@@ -66,13 +76,35 @@ After cutover, runtime-facing code must not use `hexorl.model` as an architectur
 ## Non-Goals
 
 - Do not split every linear layer into a separate file just for aesthetics.
+- Do not build a general architecture framework beyond the needs of this RL system.
+- Do not add contracts for ordinary internal neural-network plumbing unless that tensor crosses a replay, training, inference, or search boundary.
 - Do not preserve silent target/loss skips as default behavior.
 - Do not add a wrapper facade that keeps current trainer, inference, and self-play behavior intact indefinitely.
 - Do not let architecture specs enable pair scoring by head presence.
 - Do not make config mutation the source of resolved model behavior.
+- Do not preserve checkpoint compatibility or old runtime APIs.
 - Do not rewrite Rust MCTS rules or legal move generation as part of this model refactor.
 
 ## Core Architecture
+
+### Modularity Rule
+
+Split semantics before splitting math.
+
+Contracts are required at boundaries where wrong assumptions can silently corrupt training or search:
+
+```text
+replay projection
+row tables
+target tensors
+model outputs
+loss plans
+inference requests/responses
+search policy/value inputs
+pair strategies
+```
+
+Contracts are not required for ordinary internal tensors, attention blocks, MLPs, or tiny projections unless those tensors cross one of these boundaries. A model implementation may be a cohesive family class if that is the clearest way to run experiments.
 
 ### ArchitectureSpec
 
@@ -80,24 +112,47 @@ After cutover, runtime-facing code must not use `hexorl.model` as an architectur
 
 ```python
 @dataclass(frozen=True)
+class SearchCapability:
+    policy_output: str
+    policy_contract: str
+    value_output: str
+    value_contract: str
+
+
+@dataclass(frozen=True)
+class PairCapability:
+    first_output: str | None
+    joint_output: str | None
+    second_output: str | None
+    supported_pair_strategies: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ArchitectureSpec:
     name: str
     version: str
     family: str
     input_contract: str
-    trunk: str
-    heads: tuple[str, ...]
-    default_trainable_heads: tuple[str, ...]
+    recipe: str
+    default_heads: tuple[str, ...]
+    supported_optional_heads: tuple[str, ...]
+    head_families: tuple[str, ...]
+    required_selfplay_heads: tuple[str, ...]
+    search: SearchCapability
+    pair: PairCapability | None
     target_adapter: str
     training_adapter: str
     inference_adapter: str
     policy_provider: str
-    supported_pair_strategies: tuple[str, ...]
     config_schema: str
     telemetry_contract: str
 ```
 
-A spec defines what the architecture is allowed to do. It does not directly decide whether pair outputs affect MCTS. That remains the job of `PairStrategySpec`.
+A spec defines what the architecture is allowed to do and which default heads it should build. It does not directly decide whether pair outputs affect MCTS. That remains the job of `PairStrategySpec`.
+
+All current and future self-play architectures must resolve a `SearchCapability`. A dense model may use `policy` over `dense_board_rows`; a global graph model may use `policy_place` over `legal_action_rows`; a future model may use a scalar or binned value contract. The search pipeline consumes capabilities, not raw head names.
+
+Config may enable or disable supported optional heads, but it may not disable `required_selfplay_heads` when self-play is enabled. Disabling the value head or the search policy head is a hard configuration error.
 
 ### HeadSpec
 
@@ -107,10 +162,11 @@ A spec defines what the architecture is allowed to do. It does not directly deci
 @dataclass(frozen=True)
 class HeadSpec:
     name: str
-    module: str
+    implementation: str | None
     input_slot: str
     output_name: str
     output_contract: str
+    usage: str
     trainable: bool
     target_contract: str | None
     mask_contract: str | None
@@ -120,6 +176,19 @@ class HeadSpec:
     runtime_consumers: tuple[str, ...]
     missing_target_policy: str
 ```
+
+`implementation` is optional because research models may implement a head inline inside a cohesive family class. `HeadSpec` primarily owns semantics: output contract, row table, target, loss, phase, and runtime consumers.
+
+Allowed `usage` values:
+
+```text
+trainable
+runtime_consumed
+diagnostic
+internal_debug
+```
+
+Every output returned from `model.forward` must be declared. Diagnostic outputs are allowed, but they cannot affect losses, inference, search, or pair strategies unless promoted to a trainable or runtime-consumed head.
 
 Allowed `missing_target_policy` values:
 
@@ -131,21 +200,50 @@ not_trainable
 
 Default for trainable heads is `error`. Current silent skips should be removed unless a head is explicitly optional and non-required for that architecture.
 
-### TrunkSpec
+### HeadFamilySpec
 
-`TrunkSpec` defines reusable representation builders.
+`HeadFamilySpec` covers parameterized heads whose semantics are identical except for an explicit parameter. The immediate known case is `lookahead_*`.
 
 ```python
 @dataclass(frozen=True)
-class TrunkSpec:
+class HeadFamilySpec:
+    family: str
+    name_pattern: str
+    params_from_config: str
+    output_contract: str
+    target_contract_pattern: str
+    loss: str
+    trainable: bool
+    semantic_phase: str
+```
+
+Head families are expanded during architecture resolution. After resolution, training, inference, tests, and audits see concrete heads such as:
+
+```text
+lookahead_4
+lookahead_8
+lookahead_16
+```
+
+Head families should be used only when the output, loss, target, and mask semantics are the same except for the named parameter. Other experimental heads should be explicit.
+
+### Recipes And Components
+
+Architecture recipes are readable Python assembly functions. They may build a cohesive family class, compose shared components, or mix both approaches.
+
+Reusable components are optional. Add them when they remove real duplication or make a family easier to modify. Do not require every architecture to be decomposed into a fixed trunk/head hierarchy.
+
+```python
+@dataclass(frozen=True)
+class ComponentSpec:
     name: str
-    module: str
-    input_contract: str
+    implementation: str
+    input_contract: str | None
     output_slots: tuple[str, ...]
     required_features: tuple[str, ...]
 ```
 
-Example output slots:
+Example output slots when a component boundary is useful:
 
 ```text
 board_features
@@ -327,30 +425,22 @@ Python/src/hexorl/models/
   assembly.py
   bundles.py
   validation.py
-  configs.py
-  specs/
+  recipes/
     dense.py
     restnet.py
     graph_hybrid.py
     global_graph.py
-  trunks/
-    cnn.py
-    residual.py
-    graph_tokens.py
-    relation_graph.py
-    cross_attention_graph.py
-  heads/
-    dense_policy.py
-    sparse_policy.py
-    graph_policy.py
-    pair_first.py
-    pair_joint.py
-    pair_second.py
-    value.py
-    opponent_policy.py
-    tactical.py
-    regret.py
-    lookahead.py
+  families/
+    dense_cnn.py
+    restnet.py
+    graph_hybrid.py
+    global_graph.py
+  components/
+    conv_blocks.py
+    attention_blocks.py
+    graph_blocks.py
+    heads.py
+    pair_heads.py
   training/
     adapters.py
     loss_plan.py
@@ -361,16 +451,13 @@ Python/src/hexorl/contracts/
   __init__.py
   rows.py
   targets.py
-  tensors.py
+  outputs.py
   hashes.py
-  schemas.py
   phases.py
-  traces.py
 
 Python/src/hexorl/inference/
   protocol.py
-  manifests.py
-  transports.py
+  transport_shm.py
   adapters/
     dense.py
     sparse.py
@@ -389,6 +476,8 @@ Python/src/hexorl/replay/
   target_builders.py
   training_batch.py
 ```
+
+This layout is intentionally lean. `families/` contains cohesive PyTorch implementations. `components/` contains shared blocks only when reuse is real. `recipes/` contains readable Python assembly for each architecture family. Boilerplate in specs is acceptable when it makes an experiment easy to audit.
 
 ## Current Behavior Inventory Required Before Cutover
 
@@ -482,6 +571,21 @@ new provider or strategy
 old branch to delete
 ```
 
+### Test Trust Audit
+
+For each existing model, graph, replay, training, inference, and self-play test:
+
+```text
+test path
+behavior claimed
+actual code boundary covered
+classification: golden, rewrite, delete
+known blind spots
+new contract test replacing or extending it
+```
+
+The current codebase is a rough WIP, so existing tests are not automatically acceptance evidence. They become evidence only after this audit classifies them as trusted or replaces them with clearer contract tests.
+
 ## Why A Rewrite Is Hard But Manageable
 
 The rewrite is not hard because PyTorch modules are hard. It is hard because semantics are distributed.
@@ -509,48 +613,68 @@ vertical cutover
 old branch deletion
 ```
 
-## Two-Stage Implementation Plan
+## Improvement Proof
 
-This rewrite has exactly two stages.
+This refactor is only an improvement if it removes real failure modes and makes experiments easier to add.
 
-Stage 1 does not install permanent wrappers. It locks design, inventory, and test evidence.
+Required proof:
 
-Stage 2 performs the clean implementation cutover and deletes old scattered logic.
+```text
+deletion proof: scattered architecture lists, raw loss switches, direct pair-head worker checks, and graph inference decode branches are gone
+bug-class proof: row mismatch, phase mismatch, missing target, disabled self-play value, and pair-head-without-strategy failures become hard errors
+experiment proof: adding a new model touches a predictable recipe/spec/adapter/test surface instead of trainer, inference server, config validators, buffer sampler, and worker branches
+throughput proof: training/inference hot paths are benchmarked or smoke-profiled when protocol packing or batch preparation changes
+```
 
-## Stage 1: Design Lock, Inventory, And Golden Tests
+Contracts should be evaluated by this standard. If a proposed contract does not prevent a real silent failure, simplify model addition, or support deletion of scattered runtime authority, it should not be added.
+
+## Four-Stage Implementation Plan
+
+This rewrite has exactly four stages.
+
+Four stages keeps the rewrite clean without turning it into a long compatibility migration. Each stage must close a real boundary and delete or quarantine obsolete behavior before moving on.
+
+Temporary transition adapters are allowed only inside an active stage and only when they directly support evidence for the next deletion. They are not an accepted end state.
+
+## Stage 1: Inventory, Test Trust Audit, And Contract Design
 
 ### Goal
 
-Create the exact implementation blueprint and proof harness needed to rewrite cleanly without preserving accidental complexity.
+Create the exact implementation blueprint and proof harness needed to rewrite cleanly without preserving accidental complexity or assuming the current tests are already correct.
 
 ### Success Criteria
 
 - `hexorl/models/` is selected as the new architecture authority.
 - Current architecture, head/loss, target, inference, and runtime behavior is inventoried.
 - Each inventory row has a keep/replace/simplify/delete/move decision.
+- Existing tests are classified as `golden`, `rewrite`, or `delete`.
 - Row table and target contracts are designed before model code is moved.
-- Golden tests capture rules that must survive the rewrite.
+- Golden tests capture rules that must survive the rewrite, including tests newly added for bug classes the current code can miss.
 - Silent loss skips and fallback aliases are classified for removal or explicit retention.
 - Shared-memory constraints are represented as transport constraints, not output semantics.
 - Pair strategies are specified as executable runtime plans.
+- Config override behavior is locked: architecture specs own defaults, config may enable/disable supported optional heads, and self-play required heads cannot be disabled.
+- Dynamic head-family behavior is locked for `lookahead_*` and any future parameterized head families.
 
 ### Constraints
 
 - Do not add permanent runtime wrappers.
-- Do not introduce a second runtime path that remains after Stage 2.
-- Do not physically split trunks and heads until contracts and specs are locked.
-- Do not claim a behavior is preserved unless a golden test covers it.
+- Do not introduce a second runtime path that remains after the stage that created it.
+- Do not physically split model internals until contracts and specs are locked.
+- Do not claim a behavior is preserved unless a trusted golden test or newly added replacement test covers it.
 - Do not use architecture name prefixes as a future behavior mechanism.
+- Do not add contracts for internal neural tensors that do not cross replay, training, inference, or search boundaries.
 
 ### Required Evidence
 
-- `Docs/refactor/artifacts/model_architecture/architecture_inventory.md`
-- `Docs/refactor/artifacts/model_architecture/head_loss_inventory.md`
-- `Docs/refactor/artifacts/model_architecture/target_inventory.md`
-- `Docs/refactor/artifacts/model_architecture/inference_inventory.md`
-- `Docs/refactor/artifacts/model_architecture/runtime_inventory.md`
+- `Docs/artifacts/model_architecture/architecture_inventory.md`
+- `Docs/artifacts/model_architecture/head_loss_inventory.md`
+- `Docs/artifacts/model_architecture/target_inventory.md`
+- `Docs/artifacts/model_architecture/inference_inventory.md`
+- `Docs/artifacts/model_architecture/runtime_inventory.md`
+- `Docs/artifacts/model_architecture/test_trust_audit.md`
 - Contract draft files or design notes for row tables, targets, inference protocol, and pair strategies.
-- Golden test list with exact existing tests to keep and new tests to add.
+- Golden test list with exact existing tests to keep, existing tests to rewrite, existing tests to delete, and new tests to add.
 
 ### Stop Rules
 
@@ -558,69 +682,134 @@ Create the exact implementation blueprint and proof harness needed to rewrite cl
 - Stop if a runtime-consumed output cannot be tied to a row table.
 - Stop if shared-memory transport cannot carry required contract identity without a schema change.
 - Stop if pair strategy behavior cannot be separated from architecture capability.
+- Stop if policy/value self-play capability cannot be represented without hard-coded model-class checks.
 
 ### Stage 1 Work Items
 
-1. Create model architecture inventories under `Docs/refactor/artifacts/model_architecture/`.
+1. Create model architecture inventories under `Docs/artifacts/model_architecture/`.
 2. Define semantic phases in `contracts/phases.py` design notes.
 3. Define row contracts for dense, candidate, legal, opponent legal, pair joint, and known-first rows.
 4. Define target contracts for dense policy, sparse policy, graph policy, pair first, pair joint, pair second, opponent policy, value, tactical, regret, and lookahead.
 5. Define architecture specs for current dense CNN, RestNet, graph hybrid, sparse policy, global graph, global x-attn, global pair two-stage, global full graph, and champion graph families.
 6. Define head specs for all current heads that remain supported.
-7. Define loss plan entries for all trainable heads and mark silent skip behavior for removal unless explicitly optional.
-8. Define inference protocol fields and shared-memory transport mapping.
-9. Define `PairStrategySpec` entries for `none`, `two_stage_root_only`, `tactical_only`, and `diagnostic_full_root`.
-10. Decide which current behavior is deleted instead of migrated.
+7. Define `HeadFamilySpec` expansion for `lookahead_*` from configured horizons.
+8. Define search policy/value capabilities for every self-play architecture.
+9. Define loss plan entries for all trainable heads and mark silent skip behavior for removal unless explicitly optional.
+10. Define inference protocol fields and shared-memory transport mapping.
+11. Define `PairStrategySpec` entries for `none`, current diagnostic behavior, and planned pair strategy variants.
+12. Decide which current behavior is deleted instead of migrated.
+13. Classify existing tests as `golden`, `rewrite`, or `delete`.
 
-## Stage 2: Clean Cutover Implementation
+## Stage 2: Architecture Authority And Model Assembly Cutover
 
 ### Goal
 
-Implement the new modular architecture system and delete old scattered model behavior in one clean cutover.
+Implement `hexorl/models/` as the single architecture authority and make model assembly flow through registered specs, recipes, and bundles.
 
 ### Success Criteria
 
 - `hexorl/models/` is the architecture authority.
 - `build_model_from_config` delegates to `hexorl.models.assembly` or is replaced by it.
 - Model construction uses registered `ArchitectureSpec` and returns `ModelBundle`.
-- Trainer uses `TrainingAdapter` and `LossPlan`, not raw head-name loss routing.
-- Target construction uses `TargetContract` and row table contracts.
-- Inference uses protocol/adapters and treats shared memory as transport.
-- Self-play and evaluation use `PolicyProvider`, `PairStrategy`, and `EngineAdapter` boundaries.
-- Config no longer owns architecture default expansion or graph-family capability rules.
+- Architecture specs own default heads, supported optional heads, head families, self-play required heads, and adapter selections.
+- Config can enable or disable supported optional heads, but cannot disable required self-play heads.
+- `lookahead_*` and future dynamic head families are expanded to concrete heads during architecture resolution.
+- All current self-play architectures resolve a search policy capability and search value capability.
 - Old architecture-name lists are removed from config, buffer, and model implementation where they are behavior authority.
-- Old direct pair-head MCTS consumption is removed from self-play worker.
-- Old graph-specific inference head decode branches are removed from server/client hot logic and replaced by adapters.
+- Existing PyTorch implementations may be temporarily retained only as implementation modules called by new recipes.
 
 ### Constraints
 
 - No permanent compatibility facade.
-- No old/new runtime behavior remains active together after cutover.
-- No pair scoring from head presence.
-- No trainable head silently skips missing target or mask.
-- No model output reaches MCTS without row contract validation.
-- Shared-memory performance constraints must be preserved or measured.
+- No checkpoint compatibility work.
+- No config mutation that derives architecture behavior outside spec resolution.
+- Do not split PyTorch internals unless the split makes experimentation clearer or removes real coupling.
 
 ### Required Evidence
 
-- Unit tests for architecture registry, head specs, loss plans, target contracts, row contracts, inference adapters, policy providers, pair strategies, and engine adapter inputs.
+- Unit tests for architecture registry, spec resolution, head-family expansion, config enable/disable overrides, and self-play required-head protection.
+- Assembly tests for dense, RestNet, graph hybrid, and global graph bundles.
+- Code search proving architecture membership is no longer duplicated as runtime authority outside the registry.
+
+### Stop Rules
+
+- Stop if any current architecture cannot resolve through `hexorl/models/`.
+- Stop if config still mutates resolved loss/head behavior in place of architecture specs.
+- Stop if a self-play config can disable its policy or value capability.
+
+## Stage 3: Training And Replay Cutover
+
+### Goal
+
+Move replay projection, target construction, training adapters, and loss computation behind contracts.
+
+### Success Criteria
+
+- Trainer uses `TrainingAdapter` and `LossPlan`, not raw head-name loss routing.
+- Target construction uses `TargetContract` and row table contracts.
+- Trainable heads fail loudly when required targets, masks, weights, or phases are missing.
+- Silent loss skips and fallback aliases are deleted unless explicitly represented as optional non-trainable behavior.
+- Dense, sparse, graph hybrid, and global graph batches train through the same public trainer flow.
+- Global graph training cannot accidentally consume dense policy fields.
+
+### Constraints
+
+- No trainable head silently skips missing target or mask.
+- No model output reaches loss computation without output contract validation.
+- No synthetic fallback target should be kept unless Stage 1 explicitly classifies it as required.
+
+### Required Evidence
+
+- Unit tests for row contracts, target contracts, loss plans, training adapters, and missing-target failures.
 - Integration tests for dense, sparse, graph hybrid, and global graph training batches.
-- Inference adapter round-trip tests for dense and global graph requests.
-- Self-play/provider tests proving pair strategy controls pair behavior.
-- Code search proving removed behavior branches are gone.
-- Performance smoke evidence for inference shared-memory transport if protocol packing changes.
+- Code search proving the broad raw head-name loss switch is gone from trainer/runtime code.
 
 ### Stop Rules
 
 - Stop if dense, graph hybrid, or global graph cannot train through the new trainer adapter.
+- Stop if a runtime-consumed or trainable output cannot identify its row table.
+- Stop if pair-second loss can run outside the known-first phase.
+
+## Stage 4: Inference, Search, Pair Strategies, And Legacy Deletion
+
+### Goal
+
+Move inference and search runtime behavior to protocol/adapters/providers/strategies, then delete old scattered runtime authority.
+
+### Success Criteria
+
+- Inference uses protocol/adapters and treats shared memory as transport.
+- Self-play and evaluation use `PolicyProvider`, `PairStrategy`, and `EngineAdapter` boundaries.
+- Pair behavior is impossible without an explicit pair strategy.
+- Pair strategy owns pair row generation, scoring caps, phases, blending, and fallback behavior.
+- Old direct pair-head MCTS consumption is removed from self-play worker.
+- Old graph-specific inference head decode branches are removed from server/client hot logic and replaced by adapters.
+- `hexorl/model/` is deleted or fully moved into `hexorl/models/`.
+
+### Constraints
+
+- No pair scoring from head presence.
+- No model output reaches MCTS without row contract validation.
+- Shared-memory throughput and latency must be preserved or measured before protocol packing changes are accepted.
+- No old/new runtime behavior remains active together after final cutover.
+
+### Required Evidence
+
+- Inference adapter round-trip tests for dense and global graph requests.
+- Self-play/provider tests proving pair strategy controls pair behavior.
+- Engine adapter tests proving unmapped policy/value outputs are rejected.
+- Performance smoke evidence for inference shared-memory transport if protocol packing changes.
+- Code search proving removed behavior branches are gone.
+
+### Stop Rules
+
 - Stop if inference cannot map policy outputs to row contracts.
 - Stop if self-play still directly checks pair output head names outside pair strategies.
-- Stop if config still mutates resolved loss/head behavior in place of architecture specs.
 - Stop if any old direct branch remains and has no deletion ticket or explicit quarantine record.
 
-## Stage 2 Implementation Work Breakdown
+## Stage Work Breakdown
 
-### 2.1 Contracts
+### 1.1 Contracts And Test Trust Audit
 
 Create `hexorl/contracts/`.
 
@@ -629,11 +818,9 @@ Required modules:
 ```text
 rows.py
 targets.py
-tensors.py
+outputs.py
 hashes.py
-schemas.py
 phases.py
-traces.py
 ```
 
 Implement:
@@ -641,11 +828,10 @@ Implement:
 ```text
 RowTableContract
 TargetContract
-TensorContract
-ContractTrace
+OutputContract
 stable row hash helpers
 semantic phase constants
-schema version constants
+test trust audit artifact
 ```
 
 Acceptance criteria:
@@ -653,11 +839,12 @@ Acceptance criteria:
 ```text
 row contracts can hash legal_qr and pair rows
 target contracts reject mismatched row hashes
-tensor contracts validate shape, dtype, device-neutral metadata
+output contracts validate shape, dtype, row count, semantic phase, and row table identity
 semantic phases cover first-placement, second-placement known-first, any-position, auxiliary-only
+existing tests are classified as golden, rewrite, or delete before they are used as acceptance evidence
 ```
 
-### 2.2 Model Specs And Assembly
+### 2.1 Model Specs And Assembly
 
 Create `hexorl/models/`.
 
@@ -669,7 +856,9 @@ specs.py
 assembly.py
 bundles.py
 validation.py
-configs.py
+recipes/
+families/
+components/
 ```
 
 Implement:
@@ -677,12 +866,16 @@ Implement:
 ```text
 ArchitectureSpec
 HeadSpec
-TrunkSpec
+HeadFamilySpec
 OutputContract
+SearchCapability
+PairCapability
 ModelBundle
 ArchitectureRegistry
 build_model_bundle
 validate_architecture_request
+resolve_head_overrides
+expand_head_families
 ```
 
 Initial assembly can instantiate retained implementation modules, but architecture authority must come from `hexorl/models/`.
@@ -692,27 +885,31 @@ Acceptance criteria:
 ```text
 all current architecture ids resolve through registry
 unsupported heads fail at spec resolution
+config can enable or disable only supported optional heads
+self-play required policy/value heads cannot be disabled
+lookahead head families expand to concrete heads from configured horizons
 architecture defaults are resolved without mutating Config in scattered validators
 build_model_bundle returns model plus spec metadata
 dense and global graph build through the same public assembly API
 ```
 
-### 2.3 Heads And Trunks
+### 2.2 Model Families And Components
 
-Create reusable modules only where they reduce real coupling.
+Create reusable modules only where they reduce real coupling. A family implementation may keep inline heads when that is the clearest way to express an experiment.
 
 Minimum cutover:
 
 ```text
-existing HexNet and GlobalHexGraphNet behavior may be ported or retained as trunk modules
-new head modules should be split when head semantics need separate specs or masks
+existing HexNet and GlobalHexGraphNet behavior may be ported or temporarily retained as implementation modules
+current implementations should move under hexorl/models/families or be deleted
+new component modules should be split when reuse is real or semantics need separate specs or masks
 ```
 
 Preferred end state:
 
 ```text
-trunks own representations
-heads own small output projections
+families own cohesive PyTorch model implementations
+components own shared blocks only when reuse is real
 HeadSpec owns semantics
 ArchitectureSpec owns composition
 ```
@@ -722,11 +919,62 @@ Acceptance criteria:
 ```text
 model forward emits outputs declared by architecture spec
 optional heads are requested through specs, not scattered string checks
+diagnostic outputs are declared and cannot affect search or loss unless promoted
 pair head masks are phase-aware
 output contracts validate shape and row count
 ```
 
-### 2.4 Targets And Replay Projection
+### 2.3 Config Resolution
+
+Move architecture behavior resolution out of config mutation.
+
+Config should keep:
+
+```text
+syntax validation
+range validation
+type validation
+obvious local invariants
+```
+
+Architecture registry should own:
+
+```text
+architecture membership
+supported heads
+default heads
+supported optional heads
+required self-play heads
+head family expansion
+default loss plan
+supported input contracts
+supported pair strategies
+adapter/provider selection
+```
+
+Config uses spec-owned defaults plus explicit overrides:
+
+```text
+architecture spec default heads
+-> config enable_head overrides
+-> config disable_head overrides
+-> head family expansion
+-> self-play capability validation
+-> resolved ModelBundle
+```
+
+Config may enable or disable supported optional heads. It may not invent new architecture behavior, request unsupported heads, or disable heads required by the self-play capability. Disabling the value head or search policy head for a self-play architecture is a hard error.
+
+Acceptance criteria:
+
+```text
+Config no longer duplicates graph architecture membership lists
+resolved model/loss behavior comes from registry
+invalid head/architecture combinations fail during spec resolution with clear errors
+invalid self-play capability overrides fail during spec resolution with clear errors
+```
+
+### 3.1 Targets And Replay Projection
 
 Create `hexorl/replay/` modules for projection and training batch conversion.
 
@@ -752,7 +1000,7 @@ illegal target rows fail before tensors reach trainer
 global graph training does not accidentally consume dense policy fields
 ```
 
-### 2.5 Training Adapter And Loss Plan
+### 3.2 Training Adapter And Loss Plan
 
 Create `hexorl/models/training/`.
 
@@ -798,7 +1046,7 @@ loss weights come from resolved loss plan
 pair-second loss only runs in known-first phase
 ```
 
-### 2.6 Inference Protocol And Adapters
+### 4.1 Inference Protocol And Adapters
 
 Create protocol and adapters under `hexorl/inference/`.
 
@@ -806,7 +1054,7 @@ Required modules:
 
 ```text
 protocol.py
-transports.py
+transport_shm.py
 adapters/dense.py
 adapters/sparse.py
 adapters/graph_hybrid.py
@@ -838,7 +1086,7 @@ client receives decoded response metadata rather than inferring semantics from a
 existing shm arrays are either preserved with contract metadata or replaced with measured equivalent transport
 ```
 
-### 2.7 Policy Providers, Pair Strategies, Engine Adapter
+### 4.2 Policy Providers, Pair Strategies, Engine Adapter
 
 Create `hexorl/search/`.
 
@@ -873,40 +1121,7 @@ worker no longer directly checks pair head names
 leaf pair scoring is disabled unless strategy explicitly enables it and tests prove validity
 ```
 
-### 2.8 Config Resolution
-
-Move architecture behavior resolution out of config mutation.
-
-Config should keep:
-
-```text
-syntax validation
-range validation
-type validation
-obvious local invariants
-```
-
-Architecture registry should own:
-
-```text
-architecture membership
-supported heads
-default heads
-default loss plan
-supported input contracts
-supported pair strategies
-adapter/provider selection
-```
-
-Acceptance criteria:
-
-```text
-Config no longer duplicates graph architecture membership lists
-resolved model/loss behavior comes from registry
-invalid head/architecture combinations fail during spec resolution with clear errors
-```
-
-### 2.9 Legacy Deletion
+### 4.3 Legacy Deletion
 
 Delete or quarantine old behavior after new path owns the boundary.
 
@@ -948,6 +1163,11 @@ test_every_supported_head_declares_output_contract
 test_every_trainable_head_declares_target_mask_loss_phase
 test_invalid_head_for_architecture_fails_spec_resolution
 test_pair_capable_architecture_does_not_enable_pair_strategy
+test_config_can_enable_supported_optional_head
+test_config_can_disable_supported_optional_head
+test_config_cannot_disable_selfplay_policy_or_value_head
+test_lookahead_head_family_expands_from_configured_horizons
+test_diagnostic_output_must_be_declared
 ```
 
 ### Assembly Tests
@@ -996,11 +1216,21 @@ test_shared_memory_transport_preserves_contract_metadata
 ```text
 test_policy_provider_maps_dense_policy_to_legal_rows
 test_global_graph_provider_maps_logits_to_rust_legal_rows
+test_selfplay_architecture_requires_search_policy_and_value_capabilities
 test_pair_strategy_none_scores_zero_pairs
 test_pair_head_presence_does_not_enable_pair_scoring
 test_pair_strategy_declares_required_heads_and_caps
 test_worker_does_not_directly_consume_pair_head_names
 test_engine_adapter_rejects_unmapped_policy_output
+```
+
+### Test Trust Audit
+
+```text
+test_existing_global_graph_tests_are_classified
+test_existing_training_tests_are_classified
+test_existing_inference_tests_are_classified
+test_existing_selfplay_tests_are_classified
 ```
 
 ### Audit Commands
@@ -1048,12 +1278,16 @@ Stop if any runtime-consumed output cannot identify its row table.
 ## Final Acceptance Checklist
 
 - `hexorl/models/` owns architecture specs, assembly, model bundles, head specs, and loss plans.
-- `hexorl/contracts/` owns row, tensor, target, schema, phase, and trace contracts.
+- `hexorl/models/` owns spec-defined default heads, optional head overrides, self-play required heads, and dynamic head-family expansion.
+- `hexorl/contracts/` owns row, target, output, hash, and phase contracts.
 - `hexorl/replay/` owns replay projection and training batch conversion.
 - `hexorl/inference/` owns protocol, adapters, and transport mapping.
 - `hexorl/search/` owns policy providers, pair strategies, and engine adapter boundaries.
-- `hexorl/model/` is no longer runtime architecture authority.
+- `hexorl/model/` is deleted or fully moved into the cohesive `hexorl/models/` structure.
 - Config validation no longer mutates or derives architecture behavior that belongs to specs.
+- Config can enable/disable supported optional heads but cannot disable the self-play search policy or value capability.
+- Dynamic heads such as `lookahead_*` resolve from head families to concrete heads before training/inference.
+- Diagnostic outputs are allowed only when declared and cannot affect loss/search unless promoted.
 - Trainer has no broad raw head-name loss switch.
 - Inference server does not interpret graph pair heads directly.
 - Self-play worker does not directly consume pair output head names.
@@ -1062,10 +1296,11 @@ Stop if any runtime-consumed output cannot identify its row table.
 - Every trainable head has explicit target, mask, loss, weight, and semantic phase.
 - Missing trainable target or mask fails loudly.
 - Old scattered branches are deleted or quarantined with explicit owner and removal evidence.
+- No legacy checkpoint/API compatibility path remains.
 
 ## Ready-To-Implement Decision
 
-This plan is ready to implement only after Stage 1 inventories are complete and reviewed.
+This plan is ready to implement only after Stage 1 inventories, test trust audit, and contract decisions are complete and reviewed.
 
 The design itself is ready as the target direction because it matches verified current seams:
 
@@ -1077,6 +1312,9 @@ shm head flags -> inference protocol plus shm transport
 worker pair branches -> pair strategies and engine adapter
 config architecture behavior -> registry resolution
 row/logit mismatch risk -> row table contracts
+config head mutation -> spec-owned defaults plus explicit overrides
+dynamic lookahead heads -> resolved head families
+self-play assumptions -> search policy/value capabilities
 ```
 
-The implementation should not begin by wrapping the current system. It should begin by locking the inventories and golden tests, then cut over cleanly in Stage 2.
+The implementation should not begin by wrapping the current system. It should begin by locking inventories, classifying tests, and writing boundary contracts. Each later stage should make one boundary authoritative, prove it with tests/audits/performance evidence, and delete the old path before moving on.
