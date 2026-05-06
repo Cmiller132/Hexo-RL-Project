@@ -202,6 +202,55 @@ def _sparse_dense_disagreement(
     return 0.0 if dense_best == sparse_best else 1.0
 
 
+def _expand_crop_root_with_optional_sparse(
+    engine,
+    adapter: EngineAdapter,
+    policy: np.ndarray,
+    value: float,
+    offset_q: int,
+    offset_r: int,
+    legal_bytes: bytes,
+    root_generation: int,
+    legal: np.ndarray,
+    sparse_qr: np.ndarray,
+    sparse_logits: np.ndarray,
+    *,
+    sparse_root_active: bool,
+    sparse_prior_stage: int,
+    sparse_prior_mix: float,
+) -> None:
+    if sparse_root_active:
+        root_value = adapter.validate_value(
+            float(value),
+            context="sparse root inference",
+        )
+        engine.expand_root_with_sparse_priors(
+            policy,
+            root_value,
+            offset_q,
+            offset_r,
+            legal_bytes,
+            root_generation,
+            np.asarray(sparse_qr, dtype=np.int32).reshape(-1, 2),
+            np.asarray(sparse_logits, dtype=np.float32).reshape(-1),
+            int(sparse_prior_stage),
+            float(sparse_prior_mix),
+        )
+        return
+
+    adapter.validate_dense_offset_mapping(
+        legal,
+        offset_q,
+        offset_r,
+        context="dense root inference",
+    )
+    root_value = adapter.validate_value(
+        float(value),
+        context="dense root inference",
+    )
+    engine.expand_root(policy, root_value, offset_q, offset_r, legal_bytes, root_generation)
+
+
 def _read_int_attr(obj, name: str, default: int) -> int:
     value = getattr(obj, name, default)
     if callable(value):
@@ -1298,21 +1347,13 @@ class SelfPlayWorker:
                                     placements_remaining=root_placements_remaining,
                                 )
                     else:
-                        use_action_keyed_root = (
-                            (self.sparse_policy_enabled and self.sparse_prior_stage > 0)
-                            or self.pair_policy_enabled
-                        )
+                        sparse_root_active = self.sparse_policy_enabled and self.sparse_prior_stage > 0
+                        use_action_keyed_root = sparse_root_active or self.pair_policy_enabled
                         if use_action_keyed_root:
                             legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
                             self._engine_adapter.validate_legal_bytes_alignment(
                                 legal,
                                 legal_bytes,
-                                context="dense root inference",
-                            )
-                            self._engine_adapter.validate_dense_offset_mapping(
-                                legal,
-                                offset_q,
-                                offset_r,
                                 context="dense root inference",
                             )
                             winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
@@ -1371,12 +1412,21 @@ class SelfPlayWorker:
                             sparse_prior_candidate_build_ms += (time.monotonic() - t_build) * 1000.0
                             if active_width <= 0:
                                 p, v = client.submit(root_tensor, 1)
-                                root_value = self._engine_adapter.validate_value(
+                                _expand_crop_root_with_optional_sparse(
+                                    engine,
+                                    self._engine_adapter,
+                                    p,
                                     float(v[0]),
-                                    context="dense root inference",
-                                )
-                                engine.expand_root(
-                                    p, root_value, offset_q, offset_r, legal_bytes, root_generation
+                                    offset_q,
+                                    offset_r,
+                                    legal_bytes,
+                                    root_generation,
+                                    legal,
+                                    np.zeros((0, 2), dtype=np.int32),
+                                    np.zeros(0, dtype=np.float32),
+                                    sparse_root_active=sparse_root_active,
+                                    sparse_prior_stage=self.sparse_prior_stage,
+                                    sparse_prior_mix=self.sparse_prior_mix,
                                 )
                             else:
                                 root_candidate_qr = cand.qr[active_rows]
@@ -1401,29 +1451,22 @@ class SelfPlayWorker:
                                     int(offset_q),
                                     int(offset_r),
                                 )
-                                if self.sparse_policy_enabled and self.sparse_prior_stage > 0:
-                                    root_value = self._engine_adapter.validate_value(
-                                        float(v[0]),
-                                        context="sparse root inference",
-                                    )
-                                    engine.expand_root_with_sparse_priors(
-                                        p,
-                                        root_value,
-                                        offset_q,
-                                        offset_r,
-                                        legal_bytes,
-                                        root_generation,
-                                        root_candidate_qr,
-                                        root_sparse_logits,
-                                        self.sparse_prior_stage,
-                                        self.sparse_prior_mix,
-                                    )
-                                else:
-                                    root_value = self._engine_adapter.validate_value(
-                                        float(v[0]),
-                                        context="dense root inference",
-                                    )
-                                    engine.expand_root(p, root_value, offset_q, offset_r, legal_bytes, root_generation)
+                                _expand_crop_root_with_optional_sparse(
+                                    engine,
+                                    self._engine_adapter,
+                                    p,
+                                    float(v[0]),
+                                    offset_q,
+                                    offset_r,
+                                    legal_bytes,
+                                    root_generation,
+                                    legal,
+                                    root_candidate_qr,
+                                    root_sparse_logits,
+                                    sparse_root_active=sparse_root_active,
+                                    sparse_prior_stage=self.sparse_prior_stage,
+                                    sparse_prior_mix=self.sparse_prior_mix,
+                                )
                                 if self.pair_policy_enabled:
                                     pair_t0 = time.monotonic()
                                     first_qr = _current_turn_first_qr(

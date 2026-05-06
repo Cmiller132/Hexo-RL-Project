@@ -193,6 +193,7 @@ def _event_log_summary(event: str, row: dict[str, Any]) -> str:
             train = row.get("train", {}) if isinstance(row.get("train"), dict) else {}
             selfplay = row.get("selfplay", {}) if isinstance(row.get("selfplay"), dict) else {}
             buffer = row.get("buffer", {}) if isinstance(row.get("buffer"), dict) else {}
+            pair_strategy = row.get("pair_strategy", {}) if isinstance(row.get("pair_strategy"), dict) else {}
             losses = {
                 key: train.get(key)
                 for key in (
@@ -210,9 +211,16 @@ def _event_log_summary(event: str, row: dict[str, Any]) -> str:
             return (
                 "Trial epoch complete: "
                 f"trial={row.get('trial_id')} family={row.get('family')} epoch={row.get('epoch')} "
+                f"heads=[{_short_items(row.get('heads', []), limit=16)}] "
+                f"runtime_outputs=[{_short_items(row.get('runtime_outputs', []), limit=16)}] "
+                f"pair_capabilities=[{_short_items(row.get('pair_capabilities', []), limit=8)}] "
+                f"pair_strategy={pair_strategy.get('strategy')} max_pairs={pair_strategy.get('max_pairs')} "
                 f"elapsed_s={_float_text(row.get('epoch_elapsed_s'))} checkpoint={row.get('checkpoint_path')} "
                 f"selfplay_positions={selfplay.get('positions_done')} games={selfplay.get('games_done')} "
                 f"trunc_rate={_float_text(selfplay.get('truncation_rate'))} buffer_size={buffer.get('size')} "
+                f"throughput_pos_min={_float_text(selfplay.get('positions_per_min'))} "
+                f"target_mass_missing={_float_text(buffer.get('avg_missing_target_policy_mass'))} "
+                f"target_mass_outside={_float_text(buffer.get('avg_target_policy_mass_outside_window'))} "
                 f"losses={losses}"
             )
         if event == "trial_pruned":
@@ -841,6 +849,9 @@ class Phase3Supervisor:
         trial.wall_time_s += time.monotonic() - started
 
         selfplay = _latest_metric(trial.run_dir / "events.jsonl", "selfplay")
+        public_state = self._trial_public_state(trial)
+        model_contract = public_state.get("model_contract", {})
+        pair_strategy = public_state.get("pair_strategy", {})
         record = {
             "stage": stage,
             "trial_id": trial.trial_id,
@@ -851,6 +862,11 @@ class Phase3Supervisor:
             "train": result.train_stats,
             "buffer": result.buffer_stats,
             "selfplay": selfplay,
+            "heads": list(trial.cfg.model.heads),
+            "runtime_outputs": list(model_contract.get("outputs") or []),
+            "pair_capabilities": list(model_contract.get("pair_capabilities") or []),
+            "pair_strategy": pair_strategy,
+            "loss_weights": dict(trial.cfg.train.loss_weights),
             "static": asdict(trial.static),
             "dynamic": asdict(trial.dynamic),
         }

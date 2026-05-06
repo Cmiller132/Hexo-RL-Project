@@ -24,6 +24,7 @@ from hexorl.models.loading import build_runtime_model
 from hexorl.models.registry import resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import build_pair_strategy
+from hexorl.selfplay.worker import _expand_crop_root_with_optional_sparse
 
 
 def _hist(*moves):
@@ -317,6 +318,89 @@ def test_engine_adapter_validates_runtime_contracts_before_mcts():
         adapter.validate_pair_phase(rows, placements_remaining=1, first_qr=(0, 1), context="unit")
     with pytest.raises(ValueError, match="duplicate"):
         adapter.validate_pair_phase(np.asarray([[1, 0, 1, 0]], dtype=np.int32), placements_remaining=2, context="unit")
+
+
+def test_sparse_root_expansion_allows_legal_rows_outside_dense_crop():
+    class FakeEngine:
+        def __init__(self):
+            self.dense_calls = 0
+            self.sparse_calls = 0
+            self.sparse_qr = None
+            self.sparse_logits = None
+
+        def expand_root(self, *_args):
+            self.dense_calls += 1
+
+        def expand_root_with_sparse_priors(
+            self,
+            _policy,
+            _value,
+            _offset_q,
+            _offset_r,
+            _legal_bytes,
+            _root_generation,
+            sparse_qr,
+            sparse_logits,
+            _stage,
+            _sparse_mix,
+        ):
+            self.sparse_calls += 1
+            self.sparse_qr = np.asarray(sparse_qr)
+            self.sparse_logits = np.asarray(sparse_logits)
+
+    legal = np.asarray([[50, 50], [0, 0]], dtype=np.int32)
+    engine = FakeEngine()
+
+    _expand_crop_root_with_optional_sparse(
+        engine,
+        EngineAdapter(),
+        np.zeros(33 * 33, dtype=np.float32),
+        0.25,
+        -16,
+        -16,
+        legal.tobytes(),
+        1,
+        legal,
+        np.asarray([[50, 50]], dtype=np.int32),
+        np.asarray([2.0], dtype=np.float32),
+        sparse_root_active=True,
+        sparse_prior_stage=1,
+        sparse_prior_mix=0.6,
+    )
+
+    assert engine.sparse_calls == 1
+    assert engine.dense_calls == 0
+    assert engine.sparse_qr.tolist() == [[50, 50]]
+    assert engine.sparse_logits.tolist() == pytest.approx([2.0])
+
+
+def test_dense_root_expansion_still_rejects_legal_rows_outside_dense_crop():
+    class FakeEngine:
+        def expand_root(self, *_args):
+            raise AssertionError("dense expansion should not run after validation failure")
+
+        def expand_root_with_sparse_priors(self, *_args):
+            raise AssertionError("sparse expansion should not run for dense root")
+
+    legal = np.asarray([[50, 50], [0, 0]], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="dense policy offset"):
+        _expand_crop_root_with_optional_sparse(
+            FakeEngine(),
+            EngineAdapter(),
+            np.zeros(33 * 33, dtype=np.float32),
+            0.0,
+            -16,
+            -16,
+            legal.tobytes(),
+            1,
+            legal,
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros(0, dtype=np.float32),
+            sparse_root_active=False,
+            sparse_prior_stage=0,
+            sparse_prior_mix=0.0,
+        )
 
 
 def test_eval_checkpoint_loading_uses_provider_boundary(monkeypatch, tmp_path):
