@@ -125,8 +125,104 @@ mod tests {
         engine
             .re_root(best_q, best_r, 50)
             .expect("re_root should find child");
+        assert_eq!(
+            engine.root_idx, 0,
+            "re_root should compact selected child to arena root"
+        );
         let root_visits = engine.arena[engine.root_idx as usize].visit_count;
         assert_eq!(root_visits, visits_before, "re_root: visit count mismatch");
+    }
+
+    #[test]
+    fn mcts_re_root_discards_unreachable_sibling_subtrees() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint(game, 100, 300, 1.5, 2, false, 19652.0, 0);
+        let (oq, or_, legal, root_generation) = init_root_parts(&mut engine);
+        let uniform = vec![1.0 / BOARD_AREA as f32; BOARD_AREA];
+        expand_root(&mut engine, &uniform, oq, or_, &legal, root_generation);
+
+        while !engine.done() {
+            let (batch_generation, count) = select_leaves(&mut engine, 8);
+            let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
+            let values = vec![0.0f32; count as usize];
+            expand_and_backprop(&mut engine, batch_generation, &policies, &values);
+        }
+
+        let arena_len_before = engine.arena.len();
+        let (moves_q, moves_r, visits, _) = engine.get_results();
+        let best_idx = visits
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, visits)| *visits)
+            .map(|(idx, _)| idx)
+            .expect("root should have children");
+        let selected_visits = visits[best_idx];
+
+        engine
+            .re_root(moves_q[best_idx], moves_r[best_idx], 50)
+            .expect("re_root should find child");
+
+        assert_eq!(
+            engine.root_idx, 0,
+            "compacted arena should make selected child index 0"
+        );
+        assert_eq!(
+            engine.arena[0].visit_count, selected_visits,
+            "compaction must preserve selected-root visit statistics"
+        );
+        assert!(
+            engine.arena.len() < arena_len_before,
+            "re_root should drop unreachable sibling subtrees: before={} after={}",
+            arena_len_before,
+            engine.arena.len()
+        );
+    }
+
+    #[test]
+    fn mcts_child_limit_caps_global_root_and_leaf_expansion() {
+        let mut game = HexGameState::new();
+        game.place(0, 0).expect("opening move");
+        let mut engine = MCTSEngine::with_arena_sim_hint_and_child_limit(
+            game,
+            8,
+            50,
+            1.5,
+            8,
+            false,
+            19652.0,
+            0,
+            Some(3),
+        );
+        let (_oq, _or, legal, root_generation) = init_root_parts(&mut engine);
+        assert!(legal.len() > 3, "test requires a branching root");
+        let global_actions: Vec<(i32, i32)> = legal.iter().map(|h| (h.q, h.r)).collect();
+        let mut logits = vec![0.0f32; legal.len()];
+        let preferred = legal.len() - 1;
+        logits[preferred] = 10.0;
+
+        engine
+            .expand_root_with_global_priors(root_generation, &legal, &global_actions, &logits, 0.0)
+            .expect("global root expansion should succeed");
+
+        let (moves_q, moves_r, _visits, _) = engine.get_results();
+        assert_eq!(moves_q.len(), 3, "root expansion should honor child cap");
+        assert!(
+            moves_q
+                .iter()
+                .zip(moves_r.iter())
+                .any(|(&q, &r)| q == legal[preferred].q && r == legal[preferred].r),
+            "highest-prior global action should survive the cap"
+        );
+
+        let (batch_generation, count) = select_leaves(&mut engine, 4);
+        let policies = vec![1.0 / BOARD_AREA as f32; count as usize * BOARD_AREA];
+        let values = vec![0.0f32; count as usize];
+        expand_and_backprop(&mut engine, batch_generation, &policies, &values);
+
+        assert!(
+            engine.expanded_child_counts_within(3),
+            "all expanded nodes should honor child cap"
+        );
     }
 
     /// After any number of simulations with values in [-1, 1], root Q must stay in [-1, 1].
@@ -321,6 +417,53 @@ mod tests {
         let (_moves_q, _moves_r, visits, root_q) = engine.get_results();
         assert_eq!(visits.iter().sum::<u32>(), 6);
         assert!(root_q.is_finite());
+    }
+
+    #[test]
+    fn mcts_neutral_rollouts_complete_without_leaf_tensors() {
+        let game = HexGameState::new();
+        let mut engine = MCTSEngine::with_arena_sim_hint_and_child_limit(
+            game,
+            12,
+            50,
+            1.5,
+            2,
+            false,
+            0.0,
+            0,
+            Some(8),
+        );
+        let init = engine.init_root().expect("init_root").expect("root init");
+        let policy = vec![0.0f32; BOARD_AREA];
+        engine
+            .expand_root(
+                init.root_generation,
+                &policy,
+                0.0,
+                init.offset_q,
+                init.offset_r,
+                &init.legal_moves,
+            )
+            .expect("expand root");
+
+        let first = engine
+            .run_neutral_rollouts(5, 0.0)
+            .expect("neutral rollout batch");
+        assert_eq!(first, 5);
+        assert!(!engine.done());
+        let second = engine
+            .run_neutral_rollouts(99, 0.0)
+            .expect("neutral rollout remainder");
+        assert_eq!(second, 7);
+        assert!(engine.done());
+
+        let (_moves_q, _moves_r, visits, root_q) = engine.get_results();
+        assert_eq!(visits.iter().sum::<u32>(), 12);
+        assert!(root_q.is_finite());
+        assert!(
+            engine.expanded_child_counts_within(8),
+            "neutral expansion must respect the configured child cap"
+        );
     }
 
     /// After select_leaves but before expand_and_backprop, done() must be false

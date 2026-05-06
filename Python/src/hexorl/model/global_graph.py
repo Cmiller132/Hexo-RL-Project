@@ -13,6 +13,12 @@ from hexorl.graph.batch import (
     GRAPH_FEATURE_PLACEMENTS_REMAINING,
     GraphTokenType,
 )
+from hexorl.models.registry import (
+    global_graph_architecture_ids,
+    global_graph_family,
+    is_global_graph_architecture,
+    relation_required_architecture_ids,
+)
 
 
 class RelationBiasedSelfAttention(nn.Module):
@@ -49,7 +55,7 @@ class RelationBiasedSelfAttention(nn.Module):
                     f"relation_type must have shape {(b, t, t)}, got {tuple(relation_type.shape)}"
                 )
             rel = self.relation_embedding(
-                relation_type.clamp_min(0).clamp_max(31).to(device=x.device)
+                relation_type.clamp_min(0).clamp_max(31).to(device=x.device, dtype=torch.long)
             )
             score = score + rel.permute(0, 3, 1, 2).to(dtype=score.dtype)
         if relation_bias is not None:
@@ -133,26 +139,13 @@ class GlobalHexGraphNet(nn.Module):
     crop policy is intentionally absent from this model.
     """
 
-    ARCHITECTURES = {
-        "global_graph_option1",
-        "global_xattn_0",
-        "global_line_window_0",
-        "global_pair_twostage_0",
-        "global_graph_full_0",
-        "global_hybrid_action_0",
-        "global_graph768_champion",
-    }
-    RELATION_REQUIRED_ARCHITECTURES = {
-        "global_graph_option1",
-        "global_line_window_0",
-        "global_graph_full_0",
-        "global_graph768_champion",
-    }
+    ARCHITECTURES = frozenset(global_graph_architecture_ids())
+    RELATION_REQUIRED_ARCHITECTURES = frozenset(relation_required_architecture_ids())
 
     @classmethod
     def is_global_graph_architecture(cls, architecture: object) -> bool:
         """Return whether a config architecture names a registered global graph family."""
-        return str(architecture).lower() in cls.ARCHITECTURES
+        return is_global_graph_architecture(architecture)
 
     def __init__(
         self,
@@ -177,15 +170,7 @@ class GlobalHexGraphNet(nn.Module):
         self.input = nn.Linear(GRAPH_FEATURE_DIM, channels)
         self.type_embedding = nn.Embedding(max(int(t) for t in GraphTokenType) + 1, channels)
         self.coord = nn.Sequential(nn.Linear(3, channels), nn.SiLU(), nn.Linear(channels, channels))
-        self.architecture_family = {
-            "global_graph_option1": "relation_graph",
-            "global_xattn_0": "context_cross_attention",
-            "global_line_window_0": "line_window_cover",
-            "global_pair_twostage_0": "pair_two_stage",
-            "global_graph_full_0": "full_relation_graph",
-            "global_hybrid_action_0": "crop_diagnostic_global_action",
-            "global_graph768_champion": "scaled_relation_graph",
-        }[architecture]
+        self.architecture_family = global_graph_family(architecture)
         block_count = max(1, int(layers))
         if architecture == "global_xattn_0":
             block_count = max(1, min(block_count, 2))

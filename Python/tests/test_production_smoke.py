@@ -11,6 +11,8 @@ from hexorl.dashboard.replay import replay_game
 from hexorl.epoch.pipeline import _make_bootstrap_game_records
 from hexorl.eval.scorecard import compute_phase3_scorecard
 from hexorl.model.network import build_model_from_config
+from hexorl.models.registry import resolve_model_spec
+from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
 
 
@@ -72,7 +74,7 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
     )
     batch = next(iter(DataLoader(dataset, batch_size=None, num_workers=0)))
     tensors, policies, values, _lookahead, aux_targets = batch
-    targets = {"policy": policies, "value": values, **aux_targets}
+    targets = {"policy": policies, "value": values, "value_weight": torch.ones_like(values), **aux_targets}
     model = build_model_from_config(cfg, device=torch.device("cpu"), inference=False)
     model.train()
     predictions = model(
@@ -83,11 +85,16 @@ def test_tiny_production_pipeline_records_games_metrics_and_checkpoint(tmp_path)
         pair_candidate_indices=targets.get("pair_candidate_indices"),
         pair_candidate_mask=targets.get("pair_candidate_mask"),
     )
+    resolved_spec = resolve_model_spec(cfg)
+    loss_weights = dict(cfg.train.loss_weights)
+    for name, value in resolved_spec.default_loss_weights.items():
+        loss_weights.setdefault(name, value)
     total_loss, per_head = compute_losses(
         predictions,
         targets,
-        loss_weights=cfg.train.loss_weights,
+        loss_weights=loss_weights,
         n_bins=model.n_bins,
+        loss_plan=build_loss_plan(resolved_spec, loss_weights),
     )
     total_loss.backward()
     with torch.no_grad():

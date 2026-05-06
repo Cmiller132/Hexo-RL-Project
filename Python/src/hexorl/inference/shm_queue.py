@@ -34,6 +34,7 @@ MAX_PAIR_CANDIDATES = 512
 MAX_GRAPH_TOKENS = 4096
 MAX_GRAPH_ACTIONS = 4096
 MAX_GRAPH_PAIRS = 4096
+MAX_GRAPH_BATCH = 8
 TENSOR_ELEMENTS = NUM_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 13 * 33 * 33 = 14157
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ def _shm_name(base: str, worker_id: int) -> str:
         "res_pair_logits": "rpl",
         "req_mode": "qm",
         "req_graph_meta": "qgm",
+        "req_graph_batch_meta": "qgbm",
         "req_graph_token_features": "qgtf",
         "req_graph_token_type": "qgtt",
         "req_graph_token_qr": "qgtq",
@@ -193,6 +195,8 @@ class WorkerSlots:
         self.res_pair_logits: Optional[np.ndarray] = None
         self.req_graph_meta_shm: Optional[SharedMemory] = None
         self.req_graph_meta: Optional[np.ndarray] = None
+        self.req_graph_batch_meta_shm: Optional[SharedMemory] = None
+        self.req_graph_batch_meta: Optional[np.ndarray] = None
         self.req_graph_token_features_shm: Optional[SharedMemory] = None
         self.req_graph_token_features: Optional[np.ndarray] = None
         self.req_graph_token_type_shm: Optional[SharedMemory] = None
@@ -388,6 +392,16 @@ class WorkerSlots:
             MAX_GRAPH_TOKENS,
             MAX_GRAPH_ACTIONS,
         )
+        self.req_graph_batch_meta_shm = _create_shm(
+            _shm_name("req_graph_batch_meta", self.worker_id),
+            MAX_GRAPH_BATCH * 8 * 2,
+        )
+        self.req_graph_batch_meta = np.ndarray(
+            (MAX_GRAPH_BATCH, 8),
+            dtype=np.uint16,
+            buffer=self.req_graph_batch_meta_shm.buf,
+        )
+        self.req_graph_batch_meta[:] = 0
         self.req_graph_token_features_shm = _create_shm(
             _shm_name("req_graph_token_features", self.worker_id),
             MAX_GRAPH_TOKENS * GRAPH_FEATURE_DIM * 4,
@@ -509,10 +523,10 @@ class WorkerSlots:
             (MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_second_logits_shm.buf
         )
         self.res_graph_regret_rank_shm = _create_shm(
-            _shm_name("res_graph_regret_rank", self.worker_id), 4
+            _shm_name("res_graph_regret_rank", self.worker_id), MAX_GRAPH_BATCH * 4
         )
         self.res_graph_regret_rank = np.ndarray(
-            (1,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf
+            (MAX_GRAPH_BATCH,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf
         )
 
     def _connect(self):
@@ -635,6 +649,8 @@ class WorkerSlots:
     def _connect_graph_slots(self):
         self.req_graph_meta_shm = SharedMemory(name=_shm_name("req_graph_meta", self.worker_id), create=False)
         self.req_graph_meta = np.ndarray((8,), dtype=np.uint16, buffer=self.req_graph_meta_shm.buf)
+        self.req_graph_batch_meta_shm = SharedMemory(name=_shm_name("req_graph_batch_meta", self.worker_id), create=False)
+        self.req_graph_batch_meta = np.ndarray((MAX_GRAPH_BATCH, 8), dtype=np.uint16, buffer=self.req_graph_batch_meta_shm.buf)
         self.req_graph_token_features_shm = SharedMemory(name=_shm_name("req_graph_token_features", self.worker_id), create=False)
         self.req_graph_token_features = np.ndarray((MAX_GRAPH_TOKENS, GRAPH_FEATURE_DIM), dtype=np.float32, buffer=self.req_graph_token_features_shm.buf)
         self.req_graph_token_type_shm = SharedMemory(name=_shm_name("req_graph_token_type", self.worker_id), create=False)
@@ -676,7 +692,7 @@ class WorkerSlots:
         self.res_graph_pair_second_logits_shm = SharedMemory(name=_shm_name("res_graph_pair_second_logits", self.worker_id), create=False)
         self.res_graph_pair_second_logits = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_second_logits_shm.buf)
         self.res_graph_regret_rank_shm = SharedMemory(name=_shm_name("res_graph_regret_rank", self.worker_id), create=False)
-        self.res_graph_regret_rank = np.ndarray((1,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf)
+        self.res_graph_regret_rank = np.ndarray((MAX_GRAPH_BATCH,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf)
 
     def close(self):
         """Close and unlink all shared memory segments."""
@@ -697,6 +713,7 @@ class WorkerSlots:
             "req_pair_mask_shm",
             "res_pair_logits_shm",
             "req_graph_meta_shm",
+            "req_graph_batch_meta_shm",
             "req_graph_token_features_shm",
             "req_graph_token_type_shm",
             "req_graph_token_qr_shm",

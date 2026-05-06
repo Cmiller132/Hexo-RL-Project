@@ -34,8 +34,10 @@ from hexorl.action_contract.tactical_oracle import (
     scan_tactical_oracle_from_history,
 )
 from hexorl.graph.batch import (
+    GraphBatch,
     build_graph_batch_from_history,
     collate_graph_batches,
+    graph_batch_with_policy_targets,
     graph_batch_with_reference_pair_rows,
 )
 
@@ -475,8 +477,12 @@ class ReplayDataset(_IterableDataset):
         include_sparse_policy: bool = False,
         include_pair_policy: bool = False,
         include_graph_policy: bool = False,
+        defer_graph_collate: bool = False,
         candidate_budget: int = 256,
         max_game_turns: int = 256,
+        graph_context_tokens: int | None = None,
+        graph_legal_rows: int | None = None,
+        graph_cache_size: int = 256,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -485,6 +491,7 @@ class ReplayDataset(_IterableDataset):
         self.include_sparse_policy = bool(include_sparse_policy)
         self.include_pair_policy = bool(include_pair_policy)
         self.include_graph_policy = bool(include_graph_policy)
+        self.defer_graph_collate = bool(defer_graph_collate)
         self.candidate_budget = max(
             int(candidate_budget),
             int(getattr(buffer, "max_policy_v2_entries", int(candidate_budget))),
@@ -495,6 +502,21 @@ class ReplayDataset(_IterableDataset):
         self.regret_fraction = max(0.0, min(1.0, regret_fraction))
         self.regret_temperature = regret_temperature
         self.max_game_turns = max(1, int(max_game_turns))
+        self.graph_context_tokens = (
+            max(1, int(graph_context_tokens))
+            if graph_context_tokens is not None and int(graph_context_tokens) > 0
+            else None
+        )
+        self.graph_legal_rows = (
+            max(1, int(graph_legal_rows))
+            if graph_legal_rows is not None and int(graph_legal_rows) > 0
+            else None
+        )
+        self._graph_base_cache: OrderedDict[
+            tuple[bytes, int | None, int | None, tuple[tuple[int, int], ...]],
+            GraphBatch,
+        ] = OrderedDict()
+        self._graph_base_cache_max = max(0, int(graph_cache_size))
         self.include_axis_delta_norm = bool(include_axis_delta_norm)
         self._axis_delta_norm_proto = (
             get_prototype("exp_delta_norm")
@@ -837,6 +859,12 @@ class ReplayDataset(_IterableDataset):
                         aux_targets["pair_candidate_mask"][i, :pair_width] = pair_mask[:pair_width]
                         aux_targets["pair_policy_target"][i, :pair_width] = pair_target[:pair_width]
                         aux_targets["pair_candidate_missing_mass"][i] = max(0.0, total_pair_mass - represented_mass)
+                        if represented_mass <= 0.0:
+                            aux_targets["pair_policy_weight"][i] = 0.0
+                            aux_targets["pair_candidate_missing_mass"][i] = max(
+                                float(aux_targets["pair_candidate_missing_mass"][i]),
+                                1.0,
+                            )
                     else:
                         pair = build_pair_candidate_batch(
                             [(int(q), int(r)) for q, r in cand.qr[:width]],
@@ -854,30 +882,57 @@ class ReplayDataset(_IterableDataset):
                         aux_targets["pair_candidate_mask"][i, :pair_width] = pair.mask[:pair_width]
                         aux_targets["pair_policy_target"][i, :pair_width] = pair.target[:pair_width]
                         aux_targets["pair_candidate_missing_mass"][i] = pair.missing_mass
+                        if float(pair.target[:pair_width].sum()) <= 0.0:
+                            aux_targets["pair_policy_weight"][i] = 0.0
+                            aux_targets["pair_candidate_missing_mass"][i] = max(
+                                float(aux_targets["pair_candidate_missing_mass"][i]),
+                                1.0,
+                            )
                 elif self.include_pair_policy and critical_overflow:
                     aux_targets["pair_candidate_missing_mass"][i] = 1.0
             if self.include_graph_policy:
                 if opp_policy_v2 and not opp_legal_v2:
                     raise ValueError("graph training requires opp_policy_legal_v2 whenever opp_policy_target_v2 is present")
-                graph = build_graph_batch_from_history(
-                    sample_history,
+                required_graph_legal_rows = [
+                    (int(q), int(r))
+                    for q, r, prob in policy_v2
+                    if float(prob) > 0.0
+                ]
+                for first, second, prob in pair_policy_v2:
+                    if float(prob) <= 0.0:
+                        continue
+                    required_graph_legal_rows.append((int(first[0]), int(first[1])))
+                    required_graph_legal_rows.append((int(second[0]), int(second[1])))
+                graph = graph_batch_with_policy_targets(
+                    self._graph_base_for_history(
+                        sample_history,
+                        required_legal_rows=required_graph_legal_rows,
+                    ),
                     policy_target=policy_v2,
                     opp_legal_moves=[(int(q), int(r)) for q, r in opp_legal_v2] if opp_legal_v2 else None,
                     opp_policy_target=opp_policy_v2,
-                    radius=8,
-                    include_pair_rows=False,
                 )
                 if (
                     self.include_pair_policy
                     and int(graph.placements_remaining) >= 2
                     and not bool(getattr(rec, "pair_policy_complete", False))
                 ):
-                    raise ValueError(
-                        "graph pair-policy training requires complete search-observed "
-                        "first-placement joint pair targets; no synthetic product fallback is allowed"
-                    )
+                    # Missing search-observed first-placement pair targets are
+                    # valid replay rows for the other heads, but they must not
+                    # train pair heads or trigger a synthetic product fallback.
+                    aux_targets["pair_policy_weight"][i] = 0.0
+                    pair_policy_v2 = []
+                    if "pair_candidate_missing_mass" in aux_targets:
+                        aux_targets["pair_candidate_missing_mass"][i] = max(
+                            float(aux_targets["pair_candidate_missing_mass"][i]),
+                            1.0,
+                        )
                 if pair_policy_v2:
-                    graph = graph_batch_with_reference_pair_rows(graph, pair_policy_v2)
+                    graph = graph_batch_with_reference_pair_rows(
+                        graph,
+                        pair_policy_v2,
+                        max_pair_rows=candidate_width,
+                    )
                 graph_batch = aux_targets.setdefault("_graph_batches", [])
                 graph_batch.append(graph)
             if self.include_axis_delta_norm:
@@ -888,37 +943,81 @@ class ReplayDataset(_IterableDataset):
                 if h_idx < len(rec.lookahead_values):
                     lookahead_arrays[h_idx][i] = rec.lookahead_values[h_idx]
                 else:
-                    lookahead_arrays[h_idx][i] = values[i]  # fallback
+                    raise ValueError(
+                        "lookahead target missing for configured horizon "
+                        f"{self.lookahead_horizons[h_idx]} at batch row {i}"
+                    )
 
         if self.include_graph_policy:
-            graph_batch = collate_graph_batches(aux_targets.pop("_graph_batches"))
-            aux_targets.update({
-                "token_features": graph_batch.token_features,
-                "token_type": graph_batch.token_type,
-                "token_qr": graph_batch.token_qr,
-                "token_mask": graph_batch.token_mask,
-                "legal_token_indices": graph_batch.legal_token_indices,
-                "legal_qr": graph_batch.legal_qr,
-                "legal_mask": graph_batch.legal_mask,
-                "pair_token_indices": graph_batch.pair_token_indices,
-                "pair_first_indices": graph_batch.pair_first_indices,
-                "pair_second_indices": graph_batch.pair_second_indices,
-                "relation_type": graph_batch.relation_type,
-                "relation_bias": graph_batch.relation_bias,
-                "policy_target": graph_batch.policy_target,
-                "opp_legal_qr": graph_batch.opp_legal_qr,
-                "opp_legal_mask": graph_batch.opp_legal_mask,
-                "opp_policy_target": graph_batch.opp_policy_target,
-                "pair_first_policy_target": graph_batch.pair_first_policy_target,
-                "pair_policy_target": graph_batch.pair_policy_target,
-                "pair_second_policy_target": graph_batch.pair_second_policy_target,
-                "tactical_target": graph_batch.tactical_target,
-            })
+            graph_batches = aux_targets.pop("_graph_batches")
+            if self.defer_graph_collate:
+                aux_targets["_graph_batches"] = graph_batches
+            else:
+                graph_batch = collate_graph_batches(graph_batches)
+                aux_targets.update({
+                    "token_features": graph_batch.token_features,
+                    "token_type": graph_batch.token_type,
+                    "token_qr": graph_batch.token_qr,
+                    "token_mask": graph_batch.token_mask,
+                    "legal_token_indices": graph_batch.legal_token_indices,
+                    "legal_qr": graph_batch.legal_qr,
+                    "legal_mask": graph_batch.legal_mask,
+                    "pair_token_indices": graph_batch.pair_token_indices,
+                    "pair_first_indices": graph_batch.pair_first_indices,
+                    "pair_second_indices": graph_batch.pair_second_indices,
+                    "relation_type": graph_batch.relation_type,
+                    "relation_bias": graph_batch.relation_bias,
+                    "policy_target": graph_batch.policy_target,
+                    "legal_token_quality_target": graph_batch.policy_target,
+                    "opp_legal_qr": graph_batch.opp_legal_qr,
+                    "opp_legal_mask": graph_batch.opp_legal_mask,
+                    "opp_policy_target": graph_batch.opp_policy_target,
+                    "pair_first_policy_target": graph_batch.pair_first_policy_target,
+                    "pair_policy_target": graph_batch.pair_policy_target,
+                    "pair_second_policy_target": graph_batch.pair_second_policy_target,
+                    "tactical_target": graph_batch.tactical_target,
+                    "placements_remaining": graph_batch.placements_remaining_by_sample,
+                })
+                first = aux_targets["pair_first_indices"]
+                second = aux_targets["pair_second_indices"]
+                pair_row_mask = (first >= 0) & (second >= 0) & (first != second)
+                known_first = graph_batch.placements_remaining_by_sample == 1
+                unordered_first = graph_batch.placements_remaining_by_sample >= 2
+                aux_targets["pair_row_mask"] = pair_row_mask
+                aux_targets["pair_first_unordered"] = unordered_first
+                aux_targets["pair_second_known_first"] = known_first
+                aux_targets["pair_second_row_mask"] = pair_row_mask & known_first[:, None]
         return tensors, policies, values, lookahead_arrays, aux_targets
 
     def _encode_tensor(self, history: bytes) -> np.ndarray:
         tensor, _offset_q, _offset_r, _legal_bytes = self._encode_tensor_meta(history)
         return tensor
+
+    def _graph_base_for_history(
+        self,
+        history: bytes,
+        *,
+        required_legal_rows: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
+    ) -> GraphBatch:
+        required_key = tuple(sorted({(int(q), int(r)) for q, r in required_legal_rows}))
+        key = (history, self.graph_context_tokens, self.graph_legal_rows, required_key)
+        cached = self._graph_base_cache.get(key)
+        if cached is not None:
+            self._graph_base_cache.move_to_end(key)
+            return cached
+        graph = build_graph_batch_from_history(
+            history,
+            radius=8,
+            include_pair_rows=False,
+            max_context_tokens=self.graph_context_tokens,
+            max_legal_rows=self.graph_legal_rows,
+            required_legal_rows=required_key,
+        )
+        if self._graph_base_cache_max > 0:
+            self._graph_base_cache[key] = graph
+            if len(self._graph_base_cache) > self._graph_base_cache_max:
+                self._graph_base_cache.popitem(last=False)
+        return graph
 
     def _encode_tensor_meta(self, history: bytes) -> tuple[np.ndarray, int, int, bytes]:
         cached = self._meta_cache.get(history)

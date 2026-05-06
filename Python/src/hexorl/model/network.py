@@ -840,9 +840,9 @@ def from_config(cfg, device: Optional[torch.device] = None) -> nn.Module:
     Returns:
         HexNet instance on the requested device, optionally in FP16.
     """
-    model = build_model_from_config(cfg, device=device, inference=True)
-    model.eval()
-    return model
+    from hexorl.models.assembly import from_config as _from_config
+
+    return _from_config(cfg, device=device)
 
 
 def build_model_from_config(
@@ -850,72 +850,10 @@ def build_model_from_config(
     device: Optional[torch.device] = None,
     inference: bool = False,
 ) -> nn.Module:
-    """Create a HexNet from config while preserving default CNN compatibility."""
-    model_cfg = cfg.model
-    inference_cfg = cfg.inference
-    arch = getattr(model_cfg, "architecture", "cnn").lower()
-    if GlobalHexGraphNet.is_global_graph_architecture(arch):
-        graph_heads = set(getattr(model_cfg, "heads", []))
-        graph_heads.update(f"lookahead_{h}" for h in getattr(getattr(cfg, "buffer", object()), "lookahead_horizons", []))
-        model = GlobalHexGraphNet(
-            channels=model_cfg.channels,
-            layers=getattr(model_cfg, "graph_layers", 3),
-            heads=getattr(model_cfg, "attention_heads", 8),
-            architecture=arch,
-            dropout=getattr(model_cfg, "dropout", 0.0),
-            output_heads=sorted(graph_heads),
-        )
-        if device is None:
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                device = torch.device("mps")
-            else:
-                device = torch.device("cpu")
-        model = model.to(device)
-        if inference and inference_cfg.fp16 and device.type == "cuda":
-            model = model.half()
-        if inference:
-            model.eval()
-        return model
+    """Create a model through the Stage 2 architecture assembly authority."""
+    from hexorl.models.assembly import build_model_from_config as _build_model_from_config
 
-    heads = list(model_cfg.heads)
-    if getattr(model_cfg, "sparse_policy", False) and "sparse_policy" not in heads:
-        heads.append("sparse_policy")
-
-    model = HexNet(
-        channels=model_cfg.channels,
-        blocks=model_cfg.blocks,
-        heads=heads,
-        architecture=getattr(model_cfg, "architecture", "cnn"),
-        attention_positions=list(getattr(model_cfg, "attention_positions", [])),
-        attention_heads=getattr(model_cfg, "attention_heads", 8),
-        attention_mlp_ratio=getattr(model_cfg, "attention_mlp_ratio", 2.0),
-        attention_dropout=getattr(model_cfg, "attention_dropout", 0.0),
-        dropout=getattr(model_cfg, "dropout", 0.0),
-        relative_bias=getattr(model_cfg, "relative_bias", False),
-        graph_token_set=getattr(model_cfg, "graph_token_set", "graph512_turn_pair_prior"),
-        graph_token_budget=getattr(model_cfg, "graph_token_budget", 512),
-        graph_layers=getattr(model_cfg, "graph_layers", 3),
-        sparse_policy=getattr(model_cfg, "sparse_policy", False),
-    )
-
-    if device is None:
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-
-    model = model.to(device)
-
-    if inference and inference_cfg.fp16 and device.type == "cuda":
-        model = model.half()
-
-    if inference:
-        model.eval()
-    return model
+    return _build_model_from_config(cfg, device=device, inference=inference)
 
 
 def strip_compiled_prefix(state_dict: dict) -> dict:

@@ -768,7 +768,7 @@ pub struct PyMCTSEngine {
 #[pymethods]
 impl PyMCTSEngine {
     #[new]
-    #[pyo3(signature = (game, num_simulations, c_puct=1.4, near_radius=8, c_puct_init=19652.0, constrain_threats=true, arena_sim_hint=None, seed=0))]
+    #[pyo3(signature = (game, num_simulations, c_puct=1.4, near_radius=8, c_puct_init=19652.0, constrain_threats=true, arena_sim_hint=None, seed=0, max_children=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         game: &PyHexGame,
@@ -779,9 +779,10 @@ impl PyMCTSEngine {
         constrain_threats: bool,
         arena_sim_hint: Option<u32>,
         seed: u64,
+        max_children: Option<usize>,
     ) -> Self {
         let hint = arena_sim_hint.unwrap_or(num_simulations);
-        let engine = MCTSEngine::with_arena_sim_hint(
+        let engine = MCTSEngine::with_arena_sim_hint_and_child_limit(
             game.inner.clone(),
             num_simulations,
             hint,
@@ -790,6 +791,7 @@ impl PyMCTSEngine {
             constrain_threats,
             c_puct_init,
             seed,
+            max_children,
         );
         Self {
             inner: engine,
@@ -1071,6 +1073,21 @@ impl PyMCTSEngine {
 
     fn done(&self) -> bool {
         self.inner.done()
+    }
+
+    #[pyo3(signature = (batch_size, leaf_value=0.0))]
+    fn run_neutral_rollouts(
+        &mut self,
+        batch_size: u32,
+        leaf_value: f32,
+        py: Python<'_>,
+    ) -> PyResult<u32> {
+        let completed = py
+            .allow_threads(|| self.inner.run_neutral_rollouts(batch_size, leaf_value))
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        self.last_non_terminal_count = 0;
+        self.last_batch_generation = None;
+        Ok(completed)
     }
 
     fn select_leaves<'py>(

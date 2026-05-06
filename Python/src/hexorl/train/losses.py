@@ -1,4 +1,4 @@
-"""Loss functions for HexNet multi-head model.
+"""Loss functions for Hexo multi-head models.
 
 Includes the exact RGSC ranking loss (Equation 7 from arXiv 2602.20809v1)
 and KataGo-style binned value loss with soft cross-entropy.
@@ -354,11 +354,13 @@ def compute_losses(
     targets: dict[str, torch.Tensor],
     loss_weights: dict[str, float],
     n_bins: int = 65,
+    loss_plan=None,
+    row_tables=None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute all head losses and return (total_loss, per_head_losses).
 
     Args:
-        predictions: Dict of head_name → tensor from HexNet.forward().
+        predictions: Dict of head_name → tensor from model.forward().
         targets: Dict of target_name → tensor (e.g. 'policy', 'value', 'regret_rank').
         loss_weights: Dict of head_name → weight scalar.
         n_bins: Number of value bins (default 65).
@@ -367,177 +369,13 @@ def compute_losses(
         (total_loss, per_head_losses_dict) where per_head losses are already
         weighted.
     """
-    per_head: dict[str, torch.Tensor] = {}
+    if loss_plan is None:
+        from hexorl.train.loss_plan import LossContractError
 
-    for head_name, pred in predictions.items():
-        if head_name not in loss_weights:
-            continue
-
-        weight = loss_weights[head_name]
-        required_targets = {
-            "policy": "policy",
-            "value": "value",
-            "regret_rank": "regret_rank",
-            "regret_value": "regret_value",
-            "moves_left": "moves_left",
-        }
-        if head_name in required_targets and required_targets[head_name] not in targets:
-            continue
-        if head_name.startswith("lookahead_") and head_name not in targets:
-            continue
-
-        if head_name == "policy":
-            loss = policy_loss(pred, targets["policy"], targets.get("policy_weight"))
-        elif head_name == "sparse_policy":
-            if "sparse_policy_target" not in targets or "candidate_mask" not in targets:
-                continue
-            loss = sparse_policy_loss(
-                pred,
-                targets["sparse_policy_target"],
-                targets["candidate_mask"],
-                targets.get("sparse_policy_weight", targets.get("policy_weight")),
-            )
-        elif head_name == "pair_policy":
-            if "pair_policy_target" not in targets or "pair_candidate_mask" not in targets:
-                continue
-            loss = pair_policy_loss(
-                pred,
-                targets["pair_policy_target"],
-                targets["pair_candidate_mask"],
-                targets.get("pair_policy_weight", targets.get("policy_weight")),
-            )
-        elif head_name == "policy_place":
-            if "policy_target" not in targets or "legal_mask" not in targets:
-                continue
-            loss = graph_policy_loss(
-                pred,
-                targets["policy_target"],
-                targets["legal_mask"],
-                targets.get("policy_weight"),
-            )
-        elif head_name == "legal_token_quality":
-            if "legal_mask" not in targets:
-                continue
-            quality_target = targets.get("legal_token_quality_target", targets.get("policy_target"))
-            if quality_target is None:
-                continue
-            loss = sparse_policy_loss(
-                pred,
-                quality_target,
-                targets["legal_mask"],
-                targets.get("policy_weight"),
-            )
-        elif head_name == "policy_pair_first":
-            first_target = targets.get("pair_first_policy_target", targets.get("policy_target"))
-            if first_target is None or "legal_mask" not in targets:
-                continue
-            loss = graph_policy_loss(
-                pred,
-                first_target,
-                targets["legal_mask"],
-                targets.get("pair_policy_weight", targets.get("policy_weight")),
-            )
-        elif head_name == "policy_pair_joint":
-            if "pair_policy_target" not in targets:
-                continue
-            if "pair_first_indices" in targets and "pair_second_indices" in targets:
-                first = targets["pair_first_indices"]
-                second = targets["pair_second_indices"]
-                pair_mask = (first >= 0) & (second >= 0) & (first != second)
-            elif "pair_token_indices" in targets:
-                pair_mask = targets["pair_token_indices"] >= 0
-            else:
-                continue
-            loss = graph_policy_loss(
-                pred,
-                targets["pair_policy_target"],
-                pair_mask,
-                targets.get("pair_policy_weight", targets.get("policy_weight")),
-            )
-        elif head_name == "policy_pair_second":
-            if "pair_second_policy_target" not in targets:
-                continue
-            if "pair_first_indices" in targets and "pair_second_indices" in targets:
-                first = targets["pair_first_indices"]
-                second = targets["pair_second_indices"]
-                pair_mask = (first >= 0) & (second >= 0) & (first != second)
-            elif "pair_token_indices" in targets:
-                pair_mask = targets["pair_token_indices"] >= 0
-            else:
-                continue
-            pair_second_target = targets["pair_second_policy_target"]
-            target_mass = (
-                pair_second_target
-                * pair_mask.to(device=pair_second_target.device, dtype=pair_second_target.dtype)
-            ).sum(dim=-1)
-            if not torch.any(target_mass > 0):
-                continue
-            loss = graph_policy_loss(
-                pred,
-                pair_second_target,
-                pair_mask,
-                targets.get("pair_policy_weight", targets.get("policy_weight")),
-            )
-        elif head_name == "opp_policy":
-            target = targets.get("opp_policy_target", targets.get("opp_policy", targets.get("policy")))
-            if target is None:
-                continue
-            if "opp_legal_mask" in targets and pred.shape == targets["opp_legal_mask"].shape:
-                loss = graph_policy_loss(
-                    pred,
-                    target,
-                    targets["opp_legal_mask"],
-                    targets.get("opp_policy_weight"),
-                )
-            else:
-                loss = opp_policy_loss(pred, target, targets.get("opp_policy_weight"))
-        elif head_name == "value":
-            loss = binned_value_loss(pred, targets["value"], n_bins, targets.get("value_weight"))
-        elif head_name.startswith("lookahead_"):
-            loss = binned_value_loss(pred, targets[head_name], n_bins)
-        elif head_name == "regret_rank":
-            loss = regret_rank_loss(
-                pred.squeeze(-1),
-                targets["regret_rank"],
-                targets.get("regret_weight"),
-            )
-        elif head_name == "regret_value":
-            loss = regret_value_loss(
-                pred,
-                targets["regret_value"],
-                n_bins,
-                targets.get("regret_weight"),
-            )
-        elif head_name == "axis":
-            loss = axis_loss(pred, targets.get("axis"))
-        elif head_name == "axis_delta_norm":
-            target = targets.get("axis_delta_norm")
-            if target is None:
-                continue
-            loss = axis_map_loss(pred, target)
-        elif head_name == "moves_left":
-            loss = moves_left_loss(pred, targets["moves_left"], targets.get("moves_left_weight"))
-        elif head_name == "tactical":
-            target = targets.get("tactical_target")
-            if target is None:
-                continue
-            loss = tactical_loss(pred, target, targets.get("policy_weight"))
-        else:
-            continue
-
-        per_head[head_name] = weight * loss
-
-    entropy_head = "policy" if "policy" in predictions else "policy_place" if "policy_place" in predictions else None
-    if entropy_head is not None and "entropy" in loss_weights:
-        ent = entropy_loss(predictions[entropy_head])
-        per_head["entropy"] = loss_weights["entropy"] * ent
-
-    if not per_head:
-        raise ValueError(
-            "No trainable losses were computed. Check model.heads, train.loss_weights, "
-            f"and available targets. Heads={sorted(predictions.keys())}, "
-            f"loss_weights={sorted(loss_weights.keys())}, targets={sorted(targets.keys())}"
-        )
-
-    total = sum(per_head.values())
-    return total, per_head
+        raise LossContractError("compute_losses requires an explicit loss_plan")
+    return loss_plan.compute(
+        predictions,
+        targets,
+        n_bins=n_bins,
+        row_tables=row_tables,
+    )

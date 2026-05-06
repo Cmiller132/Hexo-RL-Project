@@ -7,6 +7,7 @@ expand_and_backprop → get_results.
 
 import sys
 import os
+import struct
 import unittest
 import numpy as np
 import torch
@@ -170,6 +171,48 @@ class TestInferenceServer(unittest.TestCase):
         self.assertIsNotNone(pair_joint)
         self.assertIsNone(pair_second)
         self.assertIsNone(regret)
+
+    def test_graph_client_batches_multiple_positions_from_one_worker(self):
+        cfg = load_config()
+        cfg.model.architecture = "global_xattn_0"
+        cfg.model.channels = 16
+        cfg.model.attention_heads = 4
+        cfg.model.graph_layers = 1
+        cfg.model.heads = ["value", "policy_place", "opp_policy"]
+        cfg.inference.max_batch_size = 8
+        cfg.inference.fp16 = False
+        server = InferenceServer(cfg, num_workers=1)
+        server.start()
+
+        client = InferenceClient(worker_id=0, num_workers=1, max_batch_size=8, timeout_ms=30000)
+        client.connect()
+
+        server_q = connect_inference_queue(1, 8)
+        s0 = server_q.get_slot(0)
+        client._slot.req_ready = s0.req_ready
+        client._slot.res_ready = s0.res_ready
+
+        graphs = [
+            build_graph_batch_from_history(b"", include_pair_rows=False),
+            build_graph_batch_from_history(
+                struct.pack("<iii", 0, 0, 0),
+                include_pair_rows=False,
+            ),
+        ]
+        outputs = client.submit_graph_many(graphs)
+
+        self.assertEqual(len(outputs), 2)
+        for graph, out in zip(graphs, outputs):
+            self.assertEqual(out["policy_place"].shape, (graph.legal_qr.shape[0],))
+            self.assertEqual(out["value"].shape, (1,))
+            self.assertEqual(out["metadata"]["legal_count"], graph.legal_qr.shape[0])
+            self.assertTrue(np.isfinite(out["policy_place"]).all())
+            self.assertTrue(np.isfinite(out["value"]).all())
+
+        client.disconnect()
+        server.stop()
+        server.join(timeout=5.0)
+        server_q.close()
 
     def test_adaptive_batching_two_clients(self):
         """Two clients submitting simultaneously get correct results."""

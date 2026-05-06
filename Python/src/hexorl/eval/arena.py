@@ -13,8 +13,8 @@ from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 
 from hexorl.config import Config
-from hexorl.model.network import HexNet, from_config, load_model_state
-from hexorl.eval.players import model_input_dtype, noisy_model_player
+from hexorl.models.assembly import from_config, load_model_state
+from hexorl.eval.players import _is_global_graph_model, model_input_dtype, noisy_model_player
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ def run_arena(
 
 
 def model_move_fn(
-    model: HexNet,
+    model: torch.nn.Module,
     *,
     device: Optional[torch.device] = None,
     temperature: float = 0.35,
@@ -143,7 +143,7 @@ def model_move_fn(
     Eval intentionally samples from the legal-masked policy by default so games
     are varied.  Use temperature near zero for legacy greedy behavior.
     """
-    if temperature > 1e-4 or top_p < 1.0:
+    if _is_global_graph_model(model) or temperature > 1e-4 or top_p < 1.0:
         return noisy_model_player(
             model,
             device=device,
@@ -200,8 +200,8 @@ def load_checkpoint_model(
     device: Optional[torch.device] = None,
     *,
     allow_partial: bool = False,
-) -> HexNet:
-    """Load a HexNet checkpoint for arena evaluation."""
+) -> torch.nn.Module:
+    """Load a checkpoint model for arena evaluation."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     ckpt_cfg = checkpoint.get("cfg")

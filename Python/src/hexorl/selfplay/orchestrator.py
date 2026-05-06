@@ -74,6 +74,9 @@ class SelfPlayOrchestrator:
         # Stats
         self._games_done = 0
         self._positions_done = 0
+        self._truncated_games = 0
+        self._recorder_failures = 0
+        self._terminal_reason_counts: dict[str, int] = {}
         self._start_time = 0.0
         self._stats_lock = threading.Lock()
         self._rgsc_totals: dict[str, float] = {}
@@ -212,8 +215,7 @@ class SelfPlayOrchestrator:
             # Targets are already computed by the worker before pushing.
             # Do not reprocess — it overwrites correct EMA lookahead values.
 
-            if self._recorder is not None:
-                self._recorder.game(game_record, source="selfplay", epoch=self._record_epoch)
+            self._record_game_for_dashboard(game_record)
 
             is_truncated = bool(getattr(game_record, "truncated", False))
             valid_positions = list(game_record.positions)
@@ -226,6 +228,12 @@ class SelfPlayOrchestrator:
             with self._stats_lock:
                 self._games_done += 1
                 self._positions_done += len(valid_positions)
+                if is_truncated:
+                    self._truncated_games += 1
+                terminal_reason = str(getattr(game_record, "terminal_reason", "") or "unknown")
+                self._terminal_reason_counts[terminal_reason] = (
+                    self._terminal_reason_counts.get(terminal_reason, 0) + 1
+                )
                 for key, value in getattr(game_record, "rgsc_metrics", {}).items():
                     if key == "rgsc_prb_size":
                         self._rgsc_totals[key] = max(
@@ -238,6 +246,27 @@ class SelfPlayOrchestrator:
         except Exception as e:
             logger.error(f"Failed to ingest game: {e}")
 
+    def _record_game_for_dashboard(self, game_record):
+        """Best-effort dashboard persistence; replay ingestion must keep going."""
+        if self._recorder is None:
+            return
+        last_error = None
+        for attempt in range(3):
+            try:
+                self._recorder.game(game_record, source="selfplay", epoch=self._record_epoch)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+        with self._stats_lock:
+            self._recorder_failures += 1
+        logger.warning(
+            "Dashboard recorder failed for game %s after retries; ingesting into replay only: %s",
+            getattr(game_record, "game_id", "unknown"),
+            last_error,
+        )
+
     # ── Status & Monitoring ──────────────────────────────────────────────
 
     @property
@@ -249,6 +278,9 @@ class SelfPlayOrchestrator:
             stats = {
                 "games_done": self._games_done,
                 "positions_done": self._positions_done,
+                "truncated_games": self._truncated_games,
+                "truncation_rate": self._truncated_games / max(self._games_done, 1),
+                "recorder_failures": self._recorder_failures,
                 "games_per_min": self._games_done / elapsed * 60.0,
                 "positions_per_min": self._positions_done / elapsed * 60.0,
                 "buffer_size": len(self._buffer),
@@ -257,6 +289,12 @@ class SelfPlayOrchestrator:
                 "workers_total": len(workers),
                 "elapsed_s": elapsed,
             }
+            stats.update(
+                {
+                    f"terminal_reason_{reason}": count
+                    for reason, count in self._terminal_reason_counts.items()
+                }
+            )
             stats.update(self._rgsc_totals)
             return stats
 

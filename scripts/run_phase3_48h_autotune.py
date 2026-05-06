@@ -44,6 +44,10 @@ from hexorl.eval.arena import load_checkpoint_model, model_move_fn, run_arena
 from hexorl.eval.classical import classical_opponent_fn
 from hexorl.eval.checkpoint_league import CheckpointLeague
 from hexorl.eval.tactical_suite import evaluate_tactical_suite
+from hexorl.models.registry import (
+    global_graph_architecture_ids,
+    is_global_graph_architecture as registry_is_global_graph_architecture,
+)
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
 from hexorl.selfplay.records import BOARD_AREA
 from hexorl.tuning import (
@@ -59,21 +63,19 @@ from hexorl.tuning import (
 LOGGER = logging.getLogger("phase3_autotune")
 FULL_GLOBAL_POLICY_ROWS = BOARD_AREA
 REPLAY_POLICY_WIDTH_CAP = 512
+# Stage 3 deliberately scouts the four pre-champion global graph candidates.
+# Membership and capability authority still come from hexorl.models.registry.
 GLOBAL_GRAPH_SCOUT_FAMILIES = (
     "global_xattn_0",
     "global_line_window_0",
     "global_pair_twostage_0",
     "global_graph_full_0",
 )
-GLOBAL_GRAPH_ARCHITECTURES = {
-    "global_graph_option1",
-    "global_xattn_0",
-    "global_line_window_0",
-    "global_pair_twostage_0",
-    "global_graph_full_0",
-    "global_hybrid_action_0",
-    "global_graph768_champion",
-}
+_GLOBAL_GRAPH_SCOUT_FAMILY_SET = frozenset(GLOBAL_GRAPH_SCOUT_FAMILIES)
+_GLOBAL_GRAPH_REGISTRY_IDS = frozenset(global_graph_architecture_ids())
+if not _GLOBAL_GRAPH_SCOUT_FAMILY_SET <= _GLOBAL_GRAPH_REGISTRY_IDS:
+    missing = sorted(_GLOBAL_GRAPH_SCOUT_FAMILY_SET - _GLOBAL_GRAPH_REGISTRY_IDS)
+    raise RuntimeError(f"global graph scout families missing from model registry: {missing}")
 GLOBAL_GRAPH_PAIR_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
 LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS = 128
 LOW_MEMORY_GLOBAL_GRAPH_RUNTIME_SWEEP_TIMEOUT_S = 240.0
@@ -474,10 +476,21 @@ class Phase3Supervisor:
             if not self._within_stage(stage) or not current:
                 break
             self.log.write("asha_rung_start", {"resource": resource, "trial_ids": [t.trial_id for t in current]})
+            while self._within_stage(stage):
+                progressed = False
+                for trial in current:
+                    if trial.epoch >= resource or trial.pruned:
+                        continue
+                    self._train_trial_epoch(
+                        trial,
+                        stage=stage,
+                        target_epoch_seconds=self.args.target_epoch_seconds,
+                    )
+                    progressed = True
+                if not progressed:
+                    break
             for trial in current:
-                while trial.epoch < resource and not trial.pruned and self._within_stage(stage):
-                    self._train_trial_epoch(trial, stage=stage, target_epoch_seconds=self.args.target_epoch_seconds)
-                if not trial.pruned:
+                if not trial.pruned and trial.epoch >= resource:
                     self._evaluate_trial(trial, stage=stage, force=True)
             self._score_population(current, stage=stage)
             self._record_asha_rung(current, resource)
@@ -629,7 +642,7 @@ class Phase3Supervisor:
             recorder=recorder,
             replay=replay,
         )
-        _write_json(run_dir / "trial.json", self._trial_public_state(trial))
+        self._save_trial_state(trial)
         self.log.write("trial_created", {"stage": stage, **self._trial_public_state(trial)})
         return trial
 
@@ -668,6 +681,8 @@ class Phase3Supervisor:
             trial.prune_reason = f"train_exception:{type(exc).__name__}:{exc}"
             self.log.write("trial_pruned", {"trial_id": trial.trial_id, "reason": trial.prune_reason})
             self._release_trial_runtime(trial, reason=trial.prune_reason)
+            self._save_trial_state(trial)
+            self._save_state()
             return
 
         trial.trainer = result.trainer
@@ -703,6 +718,8 @@ class Phase3Supervisor:
             self.log.write("trial_pruned", {"trial_id": trial.trial_id, "reason": reason})
             self._release_trial_runtime(trial, reason=reason)
 
+        self._save_trial_state(trial)
+        self._save_state()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -725,6 +742,8 @@ class Phase3Supervisor:
             trial.prune_reason = reason
             self.log.write("trial_pruned", {"trial_id": trial.trial_id, "reason": reason})
             self._release_trial_runtime(trial, reason=reason)
+        self._save_trial_state(trial)
+        self._save_state()
         return components
 
     def _clone_compatible_trial(self, src: TrialState, dst: TrialState, generation: int) -> bool:
@@ -835,7 +854,7 @@ class Phase3Supervisor:
 
     @staticmethod
     def _is_global_graph_architecture(architecture: str) -> bool:
-        return str(architecture).lower() in GLOBAL_GRAPH_ARCHITECTURES
+        return registry_is_global_graph_architecture(str(architecture))
 
     def _heads_for_recipe(self, family: FamilySpec, recipe: StaticRecipe) -> list[str]:
         if not family.global_graph:
@@ -876,8 +895,14 @@ class Phase3Supervisor:
         cfg.model.sparse_prior_mix = 0.0 if family.global_graph else 0.25
         cfg.model.candidate_budget = recipe.candidate_budget if (family.sparse_policy or family.graph) else 256
         cfg.model.heads = self._heads_for_recipe(family, recipe)
-        if family.global_graph and not (set(cfg.model.heads) & GLOBAL_GRAPH_PAIR_HEADS):
-            cfg.model.pair_prior_mix = 0.0
+        if family.global_graph:
+            if set(cfg.model.heads) & GLOBAL_GRAPH_PAIR_HEADS:
+                cfg.model.pair_strategy = "diagnostic_full_pair"
+                cfg.model.pair_strategy_max_pairs = min(256, max(1, int(recipe.graph_token_budget)))
+            else:
+                cfg.model.pair_prior_mix = 0.0
+                cfg.model.pair_strategy = "none"
+                cfg.model.pair_strategy_max_pairs = 0
         cfg.buffer.lookahead_horizons = [4, 12, 36]
         cfg.buffer.lookahead_lambdas = [0.75, 0.90, 0.97]
         cfg.selfplay.mcts_simulations = recipe.full_sims
@@ -1089,6 +1114,7 @@ class Phase3Supervisor:
                 "selected": selected,
             }
             self.log.write("runtime_sweep_cached", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
+            self._save_trial_state(trial)
             return
         if cached and cached.get("selected"):
             self.log.write(
@@ -1097,7 +1123,7 @@ class Phase3Supervisor:
                     "trial_id": trial.trial_id,
                     "stage": stage,
                     "key": key,
-                    "reason": "missing_or_unsafe_memory_telemetry",
+                    "reason": "unsafe_or_suboptimal_cached_selection",
                     "cached_selected": cached.get("selected"),
                     "cached_selected_record": cached.get("selected_record"),
                 },
@@ -1188,6 +1214,8 @@ class Phase3Supervisor:
             self.log.write("runtime_sweep_failed", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
             self.log.write("trial_pruned", {"trial_id": trial.trial_id, "stage": stage, "reason": reason})
             self._release_trial_runtime(trial, reason=reason)
+            self._save_trial_state(trial)
+            self._save_state()
             return
 
         selected_record = max(valid, key=lambda row: float(row.get("score", row.get("positions_per_min", 0.0)) or 0.0))
@@ -1211,6 +1239,7 @@ class Phase3Supervisor:
         }
         self._save_runtime_sweep_cache()
         self.log.write("runtime_sweep_selected", {"trial_id": trial.trial_id, "stage": stage, **trial.runtime_sweep})
+        self._save_trial_state(trial)
 
     def _run_runtime_sweep_candidate(
         self,
@@ -1458,12 +1487,32 @@ class Phase3Supervisor:
         high_search_non_graph = bool(not trial.family.graph and not trial.family.sparse_policy and trial.static.full_sims >= 512)
         if isinstance(record, dict):
             candidate = record.get("candidate") or {}
+            selected = cached.get("selected") or {}
+            if isinstance(candidate, dict) and isinstance(selected, dict) and candidate != selected:
+                return False
             workers = int(candidate.get("workers", 0) or 0) if isinstance(candidate, dict) else 0
             if high_search_non_graph and self._low_memory_cuda_host() and workers > 4:
                 return False
             if "memory" not in record:
                 return not high_search_non_graph
-            return not self._runtime_sweep_memory_unsafe(record)
+            if self._runtime_sweep_memory_unsafe(record):
+                return False
+            results = cached.get("results")
+            if isinstance(results, list):
+                valid = [
+                    row
+                    for row in results
+                    if isinstance(row, dict)
+                    and row.get("ok")
+                    and float(row.get("positions_per_min", 0.0) or 0.0) > 0.0
+                    and not self._runtime_sweep_memory_unsafe(row)
+                ]
+                if valid:
+                    best = max(valid, key=lambda row: float(row.get("score", row.get("positions_per_min", 0.0)) or 0.0))
+                    best_candidate = best.get("candidate") or {}
+                    if isinstance(candidate, dict) and isinstance(best_candidate, dict) and candidate != best_candidate:
+                        return False
+            return True
         return not high_search_non_graph
 
     def _runtime_sweep_memory_unsafe(self, row: dict[str, Any]) -> bool:
@@ -1892,10 +1941,6 @@ class Phase3Supervisor:
                     object.__setattr__(family, "available", False)
                 elif graph_available and family.sparse_policy and not family.graph:
                     reason = "host_guard:non_graph_sparse_timeout_risk_when_graph_available_on_12gb"
-                    self.blocked_families[family.name] = reason
-                    object.__setattr__(family, "available", False)
-                elif family.architecture == "global_xattn_0":
-                    reason = "host_guard:global_xattn_zero_progress_calibration_on_12gb_16core"
                     self.blocked_families[family.name] = reason
                     object.__setattr__(family, "available", False)
 
@@ -2616,6 +2661,9 @@ class Phase3Supervisor:
         }
         _write_json(self.output_root / "state.json", state)
 
+    def _save_trial_state(self, trial: TrialState) -> None:
+        _write_json(trial.run_dir / "trial.json", self._trial_public_state(trial))
+
     def _trial_public_state(self, trial: TrialState) -> dict[str, Any]:
         return {
             "trial_id": trial.trial_id,
@@ -2877,12 +2925,16 @@ class EvaluationServices:
         train = latest.get("train", {})
         elapsed = float(latest.get("epoch_elapsed_s", 0.0) or 0.0)
         positions = float((latest.get("buffer") or {}).get("size", 0.0) or 0.0)
+        truncation_rate = float(selfplay.get("truncation_rate", 0.0) or 0.0)
+        if "truncation_rate" not in selfplay and "truncated_games" in selfplay:
+            games = float(selfplay.get("games_done", 0.0) or 0.0)
+            truncation_rate = float(selfplay.get("truncated_games", 0.0) or 0.0) / max(games, 1.0)
         return {
             "epoch_seconds": elapsed,
             "positions_per_second": positions / max(elapsed, 1e-6),
             "train_batches_per_second": float(train.get("batches_per_sec", 0.0) or 0.0),
             "selfplay_positions_per_min": float(selfplay.get("positions_per_min", 0.0) or 0.0),
-            "truncation_rate": 0.0,
+            "truncation_rate": truncation_rate,
         }
 
 

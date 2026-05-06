@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from hexorl.buffer import sampler as sampler_module
 from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.regret_buffer import compute_regret
 from hexorl.buffer.sampler import (
@@ -20,6 +21,7 @@ from hexorl.buffer.targets import (
     _turn_boundary_indices,
     compute_ema_lookahead,
     hexo_turn_start_indices,
+    pair_policy_target_complete_from_sparse_rows,
     process_game_record,
     value_from_source_perspective,
 )
@@ -37,7 +39,18 @@ from hexorl.selfplay.records import (
     sparsify_policy,
 )
 from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
+from hexorl.train.loss_plan import LossContractError, build_loss_plan
 from hexorl.model.network import HexNet
+
+
+def _compute_losses(predictions, targets, loss_weights, **kwargs):
+    return compute_losses(
+        predictions,
+        targets,
+        loss_weights,
+        loss_plan=build_loss_plan(tuple(predictions.keys()), loss_weights),
+        **kwargs,
+    )
 
 
 def _move(player: int, q: int, r: int) -> bytes:
@@ -863,12 +876,15 @@ def test_sparse_d6_batch_trains_for_all_model_architectures(architecture):
     targets = {
         "policy": torch.from_numpy(policies),
         "value": torch.from_numpy(values),
+        "value_weight": torch.ones(1),
         "sparse_policy_target": torch.from_numpy(aux["sparse_policy_target"]),
         "candidate_mask": torch.from_numpy(aux["candidate_mask"]),
+        "candidate_indices": torch.from_numpy(aux["candidate_indices"]),
         "policy_weight": torch.from_numpy(aux["policy_weight"]),
+        "sparse_policy_weight": torch.from_numpy(aux["sparse_policy_weight"]),
     }
 
-    total, per_head = compute_losses(
+    total, per_head = _compute_losses(
         out,
         targets,
         {"policy": 1.0, "value": 1.0, "sparse_policy": 1.0},
@@ -948,7 +964,7 @@ def test_pair_policy_targets_use_full_policy_v2_by_default():
     assert sum(prob for _first, _second, prob in pair_target) == pytest.approx(1.0)
 
 
-def test_graph_replay_can_emit_full_first_placement_pair_rows():
+def test_graph_replay_budgets_first_placement_pair_rows_and_preserves_target():
     pair_target = [((1, 0), (0, 1), 1.0)]
     rec = PositionRecord(
         move_history=_move(0, 0, 0),
@@ -971,7 +987,7 @@ def test_graph_replay_can_emit_full_first_placement_pair_rows():
     _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
 
     assert aux["legal_qr"].shape[1] == 216
-    assert aux["pair_token_indices"].shape[1] == 216 * 215 // 2
+    assert aux["pair_token_indices"].shape[1] == 256
     assert aux["pair_policy_target"][0].sum() == pytest.approx(1.0)
     assert aux["pair_second_policy_target"][0].sum() == pytest.approx(0.0)
     legal_qr = np.asarray(aux["legal_qr"][0])
@@ -988,6 +1004,76 @@ def test_graph_replay_can_emit_full_first_placement_pair_rows():
     }[(0, 1)]
     assert aux["pair_first_policy_target"][0, first_row] == pytest.approx(1.0)
     assert aux["pair_first_policy_target"][0, second_row] == pytest.approx(0.0)
+
+
+def test_graph_replay_can_defer_full_batch_collation_for_training():
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=2,
+        use_symmetry=False,
+        include_graph_policy=True,
+        defer_graph_collate=True,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert "_graph_batches" in aux
+    assert len(aux["_graph_batches"]) == 2
+    assert "relation_bias" not in aux
+    assert aux["_graph_batches"][0].policy_target.sum() == pytest.approx(1.0)
+
+
+def test_graph_replay_reuses_cached_base_graphs(monkeypatch):
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    buffer.append(rec)
+    calls = []
+    real_build = sampler_module.build_graph_batch_from_history
+
+    def wrapped_build(history, *args, **kwargs):
+        calls.append((history, kwargs.get("max_context_tokens"), kwargs.get("max_legal_rows")))
+        return real_build(history, *args, **kwargs)
+
+    monkeypatch.setattr(sampler_module, "build_graph_batch_from_history", wrapped_build)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=2,
+        use_symmetry=False,
+        include_graph_policy=True,
+        defer_graph_collate=True,
+        graph_context_tokens=64,
+        graph_legal_rows=32,
+        graph_cache_size=8,
+    )
+    iterator = iter(dataset)
+
+    _tensors, _policies, _values, _lookahead, first_aux = next(iterator)
+    _tensors, _policies, _values, _lookahead, second_aux = next(iterator)
+
+    assert len(calls) == 1
+    assert calls[0][1] == 64
+    assert calls[0][2] == 32
+    assert first_aux["_graph_batches"][0].policy_target.sum() == pytest.approx(1.0)
+    assert second_aux["_graph_batches"][0].policy_target.sum() == pytest.approx(1.0)
 
 
 def test_pair_policy_d6_bijection_preserves_pair_identity():
@@ -1267,7 +1353,7 @@ def test_first_placement_pair_target_requires_recorded_joint_table():
     assert processed[1].pair_policy_target_v2 == [((1, 0), (2, 0), 1.0)]
 
 
-def test_graph_pair_training_rejects_incomplete_first_placement_pair_target():
+def test_graph_pair_training_masks_incomplete_first_placement_pair_target():
     rec = PositionRecord(
         move_history=_move(0, 0, 0),
         policy_target={action_to_board_index(1, 0): 1.0},
@@ -1288,8 +1374,51 @@ def test_graph_pair_training_rejects_incomplete_first_placement_pair_target():
         include_graph_policy=True,
     )
 
-    with pytest.raises(ValueError, match="complete search-observed"):
-        next(iter(dataset))
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["pair_policy_target"][0].sum() == pytest.approx(0.0)
+    assert aux["pair_policy_weight"][0] == pytest.approx(0.0)
+    if "pair_candidate_missing_mass" in aux:
+        assert aux["pair_candidate_missing_mass"][0] == pytest.approx(1.0)
+
+
+def test_graph_pair_training_accepts_sparse_search_observed_first_placement_target():
+    history = _move(0, 0, 0)
+    pair_target = [((1, 0), (2, 0), 1.0)]
+    rec = PositionRecord(
+        move_history=history,
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+        pair_policy_target_v2=pair_target,
+        pair_policy_complete=False,
+    )
+    game = GameRecord(game_id="sparse-pair-complete", positions=[rec], outcome=1.0)
+    processed = process_game_record(game)
+
+    assert processed[0].pair_policy_complete is True
+    assert pair_policy_target_complete_from_sparse_rows(
+        pair_target,
+        [(1, 0), (2, 0), (3, 0)],
+        placements_remaining=2,
+    )
+
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(processed[0])
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_pair_policy=True,
+        include_graph_policy=True,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["pair_policy_target"].sum() == pytest.approx(1.0)
+    assert aux["pair_policy_weight"][0] == pytest.approx(1.0)
 
 
 def test_sparse_policy_loss_masks_invalid_candidates():
@@ -1494,43 +1623,108 @@ def test_orchestrator_masks_truncated_game_value_targets(tmp_path):
     assert len(orchestrator.buffer) == 1
     assert orchestrator.buffer[0].value_weight == 0.0
     assert orchestrator.stats["positions_done"] == 1
+    assert orchestrator.stats["truncated_games"] == 1
+    assert orchestrator.stats["truncation_rate"] == 1.0
+    assert orchestrator.stats["terminal_reason_max_game_moves"] == 1
     rows = store.rows("SELECT payload_json FROM games")
     assert rows[0]["payload_json"]["truncated"] is True
     assert rows[0]["payload_json"]["terminal_reason"] == "max_game_moves"
 
 
-def test_compute_losses_skips_missing_targets_and_handles_batch_one():
+def test_orchestrator_ingests_game_when_dashboard_recording_fails():
+    class FailingRecorder:
+        def __init__(self):
+            self.calls = 0
+
+        def game(self, *_args, **_kwargs):
+            self.calls += 1
+            raise OSError("unable to open database file")
+
+    cfg = Config()
+    cfg.selfplay.train_on_truncated_games = False
+    recorder = FailingRecorder()
+    orchestrator = SelfPlayOrchestrator(cfg, buffer_capacity=16, recorder=recorder)
+    game = GameRecord(
+        positions=[
+            PositionRecord(
+                move_history=b"",
+                policy_target={action_to_board_index(0, 0): 1.0},
+                root_value=0.25,
+                player=0,
+                outcome=1.0,
+            )
+        ],
+        outcome=1.0,
+        game_id=10,
+        game_length=1,
+        final_move_history=b"",
+        truncated=False,
+        terminal_reason="win",
+    )
+
+    orchestrator._ingest_game(game)
+
+    assert recorder.calls == 3
+    assert len(orchestrator.buffer) == 1
+    assert orchestrator.stats["games_done"] == 1
+    assert orchestrator.stats["positions_done"] == 1
+    assert orchestrator.stats["recorder_failures"] == 1
+    assert orchestrator.stats["terminal_reason_win"] == 1
+
+
+def test_compute_losses_fails_missing_required_targets_and_weights():
     predictions = {
         "policy": torch.zeros(1, 1089),
         "value": torch.zeros(1, 65),
         "regret_rank": torch.zeros(1, 1),
-        "axis": torch.zeros(1, 3),
-        "axis_delta_norm": torch.zeros(1, 6, 33, 33),
         "moves_left": torch.ones(1, 1),
     }
     targets = {
         "policy": torch.nn.functional.one_hot(torch.tensor([0]), 1089).float(),
         "value": torch.tensor([1.0]),
+    }
+
+    with pytest.raises(LossContractError, match="policy_weight"):
+        _compute_losses(
+            predictions,
+            targets,
+            {
+                "policy": 1.0,
+                "value": 1.0,
+                "regret_rank": 1.0,
+                "moves_left": 1.0,
+            },
+        )
+
+
+def test_compute_losses_uses_explicit_contracts_for_batch_one():
+    predictions = {
+        "policy": torch.zeros(1, 1089),
+        "value": torch.zeros(1, 65),
+        "axis": torch.zeros(1, 3),
+        "axis_delta_norm": torch.zeros(1, 6, 33, 33),
+    }
+    targets = {
+        "policy": torch.nn.functional.one_hot(torch.tensor([0]), 1089).float(),
+        "policy_weight": torch.ones(1),
+        "value": torch.tensor([1.0]),
+        "value_weight": torch.ones(1),
         "axis": torch.tensor([-1]),
         "axis_delta_norm": torch.ones(1, 6, 33, 33),
     }
 
-    total, per_head = compute_losses(
+    total, per_head = _compute_losses(
         predictions,
         targets,
         {
             "policy": 1.0,
             "value": 1.0,
-            "regret_rank": 1.0,
             "axis": 1.0,
             "axis_delta_norm": 1.0,
-            "moves_left": 1.0,
         },
     )
 
     assert torch.isfinite(total)
-    assert "regret_rank" not in per_head
-    assert "moves_left" not in per_head
     assert per_head["axis"].item() == 0.0
     assert per_head["axis_delta_norm"].item() > 0.0
 
@@ -1544,7 +1738,7 @@ def test_policy_loss_can_be_masked_to_full_search_samples():
         "policy_weight": torch.tensor([1.0, 0.0]),
     }
 
-    total, per_head = compute_losses(predictions, targets, {"policy": 1.0})
+    total, per_head = _compute_losses(predictions, targets, {"policy": 1.0})
 
     expected = torch.log(torch.tensor(1089.0))
     assert torch.allclose(total.detach(), expected, atol=1e-5)
@@ -1560,14 +1754,14 @@ def test_opp_policy_loss_uses_opponent_policy_weight():
         "opp_policy_weight": torch.tensor([1.0, 0.0]),
     }
 
-    total, per_head = compute_losses(predictions, targets, {"opp_policy": 1.0})
+    total, per_head = _compute_losses(predictions, targets, {"opp_policy": 1.0})
 
     expected = torch.log(torch.tensor(1089.0))
     assert torch.allclose(total.detach(), expected, atol=1e-5)
     assert torch.allclose(per_head["opp_policy"].detach(), expected, atol=1e-5)
 
 
-def test_opp_policy_loss_skips_empty_targets():
+def test_opp_policy_loss_rejects_empty_active_targets():
     predictions = {"opp_policy": torch.zeros(2, 1089, requires_grad=True)}
     targets = {
         "opp_policy": torch.stack(
@@ -1579,11 +1773,8 @@ def test_opp_policy_loss_skips_empty_targets():
         "opp_policy_weight": torch.ones(2),
     }
 
-    total, per_head = compute_losses(predictions, targets, {"opp_policy": 1.0})
-
-    expected = torch.log(torch.tensor(1089.0))
-    assert torch.allclose(total.detach(), expected, atol=1e-5)
-    assert torch.allclose(per_head["opp_policy"].detach(), expected, atol=1e-5)
+    with pytest.raises(LossContractError, match="positive target mass"):
+        _compute_losses(predictions, targets, {"opp_policy": 1.0})
 
 
 def test_value_loss_can_be_masked_for_truncated_games():
@@ -1593,7 +1784,7 @@ def test_value_loss_can_be_masked_for_truncated_games():
         "value_weight": torch.tensor([0.0, 0.0]),
     }
 
-    total, per_head = compute_losses(predictions, targets, {"value": 1.0})
+    total, per_head = _compute_losses(predictions, targets, {"value": 1.0})
 
     assert total.item() == 0.0
     assert per_head["value"].item() == 0.0
@@ -1606,7 +1797,7 @@ def test_value_loss_ignores_non_finite_targets_with_zero_weight():
         "value_weight": torch.tensor([0.0, 1.0]),
     }
 
-    total, per_head = compute_losses(predictions, targets, {"value": 1.0})
+    total, per_head = _compute_losses(predictions, targets, {"value": 1.0})
 
     assert torch.isfinite(total)
     assert torch.isfinite(per_head["value"])
@@ -1623,7 +1814,7 @@ def test_regret_losses_can_be_masked_by_regret_weight():
         "regret_weight": torch.tensor([0.0, 0.0]),
     }
 
-    total, per_head = compute_losses(
+    total, per_head = _compute_losses(
         predictions,
         targets,
         {"regret_rank": 1.0, "regret_value": 1.0},

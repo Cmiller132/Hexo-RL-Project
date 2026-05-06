@@ -15,6 +15,49 @@ from hexorl.graph.batch import legal_moves_for_stones, parse_history
 from hexorl.selfplay.records import GameRecord, PositionRecord
 
 
+def pair_policy_target_complete_from_sparse_rows(
+    pair_policy_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]],
+    legal_rows,
+    placements_remaining: int,
+) -> bool:
+    """Validate sparse positive rows for an implicit complete joint pair table.
+
+    The pair target blob stores only positive MCTS visit rows.  During graph
+    training, ``graph_batch_with_reference_pair_rows`` recreates the complete
+    legal unordered-pair table and treats omitted valid pairs as zero target
+    mass.  Therefore completeness means the rows are search-observed, legal,
+    distinct, duplicate-free, finite, and non-empty when a two-placement joint
+    table is required.  It does not mean every legal pair received a positive
+    visit.
+    """
+
+    if int(placements_remaining) < 2:
+        return True
+    legal = np.asarray(legal_rows, dtype=np.int32).reshape(-1, 2)
+    legal_count = int(legal.shape[0])
+    if legal_count < 2:
+        return True
+    if not pair_policy_v2:
+        return False
+    legal_set = {(int(q), int(r)) for q, r in legal.tolist()}
+    seen: set[frozenset[tuple[int, int]]] = set()
+    total_mass = 0.0
+    for first, second, prob in pair_policy_v2:
+        p = float(prob)
+        if not np.isfinite(p) or p <= 0.0:
+            return False
+        a = (int(first[0]), int(first[1]))
+        b = (int(second[0]), int(second[1]))
+        if a == b or a not in legal_set or b not in legal_set:
+            return False
+        key = frozenset({a, b})
+        if key in seen:
+            return False
+        seen.add(key)
+        total_mass += p
+    return total_mass > 0.0
+
+
 def compute_value_targets(
     positions: List[PositionRecord],
     outcome: float,
@@ -207,17 +250,11 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
         if not pos.pair_policy_target_v2:
             pos.pair_policy_target_v2 = _real_pair_policy_target(positions, i)
         if pos.pair_policy_target_v2 and _is_first_placement_turn_start(positions, i):
-            legal = set(_legal_qr_from_history(pos.move_history))
-            expected_pairs = len(legal) * max(len(legal) - 1, 0) // 2
-            seen_pairs = {
-                frozenset({(int(first[0]), int(first[1])), (int(second[0]), int(second[1]))})
-                for first, second, prob in pos.pair_policy_target_v2
-                if float(prob) > 0.0
-                and (int(first[0]), int(first[1])) in legal
-                and (int(second[0]), int(second[1])) in legal
-                and (int(first[0]), int(first[1])) != (int(second[0]), int(second[1]))
-            }
-            pos.pair_policy_complete = bool(expected_pairs == 0 or len(seen_pairs) == expected_pairs)
+            pos.pair_policy_complete = pair_policy_target_complete_from_sparse_rows(
+                pos.pair_policy_target_v2,
+                _legal_qr_from_history(pos.move_history),
+                placements_remaining=2,
+            )
         tail = positions[i:]
         regret_weight = 0.0 if getattr(record, "truncated", False) else 1.0
         if any(p.selected_action_value is None for p in tail):

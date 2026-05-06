@@ -7,8 +7,9 @@ import torch
 from hexorl.buffer import RingBuffer
 from hexorl.config import Config
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
-from hexorl.selfplay.worker import SelfPlayWorker, _score_graph_pair_chunks
+from hexorl.selfplay.worker import SelfPlayWorker, _current_turn_first_qr, _score_graph_pair_chunks
 from hexorl.train.ema import ModelEMA
+from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.model.network import HexConv2d, GatedResBlock, build_model_from_config, load_model_state
 
@@ -79,12 +80,15 @@ def test_config_rejects_mismatched_lookahead_horizon_and_lambda_counts():
         )
 
 
-def test_compute_losses_raises_when_no_loss_can_be_computed():
-    with pytest.raises(ValueError, match="No trainable losses"):
+def test_compute_losses_raises_when_required_contract_target_is_missing():
+    with pytest.raises(ValueError, match="requires target 'regret_rank'"):
+        predictions = {"regret_rank": torch.zeros(2, 1)}
+        loss_weights = {"regret_rank": 1.0}
         compute_losses(
-            {"regret_rank": torch.zeros(2, 1)},
+            predictions,
             {"policy": torch.zeros(2, 1089)},
-            {"regret_rank": 1.0},
+            loss_weights,
+            loss_plan=build_loss_plan(tuple(predictions.keys()), loss_weights),
         )
 
 
@@ -120,6 +124,50 @@ def test_selfplay_worker_game_ids_are_unique_across_workers():
     worker1 = SelfPlayWorker(1, cfg, record_queue=None)
 
     assert worker0._game_id() != worker1._game_id()
+
+
+def test_selfplay_pcr_schedule_keeps_full_search_rows_inside_long_games():
+    cfg = Config()
+    cfg.selfplay.pcr_low_sim_prob = 0.70
+    cfg.selfplay.pcr_low_sims = 64
+    cfg.selfplay.mcts_simulations = 128
+    worker = SelfPlayWorker(0, cfg, record_queue=None)
+
+    schedule = [worker._search_mode_for_turn(game_seed=1234, move_idx=i) for i in range(40)]
+    full_rows = [idx for idx, (use_pcr, sims) in enumerate(schedule) if not use_pcr]
+    pcr_rows = [idx for idx, (use_pcr, sims) in enumerate(schedule) if use_pcr]
+
+    assert len(full_rows) == 12
+    assert pcr_rows
+    assert all(sims == 128 for _idx, (use_pcr, sims) in enumerate(schedule) if not use_pcr)
+    assert all(sims == 64 for _idx, (use_pcr, sims) in enumerate(schedule) if use_pcr)
+    assert any(idx % 2 == 0 for idx in full_rows)
+    assert any(idx % 2 == 1 for idx in full_rows)
+    assert any(not use_pcr for use_pcr, _sims in schedule[:20])
+    assert any(not use_pcr for use_pcr, _sims in schedule[20:])
+
+
+def test_selfplay_pcr_schedule_honors_extreme_probabilities():
+    cfg = Config()
+    cfg.selfplay.pcr_low_sims = 64
+    cfg.selfplay.mcts_simulations = 128
+    worker = SelfPlayWorker(0, cfg, record_queue=None)
+
+    worker.pcr_low_sim_prob = 0.0
+    assert [worker._search_mode_for_turn(1234, i) for i in range(4)] == [
+        (False, 128),
+        (False, 128),
+        (False, 128),
+        (False, 128),
+    ]
+
+    worker.pcr_low_sim_prob = 1.0
+    assert [worker._search_mode_for_turn(1234, i) for i in range(4)] == [
+        (True, 64),
+        (True, 64),
+        (True, 64),
+        (True, 64),
+    ]
 
 
 def test_autotune_train_batch_avoids_memory_cliff_for_production_model():
@@ -407,6 +455,45 @@ def test_global_xattn_pair_heads_do_not_enable_pair_scoring_without_strategy():
         assert worker.pair_strategy_summary(pair_rows_possible=100)["pair_rows_scored"] == 0
     finally:
         queue.close()
+
+
+def test_pair_second_scoring_only_has_known_current_turn_first_placement():
+    def move_bytes(player: int, q: int, r: int) -> bytes:
+        return (
+            int(player).to_bytes(4, "little", signed=True)
+            + int(q).to_bytes(4, "little", signed=True)
+            + int(r).to_bytes(4, "little", signed=True)
+        )
+
+    assert (
+        _current_turn_first_qr(
+            b"",
+            current_player=0,
+            placements_remaining=1,
+        )
+        is None
+    )
+    assert (
+        _current_turn_first_qr(
+            move_bytes(1, 0, 0),
+            current_player=0,
+            placements_remaining=1,
+        )
+        is None
+    )
+    assert (
+        _current_turn_first_qr(
+            move_bytes(0, 2, -1),
+            current_player=0,
+            placements_remaining=2,
+        )
+        is None
+    )
+    assert _current_turn_first_qr(
+        move_bytes(0, 2, -1),
+        current_player=0,
+        placements_remaining=1,
+    ) == (2, -1)
 
 
 def test_pair_scoring_requires_explicit_diagnostic_strategy_and_cap():

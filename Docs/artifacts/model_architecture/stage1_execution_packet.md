@@ -57,6 +57,15 @@ the fragmented model architecture logic with a contract-first authority under
 - `Docs/artifacts/model_architecture/design_examples.md`
 - `Docs/artifacts/model_architecture/golden_test_plan.md`
 
+## Local Refresh
+
+The Stage 1 plan and artifacts were fast-forwarded from `origin/main` on
+2026-05-06, then the local autotune/runtime work was reapplied and conflicts
+were resolved. `Docs/artifacts/model_architecture/baseline_command_report.md`
+was refreshed locally on this PC. The local harness has the Rust `_engine`
+extension available and the focused model, graph, replay, inference, tactical,
+engine, and config checks pass.
+
 ## Review Finding Closure
 
 - The architecture inventory records exact duplicated authority sources in

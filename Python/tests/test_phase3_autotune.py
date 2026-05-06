@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -284,6 +285,33 @@ def test_phase3_sparse_candidate_gate_failure_penalizes_scheduler_score(monkeypa
     assert row["scheduler_score"] == row["strength_score"] - 0.01 - 0.09
 
 
+def test_phase3_throughput_memory_uses_selfplay_truncation_rate():
+    module = _load_phase3_autotune_module()
+    services = module.EvaluationServices.__new__(module.EvaluationServices)
+
+    direct = module.EvaluationServices.throughput_memory(
+        services,
+        {
+            "epoch_elapsed_s": 10.0,
+            "buffer": {"size": 20},
+            "train": {"batches_per_sec": 3.0},
+            "selfplay": {"positions_per_min": 120.0, "truncation_rate": 0.75},
+        },
+    )
+    derived = module.EvaluationServices.throughput_memory(
+        services,
+        {
+            "epoch_elapsed_s": 10.0,
+            "buffer": {"size": 20},
+            "train": {"batches_per_sec": 3.0},
+            "selfplay": {"positions_per_min": 120.0, "games_done": 8, "truncated_games": 2},
+        },
+    )
+
+    assert direct["truncation_rate"] == 0.75
+    assert derived["truncation_rate"] == 0.25
+
+
 def test_transient_train_exception_does_not_quarantine_family():
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
@@ -471,11 +499,14 @@ def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
 
 def test_finalist_pool_includes_staged_global_graph_scouts():
     module = _load_phase3_autotune_module()
+    from hexorl.models.registry import global_graph_architecture_ids
+
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
 
     families = module.Phase3Supervisor._finalist_pool(supervisor)
     by_name = {family.name: family for family in families}
 
+    assert set(module.GLOBAL_GRAPH_SCOUT_FAMILIES) <= set(global_graph_architecture_ids())
     assert set(module.GLOBAL_GRAPH_SCOUT_FAMILIES) <= set(by_name)
     assert "global_graph768_champion" not in by_name
     for name in module.GLOBAL_GRAPH_SCOUT_FAMILIES:
@@ -522,6 +553,8 @@ def test_global_graph_config_uses_graph_native_heads_and_compact_replay_width(tm
     assert cfg.model.sparse_policy is False
     assert "policy_place" in cfg.model.heads
     assert "policy" not in cfg.model.heads
+    assert cfg.model.pair_strategy == "none"
+    assert cfg.model.pair_strategy_max_pairs == 0
     assert replay.max_policy_v2_entries <= module.REPLAY_POLICY_WIDTH_CAP
     assert replay.max_policy_v2_entries < module.FULL_GLOBAL_POLICY_ROWS
     assert replay.memory_estimate()["feature_groups"]["opp_policy"] is False
@@ -649,7 +682,11 @@ def test_phase3_pair_policy_storage_is_only_for_global_pair_heads(tmp_path):
 
     assert "pair_policy" not in hybrid_cfg.model.heads
     assert not (set(hybrid_cfg.model.heads) & module.GLOBAL_GRAPH_PAIR_HEADS)
+    assert hybrid_cfg.model.pair_strategy == "none"
+    assert hybrid_cfg.model.pair_strategy_max_pairs == 0
     assert set(global_cfg.model.heads) & module.GLOBAL_GRAPH_PAIR_HEADS
+    assert global_cfg.model.pair_strategy == "diagnostic_full_pair"
+    assert global_cfg.model.pair_strategy_max_pairs == 256
 
     hybrid_replay = module.Phase3Supervisor._make_replay_buffer(supervisor, hybrid_cfg, graph_hybrid)
     global_replay = module.Phase3Supervisor._make_replay_buffer(supervisor, global_cfg, pair_global)
@@ -781,6 +818,80 @@ def test_static_candidates_stay_balanced_with_global_graph_families(tmp_path):
     assert supervisor.log.events[-1][1]["family_balanced"] is True
 
 
+def test_phase3_static_asha_round_robins_epochs_within_rung(tmp_path):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.args = SimpleNamespace(max_active_trials=3, target_epoch_seconds=10.0)
+    supervisor.output_root = tmp_path
+    supervisor.log = _CaptureLog()
+    supervisor.trials = []
+    supervisor.asha_table = ASHARungTable(resources=(2,), promotion_fraction=1.0)
+    supervisor._within_stage = lambda stage: True
+    supervisor._asha_resources = lambda: [2]
+    supervisor._score_population = lambda current, stage: None
+    supervisor._record_asha_rung = lambda current, resource: None
+    supervisor._apply_asha_decision = lambda current, decision, stage: []
+    supervisor._save_state = lambda: None
+    supervisor._initial_dynamic = lambda family: module.DynamicParams()
+
+    recipe = module.StaticRecipe(
+        full_sims=512,
+        pcr_low_sims=128,
+        policy_top_k=96,
+        candidate_budget=256,
+        head_bundle="structural",
+        temperature_family="slow_cool",
+        train_batch_size=128,
+    )
+    families = [
+        module.FamilySpec("best_restnet_33", "restnet", "restnet", available=True),
+        module.FamilySpec("global_xattn_0", "global", "global_xattn_0", graph=True, global_graph=True, available=True),
+        module.FamilySpec("global_pair_twostage_0", "global", "global_pair_twostage_0", graph=True, global_graph=True, available=True),
+    ]
+    supervisor._generate_static_candidates = lambda max_trials: [(family, recipe) for family in families]
+
+    def create_trial(trial_id, family, recipe, dynamic, stage):
+        return SimpleNamespace(
+            trial_id=trial_id,
+            family=family,
+            static=recipe,
+            dynamic=dynamic,
+            epoch=0,
+            pruned=False,
+            checkpoint_path=tmp_path / trial_id / "checkpoint.pt",
+            metrics_history=[],
+            score_history=[],
+        )
+
+    train_order = []
+    eval_order = []
+
+    def train_one_epoch(trial, *, stage, target_epoch_seconds):
+        trial.epoch += 1
+        train_order.append((trial.trial_id, trial.epoch))
+        trial.metrics_history.append({"epoch": trial.epoch})
+
+    supervisor._create_trial = create_trial
+    supervisor._train_trial_epoch = train_one_epoch
+    supervisor._evaluate_trial = lambda trial, stage, force: eval_order.append((trial.trial_id, trial.epoch)) or {}
+
+    module.Phase3Supervisor.phase_3b_static_asha(supervisor)
+
+    assert train_order == [
+        ("asha_00_best_restnet_33", 1),
+        ("asha_01_global_xattn_0", 1),
+        ("asha_02_global_pair_twostage_0", 1),
+        ("asha_00_best_restnet_33", 2),
+        ("asha_01_global_xattn_0", 2),
+        ("asha_02_global_pair_twostage_0", 2),
+    ]
+    assert eval_order == [
+        ("asha_00_best_restnet_33", 2),
+        ("asha_01_global_xattn_0", 2),
+        ("asha_02_global_pair_twostage_0", 2),
+    ]
+
+
 def test_low_memory_graph_config_extends_inference_start_timeout(tmp_path):
     module = _load_phase3_autotune_module()
     supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
@@ -844,7 +955,11 @@ def test_runtime_sweep_prunes_when_all_candidates_fail(tmp_path):
         "memory": {"unsafe": True},
     }
     released = []
+    saved_trials = []
+    saved_supervisor_state = []
     supervisor._release_trial_runtime = lambda trial, reason: released.append((trial.trial_id, reason))
+    supervisor._save_trial_state = lambda trial: saved_trials.append(trial.trial_id)
+    supervisor._save_state = lambda: saved_supervisor_state.append(True)
     trial = SimpleNamespace(
         trial_id="cal_graph_hybrid_0",
         run_dir=tmp_path / "cal_graph_hybrid_0",
@@ -859,6 +974,151 @@ def test_runtime_sweep_prunes_when_all_candidates_fail(tmp_path):
     assert trial.prune_reason == "runtime_sweep_failed:all_probe_candidates_failed_or_memory_unsafe"
     assert supervisor.log.events[-2][0] == "runtime_sweep_failed"
     assert released == [("cal_graph_hybrid_0", trial.prune_reason)]
+    assert saved_trials == ["cal_graph_hybrid_0"]
+    assert saved_supervisor_state == [True]
+
+
+def test_runtime_sweep_rejects_suboptimal_cached_selection():
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.host = SimpleNamespace(
+        cuda_available=True,
+        cuda_memory_gb=12.0,
+        physical_cpus=16,
+        system_memory_gb=23.5,
+    )
+    trial = SimpleNamespace(
+        family=SimpleNamespace(graph=False, sparse_policy=False),
+        static=SimpleNamespace(full_sims=512),
+    )
+    cached = {
+        "selected": {"workers": 1, "batch_size_per_worker": 8, "max_batch_size": 72, "max_wait_us": 500},
+        "selected_record": {
+            "candidate": {"workers": 1, "batch_size_per_worker": 8, "max_batch_size": 72, "max_wait_us": 500},
+            "ok": True,
+            "positions_per_min": 141.0,
+            "score": 141.0,
+            "memory": {"unsafe": False},
+        },
+        "results": [
+            {
+                "candidate": {"workers": 1, "batch_size_per_worker": 8, "max_batch_size": 72, "max_wait_us": 500},
+                "ok": True,
+                "positions_per_min": 141.0,
+                "score": 141.0,
+                "memory": {"unsafe": False},
+            },
+            {
+                "candidate": {"workers": 2, "batch_size_per_worker": 8, "max_batch_size": 80, "max_wait_us": 500},
+                "ok": True,
+                "positions_per_min": 381.0,
+                "score": 381.0,
+                "memory": {"unsafe": False},
+            },
+        ],
+    }
+
+    assert module.Phase3Supervisor._runtime_sweep_cached_selection_safe(supervisor, trial, cached) is False
+
+    cached["selected"] = dict(cached["results"][1]["candidate"])
+    cached["selected_record"] = dict(cached["results"][1])
+
+    assert module.Phase3Supervisor._runtime_sweep_cached_selection_safe(supervisor, trial, cached) is True
+
+
+def test_phase3_persists_trial_state_after_epoch(tmp_path, monkeypatch):
+    module = _load_phase3_autotune_module()
+    supervisor = module.Phase3Supervisor.__new__(module.Phase3Supervisor)
+    supervisor.output_root = tmp_path
+    supervisor.log = _CaptureLog()
+    supervisor.calibration = {}
+    supervisor.blocked_families = {}
+    supervisor.baseline_loss_p75 = {True: 128.0, False: 128.0}
+    supervisor.runtime_sweep_cache = {}
+    supervisor.asha_table = ASHARungTable(resources=(10,), promotion_fraction=0.5)
+    supervisor.bohb_sampler = SimpleNamespace(samples=[])
+    supervisor.pb2_scheduler = SimpleNamespace(events=[])
+    supervisor.trials = []
+    supervisor.elapsed_s = lambda: 12.0
+    supervisor._cleanup_shared_memory = lambda: None
+    supervisor._apply_epoch_budget = lambda *args, **kwargs: None
+    supervisor._apply_dynamic_to_config = lambda trial: None
+    supervisor._apply_dynamic_to_trainer = lambda trial: None
+    supervisor._ensure_runtime_sweep = lambda trial, stage: None
+    supervisor._hard_prune_reason = lambda trial, record: None
+    supervisor._release_trial_runtime = lambda trial, reason: None
+
+    family = module.FamilySpec(
+        name="best_restnet_33",
+        description="test",
+        architecture="restnet",
+    )
+    trial_dir = tmp_path / "trials" / "asha_00_best_restnet_33"
+    trial_dir.mkdir(parents=True)
+    trial = SimpleNamespace(
+        trial_id="asha_00_best_restnet_33",
+        family=family,
+        static=module.StaticRecipe(
+            full_sims=512,
+            pcr_low_sims=128,
+            policy_top_k=96,
+            candidate_budget=256,
+            head_bundle="structural",
+            temperature_family="slow_cool",
+            train_batch_size=128,
+        ),
+        dynamic=module.DynamicParams(lr=3e-4),
+        cfg=SimpleNamespace(model=SimpleNamespace(heads=["policy", "value"])),
+        run_dir=trial_dir,
+        recorder=None,
+        replay=SimpleNamespace(),
+        trainer=None,
+        checkpoint_path=None,
+        epoch=0,
+        wall_time_s=0.0,
+        metrics_history=[],
+        score_history=[],
+        mutation_history=[],
+        checkpoint_history=[],
+        runtime_sweep={},
+        pruned=False,
+        prune_reason="",
+    )
+    supervisor.trials.append(trial)
+
+    def public_state(t):
+        return {
+            "trial_id": t.trial_id,
+            "epoch": t.epoch,
+            "checkpoint_path": str(t.checkpoint_path) if t.checkpoint_path else None,
+            "metrics_history": t.metrics_history,
+            "pruned": t.pruned,
+        }
+
+    supervisor._trial_public_state = public_state
+
+    result = SimpleNamespace(
+        trainer=object(),
+        checkpoint_path=trial_dir / "epoch_0001.pt",
+        train_stats={"epoch": 1, "loss_policy": 1.25},
+        buffer_stats={"size": 32},
+        elapsed_s=3.0,
+    )
+    monkeypatch.setattr(module, "run_epoch", lambda *args, **kwargs: result)
+
+    module.Phase3Supervisor._train_trial_epoch(
+        supervisor,
+        trial,
+        stage="3B_static_asha",
+        target_epoch_seconds=10.0,
+    )
+
+    trial_state = json.loads((trial_dir / "trial.json").read_text())
+    run_state = json.loads((tmp_path / "state.json").read_text())
+    assert trial_state["epoch"] == 1
+    assert trial_state["checkpoint_path"].endswith("epoch_0001.pt")
+    assert trial_state["metrics_history"][0]["train"]["loss_policy"] == 1.25
+    assert run_state["trials"][0]["epoch"] == 1
 
 
 class _CaptureLog:

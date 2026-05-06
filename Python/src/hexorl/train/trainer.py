@@ -16,8 +16,13 @@ from pathlib import Path
 
 from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.config import Config
-from hexorl.model.global_graph import GlobalHexGraphNet
-from hexorl.model.network import HexNet, load_model_state
+from hexorl.models.assembly import is_global_graph_model, load_model_state
+from hexorl.models.registry import resolve_model_spec
+from hexorl.train.adapters import (
+    prepare_dense_training_batch,
+    prepare_global_graph_training_batch,
+)
+from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.train.ema import ModelEMA
 
@@ -29,7 +34,7 @@ class Trainer:
 
     def __init__(
         self,
-        model: HexNet,
+        model: nn.Module,
         cfg: Config,
         dataloader,
         ema: Optional[ModelEMA] = None,
@@ -50,7 +55,7 @@ class Trainer:
                 device = torch.device("cpu")
         self.device = device
 
-        self._is_global_graph_model = isinstance(self.model, GlobalHexGraphNet)
+        self._is_global_graph_model = is_global_graph_model(self.model)
         self.model = self.model.to(self.device)
         self._channels_last = (
             bool(getattr(cfg.runtime, "channels_last", True))
@@ -79,32 +84,23 @@ class Trainer:
         )
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
+        self._resolved_spec = resolve_model_spec(cfg)
         self._loss_weights = dict(self.train_cfg.loss_weights)
-        if self._is_global_graph_model:
-            graph_defaults = {
-                "policy_place": self._loss_weights.get("policy", 1.0),
-                "policy_pair_first": self._loss_weights.get("pair_policy", 0.05),
-                "policy_pair_second": self._loss_weights.get("pair_policy", 0.05),
-                "policy_pair_joint": self._loss_weights.get("pair_policy", 0.05),
-                "opp_policy": self._loss_weights.get("opp_policy", 0.1),
-                "value": self._loss_weights.get("value", 1.0),
-                "regret_rank": self._loss_weights.get("regret_rank", 0.1),
-                "regret_value": self._loss_weights.get("regret_value", 0.1),
-                "moves_left": self._loss_weights.get("moves_left", 0.01),
-                "tactical": self._loss_weights.get("tactical", 0.05),
-            }
-            for name, value in graph_defaults.items():
-                self._loss_weights.setdefault(name, value)
+        for name, value in self._resolved_spec.default_loss_weights.items():
+            self._loss_weights.setdefault(name, value)
+        self._loss_plan = build_loss_plan(self._resolved_spec, self._loss_weights)
         self._n_bins = getattr(model, 'n_bins', getattr(self.model, 'n_bins', 65))
         # Lookahead horizon names derived from buffer config
         self._lookahead_keys = [
             f"lookahead_{h}" for h in getattr(cfg.buffer, 'lookahead_horizons', [])
+            if f"lookahead_{h}" in self._resolved_spec.outputs
         ]
 
         self.global_step = 0
         self.epoch = 0
         self._epoch_losses: Dict[str, list] = {}
         self._start_time = 0.0
+        self._logged_graph_microbatch = False
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         lr = self.train_cfg.peak_lr
@@ -172,10 +168,11 @@ class Trainer:
         self._start_time = time.monotonic()
         self.model.train()
 
-        batch_iter = _PrefetchIterator(
-            iter(self.dataloader),
-            max_prefetch=max(0, int(getattr(self.train_cfg, "prefetch_batches", 0))),
+        prefetch_batches = 0 if self._is_global_graph_model else max(
+            0,
+            int(getattr(self.train_cfg, "prefetch_batches", 0)),
         )
+        batch_iter = _PrefetchIterator(iter(self.dataloader), max_prefetch=prefetch_batches)
 
         try:
             for batch_idx in range(self.batches_per_epoch):
@@ -185,7 +182,7 @@ class Trainer:
                     batch_iter.close()
                     batch_iter = _PrefetchIterator(
                         iter(self.dataloader),
-                        max_prefetch=max(0, int(getattr(self.train_cfg, "prefetch_batches", 0))),
+                        max_prefetch=prefetch_batches,
                     )
                     batch = next(batch_iter)
 
@@ -217,68 +214,48 @@ class Trainer:
             tensors, policies, values = batch
             lookahead_list = []
 
-        tensors = tensors.to(self.device, non_blocking=True)
-        if self._channels_last:
-            tensors = tensors.contiguous(memory_format=torch.channels_last)
-        policies = policies.to(self.device, non_blocking=True)
-        values = values.to(self.device, non_blocking=True)
+        if self._is_global_graph_model:
+            return self._train_global_graph_step(
+                tensors,
+                policies,
+                values,
+                lookahead_list,
+                aux_targets,
+                batch_idx,
+            )
 
-        targets = {"policy": policies, "value": values}
-
-        for key, lv_arr in zip(self._lookahead_keys, lookahead_list):
-            targets[key] = lv_arr.to(self.device, non_blocking=True)
-        for key, value in aux_targets.items():
-            targets[key] = value.to(self.device, non_blocking=True)
-        if not getattr(self.cfg.selfplay, "train_policy_on_full_search_only", True):
-            targets.pop("policy_weight", None)
+        prepared = prepare_dense_training_batch(
+            tensors=tensors,
+            policies=policies,
+            values=values,
+            lookahead_list=lookahead_list,
+            aux_targets=aux_targets,
+            lookahead_keys=self._lookahead_keys,
+            device=self.device,
+            channels_last=self._channels_last,
+            train_policy_on_full_search_only=getattr(self.cfg.selfplay, "train_policy_on_full_search_only", True),
+        )
+        targets = prepared.targets
 
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            if self._is_global_graph_model:
-                required = [
-                    "token_features",
-                    "token_type",
-                    "token_qr",
-                    "token_mask",
-                    "legal_token_indices",
-                    "legal_mask",
-                    "relation_type",
-                    "relation_bias",
-                ]
-                missing = [name for name in required if name not in targets]
-                if missing:
-                    raise ValueError(f"global graph training batch is missing graph tensors: {missing}")
-                predictions = self.model(
-                    token_features=targets["token_features"],
-                    token_type=targets["token_type"],
-                    token_qr=targets["token_qr"],
-                    token_mask=targets["token_mask"],
-                    legal_token_indices=targets["legal_token_indices"],
-                    legal_mask=targets["legal_mask"],
-                    opp_legal_qr=targets.get("opp_legal_qr"),
-                    opp_legal_mask=targets.get("opp_legal_mask"),
-                    pair_first_indices=targets.get("pair_first_indices"),
-                    pair_second_indices=targets.get("pair_second_indices"),
-                    pair_token_indices=targets.get("pair_token_indices"),
-                    relation_type=targets["relation_type"],
-                    relation_bias=targets["relation_bias"],
-                )
-            else:
-                predictions = self.model(
-                    tensors,
-                    candidate_features=targets.get("candidate_features"),
-                    candidate_indices=targets.get("candidate_indices"),
-                    candidate_mask=targets.get("candidate_mask"),
-                    pair_candidate_features=targets.get("pair_candidate_features"),
-                    pair_candidate_row_indices=targets.get("pair_candidate_row_indices"),
-                    pair_candidate_indices=targets.get("pair_candidate_indices"),
-                    pair_candidate_mask=targets.get("pair_candidate_mask"),
-                )
+            predictions = self.model(
+                prepared.model_inputs["tensors"],
+                candidate_features=targets.get("candidate_features"),
+                candidate_indices=targets.get("candidate_indices"),
+                candidate_mask=targets.get("candidate_mask"),
+                pair_candidate_features=targets.get("pair_candidate_features"),
+                pair_candidate_row_indices=targets.get("pair_candidate_row_indices"),
+                pair_candidate_indices=targets.get("pair_candidate_indices"),
+                pair_candidate_mask=targets.get("pair_candidate_mask"),
+            )
             total_loss, per_head = compute_losses(
                 predictions, targets,
                 loss_weights=self._loss_weights,
                 n_bins=self._n_bins,
+                loss_plan=self._loss_plan,
+                row_tables=prepared.row_tables,
             )
             if not torch.isfinite(total_loss):
                 details = {
@@ -378,6 +355,236 @@ class Trainer:
                         )
 
         return result
+
+    def _train_global_graph_step(
+        self,
+        tensors: torch.Tensor,
+        policies: torch.Tensor,
+        values: torch.Tensor,
+        lookahead_list,
+        aux_targets: dict,
+        batch_idx: int,
+    ) -> Dict[str, float]:
+        del tensors
+        del policies
+        batch_size = int(values.shape[0])
+        graph_batches = aux_targets.get("_graph_batches")
+        if graph_batches is None:
+            required = [
+                "token_features",
+                "token_type",
+                "token_qr",
+                "token_mask",
+                "legal_token_indices",
+                "legal_mask",
+                "relation_type",
+                "relation_bias",
+            ]
+            missing = [name for name in required if name not in aux_targets]
+            if missing:
+                raise ValueError(f"global graph training batch is missing graph tensors: {missing}")
+        elif len(graph_batches) != batch_size:
+            raise ValueError(
+                "deferred graph training batch size mismatch: "
+                f"graphs={len(graph_batches)} targets={batch_size}"
+            )
+
+        microbatch_size = self._graph_train_microbatch_size(aux_targets, batch_size, graph_batches)
+        if microbatch_size < batch_size and not self._logged_graph_microbatch:
+            logger.info(
+                "global graph training uses microbatch_size=%d for effective_batch_size=%d",
+                microbatch_size,
+                batch_size,
+            )
+            self._logged_graph_microbatch = True
+
+        self.optimizer.zero_grad(set_to_none=True)
+        total_accum = 0.0
+        per_head_accum: dict[str, float] = {}
+        weight_sums: dict[str, float] = {}
+        weight_zero_counts: dict[str, float] = {}
+        microbatch_count = 0
+
+        for start in range(0, batch_size, microbatch_size):
+            end = min(batch_size, start + microbatch_size)
+            micro_count = end - start
+            micro_weight = micro_count / max(batch_size, 1)
+            micro_aux_targets = self._slice_targets_for_batch(aux_targets, start, end, batch_size)
+            micro_graph_batches = None
+            if graph_batches is not None:
+                micro_graph_batches = graph_batches[start:end]
+                micro_aux_targets.pop("_graph_batches", None)
+            micro_lookahead = [
+                self._slice_value_for_batch(value, start, end, batch_size)
+                for value in lookahead_list
+            ]
+            prepared = prepare_global_graph_training_batch(
+                values=self._slice_value_for_batch(values, start, end, batch_size),
+                lookahead_list=micro_lookahead,
+                aux_targets=micro_aux_targets,
+                lookahead_keys=self._lookahead_keys,
+                device=self.device,
+                train_policy_on_full_search_only=getattr(
+                    self.cfg.selfplay,
+                    "train_policy_on_full_search_only",
+                    True,
+                ),
+                graph_batches=micro_graph_batches,
+            )
+            micro_targets = prepared.targets
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                predictions = self.model(
+                    **prepared.model_inputs,
+                )
+                total_loss, per_head = compute_losses(
+                    predictions,
+                    micro_targets,
+                    loss_weights=self._loss_weights,
+                    n_bins=self._n_bins,
+                    loss_plan=self._loss_plan,
+                    row_tables=prepared.row_tables,
+                )
+                if not torch.isfinite(total_loss):
+                    details = {
+                        name: float(value.detach().float().cpu())
+                        for name, value in per_head.items()
+                        if isinstance(value, torch.Tensor)
+                    }
+                    raise FloatingPointError(
+                        f"Non-finite training loss at epoch={self.epoch} "
+                        f"batch={batch_idx}: total={float(total_loss.detach().float().cpu())} "
+                        f"per_head={details}"
+                    )
+                backward_loss = total_loss * micro_weight
+
+            if self.use_amp:
+                self.scaler.scale(backward_loss).backward()
+            else:
+                backward_loss.backward()
+
+            total_accum += float(total_loss.detach().float().cpu()) * micro_weight
+            for name, value in per_head.items():
+                if isinstance(value, torch.Tensor):
+                    per_head_accum[name] = (
+                        per_head_accum.get(name, 0.0)
+                        + float(value.detach().float().cpu()) * micro_weight
+                    )
+            for weight_key in ("value_weight", "policy_weight", "regret_weight", "opp_policy_weight"):
+                weight_tensor = micro_targets.get(weight_key)
+                if isinstance(weight_tensor, torch.Tensor):
+                    weight_float = weight_tensor.detach().float()
+                    weight_sums[weight_key] = weight_sums.get(weight_key, 0.0) + float(weight_float.sum().cpu())
+                    weight_zero_counts[weight_key] = weight_zero_counts.get(weight_key, 0.0) + float(
+                        (weight_float <= 0).float().sum().cpu()
+                    )
+            microbatch_count += 1
+
+        stepped = True
+        if self.use_amp:
+            scale_before = self.scaler.get_scale()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            stepped = self.scaler.get_scale() >= scale_before
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+        if stepped and self.scheduler is not None:
+            self.scheduler.step()
+        if stepped:
+            self.ema.update()
+
+        result = {
+            "total": total_accum,
+            "graph_microbatch_size": float(microbatch_size),
+            "graph_microbatch_count": float(microbatch_count),
+        }
+        result.update(per_head_accum)
+        for weight_key, weight_sum in weight_sums.items():
+            result[f"{weight_key}_mean"] = weight_sum / max(batch_size, 1)
+            result[f"{weight_key}_zero_frac"] = weight_zero_counts.get(weight_key, 0.0) / max(batch_size, 1)
+
+        return result
+
+    def _graph_train_microbatch_size(self, targets: dict, batch_size: int, graph_batches=None) -> int:
+        configured = int(getattr(self.train_cfg, "graph_microbatch_size", 0) or 0)
+        if configured > 0:
+            return max(1, min(configured, batch_size))
+        if self.device.type != "cuda":
+            return max(1, batch_size)
+
+        if graph_batches is not None:
+            token_count = max(int(graph.token_features.shape[0]) for graph in graph_batches)
+        else:
+            token_count = int(self._as_tensor(targets["token_features"]).shape[1])
+        pair_width = 0
+        if graph_batches is not None:
+            for graph in graph_batches:
+                pair_width = max(pair_width, int(graph.pair_first_indices.shape[0]))
+        else:
+            for key in ("pair_first_indices", "pair_second_indices", "pair_token_indices"):
+                value = targets.get(key)
+                if value is not None:
+                    tensor = self._as_tensor(value)
+                    if tensor.ndim >= 2:
+                        pair_width = max(pair_width, int(tensor.shape[1]))
+        layers = max(1, int(getattr(self.cfg.model, "graph_layers", 1)))
+
+        if token_count >= 1536:
+            limit = 4
+        elif token_count >= 640:
+            limit = 8
+        elif token_count >= 384:
+            limit = 16
+        else:
+            limit = 32
+        if layers >= 2:
+            limit = max(1, limit // 2)
+        if pair_width >= 1024:
+            limit = min(limit, 4)
+        elif pair_width >= 512:
+            limit = min(limit, 8)
+        return max(1, min(limit, batch_size))
+
+    def _slice_targets_for_batch(
+        self,
+        targets: dict,
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> dict:
+        sliced = {}
+        for key, value in targets.items():
+            if key.startswith("_"):
+                sliced[key] = value
+                continue
+            sliced[key] = self._slice_value_for_batch(value, start, end, batch_size)
+        return sliced
+
+    def _slice_value_for_batch(
+        self,
+        value,
+        start: int,
+        end: int,
+        batch_size: int,
+    ):
+        tensor = self._as_tensor(value)
+        if isinstance(tensor, torch.Tensor):
+            if tensor.ndim > 0 and int(tensor.shape[0]) == batch_size:
+                tensor = tensor[start:end]
+            return tensor
+        return value
+
+    @staticmethod
+    def _as_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return value
+        if hasattr(value, "__array__"):
+            return torch.as_tensor(value)
+        return value
 
     def _log_step(self, batch_idx: int):
         current_lr = self.optimizer.param_groups[0]["lr"]

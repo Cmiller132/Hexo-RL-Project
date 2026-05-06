@@ -50,7 +50,13 @@ EOF
 
 pid_alive() {
     local pid="$1"
-    [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+    [[ -n "${pid}" ]] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    local stat args
+    stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d ' ' || true)"
+    [[ -n "${stat}" && "${stat}" != *Z* ]] || return 1
+    args="$(ps -p "${pid}" -o args= 2>/dev/null || true)"
+    [[ "${args}" == *"run_phase3_48h_autotune.py"* ]] || return 1
 }
 
 read_pid() {
@@ -124,7 +130,7 @@ restart_supervisor() {
     CHAMPION_MIN_EPOCHS="${CHAMPION_MIN_EPOCHS:-20}" \
     STRATEGY_SCORE_MIN_EPOCHS="${STRATEGY_SCORE_MIN_EPOCHS:-10}" \
     CLASSICAL_SCORE_MIN_EPOCHS="${CLASSICAL_SCORE_MIN_EPOCHS:-12}" \
-    bash scripts/launch_phase3_48h_autotune.sh "${RUN_ROOT}" --foreground &
+    bash scripts/launch_phase3_48h_autotune.sh "${RUN_ROOT}" background
     sleep 8
 }
 

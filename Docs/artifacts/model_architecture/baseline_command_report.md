@@ -1,59 +1,57 @@
 # Baseline Command Report
 
-Captured on 2026-05-05 in `/Users/coltonmiller/Documents/GitHub/Hexo-RL-Project`.
+Captured on 2026-05-06 in `D:\Hexo\Hexo-RL-Project` after fast-forwarding
+`main` to `origin/main` and reapplying the local autotune/runtime work.
+
+Stage 1 is an inventory and design stage. These commands establish the local
+proof harness before runtime model modularity work begins. This local refresh
+supersedes the upstream remote-machine capture where the Rust `_engine`
+extension was unavailable.
 
 ## Environment Notes
 
-- `python` is not on `PATH`.
-- `pytest` is not on `PATH`.
-- `python3` is available.
-- `_engine` is not importable in this environment:
+- Platform: Windows PowerShell workspace.
+- Python command: `python`.
+- `PYTHONPATH`: `Python/src`.
+- Rust tactical extension: `_engine` importable locally.
+- Expected warning: Triton reports CUDA auto-detection trouble in some pytest
+  sessions; this did not block the focused Stage 1 checks.
+
+## Import Smoke
 
 ```text
-PYTHONPATH=Python/src python3 -c "import importlib.util; print('engine-spec', importlib.util.find_spec('_engine'))"
-exit 0
-engine-spec None
+python 3.14.0
+engine-spec ModuleSpec(...)
+import-ok cnn 7
 ```
-
-The missing Rust extension is the dominant expected WIP failure for graph and
-replay tests that require the production tactical oracle.
 
 ## Commands
 
 | Command | Exit | Result |
 |---|---:|---|
-| `PYTHONPATH=Python/src python3 -c "import hexorl; from hexorl.config import Config; from hexorl.model.network import build_model_from_config; from hexorl.model.global_graph import GlobalHexGraphNet; print('import-ok', Config().model.architecture, len(GlobalHexGraphNet.ARCHITECTURES))"` | 0 | `import-ok cnn 7` |
-| `PYTHONPATH=Python/src python3 -m pytest -q Python/tests/test_config_and_guardrails.py` | 0 | `31 passed in 1.46s` |
-| `PYTHONPATH=Python/src python3 -m pytest -q Python/tests/test_engine_smoke.py Python/tests/test_engine_invariants.py` | 5 | `2 skipped in 0.11s`; pytest exit 5 because all selected tests were skipped due missing `_engine` |
-| `PYTHONPATH=Python/src python3 -m pytest -q Python/tests/test_tactical_oracle.py` | 0 | `5 passed, 3 skipped in 0.08s` |
-| `PYTHONPATH=Python/src python3 -m pytest -q Python/tests/test_config_and_guardrails.py Python/tests/test_training_data_pipeline.py` | 1 | `7 failed, 97 passed, 5 skipped in 9.52s` |
-| `PYTHONPATH=Python/src python3 -m pytest -q Python/tests/test_global_graph_contract.py` | 1 | `30 failed, 5 passed in 5.70s` |
-| `PYTHONPATH=Python/src python3 -m pytest -q Python/tests/test_inference_server.py` | 1 | `1 failed, 5 passed, 1 skipped in 6.33s` |
+| `$env:PYTHONPATH='Python/src'; python -c "import sys, importlib.util; print('python', sys.version.split()[0]); print('engine-spec', importlib.util.find_spec('_engine')); from hexorl.config import Config; from hexorl.model.network import build_model_from_config; from hexorl.model.global_graph import GlobalHexGraphNet; print('import-ok', Config().model.architecture, len(GlobalHexGraphNet.ARCHITECTURES))"` | 0 | `_engine` importable; `import-ok cnn 7` |
+| `$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_config_and_guardrails.py Python/tests/test_training_data_pipeline.py` | 0 | `116 passed, 1 warning in 5.48s` |
+| `$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_tactical_oracle.py Python/tests/test_engine_smoke.py Python/tests/test_engine_invariants.py` | 0 | `35 passed in 2.96s` |
+| `$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_inference_server.py Python/tests/test_global_graph_contract.py` | 0 | `45 passed, 1 warning in 21.89s` |
 
-## Known WIP Failures
+## Harness Adjustment
 
-All observed failures in the focused model/replay/inference tests are caused by
-the production tactical oracle requiring `_engine` while `_engine` is not
-available in this shell.
+The replay-pipeline golden test for first-placement graph pair rows was updated
+to match the current performance contract: graph replay emits a budgeted pair
+row table by default (`256` rows), while still preserving first-placement pair
+target mass and suppressing second-placement target mass when no first move is
+known.
 
-Representative exception:
+This keeps Stage 1 honest about the production training contract after the pair
+row materialization bottleneck fix. Tests that require exhaustive pair rows must
+request that behavior explicitly instead of assuming it is the replay default.
 
-```text
-RuntimeError: engine tactical oracle is required but the Rust engine is unavailable
-```
+## Stage 1 Interpretation
 
-Affected areas:
-
-- `ReplayDataset` candidate and graph batch creation when sparse/graph policy is
-  enabled.
-- `build_graph_batch_from_history` in most graph contract tests.
-- `InferenceServer` graph forward test that builds a graph batch.
-
-## Baseline Trust Implication
-
-Passing tests can be used as local guardrail evidence. Failing graph/replay tests
-are not regressions in this Stage 1 run; they require either a built Rust
-extension or a test harness that explicitly opts into a Python tactical fallback.
-Stage 2 and Stage 3 should not claim graph contract closure from these failing
-tests until the engine dependency is resolved or the tests are rewritten around
-contract-local fixtures.
+Stage 1 remains an inventory and design closure, not runtime cutover. The local
+checks above prove that the current codebase can import the legacy model
+authority, build config defaults, use the Rust tactical extension, and exercise
+the focused graph, replay, inference, tactical, engine, and configuration
+guardrails. Stage 2 still needs its own contract tests for registry, row
+identity, output contracts, target contracts, loss plans, and inference protocol
+boundaries.

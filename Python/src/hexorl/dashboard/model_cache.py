@@ -20,14 +20,13 @@ from hexorl.action_contract.candidates import (
 from hexorl.eval.arena import load_checkpoint_model
 from hexorl.eval.players import model_input_dtype
 from hexorl.dashboard.replay import encode_tensor_for_history, policy_debug
-from hexorl.model.network import HexNet
 
 
 @dataclass
 class CachedModel:
     model_id: str
     path: Path
-    model: HexNet
+    model: torch.nn.Module
     device: torch.device
 
 

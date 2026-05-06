@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from hexorl.config import Config
+from hexorl.models.registry import architecture_spec
 
 
 @dataclass(frozen=True)
@@ -222,15 +223,16 @@ def _estimate_train_peak_gb(cfg: Config, batch_size: int) -> float:
     channels_scale = max(0.25, cfg.model.channels / 128.0)
     blocks_scale = max(0.25, cfg.model.blocks / 16.0)
     head_scale = max(0.75, len(cfg.model.heads) / 6.0)
-    architecture = getattr(cfg.model, "architecture", "cnn")
+    spec = architecture_spec(getattr(cfg.model, "architecture", "cnn"))
     attention_blocks = len(getattr(cfg.model, "attention_positions", []))
     attention_scale = 1.0 + 0.22 * attention_blocks
-    if architecture == "restnet":
+    if spec.architecture_id == "restnet":
         attention_scale = max(attention_scale, 1.15)
-    if architecture in {"graph", "graph_hybrid_0"}:
+    if spec.graph:
         token_scale = max(0.5, float(getattr(cfg.model, "graph_token_budget", 512)) / 512.0)
         layer_scale = max(0.5, float(getattr(cfg.model, "graph_layers", 3)) / 3.0)
-        attention_scale = max(attention_scale, 1.35 * token_scale * layer_scale)
+        graph_multiplier = 1.55 if spec.global_graph else 1.35
+        attention_scale = max(attention_scale, graph_multiplier * token_scale * layer_scale)
     sparse_scale = 1.0 + (0.04 if getattr(cfg.model, "sparse_policy", False) else 0.0)
     per_sample_gb = 0.0327 * channels_scale * blocks_scale * head_scale * attention_scale * sparse_scale
     model_overhead_gb = 0.35 * (channels_scale ** 2) * blocks_scale * attention_scale

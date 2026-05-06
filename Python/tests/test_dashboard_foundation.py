@@ -18,6 +18,7 @@ from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_
 from hexorl.eval.players import NoisyModelPlayer, NoisyPolicyConfig
 from hexorl.eval.arena import ArenaStats, MatchResult
 from hexorl.model.network import HexNet
+from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.selfplay.records import GameRecord, PositionRecord, action_to_board_index
 
 
@@ -450,6 +451,48 @@ def test_noisy_model_player_chooses_legal_origin_when_engine_available():
     model = HexNet(channels=4, blocks=1, heads=["policy", "value"])
     player = NoisyModelPlayer(model, config=NoisyPolicyConfig(seed=1))
     assert player([], 0, 0) == (0, 0)
+
+
+def test_noisy_model_player_supports_global_graph_policy_place_eval():
+    engine = pytest.importorskip("_engine")
+    model = GlobalHexGraphNet(
+        channels=8,
+        layers=1,
+        heads=2,
+        architecture="global_xattn_0",
+        output_heads=["policy_place", "value"],
+    )
+    model.graph_context_tokens = 64
+    model.graph_legal_rows = 64
+    player = NoisyModelPlayer(
+        model,
+        config=NoisyPolicyConfig(seed=7, temperature=1e-4, top_p=1.0),
+    )
+
+    q, r = player([], 0, 0)
+
+    game = engine.HexGame()
+    game.place(int(q), int(r))
+
+
+def test_arena_model_move_fn_routes_global_graph_models_to_policy_place():
+    engine = pytest.importorskip("_engine")
+    from hexorl.eval import arena as arena_mod
+
+    model = GlobalHexGraphNet(
+        channels=8,
+        layers=1,
+        heads=2,
+        architecture="global_graph_full_0",
+        output_heads=["policy_place", "value"],
+    )
+    model.graph_context_tokens = 64
+    model.graph_legal_rows = 64
+
+    q, r = arena_mod.model_move_fn(model, temperature=0.0)([], 0, 0)
+
+    game = engine.HexGame()
+    game.place(int(q), int(r))
 
 
 def test_eval_players_use_model_dtype(monkeypatch):

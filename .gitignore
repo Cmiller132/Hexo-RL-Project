@@ -81,6 +81,10 @@ Thumbs.db
 *.onnx
 *.pb
 models/
+!Python/src/hexorl/models/
+!Python/src/hexorl/models/**
+Python/src/hexorl/models/**/__pycache__/
+Python/src/hexorl/models/**/*.py[cod]
 checkpoints/
 data/
 logs/

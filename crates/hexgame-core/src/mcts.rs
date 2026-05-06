@@ -526,7 +526,9 @@ fn gather_policy_with_sparse(
 pub struct MCTSEngine {
     /// Contiguous storage for all MCTS nodes.
     ///
-    /// Nodes are never deleted; `re_root` simply moves the root pointer.
+    /// Nodes are arena-allocated during a root search. `re_root` compacts this
+    /// arena to the selected child's reachable subtree so dead sibling branches
+    /// do not accumulate across long self-play games.
     pub(crate) arena: Vec<MCTSNode>,
     /// Internal game state used during tree traversal.
     ///
@@ -556,6 +558,13 @@ pub struct MCTSEngine {
     sims_done: u32,
     /// Total number of simulations to perform.
     num_simulations: u32,
+    /// Maximum number of children to allocate at each expansion.
+    ///
+    /// Dense policy targets and global graph policy rows can contain hundreds of
+    /// legal moves, but MCTS only needs the candidate frontier that the policy
+    /// ranks highest.  Capping expansion keeps selection proportional to the
+    /// search budget instead of the full global action table.
+    max_children: Option<usize>,
     /// Pre-allocated output buffer for `select_leaves`.  Holds packed tensors
     /// for all non-terminal leaves in the current batch.
     batch_buf: Vec<f32>,
@@ -638,9 +647,36 @@ impl MCTSEngine {
         c_puct_init: f32,
         seed: u64,
     ) -> Self {
+        Self::with_arena_sim_hint_and_child_limit(
+            game,
+            num_simulations,
+            arena_sim_hint,
+            c_puct,
+            near_radius,
+            constrain_threats,
+            c_puct_init,
+            seed,
+            None,
+        )
+    }
+
+    /// Construct with an explicit arena simulation-count hint and child cap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_arena_sim_hint_and_child_limit(
+        game: HexGameState,
+        num_simulations: u32,
+        arena_sim_hint: u32,
+        c_puct: f32,
+        near_radius: i32,
+        constrain_threats: bool,
+        c_puct_init: f32,
+        seed: u64,
+        max_children: Option<usize>,
+    ) -> Self {
         let mut arena = Vec::with_capacity(arena_sim_hint as usize * CHILD_CAPACITY_HINT + 64);
         // Root node has no parent and a dummy action.
         arena.push(MCTSNode::new(NO_PARENT, (0, 0), 1.0));
+        let max_children = max_children.filter(|limit| *limit > 0);
 
         Self {
             arena,
@@ -652,6 +688,7 @@ impl MCTSEngine {
             c_puct_init,
             sims_done: 0,
             num_simulations,
+            max_children,
             batch_buf: Vec::new(),
             pending: Vec::new(),
             scratch_raw: Vec::new(),
@@ -688,6 +725,59 @@ impl MCTSEngine {
         self.leaf_source_dense = 0;
         self.leaf_source_default = 0;
         self.leaf_source_pair = 0;
+    }
+
+    fn compact_arena_to_root(&mut self, old_root_idx: u32, capacity_hint: usize) {
+        let old_root = self.arena[old_root_idx as usize];
+        let mut new_arena = Vec::with_capacity(capacity_hint.max(1));
+        let mut root = old_root;
+        root.parent = NO_PARENT;
+        new_arena.push(root);
+
+        let mut queue = vec![(old_root_idx, 0u32)];
+        let mut cursor = 0usize;
+        while cursor < queue.len() {
+            let (old_idx, new_idx) = queue[cursor];
+            cursor += 1;
+
+            let old_node = self.arena[old_idx as usize];
+            let child_count = old_node.children_count as usize;
+            if !old_node.is_expanded || child_count == 0 {
+                let node = &mut new_arena[new_idx as usize];
+                node.children_start = 0;
+                node.children_count = 0;
+                node.is_expanded = false;
+                continue;
+            }
+
+            let old_start = old_node.children_start as usize;
+            let old_end = old_start
+                .checked_add(child_count)
+                .expect("compact_arena_to_root: child range overflow");
+            assert!(
+                old_end <= self.arena.len(),
+                "compact_arena_to_root: malformed child range"
+            );
+
+            let new_start = new_arena.len() as u32;
+            {
+                let node = &mut new_arena[new_idx as usize];
+                node.children_start = new_start;
+                node.children_count = old_node.children_count;
+                node.is_expanded = true;
+            }
+
+            for old_child_idx in old_start..old_end {
+                let mut child = self.arena[old_child_idx];
+                child.parent = new_idx;
+                let new_child_idx = new_arena.len() as u32;
+                new_arena.push(child);
+                queue.push((old_child_idx as u32, new_child_idx));
+            }
+        }
+
+        self.arena = new_arena;
+        self.root_idx = 0;
     }
 
     fn record_leaf_prior_sources(&mut self, sparse_candidate_count: usize) {
@@ -1342,6 +1432,152 @@ impl MCTSEngine {
         self.sims_done >= self.num_simulations
     }
 
+    /// Run neutral leaf rollouts without encoding or returning leaf tensors.
+    ///
+    /// This is used by root-only global graph self-play: the graph scores the
+    /// root action priors, while internal tree leaves are expanded with neutral
+    /// value and uniform/default priors. The normal `select_leaves` path must
+    /// encode a full 13x33x33 tensor per leaf for GPU inference; doing that
+    /// work when the caller discards the tensors makes graph self-play CPU
+    /// bound. This method keeps the same tree bookkeeping in Rust while
+    /// skipping tensor materialization and Python round trips.
+    pub fn run_neutral_rollouts(
+        &mut self,
+        batch_size: u32,
+        leaf_value: f32,
+    ) -> Result<u32, MCTSError> {
+        validate_root_value(leaf_value)?;
+
+        let actual_batch = batch_size.min(self.num_simulations.saturating_sub(self.sims_done));
+        self.clear_pending_leaves();
+
+        for _ in 0..actual_batch {
+            let mut node_idx = self.root_idx;
+            let mut search_path = SmallVec::<[u32; 32]>::new();
+            search_path.push(self.root_idx);
+
+            while self.arena[node_idx as usize].is_expanded
+                && self.arena[node_idx as usize].children_count > 0
+            {
+                node_idx = self.select_child_puct(node_idx);
+                let child = &self.arena[node_idx as usize];
+                if let Err(_err) = self.game.place(child.action.0, child.action.1) {
+                    for _ in 0..search_path.len().saturating_sub(1) {
+                        self.game
+                            .unplace()
+                            .expect("selected path rollback should match applied moves");
+                    }
+                    return Err(MCTSError::IllegalTreeAction {
+                        q: child.action.0,
+                        r: child.action.1,
+                        node_idx,
+                    });
+                }
+                search_path.push(node_idx);
+            }
+
+            if self.arena[node_idx as usize].player == 255 {
+                self.arena[node_idx as usize].player = self.game.current_player();
+            }
+            let depth = search_path.len() as u32 - 1;
+
+            for &ni in &search_path {
+                let n = &mut self.arena[ni as usize];
+                n.visit_count += VIRTUAL_LOSS_VISITS;
+                n.total_value -= VIRTUAL_LOSS_VISITS as f32;
+            }
+
+            if self.game.is_over() {
+                let node_player = self.arena[node_idx as usize].player;
+                let value = if self.game.winner() == Some(node_player) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                self.pending.push(PendingLeaf {
+                    node_idx,
+                    search_path,
+                    is_terminal: true,
+                    terminal_value: value,
+                    offset_q: 0,
+                    offset_r: 0,
+                    legal_moves: Vec::new(),
+                    move_history: Vec::new(),
+                });
+            } else {
+                self.legal_buf.clear();
+                self.game
+                    .legal_moves_near_into(self.near_radius, &mut self.legal_buf);
+                self.pending.push(PendingLeaf {
+                    node_idx,
+                    search_path,
+                    is_terminal: false,
+                    terminal_value: 0.0,
+                    offset_q: 0,
+                    offset_r: 0,
+                    legal_moves: self.legal_buf.clone(),
+                    move_history: Vec::new(),
+                });
+            }
+
+            for _ in 0..depth {
+                self.game
+                    .unplace()
+                    .expect("selection depth rollback should match applied moves");
+            }
+        }
+
+        let mut leaves = Vec::new();
+        std::mem::swap(&mut leaves, &mut self.pending);
+        self.sims_done += leaves.len() as u32;
+
+        for leaf in &leaves {
+            for &ni in &leaf.search_path {
+                let n = &mut self.arena[ni as usize];
+                n.visit_count -= VIRTUAL_LOSS_VISITS;
+                n.total_value += VIRTUAL_LOSS_VISITS as f32;
+            }
+
+            let value = if leaf.is_terminal {
+                leaf.terminal_value
+            } else {
+                if !leaf.legal_moves.is_empty() {
+                    let uniform = 1.0 / leaf.legal_moves.len() as f32;
+                    self.scratch_priors.clear();
+                    self.scratch_priors
+                        .extend(std::iter::repeat_n(uniform, leaf.legal_moves.len()));
+                    self.scratch_sources.clear();
+                    self.scratch_sources.extend(std::iter::repeat_n(
+                        PRIOR_SOURCE_DEFAULT,
+                        leaf.legal_moves.len(),
+                    ));
+                    let player = self.arena[leaf.node_idx as usize].player;
+                    self.expand_node_with_priors(leaf.node_idx, &leaf.legal_moves, player);
+                    self.record_leaf_prior_sources(0);
+                }
+                leaf_value
+            };
+
+            let mut parity_value = value;
+            let mut value_player = self.arena[leaf.node_idx as usize].player;
+            for &ni in leaf.search_path.iter().rev() {
+                let n = &mut self.arena[ni as usize];
+                if n.player != 255 && value_player != 255 && n.player != value_player {
+                    parity_value = -parity_value;
+                    value_player = n.player;
+                }
+                n.visit_count += 1;
+                n.total_value += parity_value;
+            }
+        }
+
+        let completed = leaves.len() as u32;
+        leaves.clear();
+        std::mem::swap(&mut leaves, &mut self.pending);
+        self.pending_batch_generation = None;
+        Ok(completed)
+    }
+
     /// Select up to `batch_size` leaves, encode their boards into tensors.
     ///
     /// # Steps for each leaf
@@ -1764,9 +2000,11 @@ impl MCTSEngine {
     /// **Precondition:** No pending leaves must exist (call after a fully
     /// completed expand_and_backprop cycle).
     ///
-    /// The arena is not compacted — dead sibling subtrees remain in memory but
-    /// are never referenced.  With typical tree sizes this wastes ~400KB, which
-    /// is acceptable since the arena is recreated per turn.
+    /// The arena is compacted after the selected child becomes root. This keeps
+    /// reachable subtree statistics for reuse while freeing dead sibling
+    /// branches before the next placement search. Without compaction, long
+    /// games with subtree reuse retain every abandoned root search and can grow
+    /// memory roughly linearly with move count.
     pub fn re_root(&mut self, q: i32, r: i32, new_num_simulations: u32) -> Result<(), MCTSError> {
         self.clear_pending_leaves();
 
@@ -1817,6 +2055,11 @@ impl MCTSEngine {
             node.children_count = 0;
         }
 
+        let compact_capacity_hint =
+            new_num_simulations as usize * CHILD_CAPACITY_HINT + CHILD_CAPACITY_HINT;
+        self.compact_arena_to_root(child_idx, compact_capacity_hint);
+        self.reset_prior_telemetry();
+
         // Reset simulation state for the new search.
         self.sims_done = 0;
         self.num_simulations = new_num_simulations;
@@ -1855,6 +2098,14 @@ impl MCTSEngine {
     /// Get the number of children at root.
     pub fn root_child_count(&self) -> u16 {
         self.arena[self.root_idx as usize].children_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expanded_child_counts_within(&self, limit: usize) -> bool {
+        self.arena
+            .iter()
+            .filter(|node| node.is_expanded)
+            .all(|node| node.children_count as usize <= limit)
     }
 
     /// Get the prior probabilities of root children (for shaped Dirichlet noise).
@@ -2189,7 +2440,7 @@ impl MCTSEngine {
         best_idx
     }
 
-    /// Expand a node by creating children for all legal moves.
+    /// Expand a node by creating children for legal moves, capped when configured.
     ///
     /// Gathers policy priors for the legal moves, runs softmax, then appends
     /// children contiguously to the arena.  Sets the node's `children_start`,
@@ -2256,9 +2507,52 @@ impl MCTSEngine {
     }
 
     fn expand_node_with_priors(&mut self, node_idx: u32, legal_moves: &[Hex], player: u8) {
+        let mut limited_moves: Option<Vec<Hex>> = None;
+        let child_count = legal_moves.len();
+        let child_limit = self.max_children.unwrap_or(child_count).min(child_count);
+        if child_limit < child_count {
+            let mut selected: Vec<usize> = (0..child_count).collect();
+            selected.sort_unstable_by(|&a, &b| {
+                self.scratch_priors[b]
+                    .total_cmp(&self.scratch_priors[a])
+                    .then_with(|| a.cmp(&b))
+            });
+            selected.truncate(child_limit);
+            selected.sort_unstable();
+
+            let mut moves = Vec::with_capacity(child_limit);
+            let mut priors = Vec::with_capacity(child_limit);
+            let mut sources = Vec::with_capacity(child_limit);
+            for &idx in &selected {
+                moves.push(legal_moves[idx]);
+                priors.push(self.scratch_priors[idx]);
+                sources.push(
+                    self.scratch_sources
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(PRIOR_SOURCE_DEFAULT),
+                );
+            }
+
+            let total: f32 = priors.iter().sum();
+            if total > 0.0 && total.is_finite() {
+                for prior in &mut priors {
+                    *prior /= total;
+                }
+            } else if !priors.is_empty() {
+                let uniform = 1.0 / priors.len() as f32;
+                priors.fill(uniform);
+            }
+
+            self.scratch_priors = priors;
+            self.scratch_sources = sources;
+            limited_moves = Some(moves);
+        }
+
+        let moves = limited_moves.as_deref().unwrap_or(legal_moves);
         // Allocate children contiguously in arena.
         let children_start = self.arena.len() as u32;
-        let child_count = legal_moves.len();
+        let child_count = moves.len();
         assert!(
             child_count <= u16::MAX as usize,
             "expand_node: legal_moves count {} exceeds u16::MAX",
@@ -2266,7 +2560,7 @@ impl MCTSEngine {
         );
         let children_count = child_count as u16;
 
-        for (i, h) in legal_moves.iter().enumerate() {
+        for (i, h) in moves.iter().enumerate() {
             let child = MCTSNode::new(node_idx, (h.q, h.r), self.scratch_priors[i]);
             self.arena.push(child);
         }

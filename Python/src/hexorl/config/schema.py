@@ -4,6 +4,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List
 import warnings
 
+from hexorl.models.registry import (
+    architecture_ids,
+    architecture_spec,
+    normalize_architecture_id,
+    resolve_model_spec,
+)
+
 
 class RunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -41,15 +48,6 @@ class ModelConfig(BaseModel):
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
         arch = self.architecture.lower()
-        global_architectures = {
-            "global_graph_option1",
-            "global_xattn_0",
-            "global_line_window_0",
-            "global_pair_twostage_0",
-            "global_graph_full_0",
-            "global_hybrid_action_0",
-            "global_graph768_champion",
-        }
         if arch == "graph":
             warnings.warn(
                 "model.architecture='graph' is a deprecated crop-compatible alias; "
@@ -57,12 +55,14 @@ class ModelConfig(BaseModel):
                 "for the first-class global graph contract.",
                 stacklevel=2,
             )
-            arch = "graph_hybrid_0"
-        if arch not in {"cnn", "restnet", "graph_hybrid_0", *global_architectures}:
+        try:
+            arch = normalize_architecture_id(arch)
+        except ValueError as exc:
             raise ValueError(
-                "model.architecture must be cnn, restnet, graph_hybrid_0, "
-                "or a global_graph_option1 family architecture"
-            )
+                "model.architecture must be one of "
+                f"{sorted(architecture_ids())}"
+            ) from exc
+        spec = architecture_spec(arch)
         self.architecture = arch
         if self.blocks <= 0:
             raise ValueError("model.blocks must be positive")
@@ -70,7 +70,11 @@ class ModelConfig(BaseModel):
             raise ValueError("model.channels must be positive")
         if self.attention_heads <= 0:
             raise ValueError("model.attention_heads must be positive")
-        if (arch in {"restnet", "graph_hybrid_0", *global_architectures} or self.attention_positions) and self.channels % self.attention_heads != 0:
+        if (
+            spec.architecture_id in {"restnet", "graph_hybrid_0"}
+            or spec.global_graph
+            or self.attention_positions
+        ) and self.channels % self.attention_heads != 0:
             raise ValueError("model.channels must be divisible by model.attention_heads")
         if self.attention_mlp_ratio <= 0.0:
             raise ValueError("model.attention_mlp_ratio must be positive")
@@ -138,7 +142,7 @@ class ModelConfig(BaseModel):
             )
         if arch == "cnn" and self.attention_positions:
             raise ValueError("model.attention_positions require architecture='restnet'")
-        if arch in {"graph_hybrid_0", *global_architectures} and self.attention_positions:
+        if (spec.architecture_id == "graph_hybrid_0" or spec.global_graph) and self.attention_positions:
             raise ValueError("model.attention_positions are only used by architecture='restnet'")
         return self
 
@@ -196,6 +200,7 @@ class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     batch_size: int = 256
+    graph_microbatch_size: int = 0
     batches_per_epoch: int = 2000
     prefetch_batches: int = 2
     optimizer: str = "adamw"
@@ -237,7 +242,7 @@ class Config(BaseModel):
 
         configured_horizons = {f"lookahead_{h}" for h in self.buffer.lookahead_horizons}
         model_lookahead_heads = {
-            head for head in self.model.heads if head.startswith("lookahead_")
+            head for head in self.model.heads if head.startswith("lookahead_") and head != "lookahead_*"
         }
         missing_horizons = sorted(model_lookahead_heads - configured_horizons)
         if missing_horizons:
@@ -250,16 +255,20 @@ class Config(BaseModel):
                 "model heads sparse_policy/pair_policy require explicit model.sparse_policy = true; "
                 "the config is not auto-mutated"
             )
-        if (
-            self.model.pair_strategy != "none"
-            and not (
+        resolved = resolve_model_spec(self)
+        self.model.heads = list(resolved.outputs)
+        if self.model.pair_strategy != "none":
+            if not resolved.pair_capabilities:
+                raise ValueError(
+                    "non-none model.pair_strategy requires an architecture with pair capability"
+                )
+            if not (
                 {"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"}
-                & set(self.model.heads)
-            )
-        ):
-            raise ValueError(
-                "non-none model.pair_strategy requires an explicit pair policy head"
-            )
+                & set(resolved.outputs)
+            ):
+                raise ValueError(
+                    "non-none model.pair_strategy requires an explicit pair policy head"
+                )
         if self.model.sparse_policy and max(
             self.model.candidate_budget,
             self.selfplay.policy_target_top_k,
@@ -286,39 +295,14 @@ class Config(BaseModel):
             "legal_token_quality",
             "tactical",
         }
-        global_architectures = {
-            "global_graph_option1",
-            "global_xattn_0",
-            "global_line_window_0",
-            "global_pair_twostage_0",
-            "global_graph_full_0",
-            "global_hybrid_action_0",
-            "global_graph768_champion",
-        }
-        if self.model.architecture in global_architectures:
-            graph_defaults = {
-                "policy_place": self.train.loss_weights.get("policy", 1.0),
-                "policy_pair_first": self.train.loss_weights.get("pair_policy", 0.05),
-                "policy_pair_second": self.train.loss_weights.get("pair_policy", 0.05),
-                "policy_pair_joint": self.train.loss_weights.get("pair_policy", 0.05),
-                "opp_policy": self.train.loss_weights.get("opp_policy", 0.15),
-                "value": self.train.loss_weights.get("value", 1.0),
-                "regret_rank": self.train.loss_weights.get("regret_rank", 0.1),
-                "regret_value": self.train.loss_weights.get("regret_value", 0.1),
-                "moves_left": self.train.loss_weights.get("moves_left", 0.05),
-                "tactical": self.train.loss_weights.get("tactical", 0.05),
-                "legal_token_quality": self.train.loss_weights.get("policy", 0.05),
-            }
-            for name, weight in graph_defaults.items():
-                self.train.loss_weights.setdefault(name, weight)
-            for horizon in self.buffer.lookahead_horizons:
-                name = f"lookahead_{horizon}"
-                self.train.loss_weights.setdefault(name, self.train.loss_weights.get("value", 1.0) * 0.1)
-            graph_auto_heads = set(self.model.heads) | {
-                f"lookahead_{h}" for h in self.buffer.lookahead_horizons
-            }
-        else:
-            graph_auto_heads = set(self.model.heads)
+        for name, weight in resolved.default_loss_weights.items():
+            if name.startswith("lookahead_"):
+                if not resolved.global_graph:
+                    continue
+                weight = self.train.loss_weights.get("value", weight)
+                weight = float(weight) * 0.1
+            self.train.loss_weights.setdefault(name, weight)
+        graph_auto_heads = set(resolved.outputs)
         missing_or_inactive = sorted(
             head
             for head in graph_auto_heads

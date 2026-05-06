@@ -36,6 +36,7 @@ from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
 from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
 from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
+from hexorl.models.registry import architecture_display_summary, trial_model_summary
 from hexorl.graph.batch import (
     GRAPH_FEATURE_DIM,
     GRAPH_SCHEMA_VERSION,
@@ -1095,30 +1096,11 @@ def _checkpoint_metadata(path: Path) -> dict[str, Any]:
 
 
 def _architecture_summary(model: dict[str, Any], family: dict[str, Any] | None = None) -> str:
-    family = family or {}
-    arch = str(model.get("architecture") or family.get("architecture") or "").lower()
-    channels = model.get("channels") or family.get("channels")
-    blocks = model.get("blocks") or family.get("blocks")
-    heads = model.get("heads") or []
-    if arch in {"graph", "graph_hybrid_0"}:
-        return (
-            f"Graph hybrid 0, {channels} channels, {blocks} residual blocks, "
-            f"{model.get('graph_token_budget', '?')} {model.get('graph_token_set', 'tokens')}, "
-            f"{model.get('graph_layers', '?')} graph layers, heads: {len(heads)}."
-        )
-    if arch == "restnet":
-        return (
-            f"ResTNet hybrid trunk, {channels} channels, {blocks} blocks, "
-            f"attention at {model.get('attention_positions') or []}, heads: {len(heads)}."
-        )
-    return f"CNN residual trunk, {channels} channels, {blocks} blocks, heads: {len(heads)}."
+    return architecture_display_summary(model, family)
 
 
 def _model_summary_from_trial(family: dict[str, Any], static: dict[str, Any]) -> str:
-    arch = str(family.get("architecture") or "")
-    if arch in {"graph", "graph_hybrid_0"}:
-        return f"graph_hybrid_0 {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
-    return f"{arch or 'model'} {family.get('channels', '?')}x{family.get('blocks', '?')}"
+    return trial_model_summary(family, static)
 
 
 def _worker_summary(selfplay: dict[str, Any]) -> str:

@@ -16,8 +16,8 @@ import torch
 from typing import List, Optional, Tuple
 
 from hexorl.config import Config
-from hexorl.model.network import from_config, HexNet, load_model_state
-from hexorl.model.global_graph import GlobalHexGraphNet
+from hexorl.models.assembly import bins_to_value, from_config, load_model_state
+from hexorl.models.registry import resolve_model_spec
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
     CANDIDATE_FEATURES,
@@ -68,12 +68,9 @@ class InferenceServer:
         initial_state_dict: Optional[dict] = None,
     ):
         self.cfg = cfg
-        architecture = str(getattr(cfg.model, "architecture", "")).lower()
-        self._global_graph_mode = GlobalHexGraphNet.is_global_graph_architecture(architecture)
-        required_heads = {"value"} if self._global_graph_mode else {"policy", "value"}
-        missing_heads = sorted(required_heads - set(cfg.model.heads))
-        if self._global_graph_mode and not ({"policy", "policy_place"} & set(cfg.model.heads)):
-            missing_heads.append("policy_place")
+        resolved = resolve_model_spec(cfg)
+        self._global_graph_mode = resolved.global_graph
+        missing_heads = sorted(set(resolved.selfplay_required_outputs) - set(resolved.outputs))
         if missing_heads:
             raise ValueError(
                 "InferenceServer requires model heads for self-play inference: "
@@ -291,7 +288,7 @@ class InferenceServer:
 
             build_t0 = time.monotonic()
             if self._is_graph_request(ready_workers):
-                graph_inputs, per_worker_counts, total_count = self._build_graph_inputs(ready_workers)
+                graph_inputs, graph_row_sources, total_count = self._build_graph_inputs(ready_workers)
                 batch_tensor = None
                 sparse_inputs = None
             else:
@@ -323,7 +320,7 @@ class InferenceServer:
                 scatter_t0 = time.monotonic()
                 if graph_inputs is not None:
                     self._scatter_graph_results(
-                        ready_workers,
+                        graph_row_sources,
                         values,
                         graph_place,
                         graph_opp,
@@ -461,14 +458,17 @@ class InferenceServer:
     def _build_graph_inputs(
         self,
         ready_workers: List[int],
-    ) -> Tuple[dict[str, torch.Tensor], List[int], int]:
+    ) -> Tuple[dict[str, torch.Tensor], List[tuple[int, int]], int]:
         if not self._global_graph_mode:
             raise RuntimeError("graph IPC request received by a non-global-graph inference server")
-        metas = []
+        row_meta: list[tuple[int, int, np.ndarray]] = []
         for worker_id in ready_workers:
             slot = self._queue.get_slot(worker_id)
-            if int(slot.req_count[0]) != 1:
-                raise ValueError("graph IPC supports exactly one graph position per worker request")
+            request_count = int(slot.req_count[0])
+            if request_count <= 0:
+                continue
+            if request_count > int(getattr(slot, "req_graph_batch_meta").shape[0]):
+                raise ValueError("graph IPC request count exceeds per-worker graph batch capacity")
             meta = np.array(slot.req_graph_meta, copy=True)
             if int(meta[0]) != GRAPH_SCHEMA_VERSION or int(meta[1]) != RELATION_SCHEMA_VERSION:
                 raise ValueError(
@@ -481,14 +481,18 @@ class InferenceServer:
                 raise ValueError("graph request exceeds shared-memory token/legal capacity")
             if opp_count > MAX_GRAPH_ACTIONS or pair_count > MAX_GRAPH_PAIRS:
                 raise ValueError("graph request exceeds shared-memory opponent/pair capacity")
-            metas.append(meta)
-        total = len(ready_workers)
+            batch_meta = np.array(slot.req_graph_batch_meta[:request_count], copy=True)
+            if request_count == 1 and not batch_meta[0].any():
+                batch_meta[0] = (token_count, legal_count, opp_count, pair_count, 0, 0, 0, 0)
+            for local_row in range(request_count):
+                row_meta.append((worker_id, local_row, batch_meta[local_row]))
+        total = len(row_meta)
         if total == 0:
             return {}, [], 0
-        max_t = max(int(meta[2]) for meta in metas)
-        max_a = max(int(meta[3]) for meta in metas)
-        max_o = max(int(meta[4]) for meta in metas)
-        max_p = max(int(meta[5]) for meta in metas)
+        max_t = max(int(meta[0]) for _worker_id, _local_row, meta in row_meta)
+        max_a = max(int(meta[1]) for _worker_id, _local_row, meta in row_meta)
+        max_o = max(int(meta[2]) for _worker_id, _local_row, meta in row_meta)
+        max_p = max(int(meta[3]) for _worker_id, _local_row, meta in row_meta)
 
         token_features = np.zeros((total, max_t, self._queue.get_slot(ready_workers[0]).req_graph_token_features.shape[1]), dtype=np.float32)
         token_type = np.zeros((total, max_t), dtype=np.int64)
@@ -501,27 +505,37 @@ class InferenceServer:
         pair_token_indices = np.full((total, max_p), -1, dtype=np.int64)
         pair_first_indices = np.full((total, max_p), -1, dtype=np.int64)
         pair_second_indices = np.full((total, max_p), -1, dtype=np.int64)
-        relation_type = np.zeros((total, max_t, max_t), dtype=np.int64)
+        relation_type = np.zeros((total, max_t, max_t), dtype=np.int16)
         relation_bias = np.zeros((total, 1, max_t, max_t), dtype=np.float32)
 
-        for row, worker_id in enumerate(ready_workers):
+        row_sources: list[tuple[int, int]] = []
+        for row, (worker_id, local_row, meta) in enumerate(row_meta):
             slot = self._queue.get_slot(worker_id)
-            t, a, o, p = map(int, metas[row][2:6])
-            token_features[row, :t] = slot.req_graph_token_features[:t]
-            token_type[row, :t] = slot.req_graph_token_type[:t].astype(np.int64)
-            token_qr[row, :t] = slot.req_graph_token_qr[:t]
-            token_mask[row, :t] = slot.req_graph_token_mask[:t].astype(bool)
-            legal_token_indices[row, :a] = slot.req_graph_legal_token_indices[:a]
-            legal_mask[row, :a] = slot.req_graph_legal_mask[:a].astype(bool)
+            t, a, o, p, token_off, legal_off, opp_off, pair_off = map(int, meta[:8])
+            if token_off + t > MAX_GRAPH_TOKENS or legal_off + a > MAX_GRAPH_ACTIONS:
+                raise ValueError("graph batch row exceeds packed token/legal capacity")
+            if opp_off + o > MAX_GRAPH_ACTIONS or pair_off + p > MAX_GRAPH_PAIRS:
+                raise ValueError("graph batch row exceeds packed opponent/pair capacity")
+            token_slice = slice(token_off, token_off + t)
+            legal_slice = slice(legal_off, legal_off + a)
+            opp_slice = slice(opp_off, opp_off + o)
+            pair_slice = slice(pair_off, pair_off + p)
+            token_features[row, :t] = slot.req_graph_token_features[token_slice]
+            token_type[row, :t] = slot.req_graph_token_type[token_slice].astype(np.int64)
+            token_qr[row, :t] = slot.req_graph_token_qr[token_slice]
+            token_mask[row, :t] = slot.req_graph_token_mask[token_slice].astype(bool)
+            legal_token_indices[row, :a] = slot.req_graph_legal_token_indices[legal_slice]
+            legal_mask[row, :a] = slot.req_graph_legal_mask[legal_slice].astype(bool)
             if o:
-                opp_legal_qr[row, :o] = slot.req_graph_opp_legal_qr[:o]
-                opp_legal_mask[row, :o] = slot.req_graph_opp_legal_mask[:o].astype(bool)
+                opp_legal_qr[row, :o] = slot.req_graph_opp_legal_qr[opp_slice]
+                opp_legal_mask[row, :o] = slot.req_graph_opp_legal_mask[opp_slice].astype(bool)
             if p:
-                pair_token_indices[row, :p] = slot.req_graph_pair_token_indices[:p]
-                pair_first_indices[row, :p] = slot.req_graph_pair_first_indices[:p]
-                pair_second_indices[row, :p] = slot.req_graph_pair_second_indices[:p]
-            relation_type[row, :t, :t] = slot.req_graph_relation_type[:t, :t].astype(np.int64)
-            relation_bias[row, :, :t, :t] = slot.req_graph_relation_bias[:, :t, :t]
+                pair_token_indices[row, :p] = slot.req_graph_pair_token_indices[pair_slice]
+                pair_first_indices[row, :p] = slot.req_graph_pair_first_indices[pair_slice]
+                pair_second_indices[row, :p] = slot.req_graph_pair_second_indices[pair_slice]
+            relation_type[row, :t, :t] = slot.req_graph_relation_type[token_slice, token_slice]
+            relation_bias[row, :, :t, :t] = slot.req_graph_relation_bias[:, token_slice, token_slice]
+            row_sources.append((worker_id, local_row))
 
         return (
             {
@@ -539,7 +553,7 @@ class InferenceServer:
                 "relation_type": torch.from_numpy(relation_type).to(self._device, non_blocking=True),
                 "relation_bias": torch.from_numpy(relation_bias).to(self._device, non_blocking=True),
             },
-            [1 for _ in ready_workers],
+            row_sources,
             total,
         )
 
@@ -651,7 +665,7 @@ class InferenceServer:
         p = self._sanitize_policy_logits(out["policy"])
         value_logits = self._sanitize_value_logits(out["value"])
         v = torch.nan_to_num(
-            HexNet.bins_to_value(value_logits).float(),
+            bins_to_value(value_logits).float(),
             nan=0.0,
             posinf=1.0,
             neginf=-1.0,
@@ -717,7 +731,7 @@ class InferenceServer:
         place = self._sanitize_policy_logits(out["policy_place"])
         value_logits = self._sanitize_value_logits(out["value"])
         values = torch.nan_to_num(
-            HexNet.bins_to_value(value_logits).float(),
+            bins_to_value(value_logits).float(),
             nan=0.0,
             posinf=1.0,
             neginf=-1.0,
@@ -816,7 +830,7 @@ class InferenceServer:
 
     def _scatter_graph_results(
         self,
-        ready_workers: List[int],
+        row_sources: List[tuple[int, int]],
         values: np.ndarray,
         place_logits: np.ndarray,
         opp_logits: Optional[np.ndarray],
@@ -826,55 +840,68 @@ class InferenceServer:
         regret_rank: Optional[np.ndarray] = None,
     ):
         """Scatter graph logits using each worker's keyed legal/pair counts."""
-        for row, worker_id in enumerate(ready_workers):
+        head_flags = 0
+        if opp_logits is not None:
+            head_flags |= GRAPH_HEAD_OPP
+        if pair_first_logits is not None:
+            head_flags |= GRAPH_HEAD_PAIR_FIRST
+        if pair_joint_logits is not None:
+            head_flags |= GRAPH_HEAD_PAIR_JOINT
+        if pair_second_logits is not None:
+            head_flags |= GRAPH_HEAD_PAIR_SECOND
+        if regret_rank is not None:
+            head_flags |= GRAPH_HEAD_REGRET
+
+        worker_totals: dict[int, list[int]] = {}
+        for row, (worker_id, local_row) in enumerate(row_sources):
             slot = self._queue.get_slot(worker_id)
-            token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
+            meta = np.array(slot.req_graph_batch_meta[local_row], copy=True)
+            if local_row == 0 and not meta.any():
+                token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
+                token_off = legal_off = opp_off = pair_off = 0
+            else:
+                token_count, legal_count, opp_count, pair_count, token_off, legal_off, opp_off, pair_off = map(int, meta[:8])
             if legal_count > place_logits.shape[1]:
                 raise ValueError("graph place logits shorter than legal row table")
             if pair_count and pair_joint_logits is None and pair_second_logits is None:
                 raise ValueError("graph model did not return any pair logits for a pair request")
-            head_flags = 0
-            if opp_logits is not None:
-                head_flags |= GRAPH_HEAD_OPP
-            if pair_first_logits is not None:
-                head_flags |= GRAPH_HEAD_PAIR_FIRST
-            if pair_joint_logits is not None:
-                head_flags |= GRAPH_HEAD_PAIR_JOINT
-            if pair_second_logits is not None:
-                head_flags |= GRAPH_HEAD_PAIR_SECOND
-            if regret_rank is not None:
-                head_flags |= GRAPH_HEAD_REGRET
-            slot.res_value[0] = float(values[row])
+            slot.res_value[local_row] = float(values[row])
+            totals = worker_totals.setdefault(worker_id, [0, 0, 0, 0])
+            totals[0] += token_count
+            totals[1] += legal_count
+            totals[2] += opp_count
+            totals[3] += pair_count
             slot.res_graph_meta[:] = (
                 GRAPH_SCHEMA_VERSION,
                 RELATION_SCHEMA_VERSION,
-                legal_count,
-                opp_count,
-                pair_count,
-                token_count,
+                totals[1],
+                totals[2],
+                totals[3],
+                totals[0],
                 MAX_GRAPH_TOKENS,
                 head_flags,
             )
-            slot.res_graph_place_logits.fill(0.0)
-            slot.res_graph_opp_logits.fill(0.0)
-            slot.res_graph_pair_first_logits.fill(0.0)
-            slot.res_graph_pair_logits.fill(0.0)
-            slot.res_graph_pair_second_logits.fill(0.0)
+            if local_row == 0:
+                slot.res_graph_place_logits.fill(0.0)
+                slot.res_graph_opp_logits.fill(0.0)
+                slot.res_graph_pair_first_logits.fill(0.0)
+                slot.res_graph_pair_logits.fill(0.0)
+                slot.res_graph_pair_second_logits.fill(0.0)
             if getattr(slot, "res_graph_regret_rank", None) is not None:
-                slot.res_graph_regret_rank[0] = (
+                slot.res_graph_regret_rank[local_row] = (
                     float(regret_rank[row])
                     if regret_rank is not None and row < len(regret_rank)
                     else 0.0
                 )
-            slot.res_graph_place_logits[:legal_count] = place_logits[row, :legal_count]
+            slot.res_graph_place_logits[legal_off : legal_off + legal_count] = place_logits[row, :legal_count]
             if opp_count and opp_logits is not None:
-                slot.res_graph_opp_logits[:opp_count] = opp_logits[row, :opp_count]
+                slot.res_graph_opp_logits[opp_off : opp_off + opp_count] = opp_logits[row, :opp_count]
             if legal_count and pair_first_logits is not None:
-                slot.res_graph_pair_first_logits[:legal_count] = pair_first_logits[row, :legal_count]
+                slot.res_graph_pair_first_logits[legal_off : legal_off + legal_count] = pair_first_logits[row, :legal_count]
             if pair_count and pair_joint_logits is not None:
-                slot.res_graph_pair_logits[:pair_count] = pair_joint_logits[row, :pair_count]
+                slot.res_graph_pair_logits[pair_off : pair_off + pair_count] = pair_joint_logits[row, :pair_count]
             if pair_count and pair_second_logits is not None:
-                slot.res_graph_pair_second_logits[:pair_count] = pair_second_logits[row, :pair_count]
+                slot.res_graph_pair_second_logits[pair_off : pair_off + pair_count] = pair_second_logits[row, :pair_count]
             slot.req_mode[0] = 0
 
     # ── Stats ─────────────────────────────────────────────────────────────

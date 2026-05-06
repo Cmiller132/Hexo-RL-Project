@@ -24,7 +24,8 @@ from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
-from hexorl.model.network import HexNet, build_model_from_config
+from hexorl.models.assembly import build_model_from_config
+from hexorl.models.registry import is_global_graph_architecture
 from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import (
@@ -60,7 +61,7 @@ class EpochResult:
 def run_epoch(
     cfg: Config,
     *,
-    model: Optional[HexNet] = None,
+    model: Optional[torch.nn.Module] = None,
     trainer: Optional[Trainer] = None,
     buffer: Optional[RingBuffer] = None,
     output_dir: Optional[Path] = None,
@@ -181,8 +182,11 @@ def run_epoch(
                 or "pair_policy" in cfg.model.heads
             ),
             include_pair_policy=_uses_pair_policy_targets(cfg),
-            include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
+            include_graph_policy=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
+            defer_graph_collate=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
             candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
+            graph_context_tokens=int(getattr(cfg.model, "graph_token_budget", 512)),
+            graph_legal_rows=int(getattr(cfg.model, "candidate_budget", 256)),
             max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
         )
         num_workers = dataloader_worker_count(cfg)
@@ -320,7 +324,7 @@ def run_tiny_training_smoke(
             or "pair_policy" in cfg.model.heads
         ),
         include_pair_policy=_uses_pair_policy_targets(cfg),
-        include_graph_policy=str(getattr(cfg.model, "architecture", "")).lower().startswith("global_"),
+        include_graph_policy=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
         candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
     )
     num_workers = dataloader_worker_count(cfg)

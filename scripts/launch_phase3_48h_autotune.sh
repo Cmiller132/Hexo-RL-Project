@@ -47,9 +47,20 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     log_launch "gpu $(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
 fi
 
+live_supervisor() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    local stat args
+    stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d ' ' || true)"
+    [[ -n "${stat}" && "${stat}" != *Z* ]] || return 1
+    args="$(ps -p "${pid}" -o args= 2>/dev/null || true)"
+    [[ "${args}" == *"run_phase3_48h_autotune.py"* ]] || return 1
+}
+
 if [[ -f "${RUN_ROOT}/supervisor.pid" ]]; then
     old_pid="$(cat "${RUN_ROOT}/supervisor.pid" 2>/dev/null || true)"
-    if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
+    if live_supervisor "${old_pid}"; then
         old_args="$(ps -p "${old_pid}" -o args= 2>/dev/null || true)"
         log_launch "existing supervisor still alive pid=${old_pid} args=${old_args}"
         echo "${old_pid}"

@@ -21,6 +21,7 @@ from hexorl.graph.batch import graph_capacity_report, validate_graph_ipc_capacit
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.model.global_graph import GlobalHexGraphNet
 from hexorl.model.network import build_model_from_config
+from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.selfplay.worker import _align_global_logits_to_rust_legal, _graph_batch_with_pair_rows
 from hexorl.train.trainer import Trainer
@@ -249,6 +250,23 @@ def test_global_graph_relation_bias_contract_includes_cover_pair_and_component_e
     assert np.isfinite(graph.relation_bias).all()
 
 
+def test_global_graph_legal_budget_preserves_positive_policy_rows():
+    graph = build_graph_batch_from_history(
+        _hist((0, 0, 0)),
+        radius=8,
+        max_legal_rows=4,
+        required_legal_rows=[(8, 0)],
+        policy_target=[(7, 1, 1.0)],
+        include_pair_rows=False,
+    )
+    legal = {tuple(int(x) for x in qr) for qr in graph.legal_qr.tolist()}
+
+    assert len(legal) == 4
+    assert (8, 0) in legal
+    assert (7, 1) in legal
+    assert graph.policy_target.sum() == pytest.approx(1.0)
+
+
 def test_global_graph_pair_rows_mask_opening_and_exist_on_two_placement_turns():
     opening = build_graph_batch_from_history(b"", radius=2)
     normal_turn = build_graph_batch_from_history(
@@ -407,6 +425,41 @@ def test_global_graph_reference_pair_rows_cover_full_first_placement_table():
     assert graph.pair_first_policy_target[second_row] == pytest.approx(0.0)
 
 
+def test_global_graph_reference_pair_rows_can_budget_training_table():
+    graph = build_graph_batch_from_history(
+        _hist((0, 0, 0)),
+        radius=2,
+        include_pair_rows=False,
+    )
+    legal = [tuple(qr.tolist()) for qr in graph.legal_qr]
+    pair_policy = [
+        (legal[2], legal[5], 0.7),
+        (legal[3], legal[6], 0.3),
+    ]
+
+    graph = graph_batch_with_reference_pair_rows(
+        graph,
+        pair_policy,
+        max_pair_rows=4,
+    )
+
+    token_to_legal = {int(tok): idx for idx, tok in enumerate(graph.legal_token_indices.tolist())}
+    selected_pairs = {
+        frozenset(
+            {
+                tuple(graph.legal_qr[token_to_legal[int(first_tok)]].tolist()),
+                tuple(graph.legal_qr[token_to_legal[int(second_tok)]].tolist()),
+            }
+        )
+        for first_tok, second_tok in zip(graph.pair_first_indices, graph.pair_second_indices)
+    }
+    target_pairs = {frozenset({first, second}) for first, second, _ in pair_policy}
+
+    assert graph.pair_first_indices.shape[0] == 4
+    assert graph.pair_policy_target.sum() == pytest.approx(1.0)
+    assert target_pairs.issubset(selected_pairs)
+
+
 def test_global_graph_model_forward_with_padded_batch():
     graphs = [
         build_graph_batch_from_history(_hist((0, 0, 0)), radius=2),
@@ -448,13 +501,14 @@ def test_global_graph_model_forward_with_padded_batch():
 
 
 def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
-    graph = collate_graph_batches([
+    graphs = [
         build_graph_batch_from_history(
             _hist((0, 0, 0), (1, 1, 0), (1, 0, 1)),
             policy_target=[(2, 0, 1.0)],
             include_pair_rows=False,
         )
-    ])
+        for _ in range(3)
+    ]
     cfg = Config.model_validate(
         {
             "model": {
@@ -462,15 +516,15 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
                 "channels": 16,
                 "attention_heads": 4,
                 "graph_layers": 1,
+                "heads": ["policy_place", "value"],
             },
             "train": {
                 "batches_per_epoch": 1,
+                "graph_microbatch_size": 2,
                 "loss_weights": {
                     "policy": 1.0,
                     "policy_place": 1.0,
                     "value": 1.0,
-                    "opp_policy": 0.1,
-                    "tactical": 0.1,
                 },
             },
             "inference": {"fp16": False},
@@ -478,33 +532,14 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
     )
     model = build_model_from_config(cfg, device=torch.device("cpu"))
     aux = {
-        "token_features": torch.from_numpy(graph.token_features),
-        "token_type": torch.from_numpy(graph.token_type),
-        "token_qr": torch.from_numpy(graph.token_qr),
-        "token_mask": torch.from_numpy(graph.token_mask),
-        "legal_token_indices": torch.from_numpy(graph.legal_token_indices),
-        "legal_qr": torch.from_numpy(graph.legal_qr),
-        "legal_mask": torch.from_numpy(graph.legal_mask),
-        "policy_target": torch.from_numpy(graph.policy_target),
-        "opp_legal_qr": torch.from_numpy(graph.opp_legal_qr),
-        "opp_legal_mask": torch.from_numpy(graph.opp_legal_mask),
-        "opp_policy_target": torch.from_numpy(graph.opp_policy_target),
-        "pair_token_indices": torch.from_numpy(graph.pair_token_indices),
-        "pair_first_indices": torch.from_numpy(graph.pair_first_indices),
-        "pair_second_indices": torch.from_numpy(graph.pair_second_indices),
-        "pair_policy_target": torch.from_numpy(graph.pair_policy_target),
-        "pair_second_policy_target": torch.from_numpy(graph.pair_second_policy_target),
-        "relation_type": torch.from_numpy(graph.relation_type),
-        "relation_bias": torch.from_numpy(graph.relation_bias),
-        "tactical_target": torch.from_numpy(graph.tactical_target),
-        "policy_weight": torch.ones(1),
-        "opp_policy_weight": torch.ones(1),
+        "_graph_batches": graphs,
+        "policy_weight": torch.ones(3),
     }
     batch = (
-        torch.zeros(1, 13, 33, 33),
-        torch.zeros(1, 1089),
-        torch.zeros(1),
-        [],
+        torch.zeros(3, 13, 33, 33),
+        torch.zeros(3, 1089),
+        torch.zeros(3),
+        [torch.zeros(3), torch.zeros(3), torch.zeros(3)],
         aux,
     )
     trainer = Trainer(model, cfg, dataloader=[], device=torch.device("cpu"))
@@ -512,6 +547,8 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
     losses = trainer._train_step(batch, 0)
 
     assert np.isfinite(losses["total"])
+    assert losses["graph_microbatch_size"] == 2.0
+    assert losses["graph_microbatch_count"] == 2.0
 
 
 def test_global_graph_pair_second_loss_is_known_first_only():
@@ -539,17 +576,26 @@ def test_global_graph_pair_second_loss_is_known_first_only():
             "pair_second_policy_target": torch.from_numpy(batch.pair_second_policy_target),
             "pair_first_indices": torch.from_numpy(batch.pair_first_indices),
             "pair_second_indices": torch.from_numpy(batch.pair_second_indices),
+            "pair_row_mask": (torch.from_numpy(batch.pair_first_indices) >= 0)
+            & (torch.from_numpy(batch.pair_second_indices) >= 0)
+            & (torch.from_numpy(batch.pair_first_indices) != torch.from_numpy(batch.pair_second_indices)),
+            "pair_policy_weight": torch.ones(batch.pair_policy_target.shape[0]),
+            "placements_remaining": torch.from_numpy(batch.placements_remaining_by_sample),
+            "pair_second_known_first": torch.from_numpy(batch.placements_remaining_by_sample) == 1,
         }
+        targets["pair_second_row_mask"] = targets["pair_row_mask"] & targets["pair_second_known_first"].unsqueeze(1)
+        loss_weights = {"policy_pair_joint": 1.0, "policy_pair_second": 1.0}
         _total, per_head = compute_losses(
             preds,
             targets,
-            loss_weights={"policy_pair_joint": 1.0, "policy_pair_second": 1.0},
+            loss_weights=loss_weights,
+            loss_plan=build_loss_plan(tuple(preds.keys()), loss_weights),
         )
         return per_head
 
     first_losses = pair_losses(first_batch)
     assert "policy_pair_joint" in first_losses
-    assert "policy_pair_second" not in first_losses
+    assert first_losses["policy_pair_second"].item() == pytest.approx(0.0)
 
     second_losses = pair_losses(second_batch)
     assert "policy_pair_joint" in second_losses
