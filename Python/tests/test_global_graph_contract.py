@@ -35,6 +35,35 @@ def _hist(*moves):
     return bytes(data)
 
 
+def _must_block_history():
+    return _hist(
+        (0, 0, 0),
+        (1, 0, 5),
+        (1, 0, 6),
+        (0, 1, 0),
+        (0, 2, 0),
+        (1, 1, 5),
+        (1, 1, 6),
+        (0, 3, 0),
+        (0, 4, 0),
+    )
+
+
+def _engine_legal_from_history(history: bytes, *, constrain_threats: bool):
+    engine = pytest.importorskip("_engine")
+    game_cls = getattr(engine, "HexGame", None) or getattr(engine, "PyHexGame")
+    game = game_cls()
+    for player, q, r in struct.iter_unpack("<iii", history):
+        current = game.current_player() if callable(game.current_player) else game.current_player
+        assert int(player) == int(current)
+        game.place(int(q), int(r))
+    _tensor, _offset_q, _offset_r, legal_bytes = game.encode_board_and_legal(
+        8,
+        constrain_threats,
+    )
+    return np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+
+
 def build_graph_batch_from_history(history, **kwargs):
     """Test helper: graph contract always uses the Rust radius-8 legal table."""
     kwargs.pop("radius", None)
@@ -88,6 +117,43 @@ def test_global_graph_builder_preserves_all_legal_rows():
     assert (0, 0) not in {tuple(qr) for qr in graph.legal_qr.tolist()}
     legal_token_types = graph.token_type[graph.legal_token_indices]
     assert np.all(legal_token_types == int(GraphTokenType.LEGAL))
+
+
+def test_global_graph_builder_can_use_threat_constrained_engine_legal_rows():
+    history = _must_block_history()
+    full_legal = _engine_legal_from_history(history, constrain_threats=False)
+    threat_legal = _engine_legal_from_history(history, constrain_threats=True)
+
+    graph = build_graph_batch_from_history(
+        history,
+        constrain_threats=True,
+        include_pair_rows=False,
+    )
+
+    assert threat_legal.shape[0] == 2
+    assert threat_legal.shape[0] < full_legal.shape[0]
+    assert {tuple(row) for row in threat_legal.tolist()} == {(-1, 0), (5, 0)}
+    assert np.array_equal(graph.legal_qr, threat_legal)
+
+
+def test_global_graph_builder_honors_explicit_legal_rows():
+    history = _must_block_history()
+    override = [(5, 0), (-1, 0)]
+
+    graph = build_graph_batch_from_history(
+        history,
+        legal_moves=override,
+        constrain_threats=False,
+        include_pair_rows=False,
+    )
+
+    assert [tuple(row) for row in graph.legal_qr.tolist()] == override
+    with pytest.raises(ValueError, match="legal_moves contains occupied"):
+        build_graph_batch_from_history(
+            history,
+            legal_moves=[(0, 0), (5, 0)],
+            include_pair_rows=False,
+        )
 
 
 def test_global_graph_ipc_capacity_allows_full_legal_scout_requests():

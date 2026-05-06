@@ -26,6 +26,39 @@ def _move(player: int, q: int, r: int) -> bytes:
     return struct.pack("<iii", player, q, r)
 
 
+def _must_block_moves() -> list[tuple[int, int, int]]:
+    return [
+        (0, 0, 0),
+        (1, 0, 5),
+        (1, 0, 6),
+        (0, 1, 0),
+        (0, 2, 0),
+        (1, 1, 5),
+        (1, 1, 6),
+        (0, 3, 0),
+        (0, 4, 0),
+    ]
+
+
+class _GraphPrefersLastLegal(torch.nn.Module):
+    hexorl_architecture = "global_xattn_0"
+    graph_context_tokens = 64
+    graph_legal_rows = 64
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, *, legal_mask, **kwargs):
+        width = int(legal_mask.shape[1])
+        logits = torch.arange(width, device=legal_mask.device, dtype=torch.float32)
+        logits = logits.unsqueeze(0) + self.weight
+        return {
+            "policy_place": logits,
+            "value": torch.zeros(1, 65, device=legal_mask.device),
+        }
+
+
 def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     store = DashboardStore(tmp_path / "dashboard.sqlite3")
     recorder = RunRecorder(store, "test-run", tmp_path / "events.jsonl")
@@ -473,6 +506,28 @@ def test_noisy_model_player_supports_global_graph_policy_place_eval():
 
     game = engine.HexGame()
     game.place(int(q), int(r))
+
+
+def test_noisy_model_player_global_graph_eval_uses_threat_constrained_legal_rows():
+    engine = pytest.importorskip("_engine")
+    model = _GraphPrefersLastLegal()
+    player = NoisyModelPlayer(
+        model,
+        config=NoisyPolicyConfig(seed=7, temperature=1e-4, top_p=1.0),
+    )
+
+    q, r = player(_must_block_moves(), 0, 1)
+
+    game = engine.HexGame()
+    for _player, mq, mr in _must_block_moves():
+        game.place(int(mq), int(mr))
+    _tensor, _offset_q, _offset_r, legal_bytes = game.encode_board_and_legal(8, True)
+    threat_legal = {
+        tuple(row)
+        for row in np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2).tolist()
+    }
+    assert threat_legal == {(-1, 0), (5, 0)}
+    assert (q, r) in threat_legal
 
 
 def test_arena_model_move_fn_routes_global_graph_models_to_policy_place():

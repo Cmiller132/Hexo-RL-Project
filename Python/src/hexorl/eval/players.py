@@ -134,8 +134,17 @@ class NoisyModelPlayer:
         move_history: list[tuple[int, int, int]],
     ) -> tuple[int | None, int | None]:
         history = _encode_move_history(move_history)
+        legal_override = _rust_legal_rows_for_history(
+            move_history,
+            near_radius=8,
+            constrain_threats=self.config.constrain_threats,
+        )
+        if legal_override is not None and len(legal_override) == 0:
+            return None, None
         graph = build_graph_batch_from_history(
             history,
+            legal_moves=legal_override,
+            constrain_threats=self.config.constrain_threats,
             include_pair_rows=False,
             max_context_tokens=_positive_int_attr(
                 self._unwrapped_model,
@@ -256,6 +265,25 @@ def _encode_move_history(move_history: list[tuple[int, int, int]]) -> bytes:
     for player, q, r in move_history:
         data.extend(struct.pack("<iii", int(player), int(q), int(r)))
     return bytes(data)
+
+
+def _rust_legal_rows_for_history(
+    move_history: list[tuple[int, int, int]],
+    *,
+    near_radius: int,
+    constrain_threats: bool,
+) -> list[tuple[int, int]] | None:
+    if not HAS_ENGINE:
+        return None
+    game = _new_game()
+    for _player, q, r in move_history:
+        game.place(int(q), int(r))
+    _tensor, _offset_q, _offset_r, legal_bytes = game.encode_board_and_legal(
+        int(near_radius),
+        bool(constrain_threats),
+    )
+    legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+    return [(int(q), int(r)) for q, r in legal.tolist()]
 
 
 def _graph_batch_to_tensors(

@@ -430,6 +430,7 @@ def test_global_xattn_pair_strategy_defaults_to_none():
     try:
         worker = SelfPlayWorker(0, cfg, queue, num_workers=1, max_batch_size=1)
         assert worker.global_graph_enabled is True
+        assert worker.constrain_threats is True
         assert worker.pair_strategy == "none"
         assert worker.pair_policy_enabled is False
         assert worker.pair_strategy_summary()["pair_rows_scored"] == 0

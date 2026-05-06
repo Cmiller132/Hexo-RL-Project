@@ -994,7 +994,6 @@ class SelfPlayWorker:
         self.global_graph_leaf_eval = bool(getattr(cfg.model, "global_graph_leaf_eval", False))
         if self.global_graph_enabled:
             self.near_radius = 8
-            self.constrain_threats = False
         self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
         self._pair_strategy = build_pair_strategy(
             str(getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)).lower(),
@@ -1219,9 +1218,12 @@ class SelfPlayWorker:
                 try:
                     root_tensor = tensor_3d.reshape(1, 13, 33, 33).astype(np.float32, copy=False)
                     if self.global_graph_enabled:
+                        rust_legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
                         graph_batch = build_graph_batch_from_history(
                             bytes(move_history),
+                            legal_moves=[(int(q), int(r)) for q, r in rust_legal],
                             radius=8,
+                            constrain_threats=self.constrain_threats,
                             max_pair_rows=0,
                             include_pair_rows=False,
                             max_legal_rows=self.candidate_budget,
@@ -1229,7 +1231,6 @@ class SelfPlayWorker:
                         )
                         graph_out = client.submit_graph(graph_batch)
                         raw_graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
-                        rust_legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
                         policy_place = np.asarray(graph_out["policy_place"], dtype=np.float32)
                         graph_value = float(np.asarray(graph_out["value"], dtype=np.float32)[0])
                         self._engine_adapter.validate_value_perspective(
@@ -1628,8 +1629,10 @@ class SelfPlayWorker:
                                 legal = np.frombuffer(bytes(leaf_legal_bytes), dtype=np.int32).reshape(-1, 2)
                                 graph_batch = build_graph_batch_from_history(
                                     bytes(leaf_history_bytes),
+                                    legal_moves=[(int(q), int(r)) for q, r in legal],
                                     opp_legal_moves=[(int(q), int(r)) for q, r in legal],
                                     radius=8,
+                                    constrain_threats=self.constrain_threats,
                                     max_pair_rows=0,
                                     include_pair_rows=False,
                                     max_legal_rows=self.candidate_budget,
@@ -1910,6 +1913,7 @@ class SelfPlayWorker:
                             graph = build_graph_batch_from_history(
                                 move_bytes,
                                 radius=8,
+                                constrain_threats=self.constrain_threats,
                                 max_pair_rows=0,
                                 include_pair_rows=False,
                                 max_legal_rows=self.candidate_budget,

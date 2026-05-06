@@ -492,10 +492,12 @@ def build_graph_batch_from_history(
     history: bytes,
     *,
     policy_target: Sequence[tuple[int, int, float]] = (),
+    legal_moves: Sequence[tuple[int, int]] | None = None,
     opp_legal_moves: Sequence[tuple[int, int]] | None = None,
     opp_policy_target: Sequence[tuple[int, int, float]] = (),
     pair_policy_target: Sequence[tuple[tuple[int, int], tuple[int, int], float]] = (),
     radius: int = 8,
+    constrain_threats: bool = False,
     max_pair_rows: int = PAIR_CHUNK_LIMIT,
     allow_pair_truncation: bool = False,
     include_pair_rows: bool = True,
@@ -509,11 +511,26 @@ def build_graph_batch_from_history(
     moves = parse_history(history)
     stones = {(q, r): player for player, q, r in moves}
     current_player, placements_remaining = current_turn_state(moves)
-    engine_state = _engine_state_from_history(history)
+    engine_state = _engine_state_from_history(
+        history,
+        radius=radius,
+        constrain_threats=bool(constrain_threats) and legal_moves is None,
+    )
     if engine_state is not None:
         legal, current_player, placements_remaining = engine_state
     else:
         legal = legal_moves_for_stones(stones, radius=radius)
+        if constrain_threats and legal_moves is None:
+            legal = _threat_constrained_fallback(history, legal)
+    if legal_moves is not None:
+        occupied_rows = [
+            (int(qr[0]), int(qr[1]))
+            for qr in legal_moves
+            if (int(qr[0]), int(qr[1])) in stones
+        ]
+        if occupied_rows:
+            raise ValueError(f"legal_moves contains occupied cells: {occupied_rows[:8]}")
+        legal = _unique_qr(legal_moves)
     oracle = scan_tactical_oracle_from_history(
         history,
         legal,
@@ -1309,7 +1326,12 @@ def _opponent_legal_after_passive_turn(
     return legal_moves_for_stones(future, radius=radius)
 
 
-def _engine_state_from_history(history: bytes) -> tuple[list[tuple[int, int]], int, int] | None:
+def _engine_state_from_history(
+    history: bytes,
+    *,
+    radius: int = 8,
+    constrain_threats: bool = False,
+) -> tuple[list[tuple[int, int]], int, int] | None:
     try:
         import _engine  # type: ignore
     except Exception:
@@ -1324,7 +1346,17 @@ def _engine_state_from_history(history: bytes) -> tuple[list[tuple[int, int]], i
         if int(player) != int(current):
             raise ValueError(f"invalid graph history: player {player} does not match engine current player {current}")
         game.place(int(q), int(r))
-    legal = getattr(game, "legal_moves", lambda: [])()
+    if constrain_threats and hasattr(game, "encode_board_and_legal"):
+        _tensor, _offset_q, _offset_r, legal_bytes = game.encode_board_and_legal(
+            int(radius),
+            True,
+        )
+        legal_arr = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+        legal = [(int(q), int(r)) for q, r in legal_arr.tolist()]
+    elif constrain_threats and hasattr(game, "threat_constrained_moves"):
+        legal = game.threat_constrained_moves(int(radius))
+    else:
+        legal = getattr(game, "legal_moves", lambda: [])()
     current_player = getattr(game, "current_player", 0)
     placements_remaining = getattr(game, "placements_remaining", 1)
     if callable(current_player):
@@ -1336,6 +1368,27 @@ def _engine_state_from_history(history: bytes) -> tuple[list[tuple[int, int]], i
         int(current_player),
         int(placements_remaining),
     )
+
+
+def _threat_constrained_fallback(
+    history: bytes,
+    legal: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    oracle = scan_tactical_oracle_from_history(
+        history,
+        legal,
+        near_radius=8,
+        allow_python_fallback=True,
+    )
+    win_now = {(int(q), int(r)) for q, r in getattr(oracle, "win_now_cells", ())}
+    forced = {(int(q), int(r)) for q, r in getattr(oracle, "forced_block_cells", ())}
+    if win_now:
+        allowed = win_now
+    elif forced:
+        allowed = forced
+    else:
+        return list(legal)
+    return [qr for qr in legal if qr in allowed]
 
 
 def _tactical_target_from_oracle(oracle) -> np.ndarray:
