@@ -1121,6 +1121,90 @@ def test_phase3_persists_trial_state_after_epoch(tmp_path, monkeypatch):
     assert run_state["trials"][0]["epoch"] == 1
 
 
+def test_phase3_runtime_sweep_log_summary_names_quality_and_resource_signals():
+    module = _load_phase3_autotune_module()
+    summary = module._event_log_summary(
+        "runtime_sweep_result",
+        {
+            "event": "runtime_sweep_result",
+            "trial_id": "cal_graph_hybrid_0",
+            "stage": "3A_calibration",
+            "ok": True,
+            "candidate": {
+                "workers": 2,
+                "batch_size_per_worker": 8,
+                "max_batch_size": 80,
+                "max_wait_us": 500,
+            },
+            "positions": 500,
+            "positions_per_min": 120.8,
+            "elapsed_s": 248.9,
+            "score": 121.4,
+            "selfplay": {
+                "games_done": 1,
+                "truncation_rate": 1.0,
+                "terminal_reason_max_game_moves": 1,
+            },
+            "gpu_after": {
+                "gpu_util_pct": 38,
+                "memory_used_mb": 3437,
+                "memory_total_mb": 12282,
+            },
+            "memory": {
+                "min_available_gb": 20.1,
+                "unsafe": False,
+            },
+        },
+    )
+
+    assert "Runtime sweep result" in summary
+    assert "trial=cal_graph_hybrid_0" in summary
+    assert "workers=2" in summary
+    assert "trunc_rate=1.00" in summary
+    assert "max_move_games=1" in summary
+    assert "gpu_mem=3437/12282MiB" in summary
+    assert "unsafe_memory=False" in summary
+
+
+def test_phase3_trial_created_log_summary_names_model_contract():
+    module = _load_phase3_autotune_module()
+    summary = module._event_log_summary(
+        "trial_created",
+        {
+            "event": "trial_created",
+            "trial_id": "cal_global_pair_twostage_0",
+            "stage": "3A_calibration",
+            "family": {
+                "name": "global_pair_twostage_0",
+                "architecture": "global_pair_twostage_0",
+            },
+            "heads": ["policy_place", "value", "policy_pair_first", "policy_pair_joint", "policy_pair_second"],
+            "model_contract": {
+                "outputs": ["policy_place", "value", "policy_pair_first", "policy_pair_joint", "policy_pair_second"],
+                "pair_capabilities": ["graph_pair_first", "graph_pair_joint", "graph_pair_second"],
+            },
+            "pair_strategy": {
+                "strategy": "diagnostic_full_pair",
+                "max_pairs": 256,
+            },
+            "static": {
+                "full_sims": 512,
+                "pcr_low_sims": 128,
+                "graph_token_budget": 256,
+                "graph_layers": 1,
+                "candidate_budget": 256,
+            },
+        },
+    )
+
+    assert "Trial created" in summary
+    assert "family=global_pair_twostage_0" in summary
+    assert "runtime_outputs=[policy_place, value, policy_pair_first" in summary
+    assert "pair_capabilities=[graph_pair_first, graph_pair_joint, graph_pair_second]" in summary
+    assert "pair_strategy=diagnostic_full_pair" in summary
+    assert "max_pairs=256" in summary
+
+
 class _CaptureLog:
     def __init__(self):
         self.events = []

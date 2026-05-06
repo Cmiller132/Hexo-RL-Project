@@ -45,8 +45,10 @@ from hexorl.eval.classical import classical_opponent_fn
 from hexorl.eval.checkpoint_league import CheckpointLeague
 from hexorl.eval.tactical_suite import evaluate_tactical_suite
 from hexorl.models.registry import (
+    architecture_display_summary,
     global_graph_architecture_ids,
     is_global_graph_architecture as registry_is_global_graph_architecture,
+    resolve_model_spec,
 )
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
 from hexorl.selfplay.records import BOARD_AREA
@@ -83,6 +85,149 @@ LOW_MEMORY_GLOBAL_GRAPH_RUNTIME_SWEEP_TIMEOUT_S = 240.0
 
 class RuntimeSweepTimeout(TimeoutError):
     pass
+
+
+def _short_items(items: Iterable[Any], *, limit: int = 8) -> str:
+    values = [str(item) for item in items]
+    if len(values) <= limit:
+        return ", ".join(values)
+    return ", ".join(values[:limit]) + f", +{len(values) - limit} more"
+
+
+def _candidate_log_summary(candidate: dict[str, Any] | None) -> str:
+    if not isinstance(candidate, dict):
+        return "{}"
+    fields = []
+    for key in ("workers", "batch_size_per_worker", "max_batch_size", "max_wait_us"):
+        if key in candidate:
+            fields.append(f"{key}={candidate[key]}")
+    return "{" + ", ".join(fields) + "}"
+
+
+def _float_text(value: Any, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(number):
+        return str(number)
+    return f"{number:.{digits}f}"
+
+
+def _event_log_summary(event: str, row: dict[str, Any]) -> str:
+    try:
+        if event == "run_start":
+            families = [
+                item.get("name", "?")
+                for item in row.get("families", [])
+                if isinstance(item, dict)
+            ]
+            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+            return (
+                "Autotune run start: "
+                f"scope=[{_short_items(families)}], "
+                f"max_game_moves={args.get('max_game_moves')}, "
+                f"asha_resources={args.get('asha_resources')}, "
+                f"reference_checkpoints={len(args.get('reference_checkpoint') or [])}, "
+                f"fallback='{row.get('fallback_branch', '')}'"
+            )
+        if event == "stage_start":
+            return f"Stage start: stage={row.get('stage')} details={{{', '.join(k + '=' + str(v) for k, v in row.items() if k not in {'time', 'event', 'stage'})}}}"
+        if event == "trial_created":
+            family = row.get("family", {})
+            if isinstance(family, dict):
+                family_name = family.get("name")
+                architecture = family.get("architecture")
+            else:
+                family_name = family
+                architecture = "?"
+            static = row.get("static", {}) if isinstance(row.get("static"), dict) else {}
+            contract = row.get("model_contract", {}) if isinstance(row.get("model_contract"), dict) else {}
+            pair_strategy = row.get("pair_strategy", {}) if isinstance(row.get("pair_strategy"), dict) else {}
+            return (
+                "Trial created: "
+                f"id={row.get('trial_id')} stage={row.get('stage')} "
+                f"family={family_name} arch={architecture} "
+                f"heads=[{_short_items(row.get('heads', []), limit=12)}] "
+                f"runtime_outputs=[{_short_items(contract.get('outputs', []), limit=12)}] "
+                f"pair_capabilities=[{_short_items(contract.get('pair_capabilities', []), limit=6)}] "
+                f"pair_strategy={pair_strategy.get('strategy')} max_pairs={pair_strategy.get('max_pairs')} "
+                f"sims={static.get('full_sims')} pcr_low={static.get('pcr_low_sims')} "
+                f"graph_tokens={static.get('graph_token_budget')} graph_layers={static.get('graph_layers')} "
+                f"candidate_budget={static.get('candidate_budget')}"
+            )
+        if event == "calibration_trial_start":
+            return f"Calibration trial start: trial={row.get('trial_id')} family={row.get('family')}"
+        if event == "runtime_sweep_start":
+            candidates = row.get("candidates", [])
+            return (
+                "Runtime sweep start: "
+                f"trial={row.get('trial_id')} stage={row.get('stage')} states={row.get('states')} "
+                f"candidates=[{_short_items((_candidate_log_summary(c) for c in candidates), limit=4)}]"
+            )
+        if event == "runtime_sweep_result":
+            selfplay = row.get("selfplay", {}) if isinstance(row.get("selfplay"), dict) else {}
+            memory = row.get("memory", {}) if isinstance(row.get("memory"), dict) else {}
+            gpu_after = row.get("gpu_after", {}) if isinstance(row.get("gpu_after"), dict) else {}
+            return (
+                "Runtime sweep result: "
+                f"trial={row.get('trial_id')} stage={row.get('stage')} ok={row.get('ok')} "
+                f"candidate={_candidate_log_summary(row.get('candidate'))} "
+                f"positions={row.get('positions')} pos_per_min={_float_text(row.get('positions_per_min'))} "
+                f"elapsed_s={_float_text(row.get('elapsed_s'))} score={_float_text(row.get('score'))} "
+                f"games={selfplay.get('games_done')} trunc_rate={_float_text(selfplay.get('truncation_rate'))} "
+                f"max_move_games={selfplay.get('terminal_reason_max_game_moves')} "
+                f"gpu_util={gpu_after.get('gpu_util_pct')} gpu_mem={gpu_after.get('memory_used_mb')}/{gpu_after.get('memory_total_mb')}MiB "
+                f"mem_min_available_gb={_float_text(memory.get('min_available_gb'))} unsafe_memory={memory.get('unsafe')} "
+                f"error={row.get('error', '')}"
+            )
+        if event == "runtime_sweep_selected":
+            return (
+                "Runtime sweep selected: "
+                f"trial={row.get('trial_id')} stage={row.get('stage')} "
+                f"selected={_candidate_log_summary(row.get('selected'))} "
+                f"positions_per_min={_float_text(row.get('selected_positions_per_min'))} "
+                f"candidates={row.get('candidate_count')} cached={row.get('cached')}"
+            )
+        if event == "trial_epoch_complete":
+            train = row.get("train", {}) if isinstance(row.get("train"), dict) else {}
+            selfplay = row.get("selfplay", {}) if isinstance(row.get("selfplay"), dict) else {}
+            buffer = row.get("buffer", {}) if isinstance(row.get("buffer"), dict) else {}
+            losses = {
+                key: train.get(key)
+                for key in (
+                    "loss_total",
+                    "total_loss",
+                    "policy_loss",
+                    "value_loss",
+                    "sparse_policy_loss",
+                    "policy_pair_first_loss",
+                    "policy_pair_joint_loss",
+                    "policy_pair_second_loss",
+                )
+                if key in train
+            }
+            return (
+                "Trial epoch complete: "
+                f"trial={row.get('trial_id')} family={row.get('family')} epoch={row.get('epoch')} "
+                f"elapsed_s={_float_text(row.get('epoch_elapsed_s'))} checkpoint={row.get('checkpoint_path')} "
+                f"selfplay_positions={selfplay.get('positions_done')} games={selfplay.get('games_done')} "
+                f"trunc_rate={_float_text(selfplay.get('truncation_rate'))} buffer_size={buffer.get('size')} "
+                f"losses={losses}"
+            )
+        if event == "trial_pruned":
+            return f"Trial pruned: trial={row.get('trial_id')} stage={row.get('stage')} reason={row.get('reason')}"
+        if event == "trial_evaluated" or event == "score_updated":
+            return (
+                f"{event}: trial={row.get('trial_id')} stage={row.get('stage') or row.get('score_stage')} "
+                f"scheduler_score={_float_text(row.get('scheduler_score'))} "
+                f"score_mode={row.get('score_mode', '')}"
+            )
+        if event in {"family_quarantined", "family_throughput_below_gate", "runtime_sweep_failed", "run_failed"}:
+            return f"{event}: " + json.dumps({k: v for k, v in row.items() if k not in {"time", "event"}}, sort_keys=True)
+    except Exception as exc:
+        return f"{event}: summary_failed={type(exc).__name__}:{exc}"
+    return ""
 
 
 HEAD_BUNDLES: dict[str, list[str]] = {
@@ -311,6 +456,9 @@ class JsonlLogger:
         row = {"time": time.time(), "event": event, **_jsonable(payload)}
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, sort_keys=True) + "\n")
+        summary = _event_log_summary(event, row)
+        if summary:
+            LOGGER.info(summary)
 
 
 class Phase3Supervisor:
@@ -2670,9 +2818,28 @@ class Phase3Supervisor:
         _write_json(trial.run_dir / "trial.json", self._trial_public_state(trial))
 
     def _trial_public_state(self, trial: TrialState) -> dict[str, Any]:
+        resolved = resolve_model_spec(trial.cfg)
+        model_dump = (
+            trial.cfg.model.model_dump()
+            if hasattr(trial.cfg.model, "model_dump")
+            else dict(getattr(trial.cfg, "model", {}))
+        )
+        family_dump = asdict(trial.family)
+        output_contracts = {
+            name: {
+                "kind": contract.kind,
+                "prediction_key": contract.prediction_key,
+                "row_family": contract.row_family,
+                "state_row": contract.state_row,
+                "runtime_consumed": contract.runtime_consumed,
+                "required_for_selfplay": contract.required_for_selfplay,
+                "optional": contract.optional,
+            }
+            for name, contract in resolved.output_contracts.items()
+        }
         return {
             "trial_id": trial.trial_id,
-            "family": asdict(trial.family),
+            "family": family_dump,
             "static": asdict(trial.static),
             "dynamic": asdict(trial.dynamic),
             "run_dir": str(trial.run_dir),
@@ -2688,6 +2855,43 @@ class Phase3Supervisor:
             "pruned": trial.pruned,
             "prune_reason": trial.prune_reason,
             "heads": list(trial.cfg.model.heads),
+            "model_summary": architecture_display_summary(model_dump, family_dump),
+            "model_contract": {
+                "architecture_id": resolved.architecture_id,
+                "family_id": resolved.family_id,
+                "recipe_id": resolved.recipe_id,
+                "input_contract_id": resolved.spec.input_contract_id,
+                "training_adapter_id": resolved.spec.training_adapter_id,
+                "inference_adapter_id": resolved.spec.inference_adapter_id,
+                "policy_provider_id": resolved.spec.policy_provider_id,
+                "value_provider_id": resolved.spec.value_provider_id,
+                "outputs": list(resolved.outputs),
+                "selfplay_required_outputs": list(resolved.selfplay_required_outputs),
+                "pair_capabilities": list(resolved.pair_capabilities),
+                "output_contracts": output_contracts,
+                "row_tables": {
+                    name: {
+                        "family": row.family,
+                        "schema_version": row.schema_version,
+                        "ordering_rule": row.ordering_rule,
+                        "mask_semantics": row.mask_semantics,
+                    }
+                    for name, row in resolved.row_table_definitions.items()
+                },
+                "value_decoder": {
+                    "name": resolved.value_decoder.name,
+                    "logits_key": resolved.value_decoder.logits_key,
+                    "n_bins": resolved.value_decoder.n_bins,
+                    "output_range": list(resolved.value_decoder.output_range),
+                    "perspective": resolved.value_decoder.perspective,
+                },
+            },
+            "loss_weights": dict(trial.cfg.train.loss_weights),
+            "pair_strategy": {
+                "strategy": getattr(trial.cfg.model, "pair_strategy", "none"),
+                "max_pairs": int(getattr(trial.cfg.model, "pair_strategy_max_pairs", 0) or 0),
+                "prior_mix": float(getattr(trial.cfg.model, "pair_prior_mix", 0.0) or 0.0),
+            },
             "replay_memory": self._replay_memory_estimate(trial.replay, trial.family),
         }
 
