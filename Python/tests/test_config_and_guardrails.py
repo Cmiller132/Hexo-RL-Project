@@ -7,11 +7,14 @@ import torch
 from hexorl.buffer import RingBuffer
 from hexorl.config import Config
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
-from hexorl.selfplay.worker import SelfPlayWorker, _current_turn_first_qr, _score_graph_pair_chunks
+from hexorl.selfplay.worker import SelfPlayWorker, _current_turn_first_qr
+from hexorl.search.pair_strategy import build_pair_strategy
 from hexorl.train.ema import ModelEMA
 from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
-from hexorl.model.network import HexConv2d, GatedResBlock, build_model_from_config, load_model_state
+from hexorl.models.assembly import build_model_from_config
+from hexorl.models.families.network import HexConv2d, GatedResBlock
+from hexorl.models.loading import restore_model_weights
 
 
 def test_config_rejects_lookahead_head_without_matching_horizon():
@@ -331,7 +334,7 @@ def test_hex_conv_masks_are_reapplied_after_loading_state_dict():
             value[:, :, 0, 0].fill_(1.0)
             value[:, :, 2, 2].fill_(1.0)
 
-    load_model_state(model, state)
+    restore_model_weights(model, state)
 
     for conv in [m for m in model.modules() if isinstance(m, HexConv2d)]:
         assert torch.count_nonzero(conv.weight[:, :, 0, 0]) == 0
@@ -535,14 +538,17 @@ def test_pair_scoring_requires_explicit_diagnostic_strategy_and_cap():
         queue.close()
 
     with pytest.raises(ValueError, match="pair_strategy_max_pairs"):
-        _score_graph_pair_chunks(
+        build_pair_strategy(
+            "diagnostic_full_pair",
+            max_pairs=0,
+            prior_mix=0.35,
+        ).score_graph_pair_chunks(
             client=object(),  # type: ignore[arg-type]
             graph_batch=SimpleNamespace(
                 legal_qr=torch.zeros(2, 2, dtype=torch.int32).numpy(),
                 legal_token_indices=torch.arange(2).numpy(),
             ),
             second_placement=False,
-            max_pair_rows=0,
         )
 
 

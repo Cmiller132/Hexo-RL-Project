@@ -72,8 +72,7 @@ class ModelConfig(BaseModel):
         if self.attention_heads <= 0:
             raise ValueError("model.attention_heads must be positive")
         if (
-            spec.architecture_id in {"restnet", "graph_hybrid_0"}
-            or spec.global_graph
+            spec.requires_attention_head_divisibility
             or self.attention_positions
         ) and self.channels % self.attention_heads != 0:
             raise ValueError("model.channels must be divisible by model.attention_heads")
@@ -124,9 +123,7 @@ class ModelConfig(BaseModel):
                 "model.attention_positions must be 1-based block positions within "
                 f"1..{self.blocks}; got {invalid_positions}"
             )
-        if arch == "cnn" and self.attention_positions:
-            raise ValueError("model.attention_positions require architecture='restnet'")
-        if (spec.architecture_id == "graph_hybrid_0" or spec.global_graph) and self.attention_positions:
+        if self.attention_positions and not spec.supports_attention_positions:
             raise ValueError("model.attention_positions are only used by architecture='restnet'")
         return self
 

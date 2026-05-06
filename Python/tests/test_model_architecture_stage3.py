@@ -148,6 +148,43 @@ def test_lookahead_head_requires_exact_horizon_target():
         )
 
 
+def test_ring_buffer_does_not_synthesize_missing_lookahead_targets():
+    full = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        root_value=0.0,
+        player=0,
+        outcome=0.5,
+        lookahead_values=[0.1, 0.2],
+    )
+    short = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(1, 0): 1.0},
+        root_value=0.0,
+        player=0,
+        outcome=0.5,
+        lookahead_values=[0.25],
+    )
+    replay = RingBuffer(capacity=1, num_lookahead=2)
+    replay.append(full)
+    replay.append(short)
+
+    stored = replay[0]
+
+    assert stored is not None
+    assert stored.lookahead_values == pytest.approx([0.25])
+
+    dataset = ReplayDataset(
+        replay,
+        batch_size=1,
+        use_symmetry=False,
+        lookahead_horizons=[4, 12],
+    )
+
+    with pytest.raises(ValueError, match="lookahead target missing"):
+        next(iter(dataset))
+
+
 def test_global_graph_policy_place_does_not_consume_dense_policy_target():
     with pytest.raises(LossContractError, match="requires target 'policy_target'"):
         _compute_losses(

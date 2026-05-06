@@ -92,6 +92,104 @@ def _finite_numpy(name: str, tensor: torch.Tensor) -> np.ndarray:
     return arr
 
 
+def _decode_value_tensor(
+    logits: torch.Tensor,
+    *,
+    value_decoder: ValueDecoderFn,
+    value_contract: ValueDecoderContract | None,
+) -> torch.Tensor:
+    contract = value_contract or ValueDecoderContract()
+    if int(contract.n_bins) <= 1 or str(contract.name).startswith("scalar"):
+        decoded = logits.float().reshape(logits.shape[0], -1)[:, 0]
+    else:
+        decoded = value_decoder(logits).float()
+    low, high = (float(x) for x in contract.output_range)
+    return torch.nan_to_num(decoded, nan=0.0, posinf=high, neginf=low).clamp_(low, high)
+
+
+def _rows_from_token_indices(
+    token_qr: torch.Tensor | None,
+    indices: torch.Tensor | None,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    width = int(width)
+    rows = np.zeros((width, 2), dtype=np.int32)
+    mask = np.zeros(width, dtype=np.bool_)
+    if token_qr is None or indices is None or width <= 0:
+        return rows, mask
+    token_qr_np = np.asarray(token_qr.detach().cpu().numpy(), dtype=np.int32)
+    index_np = np.asarray(indices.detach().cpu().numpy(), dtype=np.int64)
+    if token_qr_np.ndim == 3:
+        token_qr_np = token_qr_np[0]
+    if index_np.ndim == 2:
+        index_np = index_np[0]
+    index_np = index_np.reshape(-1)[:width]
+    valid = (index_np >= 0) & (index_np < token_qr_np.shape[0])
+    if valid.any():
+        rows[valid] = token_qr_np[index_np[valid], :2]
+        mask[valid] = True
+    return rows, mask
+
+
+def _pair_rows_from_token_indices(
+    token_qr: torch.Tensor | None,
+    first_indices: torch.Tensor | None,
+    second_indices: torch.Tensor | None,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    width = int(width)
+    rows = np.zeros((width, 4), dtype=np.int32)
+    mask = np.zeros(width, dtype=np.bool_)
+    if token_qr is None or first_indices is None or second_indices is None or width <= 0:
+        return rows, mask
+    token_qr_np = np.asarray(token_qr.detach().cpu().numpy(), dtype=np.int32)
+    first_np = np.asarray(first_indices.detach().cpu().numpy(), dtype=np.int64)
+    second_np = np.asarray(second_indices.detach().cpu().numpy(), dtype=np.int64)
+    if token_qr_np.ndim == 3:
+        token_qr_np = token_qr_np[0]
+    if first_np.ndim == 2:
+        first_np = first_np[0]
+    if second_np.ndim == 2:
+        second_np = second_np[0]
+    first_np = first_np.reshape(-1)[:width]
+    second_np = second_np.reshape(-1)[:width]
+    valid = (
+        (first_np >= 0)
+        & (second_np >= 0)
+        & (first_np < token_qr_np.shape[0])
+        & (second_np < token_qr_np.shape[0])
+    )
+    if valid.any():
+        rows[valid, :2] = token_qr_np[first_np[valid], :2]
+        rows[valid, 2:] = token_qr_np[second_np[valid], :2]
+        mask[valid] = np.any(rows[valid, :2] != rows[valid, 2:], axis=1)
+    return rows, mask
+
+
+def _pair_rows_from_graph_batch(graph_batch) -> tuple[np.ndarray, np.ndarray]:
+    first = np.asarray(graph_batch.pair_first_indices, dtype=np.int64).reshape(-1)
+    second = np.asarray(graph_batch.pair_second_indices, dtype=np.int64).reshape(-1)
+    width = min(first.shape[0], second.shape[0])
+    rows = np.zeros((width, 4), dtype=np.int32)
+    mask = np.zeros(width, dtype=np.bool_)
+    if width <= 0:
+        return rows, mask
+    token_qr = np.asarray(graph_batch.token_qr, dtype=np.int32)
+    first = first[:width]
+    second = second[:width]
+    valid = (
+        (first >= 0)
+        & (second >= 0)
+        & (first < token_qr.shape[0])
+        & (second < token_qr.shape[0])
+    )
+    if valid.any():
+        rows[valid, :2] = token_qr[first[valid], :2]
+        rows[valid, 2:] = token_qr[second[valid], :2]
+        mask[valid] = np.any(rows[valid, :2] != rows[valid, 2:], axis=1)
+    return rows, mask
+
+
 def decode_dense_outputs(
     outputs: Mapping[str, torch.Tensor],
     *,
@@ -101,12 +199,11 @@ def decode_dense_outputs(
 ) -> DecodedDenseOutputs:
     policy = _require_2d("policy", sanitize_policy_logits(_require_output(outputs, "policy")))
     value_logits = sanitize_value_logits(_require_output(outputs, "value"))
-    values = torch.nan_to_num(
-        value_decoder(value_logits).float(),
-        nan=0.0,
-        posinf=1.0,
-        neginf=-1.0,
-    ).clamp_(-1.0, 1.0)
+    values = _decode_value_tensor(
+        value_logits,
+        value_decoder=value_decoder,
+        value_contract=value_contract,
+    )
     batch = int(policy.shape[0])
     if values.reshape(-1).shape[0] != batch:
         raise ValueError(
@@ -189,12 +286,11 @@ def decode_global_graph_outputs(
         raise ValueError("policy_place batch dimension does not match graph inputs")
 
     value_logits = sanitize_value_logits(_require_output(outputs, "value"))
-    values = torch.nan_to_num(
-        value_decoder(value_logits).float(),
-        nan=0.0,
-        posinf=1.0,
-        neginf=-1.0,
-    ).clamp_(-1.0, 1.0)
+    values = _decode_value_tensor(
+        value_logits,
+        value_decoder=value_decoder,
+        value_contract=value_contract,
+    )
     if values.reshape(-1).shape[0] != batch:
         raise ValueError(
             f"value decoder returned {values.reshape(-1).shape[0]} values for graph batch {batch}"
@@ -249,14 +345,75 @@ def decode_global_graph_outputs(
             neginf=0.0,
         ).cpu().numpy()
 
+    legal_rows, legal_active = _rows_from_token_indices(
+        graph_inputs.get("token_qr"),
+        graph_inputs.get("legal_token_indices"),
+        legal_width,
+    )
+    legal_active &= np.asarray(legal_mask.detach().cpu().numpy(), dtype=np.bool_)[0, :legal_width]
+    legal_meta = row_table_metadata(
+        "legal",
+        legal_rows,
+        legal_active,
+        phase="any_position",
+        source="global_graph_inference_adapter",
+    )
+    row_tables = {"policy_place": legal_meta.to_dict()}
+    output_metadata = {
+        "policy_place": OutputMetadata("policy_place", "policy", row_table=legal_meta).to_dict(),
+        "value": OutputMetadata(
+            "value",
+            "value",
+            value_decoder=value_decoder_metadata(value_contract),
+        ).to_dict(),
+    }
+    if pair_first_np is not None:
+        row_tables["policy_pair_first"] = legal_meta.to_dict()
+        output_metadata["policy_pair_first"] = OutputMetadata(
+            "policy_pair_first",
+            "policy",
+            row_table=legal_meta,
+        ).to_dict()
+    if pair_joint is not None or pair_second is not None:
+        pair_rows, pair_active = _pair_rows_from_token_indices(
+            graph_inputs.get("token_qr"),
+            graph_inputs.get("pair_first_indices"),
+            graph_inputs.get("pair_second_indices"),
+            pair_width,
+        )
+        if pair_joint is not None:
+            pair_joint_meta = row_table_metadata(
+                "pair_joint",
+                pair_rows,
+                pair_active,
+                phase="first_placement_unordered",
+                source="global_graph_inference_adapter",
+            )
+            row_tables["policy_pair_joint"] = pair_joint_meta.to_dict()
+            output_metadata["policy_pair_joint"] = OutputMetadata(
+                "policy_pair_joint",
+                "policy",
+                row_table=pair_joint_meta,
+            ).to_dict()
+        if pair_second is not None:
+            pair_second_meta = row_table_metadata(
+                "known_first_pair",
+                pair_rows,
+                pair_active,
+                phase="second_placement_known_first",
+                source="global_graph_inference_adapter",
+            )
+            row_tables["policy_pair_second"] = pair_second_meta.to_dict()
+            output_metadata["policy_pair_second"] = OutputMetadata(
+                "policy_pair_second",
+                "policy",
+                row_table=pair_second_meta,
+            ).to_dict()
+
     metadata = {
+        "row_tables": row_tables,
         "outputs": {
-            "policy_place": OutputMetadata("policy_place", "policy").to_dict(),
-            "value": OutputMetadata(
-                "value",
-                "value",
-                value_decoder=value_decoder_metadata(value_contract),
-            ).to_dict(),
+            **output_metadata,
         }
     }
     return DecodedGraphOutputs(
@@ -333,16 +490,51 @@ def decode_graph_slot_response(
         if head_flags & GRAPH_HEAD_OPP:
             result["opp_policy"] = np.array(slot.res_graph_opp_logits[opp_off : opp_off + opp_count], copy=True)
         if head_flags & GRAPH_HEAD_PAIR_FIRST:
+            meta["row_tables"]["policy_pair_first"] = legal_meta.to_dict()
+            meta["outputs"]["policy_pair_first"] = OutputMetadata(
+                "policy_pair_first",
+                "policy",
+                row_table=legal_meta,
+            ).to_dict()
             result["policy_pair_first"] = np.array(
                 slot.res_graph_pair_first_logits[legal_off : legal_off + legal_count],
                 copy=True,
             )
+        pair_rows, pair_mask = _pair_rows_from_graph_batch(graph_batch)
+        pair_rows = pair_rows[:pair_count]
+        pair_mask = pair_mask[:pair_count]
         if head_flags & GRAPH_HEAD_PAIR_JOINT:
+            pair_meta = row_table_metadata(
+                "pair_joint",
+                pair_rows,
+                pair_mask,
+                phase="first_placement_unordered",
+                source="graph inference response",
+            )
+            meta["row_tables"]["policy_pair_joint"] = pair_meta.to_dict()
+            meta["outputs"]["policy_pair_joint"] = OutputMetadata(
+                "policy_pair_joint",
+                "policy",
+                row_table=pair_meta,
+            ).to_dict()
             result["policy_pair_joint"] = np.array(
                 slot.res_graph_pair_logits[pair_off : pair_off + pair_count],
                 copy=True,
             )
         if head_flags & GRAPH_HEAD_PAIR_SECOND:
+            pair_meta = row_table_metadata(
+                "known_first_pair",
+                pair_rows,
+                pair_mask,
+                phase="second_placement_known_first",
+                source="graph inference response",
+            )
+            meta["row_tables"]["policy_pair_second"] = pair_meta.to_dict()
+            meta["outputs"]["policy_pair_second"] = OutputMetadata(
+                "policy_pair_second",
+                "policy",
+                row_table=pair_meta,
+            ).to_dict()
             result["policy_pair_second"] = np.array(
                 slot.res_graph_pair_second_logits[pair_off : pair_off + pair_count],
                 copy=True,

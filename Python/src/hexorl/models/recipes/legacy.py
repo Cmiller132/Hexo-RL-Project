@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 
 from hexorl.models.specs import ResolvedArchitectureSpec
-from hexorl.model.global_graph import GlobalHexGraphNet
-from hexorl.model.network import HexNet
-from hexorl.model.network import load_model_state as _legacy_load_model_state
+from hexorl.models.families.global_graph import GlobalHexGraphNet
+from hexorl.models.families.network import HexNet
+from hexorl.models.families.network import restore_family_state as _restore_family_state
 
 
 def _select_device(device: Optional[torch.device]) -> torch.device:
@@ -87,4 +87,4 @@ def bins_to_value(logits: torch.Tensor) -> torch.Tensor:
 
 
 def load_model_state(model: nn.Module, state_dict: dict, *, allow_partial: bool = False):
-    return _legacy_load_model_state(model, state_dict, allow_partial=allow_partial)
+    return _restore_family_state(model, state_dict, allow_partial=allow_partial)

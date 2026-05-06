@@ -1,8 +1,8 @@
 # Global Graph Pair Heads
 
 This document describes the current global graph pair-head contract used by
-`Python/src/hexorl/model/global_graph.py`, graph batching, replay sampling, and
-training losses.
+`Python/src/hexorl/models/families/global_graph.py`, graph batching, replay
+sampling, inference adapters, pair strategies, and training losses.
 
 ## Purpose
 

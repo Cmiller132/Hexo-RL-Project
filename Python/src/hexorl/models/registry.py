@@ -26,6 +26,8 @@ _SPECS: dict[str, ArchitectureSpec] = {
         family_id="restnet",
         recipe_id="legacy_restnet",
         description="Dense crop CNN with configured spatial transformer blocks.",
+        requires_attention_head_divisibility=True,
+        supports_attention_positions=True,
     ),
     "graph_hybrid_0": dense_spec(
         "graph_hybrid_0",
@@ -33,6 +35,7 @@ _SPECS: dict[str, ArchitectureSpec] = {
         recipe_id="legacy_graph_hybrid_0",
         description="Crop-compatible sparse graph hybrid scout.",
         replay_sparse_diagnostics=True,
+        requires_attention_head_divisibility=True,
     ),
     "global_graph_option1": global_graph_spec(
         "global_graph_option1",
@@ -206,15 +209,15 @@ def architecture_display_summary(
             f"{model.get('graph_token_budget', '?')} tokens, "
             f"{model.get('graph_layers', '?')} graph layers, heads: {len(heads)}."
         )
-    if spec.architecture_id == "graph_hybrid_0":
+    if spec.graph and not spec.global_graph:
         return (
-            f"Graph hybrid 0, {channels} channels, {blocks} residual blocks, "
+            f"{spec.family_id}, {channels} channels, {blocks} residual blocks, "
             f"{model.get('graph_token_budget', '?')} {model.get('graph_token_set', 'tokens')}, "
             f"{model.get('graph_layers', '?')} graph layers, heads: {len(heads)}."
         )
-    if spec.architecture_id == "restnet":
+    if spec.supports_attention_positions:
         return (
-            f"ResTNet hybrid trunk, {channels} channels, {blocks} blocks, "
+            f"{spec.family_id} hybrid trunk, {channels} channels, {blocks} blocks, "
             f"attention at {model.get('attention_positions') or []}, heads: {len(heads)}."
         )
     return f"CNN residual trunk, {channels} channels, {blocks} blocks, heads: {len(heads)}."
@@ -228,6 +231,6 @@ def trial_model_summary(family: Mapping[str, object], static: Mapping[str, objec
         return f"{arch or 'model'} {family.get('channels', '?')}x{family.get('blocks', '?')}"
     if spec.global_graph:
         return f"{spec.architecture_id} {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
-    if spec.architecture_id == "graph_hybrid_0":
-        return f"graph_hybrid_0 {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
+    if spec.graph and not spec.global_graph:
+        return f"{spec.architecture_id} {static.get('graph_token_budget', '?')} tokens x {static.get('graph_layers', '?')} layers"
     return f"{spec.architecture_id} {family.get('channels', '?')}x{family.get('blocks', '?')}"

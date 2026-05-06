@@ -314,6 +314,11 @@ class RingBuffer:
             if self.num_lookahead > 0
             else None
         )
+        self._lookahead_counts = (
+            np.zeros(self.capacity, dtype=np.uint16)
+            if self.num_lookahead > 0
+            else None
+        )
 
         self._opp_policy_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_opp_policy else None
         self._opp_policy_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_opp_policy else None
@@ -432,10 +437,10 @@ class RingBuffer:
         if self._lookahead is not None:
             values = list(record.lookahead_values)
             k = min(len(values), self.num_lookahead)
+            self._lookahead_counts[idx] = k
+            self._lookahead[idx].fill(0.0)
             if k:
                 self._lookahead[idx, :k] = values[:k]
-            if k < self.num_lookahead:
-                self._lookahead[idx, k:] = self._values[idx]
 
         self._head = (self._head + 1) % self.capacity
         if self._size == self.capacity:
@@ -461,6 +466,8 @@ class RingBuffer:
                 self._free_game_slots.append(slot)
         self._game_slots[idx] = -1
         self._prefix_plies[idx] = 0
+        if self._lookahead_counts is not None:
+            self._lookahead_counts[idx] = 0
         if self._opp_policy_blobs is not None:
             self._opp_policy_blobs[idx] = None
             self._opp_policy_v2_blobs[idx] = None
@@ -657,7 +664,11 @@ class RingBuffer:
         stored_value = float(self._values[idx])
         player = int(self._players[idx])
         outcome = stored_value if player == 0 else -stored_value
-        lookahead = self._lookahead[idx].tolist() if self._lookahead is not None else []
+        if self._lookahead is not None and self._lookahead_counts is not None:
+            lookahead_count = min(int(self._lookahead_counts[idx]), self.num_lookahead)
+            lookahead = self._lookahead[idx, :lookahead_count].tolist()
+        else:
+            lookahead = []
 
         return PositionRecord(
             move_history=move_history,
@@ -859,6 +870,8 @@ class RingBuffer:
             self._players.fill(0)
             if self._lookahead is not None:
                 self._lookahead.fill(0.0)
+            if self._lookahead_counts is not None:
+                self._lookahead_counts.fill(0)
             if self._opp_policy_blobs is not None:
                 self._opp_policy_blobs = [None] * self.capacity
                 self._opp_policy_v2_blobs = [None] * self.capacity

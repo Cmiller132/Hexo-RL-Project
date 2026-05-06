@@ -30,12 +30,11 @@ Get-ChildItem -Path Python\src\hexorl\models\recipes -Recurse -File -Include *.p
 Result:
 
 ```text
-Python/src/hexorl/models/recipes/legacy.py:11: from hexorl.model.global_graph import GlobalHexGraphNet
-Python/src/hexorl/models/recipes/legacy.py:12: from hexorl.model.network import HexNet
-Python/src/hexorl/models/recipes/legacy.py:13: from hexorl.model.network import load_model_state as _legacy_load_model_state
+<no matches>
 ```
 
-These are the only approved Stage 2 imports from retained legacy implementation.
+The Stage 2 legacy recipe quarantine is closed by Stage 4. Family
+implementations now live under `Python/src/hexorl/models/families/`.
 
 ## Duplicated Global Authority Audit
 
@@ -70,9 +69,9 @@ Result:
 
 ## Notes
 
-`Python/src/hexorl/model/` remains as quarantined implementation source. Its
-global graph constructor imports registry metadata so its allow-list and
-relation-required metadata are no longer a separate runtime authority.
+`Python/src/hexorl/model/` no longer exists. Its implementation contents moved
+under `Python/src/hexorl/models/families/`, and the final Stage 4 runtime audit
+found no `hexorl.model` imports.
 
 `scripts/run_phase3_48h_autotune.py` retains an explicit
 `GLOBAL_GRAPH_SCOUT_FAMILIES` experiment scope for the four pre-champion

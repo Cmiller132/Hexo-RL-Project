@@ -50,6 +50,9 @@ to the wrong target, mask, weight, phase, or row table.
   targets are missing, masks crop/graph pair-head training when no positive
   pair target mass is represented, and emits graph target/phase metadata when
   graph batches are materialized.
+- `Python/src/hexorl/buffer/ring.py` tracks the number of lookahead targets
+  actually stored for each row and returns only those targets, so compact replay
+  cannot synthesize missing horizons before the sampler validates them.
 - `Python/src/hexorl/graph/batch.py` preserves per-sample
   `placements_remaining_by_sample` through graph collation.
 - `Python/src/hexorl/models/specs.py` gives dense and global opponent policy
@@ -62,6 +65,8 @@ to the wrong target, mask, weight, phase, or row table.
 - Global graph target and phase tensor assembly was removed from
   `Trainer`; global graph training now uses `prepare_global_graph_training_batch`.
 - Lookahead value fallback in replay sampling was removed.
+- Lookahead value fallback in compact replay storage was removed; unused
+  lookahead slots are zeroed and hidden by the stored target count.
 - Synthetic pair target fallback remains forbidden; incomplete first-placement
   graph pair rows are masked out of pair-head training instead of generating
   product targets.
@@ -128,6 +133,23 @@ cargo workspace suite: 179 non-ignored tests/docs passed; 6 slow oracle tests re
 git diff --check passed with CRLF warnings only
 ```
 
+Additional 2026-05-06 verification after the compact replay lookahead audit:
+
+```powershell
+$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_model_architecture_stage3.py
+$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests
+Get-ChildItem -Path Python/src/hexorl -Recurse -File -Include *.py |
+  Select-String -Pattern 'lookahead\[idx, k:\] = self\._values','policy_pair_second.*pair_policy_target','build_loss_plan\(tuple\(predictions\.keys\(\)\)'
+```
+
+Results:
+
+```text
+Stage 3 focused suite: 17 passed, 1 warning
+full Python suite: 312 passed, 1 warning
+lookahead/pair-second fallback audit: no fallback matches
+```
+
 ## Stop Rule Results
 
 - Dense, sparse, graph hybrid, and global graph training batches are covered by
@@ -136,6 +158,9 @@ git diff --check passed with CRLF warnings only
   loss computation.
 - `compute_losses` cannot execute without an explicit architecture-resolved
   loss plan.
+- Compact replay rows cannot turn missing lookahead horizons into value targets;
+  configured lookahead horizons still fail in the sampler when the source row
+  lacks an exact target.
 - `policy_pair_second` cannot train outside `pair_second_known_first=True`
   when positive target mass exists.
 - Global graph policy heads require graph `policy_target`/`legal_mask` targets
@@ -146,6 +171,7 @@ git diff --check passed with CRLF warnings only
 ## Explicit Completeness Statement
 
 Stage 3 closes the training and replay cutover scope. No skipped, deferred,
-flaky, or manual-only Stage 3 requirement is claimed complete. Inference
-protocol, search providers, pair strategies, and final `hexorl/model/`
-deletion remain Stage 4 scope.
+flaky, or manual-only Stage 3 requirement is claimed complete. The remaining
+Stage 4 inference protocol, search provider, pair-strategy, and final
+`hexorl/model/` deletion scope has now been closed by the Stage 4 completion
+packet.

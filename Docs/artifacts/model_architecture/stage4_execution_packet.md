@@ -8,10 +8,10 @@ authority.
 
 ## Current Status
 
-Stage 4 has started. This packet records the first completed cut: inference
-protocol/adapters plus initial search pair-strategy and engine-adapter
-boundaries. Stage 4 is not yet claimed complete because the final legacy model
-deletion/move gate remains open.
+Stage 4 is complete. Inference, evaluation, self-play search, pair-prior
+handling, engine validation, and model-family loading now flow through the
+Stage 4 runtime boundaries, and the legacy `Python/src/hexorl/model/` package
+has been moved out of the runtime tree.
 
 ## Checklist
 
@@ -27,14 +27,14 @@ deletion/move gate remains open.
 - [x] Direct graph pair-head decode branches are removed from
   `inference/server.py` and `inference/client.py` hot logic.
 - [x] Self-play no longer checks concrete global pair-head names directly.
-- [ ] Self-play root/leaf pair scoring should move fully into pair-strategy
+- [x] Self-play root/leaf pair scoring should move fully into pair-strategy
   methods.
-- [ ] Evaluation should either use the provider boundary or receive a final
+- [x] Evaluation should either use the provider boundary or receive a final
   runtime quarantine record.
-- [ ] `hexorl/model/` must be deleted or fully moved into `hexorl/models/`.
-- [ ] Final import audit must prove old model-class API is not runtime
+- [x] `hexorl/model/` must be deleted or fully moved into `hexorl/models/`.
+- [x] Final import audit must prove old model-class API is not runtime
   authority.
-- [ ] Final Stage 4 full-suite and performance evidence must be recorded.
+- [x] Final Stage 4 full-suite and performance evidence must be recorded.
 
 ## Runtime Consumers Changed
 
@@ -50,16 +50,28 @@ deletion/move gate remains open.
 - `Python/src/hexorl/inference/client.py` now calls an adapter to decode graph
   shared-memory responses and attach semantic metadata.
 - `Python/src/hexorl/search/pair_strategy.py` defines explicit pair strategy
-  descriptors, required output contracts, max-pair/mix validation, and graph
-  pair output accessors.
+  descriptors, required output contracts, max-pair/mix validation, graph pair
+  output accessors, root/leaf graph pair chunk scoring, crop pair chunk
+  scoring, pair-logit projection, pair-logit blending, and root pair-prior
+  application.
 - `Python/src/hexorl/search/engine_adapter.py` owns legal-row alignment,
-  legal-subset validation, and value range validation before Rust MCTS
+  legal-subset validation, search-phase validation, batch-generation
+  validation, legal-byte alignment, dense offset mapping, value range and
+  perspective validation, and pair-phase validation before Rust MCTS
   consumption.
 - `Python/src/hexorl/config/schema.py` validates pair strategy through the
   strategy registry.
 - `Python/src/hexorl/selfplay/worker.py` delegates pair enablement and concrete
-  graph pair-output access to `PairStrategy`, and delegates global legal/value
-  validation to `EngineAdapter`.
+  graph pair-output access, root/leaf pair scoring, action-logit projection,
+  pair blending, and root prior application to `PairStrategy`. It delegates
+  global legal/value, dense offset, phase, and pair-row validation to
+  `EngineAdapter`.
+- `Python/src/hexorl/eval/model_provider.py` is the evaluation provider
+  boundary. `Python/src/hexorl/eval/arena.py` loads checkpoints through it.
+- `Python/src/hexorl/models/loading.py` is the runtime model loading boundary
+  used by inference, training checkpoint restore, and evaluation.
+- `Python/src/hexorl/models/families/` now contains `HexNet` and
+  `GlobalHexGraphNet`; `Python/src/hexorl/model/` has been deleted.
 
 ## Evidence
 
@@ -72,28 +84,67 @@ $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_inference_se
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests
 Select-String -Path Python\src\hexorl\inference\server.py,Python\src\hexorl\inference\client.py -Pattern 'if .*policy_pair','if .*policy_place','if .*opp_policy','head_flags &'
 Select-String -Path Python\src\hexorl\selfplay\worker.py -Pattern 'policy_pair_joint','policy_pair_second','policy_pair_first'
+$env:PYTHONPATH='Python/src'; python -m py_compile Python\src\hexorl\inference\adapters.py Python\src\hexorl\inference\server.py Python\src\hexorl\inference\client.py Python\src\hexorl\search\engine_adapter.py Python\src\hexorl\search\pair_strategy.py Python\src\hexorl\selfplay\worker.py Python\src\hexorl\eval\arena.py Python\src\hexorl\eval\model_provider.py Python\src\hexorl\models\loading.py Python\src\hexorl\models\families\network.py Python\src\hexorl\models\families\global_graph.py Python\tests\test_model_architecture_stage4.py
+$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_inference_server.py Python/tests/test_config_and_guardrails.py Python/tests/test_global_graph_contract.py Python/tests/test_training_data_pipeline.py Python/tests/test_production_smoke.py Python/tests/test_dashboard_foundation.py
+cargo test --workspace
+Get-ChildItem -Path Python\src\hexorl,Python\tests -Recurse -File -Include *.py | Where-Object { $_.FullName -notmatch '\\__pycache__\\' } | Select-String -Pattern 'from hexorl\.model(?!s)','import hexorl\.model(?!s)'
+Get-ChildItem -Path Python\src\hexorl\inference,Python\src\hexorl\train,Python\src\hexorl\eval,Python\src\hexorl\selfplay,Python\src\hexorl\config,Python\src\hexorl\buffer,Python\src\hexorl\dashboard -Recurse -File -Include *.py | Where-Object { $_.FullName -notmatch '\\__pycache__\\' } | Select-String -Pattern '\bHexNet\b','\bGlobalHexGraphNet\b','from_config','load_model_state'
+Get-ChildItem -Path Python\src\hexorl\selfplay -Recurse -File -Include *.py | Where-Object { $_.FullName -notmatch '\\__pycache__\\' } | Select-String -Pattern '_score_graph_pair_chunks','_score_crop_pair_chunks','_graph_batch_with_pair_rows','_pair_logits_to_action_logits','_filter_pair_rows_for_root_children','_blend_action_logits','policy_pair_joint','policy_pair_second','policy_pair_first'
+Test-Path Python\src\hexorl\model
 ```
 
 Results:
 
 ```text
 py_compile passed
-Stage 4 focused tests: 6 passed
+Stage 4 focused tests: 10 passed
 affected integration suite: 162 passed, 1 warning
-full Python suite: 311 passed, 1 warning
+affected final integration suite: 182 passed, 1 warning
+full Python suite: 316 passed, 1 warning
+Rust workspace: 177 passed, 6 ignored, 2 doc-tests passed
 inference hot-logic graph-head branch audit: no matches
 self-play concrete global pair-head audit: no matches
+legacy hexorl.model import audit: no matches
+runtime old model-class API audit: no matches
+old self-play pair helper/direct pair-head audit: no matches
+Python/src/hexorl/model exists: False
+```
+
+Performance smoke:
+
+```text
+graph_response_decode_pair_metadata rows legal=216 pair=256 iterations=300 mean_ms=0.0879 median_ms=0.0867 p95_ms=0.0933
 ```
 
 ## Stop Rule Notes
 
-- Inference can map dense and global graph policy outputs to row contracts for
-  the paths touched in this cut.
-- Self-play no longer directly checks concrete global pair output names.
-- Old direct runtime branches remain in scope for continued Phase 4 work:
-  `hexorl/model/` has not yet been deleted or fully moved.
+- Inference maps dense, global legal, pair-first, pair-joint, and known-first
+  pair outputs to row contracts with value decoder metadata.
+- Self-play consumes pair priors only through `PairStrategy`, including root and
+  leaf pair scoring.
+- Evaluation loads models only through `eval.model_provider`.
+- Runtime model construction and checkpoint restore go through
+  `models.loading`.
+- `Python/src/hexorl/model/` is deleted.
+
+## Full Verification Addendum
+
+The 2026-05-06 completion pass fixed the prior full verification blockers:
+legacy model implementation was moved under `hexorl.models.families`,
+evaluation moved behind `eval.model_provider`, pair strategy now owns root/leaf
+pair scoring and root prior application, inference adapters emit pair row-table
+metadata, and final performance evidence has been recorded.
+
+Additional evidence gathered during the pass:
+
+```text
+Stage 4 focused tests: 10 passed
+full Python suite: 316 passed, 1 warning
+Rust workspace: 177 passed, 6 ignored, 2 doc-tests passed
+runtime import/deletion audits: clean
+```
 
 ## Explicit Completeness Statement
 
-This is a Phase 4 start packet, not a completion packet. No unchecked Stage 4
-requirement is claimed complete.
+Stage 4 is complete. No skipped, deferred, flaky, quarantined, or manual-only
+Stage 4 requirement is being claimed complete.

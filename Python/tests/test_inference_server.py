@@ -19,7 +19,7 @@ from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import CANDIDATE_FEATURES, connect_inference_queue
 from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
-from hexorl.model.network import from_config
+from hexorl.models.loading import build_runtime_model
 
 # Try to import the compiled Rust extension.
 try:
@@ -90,7 +90,7 @@ class TestInferenceServer(unittest.TestCase):
         cfg.inference.fp16 = False
         server = InferenceServer(cfg, num_workers=1)
         server._device = torch.device("cpu")
-        server._model = from_config(cfg, device=server._device)
+        server._model = build_runtime_model(cfg, device=server._device, inference=True)
         server._model.eval()
 
         count = 2
@@ -139,7 +139,7 @@ class TestInferenceServer(unittest.TestCase):
         cfg.inference.fp16 = False
         server = InferenceServer(cfg, num_workers=1)
         server._device = torch.device("cpu")
-        server._model = from_config(cfg, device=server._device)
+        server._model = build_runtime_model(cfg, device=server._device, inference=True)
         server._model.eval()
         graph = collate_graph_batches([
             build_graph_batch_from_history(b"", include_pair_rows=False),

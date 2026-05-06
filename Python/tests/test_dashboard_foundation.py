@@ -17,8 +17,8 @@ from hexorl.dashboard.recorder import RunRecorder
 from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png
 from hexorl.eval.players import NoisyModelPlayer, NoisyPolicyConfig
 from hexorl.eval.arena import ArenaStats, MatchResult
-from hexorl.model.network import HexNet
-from hexorl.model.global_graph import GlobalHexGraphNet
+from hexorl.models.families.network import HexNet
+from hexorl.models.families.global_graph import GlobalHexGraphNet
 from hexorl.selfplay.records import GameRecord, PositionRecord, action_to_board_index
 
 

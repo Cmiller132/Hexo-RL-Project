@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import numpy as np
 
@@ -19,6 +20,38 @@ class EngineAdapter:
     value_min: float = -1.0
     value_max: float = 1.0
 
+    @staticmethod
+    def validate_search_phase(
+        placements_remaining: int,
+        *,
+        root: bool,
+        context: str,
+    ) -> int:
+        phase = int(placements_remaining)
+        if phase not in (1, 2):
+            location = "root" if root else "leaf"
+            raise ValueError(
+                f"{context}: {location} search phase must have placements_remaining 1 or 2, got {phase}"
+            )
+        return phase
+
+    @staticmethod
+    def validate_batch_generation(
+        observed: int,
+        expected: int,
+        *,
+        context: str,
+    ) -> int:
+        observed_i = int(observed)
+        expected_i = int(expected)
+        if observed_i < 0 or expected_i < 0:
+            raise ValueError(f"{context}: batch generation must be non-negative")
+        if observed_i != expected_i:
+            raise ValueError(
+                f"{context}: stale MCTS batch generation observed={observed_i} expected={expected_i}"
+            )
+        return observed_i
+
     def validate_value(self, value: float, *, context: str) -> float:
         out = float(value)
         if not np.isfinite(out):
@@ -28,6 +61,101 @@ class EngineAdapter:
                 f"{context}: value {out:g} outside [{self.value_min:g}, {self.value_max:g}]"
             )
         return out
+
+    def validate_value_perspective(
+        self,
+        metadata: Mapping[str, object] | None,
+        *,
+        expected: str = "current_player",
+        context: str,
+    ) -> None:
+        if metadata is None:
+            raise ValueError(f"{context}: value metadata is missing")
+        outputs = metadata.get("outputs") if isinstance(metadata, Mapping) else None
+        value_meta = outputs.get("value") if isinstance(outputs, Mapping) else None
+        decoder_meta = value_meta.get("value_decoder") if isinstance(value_meta, Mapping) else None
+        if not isinstance(decoder_meta, Mapping):
+            decoder_meta = metadata.get("value_decoder") if isinstance(metadata, Mapping) else None
+        if not isinstance(decoder_meta, Mapping):
+            raise ValueError(f"{context}: value decoder metadata is missing")
+        observed = str(decoder_meta.get("perspective", ""))
+        if observed != str(expected):
+            raise ValueError(
+                f"{context}: value perspective {observed!r} does not match expected {expected!r}"
+            )
+
+    @staticmethod
+    def validate_legal_bytes_alignment(
+        rust_legal: np.ndarray,
+        legal_bytes: bytes | bytearray | memoryview,
+        *,
+        context: str,
+    ) -> np.ndarray:
+        expected = np.asarray(rust_legal, dtype=np.int32).reshape(-1, 2)
+        observed = np.frombuffer(bytes(legal_bytes), dtype=np.int32)
+        if observed.size % 2 != 0:
+            raise ValueError(f"{context}: legal byte buffer does not contain q/r pairs")
+        observed = observed.reshape(-1, 2)
+        if expected.shape != observed.shape or not np.array_equal(expected, observed):
+            raise ValueError(
+                f"{context}: Rust legal rows changed before model consumption "
+                f"expected={expected.shape[0]} observed={observed.shape[0]}"
+            )
+        return observed
+
+    @staticmethod
+    def validate_dense_offset_mapping(
+        legal: np.ndarray,
+        offset_q: int,
+        offset_r: int,
+        *,
+        board_size: int = 33,
+        context: str,
+    ) -> np.ndarray:
+        rows = np.asarray(legal, dtype=np.int32).reshape(-1, 2)
+        q = rows[:, 0] - int(offset_q)
+        r = rows[:, 1] - int(offset_r)
+        size = int(board_size)
+        in_bounds = (q >= 0) & (q < size) & (r >= 0) & (r < size)
+        if not bool(np.all(in_bounds)):
+            bad = rows[~in_bounds][:5].tolist()
+            raise ValueError(
+                f"{context}: dense policy offset does not cover legal rows bad_examples={bad}"
+            )
+        return (q * size + r).astype(np.int64)
+
+    @staticmethod
+    def validate_pair_phase(
+        pair_qr: np.ndarray,
+        *,
+        placements_remaining: int,
+        first_qr: tuple[int, int] | None = None,
+        context: str,
+    ) -> np.ndarray:
+        phase = EngineAdapter.validate_search_phase(
+            placements_remaining,
+            root=True,
+            context=context,
+        )
+        rows = np.asarray(pair_qr, dtype=np.int32).reshape(-1, 4)
+        if rows.shape[0] == 0:
+            return rows
+        duplicate = np.all(rows[:, :2] == rows[:, 2:], axis=1)
+        if bool(np.any(duplicate)):
+            bad = rows[duplicate][:5].tolist()
+            raise ValueError(f"{context}: pair rows contain duplicate first/second cells {bad}")
+        if phase == 1:
+            if first_qr is None:
+                raise ValueError(f"{context}: second-placement pair rows require first_qr")
+            first = np.asarray(first_qr, dtype=np.int32).reshape(1, 2)
+            mismatch = ~np.all(rows[:, :2] == first, axis=1)
+            if bool(np.any(mismatch)):
+                bad = rows[mismatch][:5].tolist()
+                raise ValueError(
+                    f"{context}: known-first pair rows do not match first_qr {tuple(first.reshape(-1))} "
+                    f"bad_examples={bad}"
+                )
+        return rows
 
     @staticmethod
     def align_global_logits_to_rust_legal(
@@ -104,4 +232,3 @@ class EngineAdapter:
                 f"duplicates={duplicates[:5]} extras={extras[:5]}"
             )
         return graph_legal, logits[: graph_legal.shape[0]]
-

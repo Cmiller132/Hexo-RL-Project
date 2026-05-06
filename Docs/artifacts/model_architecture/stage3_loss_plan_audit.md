@@ -96,8 +96,8 @@ combinations are rejected by resolver contracts before loss-plan construction.
 Command:
 
 ```powershell
-Select-String -Path Python\src\hexorl\buffer\sampler.py,Python\src\hexorl\train\*.py `
-  -Pattern 'lookahead_arrays\[.*=\s*values','pair_second.*target_mass','pair_second.*sum','policy_pair_second.*pair_policy_target'
+Select-String -Path Python\src\hexorl\buffer\ring.py,Python\src\hexorl\buffer\sampler.py,Python\src\hexorl\train\*.py `
+  -Pattern 'lookahead\[idx, k:\] = self\._values','lookahead_arrays\[.*=\s*values','pair_second.*target_mass','pair_second.*sum','policy_pair_second.*pair_policy_target'
 ```
 
 Result:
@@ -106,9 +106,9 @@ Result:
 <no matches>
 ```
 
-Replay no longer falls back from missing lookahead horizons to value targets,
-and pair-second routing is no longer inferred from target mass or the joint pair
-target.
+Compact replay storage and replay sampling no longer fall back from missing
+lookahead horizons to value targets, and pair-second routing is no longer
+inferred from target mass or the joint pair target.
 
 ## Runtime Legacy Import Audit
 
@@ -143,6 +143,8 @@ the model implementation and recipe compatibility scope.
 - Zero-mass active policy target.
 - Pair-second positive targets outside known-first phase.
 - Exact lookahead target requirement.
+- Compact replay rows preserve the actual number of lookahead targets and make
+  the sampler raise when a configured horizon is absent after slot overwrite.
 - Global graph rejection of dense policy target fields.
 - Global graph adapter phase metadata and graph policy namespace generation.
 - Crop pair replay rows with empty pair target mass are masked out of pair-head

@@ -19,11 +19,12 @@ from hexorl.graph import (
 )
 from hexorl.graph.batch import graph_capacity_report, validate_graph_ipc_capacity
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
-from hexorl.model.global_graph import GlobalHexGraphNet
-from hexorl.model.network import build_model_from_config
+from hexorl.models.assembly import build_model_from_config
+from hexorl.models.families.global_graph import GlobalHexGraphNet
+from hexorl.search.engine_adapter import EngineAdapter
+from hexorl.search.pair_strategy import build_pair_strategy
 from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
-from hexorl.selfplay.worker import _align_global_logits_to_rust_legal, _graph_batch_with_pair_rows
 from hexorl.train.trainer import Trainer
 
 
@@ -52,7 +53,7 @@ def test_global_graph_policy_logits_align_to_rust_legal_order():
     rust_legal = np.asarray([[2, -1], [1, 0], [0, 1]], dtype=np.int32)
     logits = np.asarray([10.0, 20.0, 30.0], dtype=np.float32)
 
-    aligned_legal, aligned_logits = _align_global_logits_to_rust_legal(
+    aligned_legal, aligned_logits = EngineAdapter.align_global_logits_to_rust_legal(
         graph_legal,
         rust_legal,
         logits,
@@ -68,7 +69,7 @@ def test_global_graph_policy_alignment_rejects_true_set_mismatch():
     rust_legal = np.asarray([[2, -1], [1, 0], [3, -1]], dtype=np.int32)
 
     with pytest.raises(ValueError, match="legal_qr set mismatch"):
-        _align_global_logits_to_rust_legal(
+        EngineAdapter.align_global_logits_to_rust_legal(
             graph_legal,
             rust_legal,
             np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
@@ -371,7 +372,8 @@ def test_global_graph_pair_chunks_remove_ipc_pair_cap_as_semantic_limit():
                 break
         if len(pair_first) == 4096:
             break
-    chunk = _graph_batch_with_pair_rows(
+    strategy = build_pair_strategy("diagnostic_full_pair", max_pairs=4096, prior_mix=0.35)
+    chunk = strategy.graph_batch_with_pair_rows(
         graph,
         np.asarray(pair_first, dtype=np.int64),
         np.asarray(pair_second, dtype=np.int64),

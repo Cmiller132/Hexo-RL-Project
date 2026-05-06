@@ -50,6 +50,8 @@ class ArchitectureSpec:
     crop_pair_capable: bool = False
     graph_pair_capable: bool = False
     replay_sparse_diagnostics: bool = False
+    requires_attention_head_divisibility: bool = False
+    supports_attention_positions: bool = False
     display_name: str = "model"
     default_loss_weights: Mapping[str, float] = field(default_factory=dict)
     output_contracts: Mapping[str, OutputContract] = field(default_factory=dict)
@@ -260,6 +262,8 @@ def dense_spec(
     description: str,
     sparse_policy_capable: bool = True,
     replay_sparse_diagnostics: bool = False,
+    requires_attention_head_divisibility: bool = False,
+    supports_attention_positions: bool = False,
 ) -> ArchitectureSpec:
     contracts = output_contracts_for(("policy", "value", *DENSE_OPTIONAL_OUTPUTS))
     contracts["opp_policy"] = OutputContract(
@@ -285,6 +289,8 @@ def dense_spec(
         sparse_policy_capable=sparse_policy_capable,
         crop_pair_capable=True,
         replay_sparse_diagnostics=replay_sparse_diagnostics,
+        requires_attention_head_divisibility=requires_attention_head_divisibility,
+        supports_attention_positions=supports_attention_positions,
         display_name=family_id,
         default_loss_weights=DENSE_LOSS_DEFAULTS,
         output_contracts=contracts,
@@ -324,6 +330,7 @@ def global_graph_spec(
         global_graph=True,
         graph_pair_capable=True,
         replay_sparse_diagnostics=True,
+        requires_attention_head_divisibility=True,
         display_name=family_id,
         default_loss_weights=GLOBAL_LOSS_DEFAULTS,
         output_contracts=output_contracts_for(("policy_place", "value", *GLOBAL_OPTIONAL_OUTPUTS)),

@@ -43,23 +43,24 @@ feature decisions through registered specs.
 - Phase 3 autotune orchestration validates its explicit global-graph scout
   scope against `hexorl.models.registry` and delegates global-graph membership
   checks to the registry.
-- Legacy `hexorl.model.network.build_model_from_config` is a delegating entry
-  point for old callers, not the assembly authority.
+- Stage 4 removed the legacy `hexorl.model` runtime package. Model family
+  implementations now live under `hexorl.models.families`, and runtime callers
+  use `hexorl.models.assembly` or `hexorl.models.loading`.
 
 ## Legacy Quarantine
 
-Retained owner: `Python/src/hexorl/models/recipes/legacy.py`.
+Retained owner: closed by Stage 4.
 
-Allowed legacy imports:
+Formerly allowed legacy imports:
 
 - `hexorl.model.network.HexNet`
 - `hexorl.model.network.load_model_state`
 - `hexorl.model.global_graph.GlobalHexGraphNet`
 
-Deletion gate: Stage 4 must move or delete retained implementation code so no
-runtime code depends on `Python/src/hexorl/model/`. Until then, legacy code is
-implementation-only and cannot own architecture membership, config behavior,
-runtime feature flags, or self-play/search behavior.
+Deletion gate: closed. `Python/src/hexorl/model/` no longer exists. `HexNet`
+and `GlobalHexGraphNet` moved to `Python/src/hexorl/models/families/`, and
+runtime code no longer imports `hexorl.model`, `HexNet`, `GlobalHexGraphNet`,
+`from_config`, or `load_model_state` as runtime authority.
 
 ## Required Evidence
 
@@ -75,8 +76,8 @@ runtime feature flags, or self-play/search behavior.
   `value`, global `policy_place`, and global `value`.
 - Direct global-architecture prefix checks and incomplete global architecture
   sets were removed from runtime and orchestration authority paths.
-- No direct `hexorl.model` imports remain outside retained implementation code
-  and `hexorl.models.recipes`.
+- No direct `hexorl.model` imports remain in runtime or test code. The retained
+  implementation quarantine has been removed by Stage 4.
 
 ## Gate Review Addendum
 
@@ -96,6 +97,24 @@ The Stage 2 unit coverage was also tightened so every registered architecture
 must expose search policy and value provider ids, and the `RowTableInstance`
 contract must produce phase-sensitive identity hashes.
 
+## Full Verification Addendum
+
+The 2026-05-06 full verification pass found remaining config/runtime
+architecture-id conditionals for attention-head divisibility, attention-position
+support, display summaries, and training-memory estimates. Those checks were
+moved behind registered spec capabilities:
+
+- `ArchitectureSpec.requires_attention_head_divisibility`
+- `ArchitectureSpec.supports_attention_positions`
+- existing graph/global graph capability flags
+
+`Config`, `architecture_display_summary`, `trial_model_summary`, and runtime
+training-memory estimation now consume those spec fields instead of concrete
+architecture-name branches. The retained explicit family names in
+`scripts/run_phase3_48h_autotune.py` are experiment scope and recipe choices,
+not membership authority; global graph membership still validates against
+`hexorl.models.registry`.
+
 ## Verification
 
 Commands:
@@ -112,6 +131,21 @@ Results:
 226 passed, 1 warning
 py_compile passed
 git diff --check passed with CRLF warnings only
+```
+
+Additional 2026-05-06 commands:
+
+```powershell
+$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_model_architecture_stage2.py Python/tests/test_config_and_guardrails.py
+Get-ChildItem -Path Python/src/hexorl -Recurse -File -Include *.py |
+  Select-String -Pattern 'architecture\.startswith','startswith\("global_','GlobalHexGraphNet\.ARCHITECTURES','GLOBAL_GRAPH_ARCHITECTURES','spec\.architecture_id in','spec\.architecture_id ==','arch == "cnn"','arch == "restnet"','arch == "graph_hybrid_0"'
+```
+
+Results:
+
+```text
+45 passed, 1 warning
+architecture-name authority audit: no matches
 ```
 
 ## Explicit Completeness Statement

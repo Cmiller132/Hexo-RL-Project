@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional
 
 from hexorl.action_contract.candidates import CANDIDATE_FEATURES
-from hexorl.model.global_graph import GlobalHexGraphNet
+from hexorl.models.families.global_graph import GlobalHexGraphNet
 
 
 BOARD_SIZE = 33
@@ -830,32 +830,6 @@ class HexNet(nn.Module):
         return out
 
 
-def from_config(cfg, device: Optional[torch.device] = None) -> nn.Module:
-    """Create a HexNet from a Config object.
-
-    Args:
-        cfg: hexorl.config.Config instance.
-        device: Target device (cpu, cuda, mps). Defaults to best available.
-
-    Returns:
-        HexNet instance on the requested device, optionally in FP16.
-    """
-    from hexorl.models.assembly import from_config as _from_config
-
-    return _from_config(cfg, device=device)
-
-
-def build_model_from_config(
-    cfg,
-    device: Optional[torch.device] = None,
-    inference: bool = False,
-) -> nn.Module:
-    """Create a model through the Stage 2 architecture assembly authority."""
-    from hexorl.models.assembly import build_model_from_config as _build_model_from_config
-
-    return _build_model_from_config(cfg, device=device, inference=inference)
-
-
 def strip_compiled_prefix(state_dict: dict) -> dict:
     """Remove torch.compile's _orig_mod prefix when present."""
     if state_dict and all(str(k).startswith("_orig_mod.") for k in state_dict):
@@ -863,7 +837,7 @@ def strip_compiled_prefix(state_dict: dict) -> dict:
     return state_dict
 
 
-def load_model_state(model: nn.Module, state_dict: dict, *, allow_partial: bool = False):
+def restore_family_state(model: nn.Module, state_dict: dict, *, allow_partial: bool = False):
     target = getattr(model, "_orig_mod", None)
     if target is not None:
         state_dict = strip_compiled_prefix(state_dict)

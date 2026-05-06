@@ -16,7 +16,8 @@ from pathlib import Path
 
 from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE_FEATURE_VERSION
 from hexorl.config import Config
-from hexorl.models.assembly import is_global_graph_model, load_model_state
+from hexorl.models.assembly import is_global_graph_model
+from hexorl.models.loading import restore_model_weights
 from hexorl.models.registry import resolve_model_spec
 from hexorl.train.adapters import (
     prepare_dense_training_batch,
@@ -666,7 +667,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        load_model_state(self.model, checkpoint["model_state_dict"], allow_partial=False)
+        restore_model_weights(self.model, checkpoint["model_state_dict"], allow_partial=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if self.scheduler and checkpoint.get("scheduler_state_dict"):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])

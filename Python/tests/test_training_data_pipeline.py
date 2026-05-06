@@ -40,7 +40,7 @@ from hexorl.selfplay.records import (
 )
 from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
 from hexorl.train.loss_plan import LossContractError, build_loss_plan
-from hexorl.model.network import HexNet
+from hexorl.models.families.network import HexNet
 
 
 def _compute_losses(predictions, targets, loss_weights, **kwargs):

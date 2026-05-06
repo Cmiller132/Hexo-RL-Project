@@ -29,7 +29,11 @@ from hexorl.inference.protocol import (
     GRAPH_HEAD_PAIR_SECOND,
     GRAPH_HEAD_REGRET,
 )
-from hexorl.models.assembly import bins_to_value, from_config, load_model_state
+from hexorl.models.loading import (
+    build_runtime_model,
+    decode_binned_value_logits,
+    restore_model_weights,
+)
 from hexorl.models.registry import resolve_model_spec
 from hexorl.runtime import configure_torch_runtime
 from hexorl.inference.shm_queue import (
@@ -215,7 +219,7 @@ class InferenceServer:
         else:
             self._device = torch.device("cpu")
 
-        self._model = from_config(self.cfg, device=self._device)
+        self._model = build_runtime_model(self.cfg, device=self._device, inference=True)
         if self._device.type == "cuda" and getattr(self.cfg.runtime, "channels_last", True):
             self._model = self._model.to(memory_format=torch.channels_last)
         compile_inference = getattr(self.cfg.runtime, "compile_inference", None)
@@ -234,7 +238,7 @@ class InferenceServer:
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
                 for k, v in self._initial_state_dict.items()
             }
-            load_model_state(self._model, initial, allow_partial=False)
+            restore_model_weights(self._model, initial, allow_partial=False)
             self._model.eval()
         if self._device.type == "cuda":
             self._forward_stream = torch.cuda.Stream(priority=-1)
@@ -670,7 +674,7 @@ class InferenceServer:
         post_t0 = time.monotonic()
         decoded = decode_dense_outputs(
             out,
-            value_decoder=bins_to_value,
+            value_decoder=decode_binned_value_logits,
             sparse_requested=sparse_inputs is not None,
         )
         post_ms = (time.monotonic() - post_t0) * 1000.0
@@ -726,7 +730,7 @@ class InferenceServer:
         decoded = decode_global_graph_outputs(
             out,
             graph_inputs,
-            value_decoder=bins_to_value,
+            value_decoder=decode_binned_value_logits,
         )
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
@@ -899,7 +903,7 @@ class InferenceServer:
                 k: v.to(self._device) if isinstance(v, torch.Tensor) else v
                 for k, v in latest.items()
             }
-            load_model_state(self._model, latest, allow_partial=False)
+            restore_model_weights(self._model, latest, allow_partial=False)
             self._model.eval()
 
     @property

@@ -10,7 +10,7 @@ from hexorl.dashboard.recorder import RunRecorder
 from hexorl.dashboard.replay import replay_game
 from hexorl.epoch.pipeline import _make_bootstrap_game_records
 from hexorl.eval.scorecard import compute_phase3_scorecard
-from hexorl.model.network import build_model_from_config
+from hexorl.models.assembly import build_model_from_config
 from hexorl.models.registry import resolve_model_spec
 from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
