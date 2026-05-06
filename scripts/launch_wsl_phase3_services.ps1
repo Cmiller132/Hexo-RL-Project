@@ -1,15 +1,17 @@
 param(
     [string]$Distro = "Ubuntu-24.04",
     [string]$RepoRoot = "/root/Hexo-RL-Project-ext4",
-    [string]$RunRoot = "/root/hexo_runs/phase2_phase3_autotune_384moves_simsweep_20260428_ext4",
+    [string]$RunRoot = "/root/hexo_runs/global_graph_hybrid_autotune_20260506",
     [int]$DashboardPort = 8765,
     [string]$RuntimeSweepWorkers = "2,3",
-    [int]$RuntimeSweepStates = 768,
+    [int]$RuntimeSweepStates = 384,
     [int]$RuntimeSweepMaxCandidates = 2,
-    [int]$MaxGameMoves = 384,
-    [int]$MaxActiveTrials = 12,
-    [string]$AshaResources = "8,12,14",
+    [int]$MaxGameMoves = 500,
+    [int]$MaxActiveTrials = 6,
+    [string]$AshaResources = "10,20,30",
     [int]$ChampionMinEpochs = 20,
+    [string]$FamilyFilter = "graph_hybrid_0,global_xattn_0,global_line_window_0,global_pair_twostage_0,global_graph_full_0",
+    [switch]$UseDefaultReferenceCheckpoint,
     [switch]$NoStartProcess
 )
 
@@ -26,6 +28,8 @@ New-Item -ItemType Directory -Force -Path $localTmp | Out-Null
 $keepalivePath = Join-Path $localTmp "hexo_phase3_keepalive.sh"
 $escapedRepo = $RepoRoot.Replace("'", "'\\''")
 $escapedRun = $RunRoot.Replace("'", "'\\''")
+$escapedFamilyFilter = $FamilyFilter.Replace("'", "'\\''")
+$defaultReferenceCheckpoint = if ($UseDefaultReferenceCheckpoint) { "1" } else { "0" }
 
 $script = @"
 #!/usr/bin/env bash
@@ -138,6 +142,8 @@ start_supervisor() {
     export CALIBRATION_THROUGHPUT_GATE='0.35'
     export ASHA_RESOURCES='$AshaResources'
     export CHAMPION_MIN_EPOCHS='$ChampionMinEpochs'
+    export FAMILY_FILTER='$escapedFamilyFilter'
+    export USE_DEFAULT_REFERENCE_CHECKPOINT='$defaultReferenceCheckpoint'
     export FULL_SIMS_OPTIONS='512,800,1200,1600'
     export MIN_SIMS_OPTIONS='128,192,256,384'
     bash scripts/launch_phase3_48h_autotune.sh "`$RUN" background >> "`$LOG" 2>&1
@@ -164,7 +170,7 @@ start_monitor() {
     sleep 1
 }
 
-log "keepalive boot pid=`$`$ repo=`$REPO run=`$RUN port=`$DASHBOARD_PORT"
+log "keepalive boot pid=`$`$ repo=`$REPO run=`$RUN port=`$DASHBOARD_PORT family_filter=$escapedFamilyFilter use_default_reference_checkpoint=$defaultReferenceCheckpoint"
 echo `$`$ > "`$RUN/service_keepalive.pid"
 tick=0
 while true; do

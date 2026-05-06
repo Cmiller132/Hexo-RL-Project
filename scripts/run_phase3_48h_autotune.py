@@ -2626,6 +2626,15 @@ class Phase3Supervisor:
         _write_json(self.output_root / "manifest.json", self._manifest_payload())
 
     def _manifest_payload(self) -> dict[str, Any]:
+        available_families = [family for family in self.families if family.available]
+        graph_available = any(family.graph for family in available_families)
+        non_graph_available = any(not family.graph for family in available_families)
+        if graph_available and not non_graph_available:
+            family_scope = "graph-only run; tuning graph_hybrid_0 and global graph scouts"
+        elif graph_available:
+            family_scope = "graph available; tuning graph finalists with configured comparison families"
+        else:
+            family_scope = "graph unavailable; no graph-family finalists available after filters"
         return {
             "doc": "Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md",
             "duration_hours": self.args.duration_hours,
@@ -2637,11 +2646,7 @@ class Phase3Supervisor:
             "schedule_method": self.args.schedule_method,
             "families": [asdict(f) for f in self.families],
             "blocked_families": self.blocked_families,
-            "fallback_branch": (
-                "graph available; tuning Phase 2 graph finalist with current/restnet/candidate-policy controls"
-                if any(f.graph and f.available for f in self.families)
-                else "graph unavailable; tuning current/restnet/candidate-policy fallback pool"
-            ),
+            "fallback_branch": family_scope,
             "host": asdict(self.host),
             "host_argument_overrides": self.host_argument_overrides,
             "args": vars(self.args),
@@ -2715,7 +2720,7 @@ class Phase3Supervisor:
                 "",
                 f"- baseline_loss_p75_by_color: `{self.baseline_loss_p75}`",
                 f"- candidate recall gate: `{self.args.candidate_recall_gate}`",
-                f"- graph beat crop/ResTNet: `tracked when graph trials pass hard gates; quarantines={self.blocked_families}`",
+                f"- graph family scorecards: `tracked when graph trials pass hard gates; quarantines={self.blocked_families}`",
                 "- BOHB static samples: persisted in `bohb_sampler.json`",
                 "- ASHA rung decisions: persisted in `asha_rungs.json`",
                 "- PB2/PBT schedule events: persisted in `pb2_scheduler.json` for PB2 or trial mutation history for PBT fallback",

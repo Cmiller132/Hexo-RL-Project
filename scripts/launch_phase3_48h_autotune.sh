@@ -30,7 +30,8 @@ STRATEGY_SCORE_MIN_EPOCHS="${STRATEGY_SCORE_MIN_EPOCHS:-10}"
 CLASSICAL_SCORE_MIN_EPOCHS="${CLASSICAL_SCORE_MIN_EPOCHS:-12}"
 EVAL_GAMES="${EVAL_GAMES:-4}"
 FINAL_EVAL_GAMES="${FINAL_EVAL_GAMES:-12}"
-FAMILY_FILTER="${FAMILY_FILTER:-best_restnet_33,global_xattn_0,global_line_window_0,global_pair_twostage_0,global_graph_full_0}"
+FAMILY_FILTER="${FAMILY_FILTER:-graph_hybrid_0,global_xattn_0,global_line_window_0,global_pair_twostage_0,global_graph_full_0}"
+USE_DEFAULT_REFERENCE_CHECKPOINT="${USE_DEFAULT_REFERENCE_CHECKPOINT:-0}"
 
 mkdir -p "${RUN_ROOT}"
 
@@ -39,7 +40,7 @@ log_launch() {
 }
 
 log_launch "launch requested mode=${RUN_MODE} cwd=${PWD} shell_pid=$$"
-log_launch "settings duration=${DURATION_HOURS} target_epoch_seconds=${TARGET_EPOCH_SECONDS} calibration_epoch_seconds=${CALIBRATION_EPOCH_SECONDS} calibration_states=${CALIBRATION_STATES} train_batches=${TRAIN_BATCHES} max_game_moves=${MAX_GAME_MOVES} runtime_sweep_states=${RUNTIME_SWEEP_STATES} runtime_sweep_workers=${RUNTIME_SWEEP_WORKERS} runtime_sweep_max_candidates=${RUNTIME_SWEEP_MAX_CANDIDATES} max_active_trials=${MAX_ACTIVE_TRIALS} asha_resources=${ASHA_RESOURCES} pbt_population=${PBT_POPULATION} champion_min_epochs=${CHAMPION_MIN_EPOCHS}"
+log_launch "settings duration=${DURATION_HOURS} target_epoch_seconds=${TARGET_EPOCH_SECONDS} calibration_epoch_seconds=${CALIBRATION_EPOCH_SECONDS} calibration_states=${CALIBRATION_STATES} train_batches=${TRAIN_BATCHES} max_game_moves=${MAX_GAME_MOVES} runtime_sweep_states=${RUNTIME_SWEEP_STATES} runtime_sweep_workers=${RUNTIME_SWEEP_WORKERS} runtime_sweep_max_candidates=${RUNTIME_SWEEP_MAX_CANDIDATES} max_active_trials=${MAX_ACTIVE_TRIALS} asha_resources=${ASHA_RESOURCES} pbt_population=${PBT_POPULATION} champion_min_epochs=${CHAMPION_MIN_EPOCHS} family_filter=${FAMILY_FILTER} use_default_reference_checkpoint=${USE_DEFAULT_REFERENCE_CHECKPOINT}"
 if command -v free >/dev/null 2>&1; then
     log_launch "memory $(free -h | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
 fi
@@ -112,7 +113,7 @@ if [[ -n "${FAMILY_FILTER}" ]]; then
 fi
 
 default_reference="runs/restnet_sparse_stage0_epoch10_stable_20260428/epoch_0010.pt"
-if [[ -f "${default_reference}" ]]; then
+if [[ "${USE_DEFAULT_REFERENCE_CHECKPOINT}" == "1" && -f "${default_reference}" ]]; then
     args+=(--reference-checkpoint "${default_reference}")
 fi
 
