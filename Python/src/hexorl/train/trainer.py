@@ -20,7 +20,9 @@ from hexorl.models.assembly import is_global_graph_model
 from hexorl.models.loading import restore_model_weights
 from hexorl.models.registry import resolve_model_spec
 from hexorl.models.specs import merge_resolved_loss_weights
+from hexorl.graph.batch import collate_graph_batches
 from hexorl.replay.training_batch import (
+    graph_batch_training_targets,
     prepare_dense_training_batch,
     prepare_global_graph_training_batch,
 )
@@ -104,6 +106,9 @@ class Trainer:
         self._epoch_losses: Dict[str, list] = {}
         self._start_time = 0.0
         self._logged_graph_microbatch = False
+        self._graph_microbatch_choice: int | None = None
+        self._graph_microbatch_heuristic: int | None = None
+        self._graph_microbatch_rejections: list[str] = []
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         lr = self.train_cfg.peak_lr
@@ -371,7 +376,8 @@ class Trainer:
         del tensors
         del policies
         batch_size = int(values.shape[0])
-        graph_batches = aux_targets.get("_graph_batches")
+        original_graph_batches = aux_targets.get("_graph_batches")
+        graph_batches = original_graph_batches
         if graph_batches is None:
             required = [
                 "token_features",
@@ -392,14 +398,127 @@ class Trainer:
                 f"graphs={len(graph_batches)} targets={batch_size}"
             )
 
-        microbatch_size = self._graph_train_microbatch_size(aux_targets, batch_size, graph_batches)
-        if microbatch_size < batch_size and not self._logged_graph_microbatch:
+        setup_timings: dict[str, float] = {}
+        effective_aux_targets = aux_targets
+        collated_once = False
+        graph_collate_fallback = 0.0
+        if graph_batches is not None:
+            try:
+                collated_graph = collate_graph_batches(graph_batches, timings=setup_timings)
+                graph_targets = graph_batch_training_targets(collated_graph)
+                effective_aux_targets = {
+                    key: value for key, value in aux_targets.items() if key != "_graph_batches"
+                }
+                effective_aux_targets.update(graph_targets)
+                graph_batches = None
+                collated_once = True
+            except MemoryError as exc:
+                graph_collate_fallback = 1.0
+                logger.warning(
+                    "global graph full-batch CPU collation failed; falling back to per-microbatch collation: %s",
+                    exc,
+                )
+
+        heuristic_size = self._graph_train_microbatch_heuristic(effective_aux_targets, batch_size, graph_batches)
+        configured_microbatch = int(getattr(self.train_cfg, "graph_microbatch_size", 0) or 0) > 0
+        microbatch_size = self._graph_train_microbatch_size(
+            effective_aux_targets,
+            batch_size,
+            graph_batches,
+            heuristic_size=heuristic_size,
+        )
+        if not self._logged_graph_microbatch:
             logger.info(
-                "global graph training uses microbatch_size=%d for effective_batch_size=%d",
+                "global graph training microbatch selected_size=%d heuristic_size=%d "
+                "effective_batch_size=%d collate_once=%s rejections=%s",
                 microbatch_size,
+                heuristic_size,
                 batch_size,
+                collated_once,
+                "; ".join(self._graph_microbatch_rejections) or "none",
             )
             self._logged_graph_microbatch = True
+
+        oom_retries = 0
+        nonfinite_retries = 0
+        while True:
+            try:
+                result = self._train_global_graph_step_once(
+                    values=values,
+                    lookahead_list=lookahead_list,
+                    aux_targets=effective_aux_targets,
+                    batch_idx=batch_idx,
+                    batch_size=batch_size,
+                    graph_batches=graph_batches,
+                    microbatch_size=microbatch_size,
+                    setup_timings=setup_timings,
+                )
+                result["graph_microbatch_heuristic_size"] = float(heuristic_size)
+                result["graph_microbatch_autotuned"] = float(
+                    (not configured_microbatch) and microbatch_size != heuristic_size
+                )
+                result["graph_microbatch_configured"] = float(configured_microbatch)
+                result["graph_microbatch_rejected_count"] = float(len(self._graph_microbatch_rejections))
+                result["graph_microbatch_oom_retries"] = float(oom_retries)
+                result["graph_microbatch_nonfinite_retries"] = float(nonfinite_retries)
+                result["graph_collate_once"] = float(collated_once)
+                result["graph_collate_fallback"] = graph_collate_fallback
+                self._graph_microbatch_choice = microbatch_size
+                return result
+            except RuntimeError as exc:
+                if not self._is_cuda_oom(exc) or microbatch_size <= 1:
+                    raise
+                next_size = self._lower_graph_microbatch_size(microbatch_size, heuristic_size)
+                if next_size >= microbatch_size:
+                    raise
+                oom_retries += 1
+                self._graph_microbatch_rejections.append(
+                    f"{microbatch_size}:cuda_oom_retry_{oom_retries}"
+                )
+                logger.warning(
+                    "global graph microbatch_size=%d hit CUDA OOM; retrying current batch with %d",
+                    microbatch_size,
+                    next_size,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                microbatch_size = next_size
+            except FloatingPointError:
+                if microbatch_size <= heuristic_size:
+                    raise
+                nonfinite_retries += 1
+                self._graph_microbatch_rejections.append(
+                    f"{microbatch_size}:nonfinite_loss_retry_{nonfinite_retries}"
+                )
+                logger.warning(
+                    "global graph microbatch_size=%d produced non-finite loss; retrying with heuristic_size=%d",
+                    microbatch_size,
+                    heuristic_size,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                microbatch_size = heuristic_size
+
+    def _train_global_graph_step_once(
+        self,
+        *,
+        values: torch.Tensor,
+        lookahead_list,
+        aux_targets: dict,
+        batch_idx: int,
+        batch_size: int,
+        graph_batches,
+        microbatch_size: int,
+        setup_timings: dict[str, float],
+    ) -> Dict[str, float]:
+        timings = dict(setup_timings)
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.reset_peak_memory_stats(self.device)
+            except RuntimeError:
+                pass
 
         self.optimizer.zero_grad(set_to_none=True)
         total_accum = 0.0
@@ -421,6 +540,7 @@ class Trainer:
                 self._slice_value_for_batch(value, start, end, batch_size)
                 for value in lookahead_list
             ]
+            prepare_started = time.perf_counter()
             prepared = prepare_global_graph_training_batch(
                 values=self._slice_value_for_batch(values, start, end, batch_size),
                 lookahead_list=micro_lookahead,
@@ -433,13 +553,22 @@ class Trainer:
                     True,
                 ),
                 graph_batches=micro_graph_batches,
+                timings=timings,
+            )
+            timings["graph_prepare_s"] = timings.get("graph_prepare_s", 0.0) + (
+                time.perf_counter() - prepare_started
             )
             micro_targets = prepared.targets
 
             with torch.amp.autocast("cuda", enabled=self.use_amp):
+                forward_started = time.perf_counter()
                 predictions = self.model(
                     **prepared.model_inputs,
                 )
+                timings["graph_forward_s"] = timings.get("graph_forward_s", 0.0) + (
+                    time.perf_counter() - forward_started
+                )
+                loss_started = time.perf_counter()
                 total_loss, per_head = compute_losses(
                     predictions,
                     micro_targets,
@@ -447,6 +576,9 @@ class Trainer:
                     n_bins=self._n_bins,
                     loss_plan=self._loss_plan,
                     row_tables=prepared.row_tables,
+                )
+                timings["graph_loss_s"] = timings.get("graph_loss_s", 0.0) + (
+                    time.perf_counter() - loss_started
                 )
                 if not torch.isfinite(total_loss):
                     details = {
@@ -461,10 +593,14 @@ class Trainer:
                     )
                 backward_loss = total_loss * micro_weight
 
+            backward_started = time.perf_counter()
             if self.use_amp:
                 self.scaler.scale(backward_loss).backward()
             else:
                 backward_loss.backward()
+            timings["graph_backward_s"] = timings.get("graph_backward_s", 0.0) + (
+                time.perf_counter() - backward_started
+            )
 
             total_accum += float(total_loss.detach().float().cpu()) * micro_weight
             for name, value in per_head.items():
@@ -489,6 +625,7 @@ class Trainer:
                     )
             microbatch_count += 1
 
+        optimizer_started = time.perf_counter()
         stepped = True
         if self.use_amp:
             scale_before = self.scaler.get_scale()
@@ -505,12 +642,32 @@ class Trainer:
             self.scheduler.step()
         if stepped:
             self.ema.update()
+        timings["graph_optimizer_s"] = timings.get("graph_optimizer_s", 0.0) + (
+            time.perf_counter() - optimizer_started
+        )
 
         result = {
             "total": total_accum,
             "graph_microbatch_size": float(microbatch_size),
             "graph_microbatch_count": float(microbatch_count),
         }
+        if self.device.type == "cuda":
+            try:
+                result["graph_peak_cuda_allocated_mb"] = float(
+                    torch.cuda.max_memory_allocated(self.device)
+                ) / (1024.0 * 1024.0)
+                result["graph_peak_cuda_reserved_mb"] = float(
+                    torch.cuda.max_memory_reserved(self.device)
+                ) / (1024.0 * 1024.0)
+            except RuntimeError:
+                result["graph_peak_cuda_allocated_mb"] = 0.0
+                result["graph_peak_cuda_reserved_mb"] = 0.0
+        else:
+            result["graph_peak_cuda_allocated_mb"] = 0.0
+            result["graph_peak_cuda_reserved_mb"] = 0.0
+        for key, value in timings.items():
+            result[key] = float(value)
+        result["graph_microbatch_efficiency"] = float(batch_size) / max(float(microbatch_count), 1.0)
         result.update(per_head_accum)
         for weight_key, weight_sum in weight_sums.items():
             result[f"{weight_key}_mean"] = weight_sum / max(batch_size, 1)
@@ -518,10 +675,38 @@ class Trainer:
 
         return result
 
-    def _graph_train_microbatch_size(self, targets: dict, batch_size: int, graph_batches=None) -> int:
+    def _graph_train_microbatch_size(
+        self,
+        targets: dict,
+        batch_size: int,
+        graph_batches=None,
+        *,
+        heuristic_size: int | None = None,
+    ) -> int:
         configured = int(getattr(self.train_cfg, "graph_microbatch_size", 0) or 0)
         if configured > 0:
             return max(1, min(configured, batch_size))
+        heuristic = heuristic_size or self._graph_train_microbatch_heuristic(targets, batch_size, graph_batches)
+        if self.device.type != "cuda":
+            self._graph_microbatch_heuristic = heuristic
+            self._graph_microbatch_rejections = []
+            return heuristic
+        if not bool(getattr(self.train_cfg, "graph_microbatch_autotune", True)):
+            self._graph_microbatch_heuristic = heuristic
+            self._graph_microbatch_rejections = []
+            return heuristic
+
+        selected, rejections = self._select_graph_microbatch_candidate(
+            targets,
+            batch_size,
+            graph_batches,
+            heuristic,
+        )
+        self._graph_microbatch_heuristic = heuristic
+        self._graph_microbatch_rejections = rejections
+        return selected
+
+    def _graph_train_microbatch_heuristic(self, targets: dict, batch_size: int, graph_batches=None) -> int:
         if self.device.type != "cuda":
             return max(1, batch_size)
 
@@ -557,6 +742,145 @@ class Trainer:
         elif pair_width >= 512:
             limit = min(limit, 8)
         return max(1, min(limit, batch_size))
+
+    def _select_graph_microbatch_candidate(
+        self,
+        targets: dict,
+        batch_size: int,
+        graph_batches,
+        heuristic: int,
+    ) -> tuple[int, list[str]]:
+        configured_max = int(getattr(self.train_cfg, "graph_microbatch_autotune_max_size", 32) or 32)
+        configured_max = max(1, configured_max)
+        device_max = configured_max
+        free_bytes = 0
+        total_bytes = 0
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        except RuntimeError:
+            pass
+        if total_bytes:
+            gib = total_bytes / float(1024**3)
+            if gib < 8.0:
+                device_max = min(device_max, 8)
+            elif gib < 11.0:
+                device_max = min(device_max, 16)
+        max_candidate = max(1, min(batch_size, device_max))
+        candidate_values = {
+            heuristic,
+            min(batch_size, heuristic * 2),
+            min(batch_size, heuristic * 4),
+            max_candidate,
+            8,
+            16,
+            32,
+        }
+        candidates = sorted(
+            {
+                int(value)
+                for value in candidate_values
+                if int(value) >= heuristic and int(value) <= max_candidate
+            },
+            reverse=True,
+        )
+        if not candidates:
+            return heuristic, []
+
+        per_sample_bytes = self._estimated_graph_training_bytes_per_sample(targets, batch_size, graph_batches)
+        rejections: list[str] = []
+        for candidate in candidates:
+            reason = self._graph_microbatch_memory_rejection(
+                candidate,
+                per_sample_bytes,
+                free_bytes,
+                total_bytes,
+            )
+            if reason:
+                rejections.append(f"{candidate}:{reason}")
+                continue
+            return max(1, min(candidate, batch_size)), rejections
+        return heuristic, rejections
+
+    def _estimated_graph_training_bytes_per_sample(self, targets: dict, batch_size: int, graph_batches) -> float:
+        if graph_batches is not None:
+            total_bytes = 0
+            for graph in graph_batches:
+                for value in graph.__dict__.values():
+                    nbytes = getattr(value, "nbytes", None)
+                    if nbytes is not None:
+                        total_bytes += int(nbytes)
+            return float(total_bytes) / max(float(len(graph_batches)), 1.0)
+
+        keys = (
+            "token_features",
+            "token_type",
+            "token_qr",
+            "token_mask",
+            "legal_token_indices",
+            "legal_qr",
+            "legal_mask",
+            "relation_type",
+            "relation_bias",
+            "policy_target",
+            "opp_legal_qr",
+            "opp_legal_mask",
+            "opp_policy_target",
+            "pair_token_indices",
+            "pair_first_indices",
+            "pair_second_indices",
+            "pair_first_policy_target",
+            "pair_policy_target",
+            "pair_second_policy_target",
+            "tactical_target",
+        )
+        total_bytes = 0
+        for key in keys:
+            value = targets.get(key)
+            if value is None:
+                continue
+            nbytes = getattr(value, "nbytes", None)
+            if nbytes is not None:
+                total_bytes += int(nbytes)
+                continue
+            tensor = self._as_tensor(value)
+            if isinstance(tensor, torch.Tensor):
+                total_bytes += int(tensor.numel() * tensor.element_size())
+        return float(total_bytes) / max(float(batch_size), 1.0)
+
+    def _graph_microbatch_memory_rejection(
+        self,
+        candidate: int,
+        per_sample_bytes: float,
+        free_bytes: int,
+        total_bytes: int,
+    ) -> str | None:
+        if per_sample_bytes <= 0.0 or free_bytes <= 0 or total_bytes <= 0:
+            return None
+        headroom = float(getattr(self.train_cfg, "graph_microbatch_memory_headroom", 0.75) or 0.75)
+        headroom = min(max(headroom, 0.1), 0.95)
+        reserved_floor = float(total_bytes) * (1.0 - headroom)
+        usable_bytes = max(0.0, float(free_bytes) - reserved_floor)
+        layers = max(1, int(getattr(self.cfg.model, "graph_layers", 1)))
+        activation_multiplier = 4.0 + (1.5 * float(layers))
+        estimated_bytes = per_sample_bytes * float(candidate) * activation_multiplier
+        if estimated_bytes > usable_bytes:
+            return (
+                "estimated_memory "
+                f"{estimated_bytes / (1024.0**3):.2f}GiB>"
+                f"{usable_bytes / (1024.0**3):.2f}GiB"
+            )
+        return None
+
+    @staticmethod
+    def _lower_graph_microbatch_size(current: int, heuristic: int) -> int:
+        if current > heuristic:
+            return max(heuristic, current // 2)
+        return max(1, current // 2)
+
+    @staticmethod
+    def _is_cuda_oom(exc: RuntimeError) -> bool:
+        text = str(exc).lower()
+        return "cuda" in text and ("out of memory" in text or "cublas_status_alloc_failed" in text)
 
     def _slice_targets_for_batch(
         self,
@@ -607,6 +931,19 @@ class Trainer:
         value_loss = self._smooth("value")
         top1_prob = self._smooth("policy_top1_prob")
         top1_acc = self._smooth("policy_top1_acc")
+        graph_suffix = ""
+        if self._is_global_graph_model:
+            graph_suffix = (
+                f" | graph_mb={self._smooth('graph_microbatch_size'):.0f}"
+                f"/{self._smooth('graph_microbatch_count'):.0f}"
+                f" collate={self._smooth('graph_collate_s'):.3f}s"
+                f" h2d={self._smooth('graph_to_device_s'):.3f}s"
+                f" fwd={self._smooth('graph_forward_s'):.3f}s"
+                f" loss={self._smooth('graph_loss_s'):.3f}s"
+                f" bwd={self._smooth('graph_backward_s'):.3f}s"
+                f" opt={self._smooth('graph_optimizer_s'):.3f}s"
+                f" peak={self._smooth('graph_peak_cuda_allocated_mb'):.0f}MB"
+            )
 
         logger.info(
             f"[Epoch {self.epoch}] "
@@ -617,6 +954,7 @@ class Trainer:
             f"top1_p={top1_prob:.3f} top1_acc={top1_acc:.3f} | "
             f"lr={current_lr:.2e} | "
             f"eta={remaining:.0f}s"
+            f"{graph_suffix}"
         )
 
     def _smooth(self, key: str, window: int = 20) -> float:

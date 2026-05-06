@@ -866,7 +866,9 @@ class Phase3Supervisor:
             "runtime_outputs": list(model_contract.get("outputs") or []),
             "pair_capabilities": list(model_contract.get("pair_capabilities") or []),
             "pair_strategy": pair_strategy,
-            "loss_weights": dict(trial.cfg.train.loss_weights),
+            "loss_weights": dict(
+                getattr(getattr(trial.cfg, "train", None), "loss_weights", {}) or {}
+            ),
             "static": asdict(trial.static),
             "dynamic": asdict(trial.dynamic),
         }
@@ -1857,32 +1859,32 @@ class Phase3Supervisor:
         graph_family_names = [family.name for family in self._eligible_families() if family.graph]
         if not graph_family_names:
             graph_family_names = ["graph_hybrid_0", *GLOBAL_GRAPH_SCOUT_FAMILIES]
-        return SearchSpace(
-            {
-                "model_family": {"type": "categorical", "choices": family_names},
-                "full_sims": {"type": "categorical", "choices": STATIC_SPACE["full_sims"]},
-                "candidate_budget": {"type": "categorical", "choices": [128, 256, 384]},
-                "policy_top_k": {"type": "categorical", "choices": [64, 96, 128]},
-                "head_bundle": {"type": "categorical", "choices": list(HEAD_BUNDLES)},
-                "temperature_family": {"type": "categorical", "choices": STATIC_SPACE["temperature_family"]},
-                "train_batch_size": {"type": "categorical", "choices": [128, 256, 384]},
-                "graph_token_budget": {
-                    "type": "categorical",
-                    "choices": [256, 384, 512],
-                    "condition": {"key": "model_family", "values": graph_family_names},
-                },
-                "graph_layers": {
-                    "type": "categorical",
-                    "choices": [1, 2, 3],
-                    "condition": {"key": "model_family", "values": graph_family_names},
-                },
-                "sparse_prior_stage": {
-                    "type": "categorical",
-                    "choices": [0, 1],
-                    "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
-                },
+        parameters = {
+            "model_family": {"type": "categorical", "choices": family_names},
+            "full_sims": {"type": "categorical", "choices": STATIC_SPACE["full_sims"]},
+            "candidate_budget": {"type": "categorical", "choices": [128, 256, 384]},
+            "policy_top_k": {"type": "categorical", "choices": [64, 96, 128]},
+            "head_bundle": {"type": "categorical", "choices": list(HEAD_BUNDLES)},
+            "temperature_family": {"type": "categorical", "choices": STATIC_SPACE["temperature_family"]},
+            "train_batch_size": {"type": "categorical", "choices": [128, 256, 384]},
+            "graph_token_budget": {
+                "type": "categorical",
+                "choices": [256, 384, 512],
+                "condition": {"key": "model_family", "values": graph_family_names},
+            },
+            "graph_layers": {
+                "type": "categorical",
+                "choices": [1, 2, 3],
+                "condition": {"key": "model_family", "values": graph_family_names},
+            },
+        }
+        if "graph_hybrid_0" in family_names:
+            parameters["sparse_prior_stage"] = {
+                "type": "categorical",
+                "choices": [0, 1],
+                "condition": {"key": "model_family", "values": ["graph_hybrid_0"]},
             }
-        )
+        return SearchSpace(parameters)
 
     def _static_recipe_from_bohb_config(self, family: FamilySpec, config: dict[str, Any]) -> StaticRecipe:
         default_global_sims = LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS if self._low_memory_cuda_host() else 384
@@ -2793,8 +2795,11 @@ class Phase3Supervisor:
         available_families = [family for family in self.families if family.available]
         graph_available = any(family.graph for family in available_families)
         non_graph_available = any(not family.graph for family in available_families)
-        if graph_available and not non_graph_available:
-            family_scope = "graph-only run; tuning graph_hybrid_0 and global graph scouts"
+        available_names = {family.name for family in available_families}
+        if graph_available and not non_graph_available and available_names <= _GLOBAL_GRAPH_SCOUT_FAMILY_SET:
+            family_scope = "no-hybrid global graph run; tuning global graph scouts only"
+        elif graph_available and not non_graph_available:
+            family_scope = "graph-only run; tuning configured graph finalists"
         elif graph_available:
             family_scope = "graph available; tuning graph finalists with configured comparison families"
         else:

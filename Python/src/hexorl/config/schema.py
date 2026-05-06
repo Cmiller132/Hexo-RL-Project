@@ -178,6 +178,9 @@ class TrainConfig(BaseModel):
 
     batch_size: int = 256
     graph_microbatch_size: int = 0
+    graph_microbatch_autotune: bool = True
+    graph_microbatch_autotune_max_size: int = 32
+    graph_microbatch_memory_headroom: float = 0.75
     batches_per_epoch: int = 2000
     prefetch_batches: int = 2
     optimizer: str = "adamw"

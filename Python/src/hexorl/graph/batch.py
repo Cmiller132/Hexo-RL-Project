@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import IntEnum
 import struct
+import time
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -1301,7 +1302,12 @@ def _build_relations(
     return rel, bias
 
 
-def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
+def collate_graph_batches(
+    batches: Sequence[GraphBatch],
+    *,
+    timings: dict[str, float] | None = None,
+) -> GraphBatch:
+    started = time.perf_counter()
     if not batches:
         raise ValueError("cannot collate an empty graph batch list")
     max_t = max(b.token_features.shape[0] for b in batches)
@@ -1363,7 +1369,7 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
         tactical_target[row] = batch.tactical_target
         placements_remaining_by_sample[row] = int(batch.placements_remaining)
 
-    return GraphBatch(
+    collated = GraphBatch(
         token_features=token_features,
         token_type=token_type,
         token_qr=token_qr,
@@ -1388,3 +1394,8 @@ def collate_graph_batches(batches: Sequence[GraphBatch]) -> GraphBatch:
         current_player=-1,
         placements_remaining_by_sample=placements_remaining_by_sample,
     )
+    if timings is not None:
+        timings["graph_collate_s"] = timings.get("graph_collate_s", 0.0) + (
+            time.perf_counter() - started
+        )
+    return collated

@@ -33,6 +33,7 @@ from hexorl.graph.batch import (
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.models.assembly import build_model_from_config
 from hexorl.models.families.global_graph import GlobalHexGraphNet
+from hexorl.replay.training_batch import graph_batch_training_targets
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import build_pair_strategy
 from hexorl.train.loss_plan import build_loss_plan
@@ -609,6 +610,61 @@ def test_global_graph_model_forward_with_padded_batch():
     assert "policy_pair_joint" not in out
 
 
+def test_collated_graph_training_targets_preserve_active_rows_when_sliced():
+    graphs = [
+        build_graph_batch_from_history(_hist((0, 0, 0)), radius=2, policy_target=[(1, 0, 1.0)]),
+        build_graph_batch_from_history(
+            _hist((0, 0, 0), (1, 1, 0), (1, 0, 1)),
+            radius=2,
+            policy_target=[(2, 0, 1.0)],
+        ),
+        build_graph_batch_from_history(
+            _hist((0, 0, 0), (1, 1, 0), (1, 0, 1), (0, 2, 0), (0, 2, -1)),
+            radius=3,
+            policy_target=[(3, 0, 1.0)],
+        ),
+    ]
+    full_targets = graph_batch_training_targets(collate_graph_batches(graphs))
+    sliced_targets = {
+        key: value[:2] if hasattr(value, "shape") and int(value.shape[0]) == 3 else value
+        for key, value in full_targets.items()
+    }
+    subset_targets = graph_batch_training_targets(collate_graph_batches(graphs[:2]))
+
+    for row, graph in enumerate(graphs[:2]):
+        token_count = int(graph.token_features.shape[0])
+        legal_count = int(graph.legal_qr.shape[0])
+        pair_count = int(graph.pair_token_indices.shape[0])
+        assert np.array_equal(
+            sliced_targets["token_features"][row, :token_count],
+            subset_targets["token_features"][row, :token_count],
+        )
+        assert np.array_equal(
+            sliced_targets["relation_type"][row, :token_count, :token_count],
+            subset_targets["relation_type"][row, :token_count, :token_count],
+        )
+        assert np.array_equal(
+            sliced_targets["relation_bias"][row, :, :token_count, :token_count],
+            subset_targets["relation_bias"][row, :, :token_count, :token_count],
+        )
+        assert np.array_equal(
+            sliced_targets["legal_qr"][row, :legal_count],
+            subset_targets["legal_qr"][row, :legal_count],
+        )
+        assert np.array_equal(
+            sliced_targets["policy_target"][row, :legal_count],
+            subset_targets["policy_target"][row, :legal_count],
+        )
+        assert np.array_equal(
+            sliced_targets["pair_first_indices"][row, :pair_count],
+            subset_targets["pair_first_indices"][row, :pair_count],
+        )
+    assert np.array_equal(
+        sliced_targets["placements_remaining"][:2],
+        subset_targets["placements_remaining"],
+    )
+
+
 def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
     graphs = [
         build_graph_batch_from_history(
@@ -658,6 +714,67 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
     assert np.isfinite(losses["total"])
     assert losses["graph_microbatch_size"] == 2.0
     assert losses["graph_microbatch_count"] == 2.0
+    assert losses["graph_microbatch_configured"] == 1.0
+    assert losses["graph_microbatch_autotuned"] == 0.0
+    assert losses["graph_collate_once"] == 1.0
+    for key in (
+        "graph_collate_s",
+        "graph_to_device_s",
+        "graph_forward_s",
+        "graph_loss_s",
+        "graph_backward_s",
+        "graph_optimizer_s",
+        "graph_peak_cuda_allocated_mb",
+    ):
+        assert key in losses
+        assert losses[key] >= 0.0
+
+
+def test_graph_microbatch_autotune_rejects_memory_heavy_candidates(monkeypatch):
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_xattn_0",
+                "channels": 16,
+                "attention_heads": 4,
+                "graph_layers": 3,
+                "heads": ["policy_place", "value"],
+            },
+            "train": {
+                "graph_microbatch_autotune_max_size": 32,
+                "graph_microbatch_memory_headroom": 0.75,
+                "loss_weights": {
+                    "policy": 1.0,
+                    "policy_place": 1.0,
+                    "value": 1.0,
+                },
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    trainer = Trainer(model, cfg, dataloader=[], device=torch.device("cpu"))
+    trainer.device = torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device=None: (1 * 1024**3, 12 * 1024**3))
+    targets = {
+        "token_features": torch.zeros(8, 512, GRAPH_FEATURE_DIM),
+        "token_type": torch.zeros(8, 512, dtype=torch.long),
+        "token_qr": torch.zeros(8, 512, 2, dtype=torch.int32),
+        "token_mask": torch.ones(8, 512, dtype=torch.bool),
+        "legal_token_indices": torch.zeros(8, 256, dtype=torch.long),
+        "legal_qr": torch.zeros(8, 256, 2, dtype=torch.int32),
+        "legal_mask": torch.ones(8, 256, dtype=torch.bool),
+        "relation_type": torch.zeros(8, 512, 512, dtype=torch.int16),
+        "relation_bias": torch.zeros(8, 1, 512, 512),
+        "pair_first_indices": torch.zeros(8, 1024, dtype=torch.long),
+        "pair_second_indices": torch.zeros(8, 1024, dtype=torch.long),
+        "pair_token_indices": torch.zeros(8, 1024, dtype=torch.long),
+    }
+
+    selected = trainer._graph_train_microbatch_size(targets, 8, None, heuristic_size=4)
+
+    assert selected == 4
+    assert trainer._graph_microbatch_rejections
 
 
 def test_global_graph_pair_second_loss_is_known_first_only():

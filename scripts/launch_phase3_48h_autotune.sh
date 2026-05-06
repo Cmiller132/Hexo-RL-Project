@@ -30,7 +30,7 @@ STRATEGY_SCORE_MIN_EPOCHS="${STRATEGY_SCORE_MIN_EPOCHS:-10}"
 CLASSICAL_SCORE_MIN_EPOCHS="${CLASSICAL_SCORE_MIN_EPOCHS:-12}"
 EVAL_GAMES="${EVAL_GAMES:-4}"
 FINAL_EVAL_GAMES="${FINAL_EVAL_GAMES:-12}"
-FAMILY_FILTER="${FAMILY_FILTER:-graph_hybrid_0,global_xattn_0,global_line_window_0,global_pair_twostage_0,global_graph_full_0}"
+FAMILY_FILTER="${FAMILY_FILTER:-global_xattn_0,global_line_window_0,global_pair_twostage_0,global_graph_full_0}"
 USE_DEFAULT_REFERENCE_CHECKPOINT="${USE_DEFAULT_REFERENCE_CHECKPOINT:-0}"
 
 mkdir -p "${RUN_ROOT}"
