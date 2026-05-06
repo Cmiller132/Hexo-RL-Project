@@ -471,7 +471,13 @@ class Trainer:
                         per_head_accum.get(name, 0.0)
                         + float(value.detach().float().cpu()) * micro_weight
                     )
-            for weight_key in ("value_weight", "policy_weight", "regret_weight", "opp_policy_weight"):
+            for weight_key in (
+                "value_weight",
+                "policy_weight",
+                "regret_weight",
+                "opp_policy_weight",
+                "pair_policy_weight",
+            ):
                 weight_tensor = micro_targets.get(weight_key)
                 if isinstance(weight_tensor, torch.Tensor):
                     weight_float = weight_tensor.detach().float()

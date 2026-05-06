@@ -363,6 +363,21 @@ def _last_move_qr(history_bytes: bytes) -> tuple[int, int] | None:
     return (q, r)
 
 
+def _graph_pair_targets_have_trainable_mass(graph: GraphBatch) -> bool:
+    placements_remaining = int(graph.placements_remaining)
+    if placements_remaining >= 2:
+        return (
+            float(np.asarray(graph.pair_policy_target, dtype=np.float32).sum()) > 0.0
+            and float(np.asarray(graph.pair_first_policy_target, dtype=np.float32).sum()) > 0.0
+        )
+    if placements_remaining == 1:
+        return (
+            float(np.asarray(graph.pair_policy_target, dtype=np.float32).sum()) > 0.0
+            and float(np.asarray(graph.pair_second_policy_target, dtype=np.float32).sum()) > 0.0
+        )
+    return False
+
+
 def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
     """Pure Python fallback for apply_d6_symmetry.
 
@@ -937,6 +952,14 @@ class ReplayDataset(_IterableDataset):
                         pair_policy_v2,
                         max_pair_rows=candidate_width,
                     )
+                if self.include_pair_policy and aux_targets["pair_policy_weight"][i] > 0.0:
+                    if not pair_policy_v2 or not _graph_pair_targets_have_trainable_mass(graph):
+                        aux_targets["pair_policy_weight"][i] = 0.0
+                        if "pair_candidate_missing_mass" in aux_targets:
+                            aux_targets["pair_candidate_missing_mass"][i] = max(
+                                float(aux_targets["pair_candidate_missing_mass"][i]),
+                                1.0,
+                            )
                 graph_batch = aux_targets.setdefault("_graph_batches", [])
                 graph_batch.append(graph)
             if self.include_axis_delta_norm:

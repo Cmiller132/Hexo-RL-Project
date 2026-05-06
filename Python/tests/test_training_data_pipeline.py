@@ -1402,6 +1402,35 @@ def test_graph_pair_training_masks_incomplete_first_placement_pair_target():
         assert aux["pair_candidate_missing_mass"][0] == pytest.approx(1.0)
 
 
+def test_graph_pair_training_masks_empty_pair_targets_even_when_record_claims_complete():
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+        pair_policy_target_v2=[],
+        pair_policy_complete=True,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_pair_policy=True,
+        include_graph_policy=True,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert bool(aux["pair_first_unordered"][0])
+    assert aux["legal_mask"][0].any()
+    assert aux["pair_first_policy_target"][0].sum() == pytest.approx(0.0)
+    assert aux["pair_policy_weight"][0] == pytest.approx(0.0)
+
+
 def test_graph_pair_training_accepts_sparse_search_observed_first_placement_target():
     history = _move(0, 0, 0)
     pair_target = [((1, 0), (2, 0), 1.0)]
