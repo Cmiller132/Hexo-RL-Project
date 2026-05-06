@@ -221,6 +221,12 @@ class Config(BaseModel):
                 "buffer.lookahead_horizons and buffer.lookahead_lambdas must have the same length"
             )
 
+        if (
+            architecture_spec(self.model.architecture).global_graph
+            and list(self.model.heads) == ["policy", "value"]
+        ):
+            self.model.heads = ["policy_place", "value", "lookahead_*"]
+
         configured_horizons = {f"lookahead_{h}" for h in self.buffer.lookahead_horizons}
         model_lookahead_heads = {
             head for head in self.model.heads if head.startswith("lookahead_") and head != "lookahead_*"

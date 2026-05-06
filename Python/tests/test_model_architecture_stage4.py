@@ -7,7 +7,7 @@ import torch
 
 from hexorl.config import Config
 from hexorl.eval import model_provider
-from hexorl.graph.batch import build_graph_batch_from_history
+from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
 from hexorl.inference.adapters import (
     decode_dense_outputs,
     decode_global_graph_outputs,
@@ -20,6 +20,8 @@ from hexorl.inference.protocol import (
 )
 from hexorl.models.assembly import bins_to_value
 from hexorl.models.contracts import ValueDecoderContract
+from hexorl.models.loading import build_runtime_model
+from hexorl.models.registry import resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import build_pair_strategy
 
@@ -88,6 +90,56 @@ def test_global_graph_adapter_rejects_unmapped_policy_output_shape():
             inputs,
             value_decoder=bins_to_value,
         )
+
+
+def test_runtime_global_graph_honors_explicit_output_heads_without_lookahead():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_xattn_0",
+                "channels": 16,
+                "attention_heads": 4,
+                "graph_layers": 1,
+                "heads": ["policy_place", "value"],
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    resolved = resolve_model_spec(cfg)
+    assert resolved.outputs == ("policy_place", "value")
+
+    model = build_runtime_model(cfg, device=torch.device("cpu"), inference=True)
+    graph = collate_graph_batches([
+        build_graph_batch_from_history(
+            _hist((0, 0, 0)),
+            include_pair_rows=True,
+            max_pair_rows=4,
+            allow_pair_truncation=True,
+        )
+    ])
+    inputs = {
+        name: torch.from_numpy(getattr(graph, name))
+        for name in (
+            "token_features",
+            "token_type",
+            "token_qr",
+            "token_mask",
+            "legal_token_indices",
+            "legal_mask",
+            "opp_legal_qr",
+            "opp_legal_mask",
+            "pair_token_indices",
+            "pair_first_indices",
+            "pair_second_indices",
+            "relation_type",
+            "relation_bias",
+        )
+    }
+
+    with torch.inference_mode():
+        out = model(**inputs)
+
+    assert set(out) == {"policy_place", "value"}
 
 
 def test_graph_response_rejects_same_count_reordered_rows():

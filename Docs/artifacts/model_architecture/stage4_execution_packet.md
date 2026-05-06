@@ -80,6 +80,7 @@ Commands:
 ```powershell
 $env:PYTHONPATH='Python/src'; python -m py_compile Python\src\hexorl\inference\protocol.py Python\src\hexorl\inference\adapters.py Python\src\hexorl\inference\server.py Python\src\hexorl\inference\client.py Python\src\hexorl\search\__init__.py Python\src\hexorl\search\engine_adapter.py Python\src\hexorl\search\pair_strategy.py Python\src\hexorl\config\schema.py Python\src\hexorl\selfplay\worker.py Python\tests\test_model_architecture_stage4.py
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_model_architecture_stage4.py
+$env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_model_architecture_stage2.py Python/tests/test_model_architecture_stage4.py Python/tests/test_global_graph_contract.py
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_inference_server.py Python/tests/test_config_and_guardrails.py Python/tests/test_global_graph_contract.py Python/tests/test_training_data_pipeline.py
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests
 Select-String -Path Python\src\hexorl\inference\server.py,Python\src\hexorl\inference\client.py -Pattern 'if .*policy_pair','if .*policy_place','if .*opp_policy','head_flags &'
@@ -97,23 +98,25 @@ Results:
 
 ```text
 py_compile passed
-Stage 4 focused tests: 10 passed
+Stage 4 focused tests: 11 passed
+Stage 2/4/global output gate suite: 59 passed, 1 warning
 affected integration suite: 162 passed, 1 warning
 affected final integration suite: 182 passed, 1 warning
-full Python suite: 316 passed, 1 warning
+full Python suite: 317 passed, 1 warning
 Rust workspace: 177 passed, 6 ignored, 2 doc-tests passed
 inference hot-logic graph-head branch audit: no matches
 self-play concrete global pair-head audit: no matches
 legacy hexorl.model import audit: no matches
 runtime old model-class API audit: no matches
 old self-play pair helper/direct pair-head audit: no matches
+explicit graph-native output head smoke: ['policy_place', 'value']
 Python/src/hexorl/model exists: False
 ```
 
 Performance smoke:
 
 ```text
-graph_response_decode_pair_metadata rows legal=216 pair=256 iterations=300 mean_ms=0.0879 median_ms=0.0867 p95_ms=0.0933
+graph_response_decode_pair_metadata rows legal=216 pair=256 iterations=300 mean_ms=0.0883 median_ms=0.0863 p95_ms=0.0970
 ```
 
 ## Stop Rule Notes
@@ -138,10 +141,11 @@ metadata, and final performance evidence has been recorded.
 Additional evidence gathered during the pass:
 
 ```text
-Stage 4 focused tests: 10 passed
-full Python suite: 316 passed, 1 warning
+Stage 4 focused tests: 11 passed
+full Python suite: 317 passed, 1 warning
 Rust workspace: 177 passed, 6 ignored, 2 doc-tests passed
 runtime import/deletion audits: clean
+explicit graph-native output-head gate smoke: clean
 ```
 
 ## Explicit Completeness Statement

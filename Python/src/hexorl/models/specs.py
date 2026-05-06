@@ -372,9 +372,6 @@ def resolve_outputs(
         if spec.sparse_policy_capable and "sparse_policy" not in outputs:
             outputs.append("sparse_policy")
 
-    if spec.global_graph and not any(name.startswith("lookahead_") for name in outputs):
-        outputs.extend(f"lookahead_{int(h)}" for h in lookahead_horizons)
-
     for required in spec.selfplay_required_outputs:
         if required not in outputs:
             raise ValueError(
