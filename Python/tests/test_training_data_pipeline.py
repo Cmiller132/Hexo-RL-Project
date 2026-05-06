@@ -1470,6 +1470,60 @@ def test_graph_pair_training_accepts_sparse_search_observed_first_placement_targ
     assert aux["pair_policy_weight"][0] == pytest.approx(1.0)
 
 
+def test_sampler_masks_positive_opp_policy_weight_when_target_missing():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+        is_full_search=True,
+        opp_policy_weight=1.0,
+    )
+    buffer = RingBuffer(capacity=4)
+    buffer.append(rec)
+    dataset = ReplayDataset(buffer, batch_size=1, use_symmetry=False)
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["opp_policy"][0].sum() == pytest.approx(0.0)
+    assert aux["opp_policy_weight"][0] == pytest.approx(0.0)
+    total, per_head = _compute_losses(
+        {"opp_policy": torch.zeros(1, BOARD_SIZE * BOARD_SIZE, requires_grad=True)},
+        aux,
+        {"opp_policy": 1.0},
+    )
+    assert torch.isfinite(total)
+    assert per_head["opp_policy"].detach() == pytest.approx(0.0)
+
+
+def test_graph_sampler_masks_positive_opp_policy_weight_when_graph_target_missing():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=[(0, 0, 1.0)],
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+        is_full_search=True,
+        opp_policy_weight=1.0,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(
+        buffer,
+        batch_size=1,
+        use_symmetry=False,
+        include_graph_policy=True,
+    )
+
+    _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert aux["opp_legal_mask"][0].any()
+    assert aux["opp_policy_target"][0].sum() == pytest.approx(0.0)
+    assert aux["opp_policy_weight"][0] == pytest.approx(0.0)
+
+
 def test_sparse_policy_loss_masks_invalid_candidates():
     logits = torch.tensor([[0.0, 2.0, -5.0], [1.0, 0.0, 0.0]])
     target = torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])

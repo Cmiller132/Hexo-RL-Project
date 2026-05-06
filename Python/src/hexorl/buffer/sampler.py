@@ -378,6 +378,10 @@ def _graph_pair_targets_have_trainable_mass(graph: GraphBatch) -> bool:
     return False
 
 
+def _graph_opp_policy_target_has_trainable_mass(graph: GraphBatch) -> bool:
+    return float(np.asarray(graph.opp_policy_target, dtype=np.float32).sum()) > 0.0
+
+
 def _py_apply_d6_symmetry(tensor: np.ndarray, sym_idx: int) -> np.ndarray:
     """Pure Python fallback for apply_d6_symmetry.
 
@@ -721,11 +725,12 @@ class ReplayDataset(_IterableDataset):
             policies[i] = policy
             values[i] = rec.to_value_target()
             aux_targets["opp_policy"][i] = opp_policy
-            aux_targets["opp_policy_weight"][i] = (
-                rec.opp_policy_weight
-                if rec.opp_policy_weight > 0.0
-                else (1.0 if float(opp_policy.sum()) > 0.0 else 0.0)
-            )
+            opp_policy_mass = float(opp_policy.sum())
+            aux_targets["opp_policy_weight"][i] = 0.0
+            if opp_policy_mass > 0.0:
+                aux_targets["opp_policy_weight"][i] = (
+                    rec.opp_policy_weight if rec.opp_policy_weight > 0.0 else 1.0
+                )
             aux_targets["regret_rank"][i] = rec.regret_rank
             aux_targets["regret_value"][i] = rec.regret_value
             aux_targets["regret_weight"][i] = rec.regret_weight
@@ -931,6 +936,11 @@ class ReplayDataset(_IterableDataset):
                     opp_legal_moves=[(int(q), int(r)) for q, r in opp_legal_v2] if opp_legal_v2 else None,
                     opp_policy_target=opp_policy_v2,
                 )
+                if (
+                    aux_targets["opp_policy_weight"][i] > 0.0
+                    and not _graph_opp_policy_target_has_trainable_mass(graph)
+                ):
+                    aux_targets["opp_policy_weight"][i] = 0.0
                 if (
                     self.include_pair_policy
                     and int(graph.placements_remaining) >= 2
