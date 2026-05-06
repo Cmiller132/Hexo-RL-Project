@@ -10,6 +10,7 @@ from hexorl.models.registry import (
     normalize_architecture_id,
     resolve_model_spec,
 )
+from hexorl.search.pair_strategy import build_pair_strategy
 
 
 class RunConfig(BaseModel):
@@ -110,28 +111,11 @@ class ModelConfig(BaseModel):
         if not 0.0 <= self.pair_prior_mix <= 1.0:
             raise ValueError("model.pair_prior_mix must be in [0, 1]")
         self.pair_strategy = self.pair_strategy.lower()
-        valid_pair_strategies = {"none", "diagnostic_full_pair"}
-        if self.pair_strategy not in valid_pair_strategies:
-            raise ValueError(
-                "model.pair_strategy must be one of "
-                f"{sorted(valid_pair_strategies)}"
-            )
-        if self.pair_strategy == "none":
-            if self.pair_strategy_max_pairs != 0:
-                raise ValueError(
-                    "model.pair_strategy_max_pairs must be 0 when "
-                    "model.pair_strategy='none'"
-                )
-        else:
-            if self.pair_prior_mix <= 0.0:
-                raise ValueError(
-                    "non-none model.pair_strategy requires model.pair_prior_mix > 0"
-                )
-            if self.pair_strategy_max_pairs <= 0:
-                raise ValueError(
-                    "non-none model.pair_strategy requires "
-                    "model.pair_strategy_max_pairs > 0"
-                )
+        build_pair_strategy(
+            self.pair_strategy,
+            max_pairs=self.pair_strategy_max_pairs,
+            prior_mix=self.pair_prior_mix,
+        )
         invalid_positions = [
             pos for pos in self.attention_positions if pos < 1 or pos > self.blocks
         ]

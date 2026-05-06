@@ -16,6 +16,19 @@ import torch
 from typing import List, Optional, Tuple
 
 from hexorl.config import Config
+from hexorl.inference.adapters import (
+    decode_dense_outputs,
+    decode_global_graph_outputs,
+    sanitize_policy_logits,
+    sanitize_value_logits,
+)
+from hexorl.inference.protocol import (
+    GRAPH_HEAD_OPP,
+    GRAPH_HEAD_PAIR_FIRST,
+    GRAPH_HEAD_PAIR_JOINT,
+    GRAPH_HEAD_PAIR_SECOND,
+    GRAPH_HEAD_REGRET,
+)
 from hexorl.models.assembly import bins_to_value, from_config, load_model_state
 from hexorl.models.registry import resolve_model_spec
 from hexorl.runtime import configure_torch_runtime
@@ -30,13 +43,6 @@ from hexorl.inference.shm_queue import (
     create_inference_queue,
     connect_inference_queue,
 )
-
-
-GRAPH_HEAD_OPP = 1 << 0
-GRAPH_HEAD_PAIR_FIRST = 1 << 1
-GRAPH_HEAD_PAIR_JOINT = 1 << 2
-GRAPH_HEAD_PAIR_SECOND = 1 << 3
-GRAPH_HEAD_REGRET = 1 << 4
 
 
 def _graph_pair_request_is_second_placement(graph_inputs: dict[str, torch.Tensor]) -> bool:
@@ -662,28 +668,19 @@ class InferenceServer:
         model_ms = (time.monotonic() - model_t0) * 1000.0
 
         post_t0 = time.monotonic()
-        p = self._sanitize_policy_logits(out["policy"])
-        value_logits = self._sanitize_value_logits(out["value"])
-        v = torch.nan_to_num(
-            bins_to_value(value_logits).float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp_(-1.0, 1.0)
+        decoded = decode_dense_outputs(
+            out,
+            value_decoder=bins_to_value,
+            sparse_requested=sparse_inputs is not None,
+        )
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
         download_t0 = time.monotonic()
-        policies = p.cpu().numpy()
-        values = v.cpu().numpy()
-        sparse = None
-        pair = None
-        regret = None
-        if sparse_inputs is not None and "sparse_policy" in out:
-            sparse = self._sanitize_policy_logits(out["sparse_policy"]).cpu().numpy()
-        if sparse_inputs is not None and "pair_policy" in out:
-            pair = self._sanitize_policy_logits(out["pair_policy"]).cpu().numpy()
-        if "regret_rank" in out:
-            regret = torch.nan_to_num(out["regret_rank"].detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy()
+        policies = decoded.policy
+        values = decoded.value
+        sparse = decoded.sparse_policy
+        pair = decoded.pair_policy
+        regret = decoded.regret_rank
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -726,35 +723,21 @@ class InferenceServer:
         model_ms = (time.monotonic() - model_t0) * 1000.0
 
         post_t0 = time.monotonic()
-        if "policy_place" not in out:
-            raise RuntimeError("global graph model did not return policy_place")
-        place = self._sanitize_policy_logits(out["policy_place"])
-        value_logits = self._sanitize_value_logits(out["value"])
-        values = torch.nan_to_num(
-            bins_to_value(value_logits).float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp_(-1.0, 1.0)
-        opp = self._sanitize_policy_logits(out["opp_policy"]) if "opp_policy" in out else None
-        pair_first = self._sanitize_policy_logits(out["policy_pair_first"]) if "policy_pair_first" in out else None
-        pair_joint = None
-        pair_second = None
-        if "policy_pair_joint" in out:
-            pair_joint = self._sanitize_policy_logits(out["policy_pair_joint"])
-        if "policy_pair_second" in out:
-            pair_second = self._sanitize_policy_logits(out["policy_pair_second"])
-        regret = out.get("regret_rank")
+        decoded = decode_global_graph_outputs(
+            out,
+            graph_inputs,
+            value_decoder=bins_to_value,
+        )
         post_ms = (time.monotonic() - post_t0) * 1000.0
 
         download_t0 = time.monotonic()
-        place_np = place.cpu().numpy()
-        values_np = values.cpu().numpy()
-        opp_np = opp.cpu().numpy() if opp is not None else None
-        pair_first_np = pair_first.cpu().numpy() if pair_first is not None else None
-        pair_joint_np = pair_joint.cpu().numpy() if pair_joint is not None else None
-        pair_second_np = pair_second.cpu().numpy() if pair_second is not None else None
-        regret_np = regret.detach().float().cpu().numpy().reshape(-1) if regret is not None else None
+        place_np = decoded.policy_place
+        values_np = decoded.value
+        opp_np = decoded.opp_policy
+        pair_first_np = decoded.pair_first
+        pair_joint_np = decoded.pair_joint
+        pair_second_np = decoded.pair_second
+        regret_np = decoded.regret_rank
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -767,22 +750,12 @@ class InferenceServer:
     @staticmethod
     def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
         """Keep policy logits finite before handing them to Rust MCTS."""
-        return torch.nan_to_num(
-            logits.float(),
-            nan=0.0,
-            posinf=80.0,
-            neginf=-80.0,
-        ).clamp_(-80.0, 80.0)
+        return sanitize_policy_logits(logits)
 
     @staticmethod
     def _sanitize_value_logits(logits: torch.Tensor) -> torch.Tensor:
         """Keep value logits finite so softmax cannot produce NaNs."""
-        return torch.nan_to_num(
-            logits.float(),
-            nan=0.0,
-            posinf=80.0,
-            neginf=-80.0,
-        ).clamp_(-80.0, 80.0)
+        return sanitize_value_logits(logits)
 
     def _prepare_host_batch(self):
         """Allocate a reusable staging buffer for request gathering."""

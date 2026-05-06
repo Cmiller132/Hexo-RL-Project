@@ -34,6 +34,13 @@ from hexorl.inference.client import InferenceClient
 from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR_CANDIDATES
 from hexorl.graph.batch import GraphBatch, GraphTokenType, build_graph_batch_from_history
 from hexorl.models.registry import is_global_graph_architecture
+from hexorl.search.engine_adapter import EngineAdapter
+from hexorl.search.pair_strategy import (
+    PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR,
+    PAIR_STRATEGY_NONE,
+    PairStrategy,
+    build_pair_strategy,
+)
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
@@ -50,10 +57,6 @@ PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
 PRIOR_SOURCE_DEFAULT = 3
 PRIOR_SOURCE_PAIR = 4
-PAIR_STRATEGY_NONE = "none"
-PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR = "diagnostic_full_pair"
-
-
 def _align_global_logits_to_rust_legal(
     graph_legal: np.ndarray,
     rust_legal: np.ndarray,
@@ -62,39 +65,12 @@ def _align_global_logits_to_rust_legal(
     context: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return legal rows/logits in the exact order Rust MCTS expects."""
-    graph_legal = np.asarray(graph_legal, dtype=np.int32).reshape(-1, 2)
-    rust_legal = np.asarray(rust_legal, dtype=np.int32).reshape(-1, 2)
-    logits = np.asarray(logits, dtype=np.float32).reshape(-1)
-    if logits.shape[0] < graph_legal.shape[0]:
-        raise ValueError(
-            f"{context}: logits have {logits.shape[0]} rows for "
-            f"{graph_legal.shape[0]} graph legal moves"
-        )
-    if graph_legal.shape != rust_legal.shape:
-        raise ValueError(
-            f"{context}: legal row count mismatch graph={graph_legal.shape[0]} "
-            f"rust={rust_legal.shape[0]}"
-        )
-    if np.array_equal(graph_legal, rust_legal):
-        return rust_legal, logits[: rust_legal.shape[0]]
-
-    graph_index: dict[tuple[int, int], int] = {}
-    duplicate_graph_rows: list[tuple[int, int]] = []
-    for idx, qr in enumerate(graph_legal.tolist()):
-        key = (int(qr[0]), int(qr[1]))
-        if key in graph_index:
-            duplicate_graph_rows.append(key)
-        graph_index[key] = idx
-    rust_keys = [(int(q), int(r)) for q, r in rust_legal.tolist()]
-    missing = [key for key in rust_keys if key not in graph_index]
-    extras = sorted(set(graph_index) - set(rust_keys))
-    if duplicate_graph_rows or missing or extras:
-        raise ValueError(
-            f"{context}: legal_qr set mismatch "
-            f"duplicates={duplicate_graph_rows[:5]} missing={missing[:5]} extra={extras[:5]}"
-        )
-    order = np.asarray([graph_index[key] for key in rust_keys], dtype=np.int64)
-    return rust_legal, logits[order]
+    return EngineAdapter.align_global_logits_to_rust_legal(
+        graph_legal,
+        rust_legal,
+        logits,
+        context=context,
+    )
 
 
 def _validate_global_logits_legal_subset(
@@ -105,29 +81,12 @@ def _validate_global_logits_legal_subset(
     context: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return graph legal rows/logits after proving every row is Rust-legal."""
-    graph_legal = np.asarray(graph_legal, dtype=np.int32).reshape(-1, 2)
-    rust_legal = np.asarray(rust_legal, dtype=np.int32).reshape(-1, 2)
-    logits = np.asarray(logits, dtype=np.float32).reshape(-1)
-    if logits.shape[0] < graph_legal.shape[0]:
-        raise ValueError(
-            f"{context}: policy_place has {logits.shape[0]} rows for "
-            f"{graph_legal.shape[0]} graph legal moves"
-        )
-    seen: set[tuple[int, int]] = set()
-    duplicates: list[tuple[int, int]] = []
-    for q, r in graph_legal.tolist():
-        key = (int(q), int(r))
-        if key in seen:
-            duplicates.append(key)
-        seen.add(key)
-    rust_set = {(int(q), int(r)) for q, r in rust_legal.tolist()}
-    extras = sorted(seen - rust_set)
-    if duplicates or extras:
-        raise ValueError(
-            f"{context}: graph legal rows are not a Rust-legal subset "
-            f"duplicates={duplicates[:5]} extras={extras[:5]}"
-        )
-    return graph_legal, logits[: graph_legal.shape[0]]
+    return EngineAdapter.validate_global_logits_legal_subset(
+        graph_legal,
+        rust_legal,
+        logits,
+        context=context,
+    )
 
 
 def _graph_batch_with_pair_rows(
@@ -195,9 +154,7 @@ def _score_graph_pair_chunks(
             pair_second = legal_tokens[start:stop]
             chunk = _graph_batch_with_pair_rows(graph_batch, pair_first, pair_second)
             out = client.submit_graph(chunk)
-            if "policy_pair_second" not in out:
-                raise ValueError("second-placement graph pair scoring requires policy_pair_second output")
-            logits = np.asarray(out["policy_pair_second"], dtype=np.float32)[:width]
+            logits = PairStrategy.graph_pair_second_logits(out, width)
             pair_qr = np.column_stack([
                 np.full(width, int(first[0]), dtype=np.int32),
                 np.full(width, int(first[1]), dtype=np.int32),
@@ -234,9 +191,7 @@ def _score_graph_pair_chunks(
                         np.asarray(second_rows, dtype=np.int64),
                     )
                     out = client.submit_graph(chunk)
-                    if "policy_pair_joint" not in out:
-                        raise ValueError("first-placement graph pair scoring requires policy_pair_joint output")
-                    logit_chunks.append(np.asarray(out["policy_pair_joint"], dtype=np.float32)[: len(first_rows)])
+                    logit_chunks.append(PairStrategy.graph_pair_joint_logits(out, len(first_rows)))
                     pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
                     first_rows.clear()
                     second_rows.clear()
@@ -248,9 +203,7 @@ def _score_graph_pair_chunks(
                 np.asarray(second_rows, dtype=np.int64),
             )
             out = client.submit_graph(chunk)
-            if "policy_pair_joint" not in out:
-                raise ValueError("first-placement graph pair scoring requires policy_pair_joint output")
-            logit_chunks.append(np.asarray(out["policy_pair_joint"], dtype=np.float32)[: len(first_rows)])
+            logit_chunks.append(PairStrategy.graph_pair_joint_logits(out, len(first_rows)))
             pair_qr_chunks.append(np.asarray(qr_rows, dtype=np.int32))
 
     if not pair_qr_chunks:
@@ -1310,13 +1263,14 @@ class SelfPlayWorker:
             self.near_radius = 8
             self.constrain_threats = False
         self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
-        self.pair_strategy = str(
-            getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)
-        ).lower()
-        self.pair_strategy_max_pairs = int(
-            getattr(cfg.model, "pair_strategy_max_pairs", 0)
+        self._pair_strategy = build_pair_strategy(
+            str(getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)).lower(),
+            max_pairs=int(getattr(cfg.model, "pair_strategy_max_pairs", 0)),
+            prior_mix=self.pair_prior_mix,
         )
-        self.pair_policy_enabled = self.pair_strategy != PAIR_STRATEGY_NONE
+        self.pair_strategy = self._pair_strategy.name
+        self.pair_strategy_max_pairs = self._pair_strategy.max_pairs
+        self.pair_policy_enabled = self._pair_strategy.enabled
         self.candidate_budget = max(
             int(getattr(cfg.model, "candidate_budget", 256)),
             int(sp.policy_target_top_k),
@@ -1345,8 +1299,7 @@ class SelfPlayWorker:
             "event": "pair_strategy_summary",
             "worker_id": int(self.worker_id),
             "model_family": str(getattr(self.cfg.model, "architecture", "")),
-            "pair_strategy": self.pair_strategy,
-            "pair_prior_mix": float(self.pair_prior_mix),
+            **self._pair_strategy.summary(),
             "global_graph_leaf_eval": int(self.global_graph_leaf_eval),
             "pair_rows_possible": int(pair_rows_possible),
             "pair_rows_scored": int(pair_rows_scored),
@@ -1599,11 +1552,14 @@ class SelfPlayWorker:
                         if (
                             self.pair_policy_enabled
                             and root_placements_remaining >= 2
-                            and "policy_pair_first" in graph_out
+                            and self._pair_strategy.has_graph_pair_first(graph_out)
                         ):
                             pair_first_logits = _align_logits_to_qr(
                                 graph_legal,
-                                np.asarray(graph_out["policy_pair_first"], dtype=np.float32),
+                                self._pair_strategy.graph_pair_first_logits(
+                                    graph_out,
+                                    graph_legal.shape[0],
+                                ),
                                 root_child_qr,
                                 context="graph pair-first root priors",
                             )
@@ -1925,10 +1881,13 @@ class SelfPlayWorker:
                                                 source[:] = PRIOR_SOURCE_PAIR
                                     elif int(graph_batch.placements_remaining) >= 2:
                                         pair_blended = False
-                                        if "policy_pair_first" in graph_out:
+                                        if self._pair_strategy.has_graph_pair_first(graph_out):
                                             logits = _blend_action_logits(
                                                 logits[: graph_legal.shape[0]],
-                                                np.asarray(graph_out["policy_pair_first"], dtype=np.float32)[: graph_legal.shape[0]],
+                                                self._pair_strategy.graph_pair_first_logits(
+                                                    graph_out,
+                                                    graph_legal.shape[0],
+                                                ),
                                                 self.pair_prior_mix,
                                             )
                                             pair_blended = True

@@ -8,6 +8,7 @@ only Python call in the MCTS inner loop.
 import time
 import numpy as np
 from typing import Optional
+from hexorl.inference.adapters import decode_graph_slot_response
 from hexorl.inference.shm_queue import (
     MAX_CANDIDATES,
     MAX_GRAPH_ACTIONS,
@@ -18,13 +19,6 @@ from hexorl.inference.shm_queue import (
     InferenceQueue,
     connect_inference_queue,
 )
-
-
-GRAPH_HEAD_OPP = 1 << 0
-GRAPH_HEAD_PAIR_FIRST = 1 << 1
-GRAPH_HEAD_PAIR_JOINT = 1 << 2
-GRAPH_HEAD_PAIR_SECOND = 1 << 3
-GRAPH_HEAD_REGRET = 1 << 4
 
 
 class InferenceClient:
@@ -440,52 +434,13 @@ class InferenceClient:
         self._slot.res_ready.clear()
         self._slot.req_mode[0] = 0
 
-        head_flags = int(self._slot.res_graph_meta[7])
-        results: list[dict[str, np.ndarray | dict[str, object]]] = []
-        for row, ((token_count, legal_count, opp_count, pair_count), (token_off, legal_off, opp_off, pair_off)) in enumerate(
-            zip(counts, offsets)
-        ):
-            meta = {
-                "schema_version": int(self._slot.res_graph_meta[0]),
-                "relation_schema_version": int(self._slot.res_graph_meta[1]),
-                "legal_count": legal_count,
-                "opp_legal_count": opp_count,
-                "pair_count": pair_count,
-                "token_count": token_count,
-                "head_flags": head_flags,
-                "prior_source": "global_graph",
-                "legal_qr": np.array(self._slot.req_graph_legal_qr[legal_off : legal_off + legal_count], copy=True),
-                "legal_mask": np.array(
-                    self._slot.req_graph_legal_mask[legal_off : legal_off + legal_count].astype(bool),
-                    copy=True,
-                ),
-            }
-            result: dict[str, np.ndarray | dict[str, object]] = {
-                "policy_place": np.array(self._slot.res_graph_place_logits[legal_off : legal_off + legal_count], copy=True),
-                "value": np.array(self._slot.res_value[row : row + 1], copy=True),
-                "metadata": meta,
-            }
-            if head_flags & GRAPH_HEAD_OPP:
-                result["opp_policy"] = np.array(self._slot.res_graph_opp_logits[opp_off : opp_off + opp_count], copy=True)
-            if head_flags & GRAPH_HEAD_PAIR_FIRST:
-                result["policy_pair_first"] = np.array(
-                    self._slot.res_graph_pair_first_logits[legal_off : legal_off + legal_count],
-                    copy=True,
-                )
-            if head_flags & GRAPH_HEAD_PAIR_JOINT:
-                result["policy_pair_joint"] = np.array(self._slot.res_graph_pair_logits[pair_off : pair_off + pair_count], copy=True)
-            if head_flags & GRAPH_HEAD_PAIR_SECOND:
-                result["policy_pair_second"] = np.array(
-                    self._slot.res_graph_pair_second_logits[pair_off : pair_off + pair_count],
-                    copy=True,
-                )
-            if head_flags & GRAPH_HEAD_REGRET:
-                result["regret_rank"] = np.array(
-                    getattr(self._slot, "res_graph_regret_rank", np.zeros(MAX_GRAPH_BATCH, dtype=np.float32))[row : row + 1],
-                    copy=True,
-                )
-            results.append(result)
-        return results
+        return decode_graph_slot_response(
+            self._slot,
+            batches,
+            counts,
+            offsets,
+            head_flags=int(self._slot.res_graph_meta[7]),
+        )
 
     @property
     def avg_wait_ms(self) -> float:
