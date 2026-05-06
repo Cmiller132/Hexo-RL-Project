@@ -712,6 +712,26 @@ def test_sparse_sampler_outputs_candidate_targets():
     assert aux["sparse_policy_target"][0].sum() == pytest.approx(1.0)
 
 
+def test_replay_dataset_masks_dense_policy_when_v2_target_is_outside_crop():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        policy_target_v2=[(-45, 5, 1.0)],
+        root_value=0.0,
+        player=0,
+        outcome=1.0,
+        is_full_search=True,
+    )
+    buffer = RingBuffer(capacity=4, max_policy_v2_entries=8)
+    buffer.append(rec)
+    dataset = ReplayDataset(buffer, batch_size=1, use_symmetry=False)
+
+    _tensors, policies, _values, _lookahead, aux = next(iter(dataset))
+
+    assert policies[0].sum() == pytest.approx(0.0)
+    assert aux["policy_weight"][0] == pytest.approx(0.0)
+
+
 def test_replay_dataset_emits_regret_weight_for_loss_masking():
     rec = PositionRecord(
         move_history=b"",

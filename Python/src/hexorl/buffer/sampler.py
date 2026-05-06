@@ -718,9 +718,11 @@ class ReplayDataset(_IterableDataset):
             aux_targets["moves_left"][i] = np.log1p(max(float(rec.moves_left), 0.0)) / np.log1p(self.max_game_turns)
             aux_targets["moves_left_weight"][i] = 0.0 if rec.outcome == 0.0 else 1.0
             aux_targets["value_weight"][i] = rec.value_weight
-            aux_targets["policy_weight"][i] = 1.0 if rec.is_full_search else 0.0
-            aux_targets["sparse_policy_weight"][i] = aux_targets["policy_weight"][i]
-            aux_targets["pair_policy_weight"][i] = aux_targets["policy_weight"][i]
+            policy_search_weight = 1.0 if rec.is_full_search else 0.0
+            dense_policy_mass = float(policy.sum())
+            aux_targets["policy_weight"][i] = policy_search_weight if dense_policy_mass > 0.0 else 0.0
+            aux_targets["sparse_policy_weight"][i] = policy_search_weight
+            aux_targets["pair_policy_weight"][i] = policy_search_weight
             if int(getattr(rec, "candidate_critical_overflow_count", 0)) > 0:
                 aux_targets["sparse_policy_weight"][i] = 0.0
                 aux_targets["pair_policy_weight"][i] = 0.0
@@ -785,6 +787,8 @@ class ReplayDataset(_IterableDataset):
                     float(cand.missing_mass),
                     1.0 - represented,
                 )
+                if represented <= 0.0:
+                    aux_targets["sparse_policy_weight"][i] = 0.0
                 if self.include_pair_policy and not critical_overflow:
                     legal_list = [(int(q), int(r)) for q, r in legal]
                     legal_set = set(legal_list)
