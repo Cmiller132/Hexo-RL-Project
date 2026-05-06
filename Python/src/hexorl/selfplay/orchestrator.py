@@ -18,6 +18,7 @@ from typing import Optional, List
 from hexorl.config import Config
 from hexorl.inference.server import InferenceServer
 from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+from hexorl.models.registry import resolve_model_spec
 from hexorl.selfplay.worker import SelfPlayWorker
 from hexorl.dashboard.recorder import RunRecorder
 
@@ -58,7 +59,7 @@ class SelfPlayOrchestrator:
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
             **replay_feature_flags(
-                cfg.model.heads,
+                resolve_model_spec(cfg).outputs,
                 architecture=cfg.model.architecture,
                 sparse_policy=cfg.model.sparse_policy,
             ),

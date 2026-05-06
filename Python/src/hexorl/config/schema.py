@@ -2,14 +2,15 @@
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List
-import warnings
 
 from hexorl.models.registry import (
     architecture_ids,
     architecture_spec,
+    deprecated_aliases,
     normalize_architecture_id,
     resolve_model_spec,
 )
+from hexorl.models.specs import merge_resolved_loss_weights
 from hexorl.search.pair_strategy import build_pair_strategy
 
 
@@ -49,16 +50,11 @@ class ModelConfig(BaseModel):
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
         arch = self.architecture.lower()
-        if arch == "graph":
-            warnings.warn(
-                "model.architecture='graph' is a deprecated crop-compatible alias; "
-                "normalizing to 'graph_hybrid_0'. Use a global_graph_* architecture "
-                "for the first-class global graph contract.",
-                stacklevel=2,
-            )
         try:
             arch = normalize_architecture_id(arch)
         except ValueError as exc:
+            if arch in deprecated_aliases():
+                raise ValueError(str(exc)) from exc
             raise ValueError(
                 "model.architecture must be one of "
                 f"{sorted(architecture_ids())}"
@@ -221,12 +217,6 @@ class Config(BaseModel):
                 "buffer.lookahead_horizons and buffer.lookahead_lambdas must have the same length"
             )
 
-        if (
-            architecture_spec(self.model.architecture).global_graph
-            and list(self.model.heads) == ["policy", "value"]
-        ):
-            self.model.heads = ["policy_place", "value", "lookahead_*"]
-
         configured_horizons = {f"lookahead_{h}" for h in self.buffer.lookahead_horizons}
         model_lookahead_heads = {
             head for head in self.model.heads if head.startswith("lookahead_") and head != "lookahead_*"
@@ -243,7 +233,6 @@ class Config(BaseModel):
                 "the config is not auto-mutated"
             )
         resolved = resolve_model_spec(self)
-        self.model.heads = list(resolved.outputs)
         if self.model.pair_strategy != "none":
             if not resolved.pair_capabilities:
                 raise ValueError(
@@ -265,36 +254,17 @@ class Config(BaseModel):
                 "(max(model.candidate_budget, selfplay.policy_target_top_k))"
             )
         trainable_heads = {
-            "policy",
-            "sparse_policy",
-            "pair_policy",
-            "opp_policy",
-            "value",
-            "regret_rank",
-            "regret_value",
-            "axis",
-            "axis_delta_norm",
-            "moves_left",
-            "policy_place",
-            "policy_pair_first",
-            "policy_pair_second",
-            "policy_pair_joint",
-            "legal_token_quality",
-            "tactical",
+            name
+            for name, contract in resolved.output_contracts.items()
+            if contract.trainable and not contract.diagnostic_only
         }
-        for name, weight in resolved.default_loss_weights.items():
-            if name.startswith("lookahead_"):
-                if not resolved.global_graph:
-                    continue
-                weight = self.train.loss_weights.get("value", weight)
-                weight = float(weight) * 0.1
-            self.train.loss_weights.setdefault(name, weight)
+        effective_loss_weights = merge_resolved_loss_weights(resolved, self.train.loss_weights)
         graph_auto_heads = set(resolved.outputs)
         missing_or_inactive = sorted(
             head
             for head in graph_auto_heads
             if (head in trainable_heads or head.startswith("lookahead_"))
-            and float(self.train.loss_weights.get(head, 0.0)) <= 0.0
+            and float(effective_loss_weights.get(head, 0.0)) <= 0.0
         )
         if missing_or_inactive:
             raise ValueError(
@@ -302,7 +272,7 @@ class Config(BaseModel):
                 f"missing or inactive: {missing_or_inactive}"
             )
         regret_heads_active = all(
-            head in self.model.heads and float(self.train.loss_weights.get(head, 0.0)) > 0.0
+            head in resolved.outputs and float(effective_loss_weights.get(head, 0.0)) > 0.0
             for head in ("regret_rank", "regret_value")
         )
         if (

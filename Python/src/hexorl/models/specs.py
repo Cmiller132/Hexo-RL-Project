@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Mapping, Sequence
 
-from hexorl.models.contracts import (
+from hexorl.contracts import (
     OutputContract,
     ROW_TABLE_DEFINITIONS,
     RowTableDefinition,
@@ -109,6 +109,22 @@ class ResolvedArchitectureSpec:
     @property
     def pair_capabilities(self) -> tuple[str, ...]:
         return self.spec.pair_capabilities
+
+
+def merge_resolved_loss_weights(
+    resolved: ResolvedArchitectureSpec,
+    configured_loss_weights: Mapping[str, float],
+) -> dict[str, float]:
+    """Return effective loss weights without mutating config objects."""
+
+    merged = dict(configured_loss_weights)
+    for name, weight in resolved.default_loss_weights.items():
+        if name.startswith("lookahead_"):
+            if not resolved.global_graph:
+                continue
+            weight = float(merged.get("value", weight)) * 0.1
+        merged.setdefault(name, weight)
+    return merged
 
 
 def output_contracts_for(names: Sequence[str]) -> dict[str, OutputContract]:
@@ -347,6 +363,8 @@ def resolve_outputs(
 ) -> tuple[tuple[str, ...], Mapping[str, str]]:
     requested = list(requested_heads or spec.default_outputs)
     aliases: dict[str, str] = {}
+    if spec.global_graph and requested == ["policy", "value"]:
+        requested = ["policy_place", "value", LOOKAHEAD_FAMILY]
     if spec.global_graph:
         translated = []
         for head in requested:

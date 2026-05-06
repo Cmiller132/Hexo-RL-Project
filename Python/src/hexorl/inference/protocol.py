@@ -11,7 +11,7 @@ from typing import Mapping
 
 import numpy as np
 
-from hexorl.models.contracts import (
+from hexorl.contracts import (
     ROW_TABLE_DEFINITIONS,
     RowTableInstance,
     ValueDecoderContract,

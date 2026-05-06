@@ -9,7 +9,7 @@ from hexorl.buffer.sampler import ReplayDataset
 from hexorl.config import Config
 from hexorl.models.assembly import build_model_from_config
 from hexorl.selfplay.records import PositionRecord, action_to_board_index
-from hexorl.train.adapters import prepare_dense_training_batch, prepare_global_graph_training_batch
+from hexorl.replay.training_batch import prepare_dense_training_batch, prepare_global_graph_training_batch
 from hexorl.train.loss_plan import LossContractError, build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.train.trainer import Trainer

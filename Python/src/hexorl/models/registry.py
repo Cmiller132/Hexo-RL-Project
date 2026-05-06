@@ -18,13 +18,13 @@ _SPECS: dict[str, ArchitectureSpec] = {
     "cnn": dense_spec(
         "cnn",
         family_id="cnn",
-        recipe_id="legacy_dense_cnn",
+        recipe_id="dense_cnn",
         description="KataGo-style dense crop CNN.",
     ),
     "restnet": dense_spec(
         "restnet",
         family_id="restnet",
-        recipe_id="legacy_restnet",
+        recipe_id="restnet",
         description="Dense crop CNN with configured spatial transformer blocks.",
         requires_attention_head_divisibility=True,
         supports_attention_positions=True,
@@ -32,7 +32,7 @@ _SPECS: dict[str, ArchitectureSpec] = {
     "graph_hybrid_0": dense_spec(
         "graph_hybrid_0",
         family_id="crop_sparse_graph_hybrid",
-        recipe_id="legacy_graph_hybrid_0",
+        recipe_id="graph_hybrid_0",
         description="Crop-compatible sparse graph hybrid scout.",
         replay_sparse_diagnostics=True,
         requires_attention_head_divisibility=True,
@@ -40,49 +40,49 @@ _SPECS: dict[str, ArchitectureSpec] = {
     "global_graph_option1": global_graph_spec(
         "global_graph_option1",
         family_id="relation_graph",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Relation-biased global graph over legal action rows.",
         relation_required=True,
     ),
     "global_xattn_0": global_graph_spec(
         "global_xattn_0",
         family_id="context_cross_attention",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Global graph with legal-to-context cross attention.",
         relation_required=False,
     ),
     "global_line_window_0": global_graph_spec(
         "global_line_window_0",
         family_id="line_window_cover",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Global graph with line/window tactical gating.",
         relation_required=True,
     ),
     "global_pair_twostage_0": global_graph_spec(
         "global_pair_twostage_0",
         family_id="pair_two_stage",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Global graph with pair-specific refinement heads.",
         relation_required=False,
     ),
     "global_graph_full_0": global_graph_spec(
         "global_graph_full_0",
         family_id="full_relation_graph",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Full relation global graph variant.",
         relation_required=True,
     ),
     "global_hybrid_action_0": global_graph_spec(
         "global_hybrid_action_0",
         family_id="crop_diagnostic_global_action",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Global graph with optional crop action context.",
         relation_required=False,
     ),
     "global_graph768_champion": global_graph_spec(
         "global_graph768_champion",
         family_id="scaled_relation_graph",
-        recipe_id="legacy_global_graph",
+        recipe_id="global_graph",
         description="Scaled global graph champion recipe.",
         relation_required=True,
     ),
@@ -91,8 +91,8 @@ _SPECS: dict[str, ArchitectureSpec] = {
 _ALIASES: dict[str, AliasDecision] = {
     "graph": AliasDecision(
         alias="graph",
-        target="graph_hybrid_0",
-        decision="deprecated crop-compatible config alias; delete before Stage 4",
+        target=None,
+        decision="deleted deprecated crop-compatible alias; use 'graph_hybrid_0'",
         runtime_supported=False,
     )
 }
@@ -114,12 +114,10 @@ def deprecated_aliases() -> Mapping[str, AliasDecision]:
     return dict(_ALIASES)
 
 
-def normalize_architecture_id(architecture: object, *, allow_alias: bool = True) -> str:
+def normalize_architecture_id(architecture: object) -> str:
     arch = str(architecture).lower()
     if arch in _SPECS:
         return arch
-    if allow_alias and arch in _ALIASES and _ALIASES[arch].target is not None:
-        return str(_ALIASES[arch].target)
     if arch in _ALIASES:
         decision = _ALIASES[arch]
         raise ValueError(
@@ -129,8 +127,8 @@ def normalize_architecture_id(architecture: object, *, allow_alias: bool = True)
     raise ValueError(f"unknown model architecture {architecture!r}")
 
 
-def architecture_spec(architecture: object, *, allow_alias: bool = True) -> ArchitectureSpec:
-    return _SPECS[normalize_architecture_id(architecture, allow_alias=allow_alias)]
+def architecture_spec(architecture: object) -> ArchitectureSpec:
+    return _SPECS[normalize_architecture_id(architecture)]
 
 
 def is_global_graph_architecture(architecture: object) -> bool:
@@ -148,7 +146,7 @@ def is_graph_architecture(architecture: object) -> bool:
 
 
 def global_graph_family(architecture: object) -> str:
-    spec = architecture_spec(architecture, allow_alias=False)
+    spec = architecture_spec(architecture)
     if not spec.global_graph:
         raise ValueError(f"{architecture!r} is not a global graph architecture")
     return spec.family_id

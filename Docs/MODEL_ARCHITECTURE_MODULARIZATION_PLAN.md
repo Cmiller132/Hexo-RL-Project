@@ -8,11 +8,25 @@ The plan is intentionally not a legacy-support migration. Current behavior will 
 
 The target is a clean rewrite in four bounded stages, with temporary transition adapters allowed only when they directly support cutover evidence and are deleted before final acceptance.
 
-## Rechecked Codebase Claims
+## Implementation Status
 
-The plan below was checked against the current source layout and these claims are grounded in codebase searches.
+As of the 2026-05-06 cleanup pass, this plan has been implemented. The current
+runtime authority is `Python/src/hexorl/models/`, boundary contracts are owned
+by `Python/src/hexorl/contracts/`, replay-to-training batch conversion is owned
+by `Python/src/hexorl/replay/`, and the old `Python/src/hexorl/model/` package
+has been deleted. The deprecated `graph` architecture id is a hard error;
+configs must use `graph_hybrid_0` explicitly.
 
-| Claim | Current evidence |
+The remainder of this document preserves the design intent and the original
+implementation plan. The codebase-claim table below describes the pre-cutover
+state that motivated the rewrite.
+
+## Original Codebase Claims
+
+The plan below was checked against the source layout before implementation, and
+these claims were grounded in codebase searches at that time.
+
+| Claim | Pre-cutover evidence |
 |---|---|
 | Model assembly is currently centralized in the legacy `hexorl/model` package. | `Python/src/hexorl/model/network.py` defines `HexNet` and `build_model_from_config`; `Python/src/hexorl/model/global_graph.py` defines `GlobalHexGraphNet`. |
 | Global graph family membership is currently embedded in model/config/runtime-adjacent code. | `GlobalHexGraphNet.ARCHITECTURES` exists in `model/global_graph.py`; graph-family names are also repeated in config and buffer code. |
@@ -46,13 +60,17 @@ The new architecture authority lives under:
 Python/src/hexorl/models/
 ```
 
-The old package may remain only as temporary implementation source during the cutover:
+During the cutover, the old package could remain only as temporary
+implementation source:
 
 ```text
 Python/src/hexorl/model/
 ```
 
-After cutover, `hexorl/model/` should be deleted or its retained implementation pieces should be moved into the cohesive `hexorl/models/` structure. Runtime-facing code must not use `hexorl.model` as an architecture authority.
+After cutover, `hexorl/model/` should be deleted or its retained
+implementation pieces should be moved into the cohesive `hexorl/models/`
+structure. Runtime-facing code must not use `hexorl.model` as an architecture
+authority. The implemented code follows the deletion path.
 
 ## Design Goals
 

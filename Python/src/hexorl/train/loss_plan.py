@@ -8,7 +8,7 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 import torch
 
-from hexorl.models.contracts import ROW_TABLE_DEFINITIONS, RowTableInstance
+from hexorl.contracts import ROW_TABLE_DEFINITIONS, RowTableInstance
 from hexorl.models.specs import ResolvedArchitectureSpec
 from hexorl.train import losses as primitive
 

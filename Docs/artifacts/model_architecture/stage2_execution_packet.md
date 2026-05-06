@@ -24,19 +24,20 @@ feature decisions through registered specs.
 - [x] Current architecture ids resolve through the registry; the deprecated
   `graph` alias has an explicit deletion decision.
 - [x] Output contracts, row-table definitions, the `RowTableInstance` contract,
-  and value decoder contracts are available from `hexorl.models.contracts`;
+  and value decoder contracts are available from `hexorl.contracts`;
   assembled models carry resolved output contracts, row-table definitions, and
   value decoder metadata.
 - [x] Old architecture-name lists are removed as runtime authority from config,
   buffer, epoch, inference, self-play, eval, dashboard summaries, and runtime
   estimates.
-- [x] Retained legacy PyTorch implementations are imported only by
+- [x] PyTorch family implementations are built only through
   `hexorl.models.recipes`.
 
 ## Runtime Consumers Changed
 
-- `Config` validates architecture ids through `hexorl.models.registry` and
-  rewrites resolved heads from the spec.
+- `Config` validates architecture ids through `hexorl.models.registry`;
+  resolved heads stay in the architecture metadata path instead of being
+  materialized back into config.
 - `RingBuffer` replay feature flags use registry capability metadata.
 - `BufferProcess`, epoch orchestration, self-play, inference, eval, dashboard,
   trainer, and runtime memory estimates now query `hexorl.models`.
@@ -70,8 +71,8 @@ runtime code no longer imports `hexorl.model`, `HexNet`, `GlobalHexGraphNet`,
 ## Stop Rule Results
 
 - All current supported architecture ids resolve through `hexorl.models`.
-- `graph` is explicitly classified as a deprecated config alias targeting
-  `graph_hybrid_0`, with a Stage 4 deletion gate.
+- `graph` is deleted as a runtime architecture alias. Configs must use
+  `graph_hybrid_0` explicitly.
 - Config required-output protection rejects missing dense `policy`, dense
   `value`, global `policy_place`, and global `value`.
 - Direct global-architecture prefix checks and incomplete global architecture
@@ -121,7 +122,7 @@ Commands:
 
 ```powershell
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_model_architecture_stage2.py Python/tests/test_config_and_guardrails.py Python/tests/test_global_graph_contract.py Python/tests/test_inference_server.py Python/tests/test_training_data_pipeline.py Python/tests/test_dashboard_foundation.py Python/tests/test_phase3_autotune.py
-$env:PYTHONPATH='Python/src'; python -m py_compile Python\src\hexorl\models\__init__.py Python\src\hexorl\models\contracts.py Python\src\hexorl\models\specs.py Python\src\hexorl\models\registry.py Python\src\hexorl\models\assembly.py Python\src\hexorl\models\recipes\legacy.py scripts\run_phase3_48h_autotune.py
+$env:PYTHONPATH='Python/src'; python -m py_compile Python\src\hexorl\contracts\__init__.py Python\src\hexorl\models\__init__.py Python\src\hexorl\models\specs.py Python\src\hexorl\models\registry.py Python\src\hexorl\models\assembly.py Python\src\hexorl\models\recipes\family.py scripts\run_phase3_48h_autotune.py
 git diff --check
 ```
 
@@ -146,6 +147,25 @@ Results:
 ```text
 45 passed, 1 warning
 architecture-name authority audit: no matches
+```
+
+## Cleanup Verification Addendum
+
+The follow-up cleanup pass moved contracts to `hexorl.contracts`, moved replay
+training-batch conversion to `hexorl.replay`, deleted the `graph` runtime alias,
+removed permanent `legacy` recipe naming, and stopped materializing resolved
+heads/loss defaults back into config.
+
+Current local evidence from the cleanup pass:
+
+```text
+py_compile for touched model/config/replay/train/inference/runtime/test files: passed
+Config graph alias smoke: hard ValidationError with deleted-alias decision
+global graph default smoke: cfg.model.heads stayed ['policy', 'value']; resolved outputs were policy_place/value/lookahead_4/12/36
+deleted path audit: Python/src/hexorl/model exists: False
+stale import/name audits for removed contract, replay-adapter, and recipe paths: clean
+git diff --check: passed
+pytest rerun: blocked in this shell because the active Python interpreter has no pytest module
 ```
 
 ## Explicit Completeness Statement

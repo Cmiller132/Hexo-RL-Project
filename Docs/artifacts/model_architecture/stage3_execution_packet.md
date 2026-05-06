@@ -36,7 +36,7 @@ to the wrong target, mask, weight, phase, or row table.
   entries, row-table inference, target/mask/weight/phase validation,
   positive-mass validation, duplicate-active-row validation, and loss handler
   dispatch.
-- `Python/src/hexorl/train/adapters.py` defines prepared dense and global graph
+- `Python/src/hexorl/replay/training_batch.py` defines prepared dense and global graph
   training batches, including model inputs, target tensors, inferred row
   tables, graph phase metadata, and required sample weights. Adapter target
   assembly now rejects auxiliary targets that would overwrite prepared
@@ -109,7 +109,7 @@ benchmarks and autotune runs.
 Commands:
 
 ```powershell
-$env:PYTHONPATH='Python/src'; python -m py_compile Python\src\hexorl\train\loss_plan.py Python\src\hexorl\train\adapters.py Python\src\hexorl\train\losses.py Python\src\hexorl\train\trainer.py Python\src\hexorl\graph\batch.py Python\src\hexorl\buffer\sampler.py Python\src\hexorl\models\specs.py Python\tests\test_model_architecture_stage3.py
+$env:PYTHONPATH='Python/src'; python -m py_compile Python\src\hexorl\train\loss_plan.py Python\src\hexorl\replay\training_batch.py Python\src\hexorl\train\losses.py Python\src\hexorl\train\trainer.py Python\src\hexorl\graph\batch.py Python\src\hexorl\buffer\sampler.py Python\src\hexorl\models\specs.py Python\tests\test_model_architecture_stage3.py
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests/test_model_architecture_stage3.py Python/tests/test_training_data_pipeline.py Python/tests/test_global_graph_contract.py Python/tests/test_config_and_guardrails.py::test_compute_losses_raises_when_required_contract_target_is_missing Python/tests/test_production_smoke.py
 $env:PYTHONPATH='Python/src'; python -m pytest -q Python/tests
 $env:PYTHONPATH='Python/src'; @'

@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from hexorl.config import Config
-from hexorl.models.registry import architecture_spec
+from hexorl.models.registry import architecture_spec, resolve_model_spec
 
 
 @dataclass(frozen=True)
@@ -222,7 +222,7 @@ def _train_batch_target(cfg: Config, host: HostProfile) -> int:
 def _estimate_train_peak_gb(cfg: Config, batch_size: int) -> float:
     channels_scale = max(0.25, cfg.model.channels / 128.0)
     blocks_scale = max(0.25, cfg.model.blocks / 16.0)
-    head_scale = max(0.75, len(cfg.model.heads) / 6.0)
+    head_scale = max(0.75, len(resolve_model_spec(cfg).outputs) / 6.0)
     spec = architecture_spec(getattr(cfg.model, "architecture", "cnn"))
     attention_blocks = len(getattr(cfg.model, "attention_positions", []))
     attention_scale = 1.0 + 0.22 * attention_blocks

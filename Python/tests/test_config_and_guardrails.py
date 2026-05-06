@@ -295,10 +295,9 @@ def test_graph_config_validation_and_action_keyed_forward_shapes():
     assert out["sparse_policy"].shape == (2, 3)
 
 
-def test_graph_architecture_alias_maps_to_graph_hybrid_0():
-    with pytest.warns(UserWarning, match="deprecated crop-compatible alias"):
-        cfg = Config.model_validate({"model": {"architecture": "graph"}})
-    assert cfg.model.architecture == "graph_hybrid_0"
+def test_graph_architecture_alias_is_not_runtime_supported():
+    with pytest.raises(ValueError, match="architecture alias 'graph' is not a runtime architecture"):
+        Config.model_validate({"model": {"architecture": "graph"}})
 
 
 def test_hex_conv_invalid_axial_corners_stay_zero_after_optimizer_step():

@@ -19,7 +19,7 @@ from hexorl.inference.protocol import (
     GRAPH_HEAD_PAIR_SECOND,
 )
 from hexorl.models.assembly import bins_to_value
-from hexorl.models.contracts import ValueDecoderContract
+from hexorl.contracts import ValueDecoderContract
 from hexorl.models.loading import build_runtime_model
 from hexorl.models.registry import resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter

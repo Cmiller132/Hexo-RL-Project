@@ -33,7 +33,7 @@ rules visible.
 - `Python/tests/test_config_and_guardrails.py`
   - config lookahead validation;
   - architecture id validation;
-  - `graph` alias classification until Stage 2 decides final behavior;
+  - `graph` alias deletion decision;
   - pair strategy requires explicit strategy/cap;
   - pair heads do not enable pair scoring without strategy;
   - sparse policy config contracts;
@@ -68,8 +68,8 @@ rules visible.
   rewritten in Stage 3. Missing trainable targets should become hard errors; a
   separate diagnostic/optional-output test may cover intentionally omitted
   non-trainable heads.
-- Tests relying on `graph` alias normalization should be rewritten after Stage 2
-  chooses the final alias behavior.
+- Tests relying on `graph` alias normalization should assert the final alias
+  deletion decision: `graph` is not runtime-supported.
 - Tests that assert fallback aliases, including opponent-policy or pair-first
   fallback targets, must be rewritten to assert explicit target contracts.
 - Tests that rely on lookahead fallback to value must be rewritten to assert a
@@ -89,7 +89,8 @@ Stage 2:
 - config cannot disable self-play required policy/value outputs;
 - `lookahead_*` expands from configured horizons;
 - config override enables/disables only supported optional outputs;
-- retained `hexorl/model` implementation is imported only by approved recipes.
+- deleted `hexorl/model` implementation has no runtime imports and no
+  replacement compatibility facade.
 
 Stage 3:
 

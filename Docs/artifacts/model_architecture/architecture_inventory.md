@@ -1,16 +1,16 @@
 # Architecture Inventory
 
-Stage 1 selects `Python/src/hexorl/models/` as the future architecture
-authority. Current implementation authority remains in `Python/src/hexorl/model/`
-until Stage 2 cutover.
+Historical Stage 1 inventory for the architecture-authority cutover. The
+implemented authority now lives in `Python/src/hexorl/models/`; the old
+`Python/src/hexorl/model/` package has been deleted.
 
-## Current Architecture Table
+## Baseline Architecture Table Captured Before Cutover
 
 | Architecture id | Legacy class or constructor | Required input tensors | Optional input tensors | Supported heads | Default heads | Loss defaults | Inference adapter needed | Policy provider needed | Pair capabilities | Current runtime consumers | Decision |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `cnn` | `HexNet` via `build_model_from_config` | dense crop tensor `(B,13,33,33)` | candidate rows for sparse/pair heads | `policy`, `value`, `lookahead_*`, `opp_policy`, `axis`, `axis_delta_norm`, `regret_rank`, `regret_value`, `moves_left`, optional `sparse_policy`, optional `pair_policy` | config default `policy`, `value`; default configs add lookahead and auxiliaries | `TrainConfig.loss_weights`; sparse/pair weights require explicit active entries | dense crop adapter with optional candidate/pair transport | dense policy provider; optional sparse provider | optional crop `pair_policy` only when head is enabled and a pair strategy requests it | trainer, inference server/client, self-play worker, dashboard/eval players, epoch pipeline | keep family, replace authority and adapters |
 | `restnet` | `HexNet` with `SpatialTransformerBlock` at configured positions | dense crop tensor `(B,13,33,33)` | same as `cnn` | same as `cnn` | config-selected heads | same as `cnn` | dense crop adapter with restnet spec metadata | dense/sparse provider | same as `cnn` | config guardrails, trainer, inference, self-play, tuning | keep family, replace authority and assembly |
-| `graph_hybrid_0` | `HexNet` with `SparseHexGraphHybrid0Encoder` | dense crop tensor `(B,13,33,33)` | candidate rows for `sparse_policy` and crop `pair_policy` | same crop heads plus sparse/pair candidate heads | config-selected heads; `graph` alias normalizes here | same as `cnn` | dense/candidate adapter; not true global graph | dense/sparse provider | optional crop pair candidate scorer | config, model, trainer, inference, replay feature flags, tuning | keep as crop-compatible scout, rename metadata as crop-sparse hybrid |
+| `graph_hybrid_0` | `HexNet` with `SparseHexGraphHybrid0Encoder` | dense crop tensor `(B,13,33,33)` | candidate rows for `sparse_policy` and crop `pair_policy` | same crop heads plus sparse/pair candidate heads | config-selected heads; no `graph` alias at runtime | same as `cnn` | dense/candidate adapter; not true global graph | dense/sparse provider | optional crop pair candidate scorer | config, model, trainer, inference, replay feature flags, tuning | keep as crop-compatible scout, rename metadata as crop-sparse hybrid |
 | `global_graph_option1` | `GlobalHexGraphNet` | graph tokens, token types, token qr, token mask, legal token indices, legal mask, relation type, relation bias | opponent legal rows, pair rows, crop tensor | `policy_place`, `value`, `lookahead_*`, `opp_policy`, `policy_pair_first`, `policy_pair_joint`, `policy_pair_second`, `regret_rank`, `regret_value`, `moves_left`, `tactical`, `axis`, `axis_delta_norm`, `legal_token_quality` | config heads plus automatic lookahead horizons | config mutates graph default loss weights | global graph adapter with relation schema and row hashes | global legal-row provider | first/joint/second pair outputs; strategy gated | config, model, trainer, inference, self-play, replay, tests | keep family, move architecture membership to registry |
 | `global_xattn_0` | `GlobalHexGraphNet` family `context_cross_attention` | graph tokens and legal rows; relation tensors accepted but not required by model family | opponent legal rows, pair rows | same as global graph | config heads plus lookahead | same as global graph | global graph adapter without relation-required flag | global legal-row provider | same pair head surface | same as global graph | keep as registered recipe variant |
 | `global_line_window_0` | `GlobalHexGraphNet` family `line_window_cover` | graph tensors plus relation type/bias | opponent legal rows, pair rows | same as global graph | config heads plus lookahead | same as global graph | global graph adapter with relation-required flag | global legal-row provider | same pair head surface | same as global graph | keep as registered recipe variant |
@@ -71,7 +71,7 @@ are not equivalent today.
 | `Python/tests/test_global_graph_contract.py:749-758` | family distinctness assertion | checks four family labels but not every id by name | Assert every registered recipe id resolves expected family, requirements, and outputs. |
 | `Python/tests/test_phase3_autotune.py` global graph assertions | tuning search assumptions about global graph ids | includes an assertion that `global_graph768_champion` is absent from a search result | Rewrite tuning assertions to use registry capability filters and explicit exclusion reasons. |
 
-The exact current mismatch that blocks a blind cutover is:
+The original mismatch that blocked a blind cutover was:
 
 - `global_hybrid_action_0` and `global_graph768_champion` are accepted by
   `GlobalHexGraphNet` and `Config`.
@@ -81,6 +81,6 @@ The exact current mismatch that blocks a blind cutover is:
   so global graph variants are under-reported unless Stage 2 adds spec metadata
   before removing legacy lists.
 
-Stage 2 is ready to begin only with an import/code-search audit proving each
-source above is replaced, deleted, or intentionally quarantined as migration
-tooling outside `Python/src/hexorl/`.
+Stage 2/4 cleanup resolves this by routing architecture membership, replay
+feature flags, dashboard summaries, runtime memory estimates, and family
+construction through `hexorl.models.registry` and `hexorl.models.assembly`.

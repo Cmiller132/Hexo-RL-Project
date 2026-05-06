@@ -25,7 +25,7 @@ from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
 from hexorl.models.assembly import build_model_from_config
-from hexorl.models.registry import is_global_graph_architecture
+from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
 from hexorl.runtime import dataloader_worker_count
 from hexorl.selfplay.orchestrator import run_orchestrator
 from hexorl.selfplay.records import (
@@ -43,7 +43,7 @@ GRAPH_PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pa
 
 
 def _uses_pair_policy_targets(cfg: Config) -> bool:
-    heads = set(getattr(cfg.model, "heads", []))
+    heads = set(resolve_model_spec(cfg).outputs)
     return bool((heads & GRAPH_PAIR_POLICY_HEADS) or "pair_policy" in heads)
 
 
@@ -112,7 +112,7 @@ def run_epoch(
             recency_decay=cfg.buffer.recency_decay,
             num_lookahead=len(cfg.buffer.lookahead_horizons),
             **replay_feature_flags(
-                cfg.model.heads,
+                resolve_model_spec(cfg).outputs,
                 architecture=cfg.model.architecture,
                 sparse_policy=cfg.model.sparse_policy,
             ),
@@ -167,6 +167,7 @@ def run_epoch(
             games = max(1, (needed + 5) // 6)
             replay.extend(_make_bootstrap_positions(cfg, games, start_game_id=replay.max_game_id + 1))
 
+        resolved_outputs = set(resolve_model_spec(cfg).outputs)
         dataset = ReplayDataset(
             replay,
             batch_size=cfg.train.batch_size,
@@ -175,11 +176,11 @@ def run_epoch(
             use_symmetry=True,
             lookahead_horizons=cfg.buffer.lookahead_horizons,
             regret_fraction=cfg.buffer.regret_fraction,
-            include_axis_delta_norm="axis_delta_norm" in cfg.model.heads,
+            include_axis_delta_norm="axis_delta_norm" in resolved_outputs,
             include_sparse_policy=bool(
                 getattr(cfg.model, "sparse_policy", False)
-                or "sparse_policy" in cfg.model.heads
-                or "pair_policy" in cfg.model.heads
+                or "sparse_policy" in resolved_outputs
+                or "pair_policy" in resolved_outputs
             ),
             include_pair_policy=_uses_pair_policy_targets(cfg),
             include_graph_policy=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
@@ -303,13 +304,14 @@ def run_tiny_training_smoke(
             512,
         ),
         **replay_feature_flags(
-            cfg.model.heads,
+            resolve_model_spec(cfg).outputs,
             architecture=cfg.model.architecture,
             sparse_policy=cfg.model.sparse_policy,
         ),
     )
     replay.extend(_make_bootstrap_positions(cfg, 16))
 
+    resolved_outputs = set(resolve_model_spec(cfg).outputs)
     dataset = ReplayDataset(
         replay,
         batch_size=cfg.train.batch_size,
@@ -320,8 +322,8 @@ def run_tiny_training_smoke(
         regret_fraction=cfg.buffer.regret_fraction,
         include_sparse_policy=bool(
             getattr(cfg.model, "sparse_policy", False)
-            or "sparse_policy" in cfg.model.heads
-            or "pair_policy" in cfg.model.heads
+            or "sparse_policy" in resolved_outputs
+            or "pair_policy" in resolved_outputs
         ),
         include_pair_policy=_uses_pair_policy_targets(cfg),
         include_graph_policy=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),

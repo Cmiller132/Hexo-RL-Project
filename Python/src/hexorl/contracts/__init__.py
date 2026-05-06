@@ -1,4 +1,4 @@
-"""Architecture boundary contracts for model modularity."""
+"""Boundary contracts for model, replay, inference, and search semantics."""
 
 from __future__ import annotations
 

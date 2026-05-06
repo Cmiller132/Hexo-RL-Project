@@ -24,7 +24,7 @@ from hexorl.inference.protocol import (
     validate_row_arrays_match,
     value_decoder_metadata,
 )
-from hexorl.models.contracts import ValueDecoderContract
+from hexorl.contracts import ValueDecoderContract
 
 
 ValueDecoderFn = Callable[[torch.Tensor], torch.Tensor]

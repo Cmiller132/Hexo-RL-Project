@@ -1,4 +1,4 @@
-"""Stage 2 recipe wrapper around retained legacy PyTorch implementations."""
+"""Model-family recipe entry points."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _attach_resolved_metadata(model: nn.Module, resolved: ResolvedArchitectureSp
     return model
 
 
-def build_legacy_model(
+def build_model_family(
     cfg,
     resolved: ResolvedArchitectureSpec,
     *,

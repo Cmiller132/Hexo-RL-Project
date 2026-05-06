@@ -19,7 +19,8 @@ from hexorl.config import Config
 from hexorl.models.assembly import is_global_graph_model
 from hexorl.models.loading import restore_model_weights
 from hexorl.models.registry import resolve_model_spec
-from hexorl.train.adapters import (
+from hexorl.models.specs import merge_resolved_loss_weights
+from hexorl.replay.training_batch import (
     prepare_dense_training_batch,
     prepare_global_graph_training_batch,
 )
@@ -86,9 +87,10 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         self._resolved_spec = resolve_model_spec(cfg)
-        self._loss_weights = dict(self.train_cfg.loss_weights)
-        for name, value in self._resolved_spec.default_loss_weights.items():
-            self._loss_weights.setdefault(name, value)
+        self._loss_weights = merge_resolved_loss_weights(
+            self._resolved_spec,
+            self.train_cfg.loss_weights,
+        )
         self._loss_plan = build_loss_plan(self._resolved_spec, self._loss_weights)
         self._n_bins = getattr(model, 'n_bins', getattr(self.model, 'n_bins', 65))
         # Lookahead horizon names derived from buffer config

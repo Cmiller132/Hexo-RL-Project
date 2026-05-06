@@ -18,7 +18,7 @@ import numpy as np
 from hexorl.buffer.ring import RingBuffer, replay_feature_flags
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
-from hexorl.models.registry import is_global_graph_architecture
+from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
 
 
 @dataclass
@@ -84,7 +84,7 @@ class BufferProcess:
             recency_decay=self.cfg.buffer.recency_decay,
             num_lookahead=len(self.cfg.buffer.lookahead_horizons),
             **replay_feature_flags(
-                self.cfg.model.heads,
+                resolve_model_spec(self.cfg).outputs,
                 architecture=self.cfg.model.architecture,
                 sparse_policy=self.cfg.model.sparse_policy,
                 graph=is_global_graph_architecture(getattr(self.cfg.model, "architecture", "")),

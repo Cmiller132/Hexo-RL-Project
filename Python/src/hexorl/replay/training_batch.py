@@ -1,4 +1,4 @@
-"""Training batch adapters that bind model inputs to target contracts."""
+"""Training batch conversion that binds replay data to target contracts."""
 
 from __future__ import annotations
 

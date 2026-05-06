@@ -4,7 +4,7 @@ import pytest
 
 from hexorl.config import Config
 from hexorl.models.assembly import build_model_from_config
-from hexorl.models.contracts import RowTableInstance
+from hexorl.contracts import RowTableInstance
 from hexorl.models.registry import (
     architecture_ids,
     architecture_spec,
@@ -45,8 +45,10 @@ def test_stage2_registry_resolves_all_current_architectures_and_alias_decision()
         "global_graph_full_0",
         "global_graph768_champion",
     }
-    assert deprecated_aliases()["graph"].target == "graph_hybrid_0"
+    assert deprecated_aliases()["graph"].target is None
     assert deprecated_aliases()["graph"].runtime_supported is False
+    with pytest.raises(ValueError, match="architecture alias 'graph' is not a runtime architecture"):
+        Config.model_validate({"model": {"architecture": "graph"}})
 
 
 def test_stage2_every_architecture_exposes_search_policy_and_value_capabilities():
@@ -72,8 +74,8 @@ def test_stage2_global_default_heads_are_spec_resolved_not_policy_alias():
     )
     resolved = resolve_model_spec(cfg)
 
-    assert cfg.model.heads[:2] == ["policy_place", "value"]
     assert "policy" not in resolved.outputs
+    assert resolved.outputs[:2] == ("policy_place", "value")
     assert {"lookahead_4", "lookahead_12", "lookahead_36"} <= set(resolved.outputs)
     assert resolved.output_contracts["policy_place"].row_family == "legal"
     assert resolved.value_decoder.name == "binned_expected_value_65"

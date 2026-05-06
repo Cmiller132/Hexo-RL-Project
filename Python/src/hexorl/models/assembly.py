@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from hexorl.models.recipes import build_legacy_model
+from hexorl.models.recipes import build_model_family
 from hexorl.models.recipes import bins_to_value as _bins_to_value
 from hexorl.models.recipes import load_model_state as _load_model_state
 from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
@@ -19,7 +19,7 @@ def build_model_from_config(
     inference: bool = False,
 ) -> nn.Module:
     resolved = resolve_model_spec(cfg)
-    model = build_legacy_model(cfg, resolved, device=device, inference=inference)
+    model = build_model_family(cfg, resolved, device=device, inference=inference)
     return model
 
 

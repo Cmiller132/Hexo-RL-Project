@@ -34,8 +34,8 @@ Get-ChildItem -Path Python\src\hexorl -Recurse -File -Include *.py |
 Result:
 
 ```text
-Python/src/hexorl/train/adapters.py:22: def prepare_dense_training_batch(
-Python/src/hexorl/train/adapters.py:55: def prepare_global_graph_training_batch(
+Python/src/hexorl/replay/training_batch.py:22: def prepare_dense_training_batch(
+Python/src/hexorl/replay/training_batch.py:55: def prepare_global_graph_training_batch(
 Python/src/hexorl/train/losses.py:352: def compute_losses(
 Python/src/hexorl/train/loss_plan.py:83: def build_loss_plan(
 Python/src/hexorl/train/trainer.py:22: prepare_dense_training_batch,
