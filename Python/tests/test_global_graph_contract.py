@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from hexorl.config import Config
+from hexorl.eval.tactical_suite import phase3_tactical_suite_positions
 from hexorl.graph import (
     GRAPH_SCHEMA_VERSION,
     GraphTokenType,
@@ -134,6 +135,27 @@ def test_global_graph_builder_can_use_threat_constrained_engine_legal_rows():
     assert threat_legal.shape[0] < full_legal.shape[0]
     assert {tuple(row) for row in threat_legal.tolist()} == {(-1, 0), (5, 0)}
     assert np.array_equal(graph.legal_qr, threat_legal)
+
+
+def test_global_graph_threat_filter_prefers_immediate_wins_over_setup_cells():
+    position = next(
+        pos for pos in phase3_tactical_suite_positions() if pos.suite == "win-now"
+    )
+    history = _hist(*position.move_history)
+    threat_legal = _engine_legal_from_history(history, constrain_threats=True)
+    expected = set(position.expected_action_set)
+
+    graph = build_graph_batch_from_history(
+        history,
+        constrain_threats=True,
+        include_pair_rows=False,
+    )
+
+    assert expected == {(-1, 0), (5, 0)}
+    assert {tuple(row) for row in threat_legal.tolist()} == expected
+    assert {tuple(row) for row in graph.legal_qr.tolist()} == expected
+    assert (-2, 0) not in expected
+    assert (6, 0) not in expected
 
 
 def test_global_graph_builder_honors_explicit_legal_rows():

@@ -352,10 +352,17 @@ impl PyHexGame {
                 "unblockable"
             }
             TacticalStatus::WinningTurns(turns) => {
-                for turn in turns {
-                    win_now.push(turn.first());
-                    if let Some(second) = turn.second() {
-                        win_now.push(second);
+                for turn in turns.iter().copied() {
+                    if turn.placements() == 1 {
+                        win_now.push(turn.first());
+                    }
+                }
+                if win_now.is_empty() {
+                    for turn in turns {
+                        win_now.push(turn.first());
+                        if let Some(second) = turn.second() {
+                            win_now.push(second);
+                        }
                     }
                 }
                 "winning_turn"
@@ -442,10 +449,17 @@ impl PyHexGame {
             TacticalStatus::WinningTurns(turns) => {
                 let legal = self.inner.legal_moves_near(radius);
                 let mut allowed = Vec::new();
-                for turn in turns {
-                    allowed.push(turn.first());
-                    if let Some(second) = turn.second() {
-                        allowed.push(second);
+                for turn in turns.iter().copied() {
+                    if turn.placements() == 1 {
+                        allowed.push(turn.first());
+                    }
+                }
+                if allowed.is_empty() {
+                    for turn in turns {
+                        allowed.push(turn.first());
+                        if let Some(second) = turn.second() {
+                            allowed.push(second);
+                        }
                     }
                 }
                 let result: Vec<(i32, i32)> = legal

@@ -315,6 +315,16 @@ pub fn tactical_mask_cells(status: &TacticalStatus, out: &mut Vec<Hex>) -> bool 
         TacticalStatus::Quiet | TacticalStatus::Unblockable => return false,
         TacticalStatus::WinningTurns(turns) => {
             for &turn in turns {
+                if turn.placements() == 1 {
+                    out.push(turn.first());
+                }
+            }
+            if !out.is_empty() {
+                out.sort();
+                out.dedup();
+                return true;
+            }
+            for &turn in turns {
                 out.push(turn.first());
                 if let Some(second) = turn.second() {
                     out.push(second);

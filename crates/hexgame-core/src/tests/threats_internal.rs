@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn tactical_status_retains_multiple_winning_singles_for_masks() {
+    fn tactical_status_prefers_immediate_winning_singles_for_masks() {
         let mut game = HexGameState::new();
         game.set_position(
             &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
@@ -460,10 +460,14 @@ mod tests {
         };
         assert!(turns.contains(&Turn::single(Hex::new(-1, 0))));
         assert!(turns.contains(&Turn::single(Hex::new(5, 0))));
+        assert!(turns.contains(&Turn::pair(Hex::new(-2, 0), Hex::new(-1, 0))));
+        assert!(turns.contains(&Turn::pair(Hex::new(5, 0), Hex::new(6, 0))));
 
         let encoded = encode_board(&game, 2, true);
         assert!(encoded.legal_moves().contains(&Hex::new(-1, 0)));
         assert!(encoded.legal_moves().contains(&Hex::new(5, 0)));
+        assert!(!encoded.legal_moves().contains(&Hex::new(-2, 0)));
+        assert!(!encoded.legal_moves().contains(&Hex::new(6, 0)));
     }
 
     #[test]
