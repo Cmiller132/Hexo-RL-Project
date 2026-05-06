@@ -278,7 +278,7 @@ class GlobalHexGraphNet(nn.Module):
             legal_vec = legal_vec + self.legal_cross_attention(legal_vec, x, context_mask)
         elif self.architecture == "global_line_window_0":
             tactical_types = torch.tensor(
-                [int(GraphTokenType.WINDOW6), int(GraphTokenType.LINE), int(GraphTokenType.COVER_SET)],
+                [int(GraphTokenType.WINDOW6)],
                 device=x.device,
             )
             tactical_mask = torch.isin(token_type.to(device=x.device), tactical_types) & mask
@@ -383,7 +383,6 @@ class GlobalHexGraphNet(nn.Module):
             second_active = mask.gather(1, second)
             legal_type = int(GraphTokenType.LEGAL)
             stone_type = int(GraphTokenType.STONE)
-            pair_action_type = int(GraphTokenType.PAIR_ACTION)
             pair_mask = pair_mask & first_active & second_active
             pair_mask = pair_mask & (second_type == legal_type)
             pair_mask = pair_mask & ((first_type == legal_type) | (first_type == stone_type))
@@ -391,18 +390,7 @@ class GlobalHexGraphNet(nn.Module):
                 pair_token_raw = pair_token_indices.to(device=x.device, dtype=torch.long)
                 if pair_token_raw.shape != pair_first_indices.shape:
                     raise ValueError("pair_token_indices must match pair_first_indices shape")
-                materialized_pair_token = pair_token_raw >= 0
-                pair_token = pair_token_raw.clamp(0, max(x.shape[1] - 1, 0))
-                pair_token_type = token_type_device.gather(1, pair_token)
-                pair_token_active = mask.gather(1, pair_token)
-                pair_mask = pair_mask & (
-                    (~materialized_pair_token)
-                    | (
-                        (pair_token_raw < x.shape[1])
-                        & pair_token_active
-                        & (pair_token_type == pair_action_type)
-                    )
-                )
+                pair_mask = pair_mask & (pair_token_raw < 0)
             first_vec = x.gather(1, first.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             second_vec = x.gather(1, second.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
             state_pair = state.unsqueeze(1).expand_as(first_vec)

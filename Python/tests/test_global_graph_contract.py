@@ -18,7 +18,18 @@ from hexorl.graph import (
     transform_policy_target,
     transform_qr,
 )
-from hexorl.graph.batch import graph_capacity_report, validate_graph_ipc_capacity
+from hexorl.graph.batch import (
+    GRAPH_FEATURE_DIM,
+    GRAPH_FEATURE_LEGAL_WINDOW_COUNT,
+    GRAPH_FEATURE_NEAREST_OPPONENT,
+    GRAPH_FEATURE_NEAREST_OWN,
+    GRAPH_FEATURE_WINDOW_AXIS,
+    GRAPH_FEATURE_WINDOW_EMPTY_COUNT,
+    GRAPH_FEATURE_WINDOW_OWNER_RELATIVE,
+    GRAPH_FEATURE_WINDOW_STONE_COUNT,
+    graph_capacity_report,
+    validate_graph_ipc_capacity,
+)
 from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.models.assembly import build_model_from_config
 from hexorl.models.families.global_graph import GlobalHexGraphNet
@@ -245,34 +256,40 @@ def test_global_graph_builder_includes_required_token_families_and_relations():
     graph = build_graph_batch_from_history(history, radius=2)
     token_types = set(int(x) for x in graph.token_type.tolist())
 
-    for token_type in [
+    assert token_types == {
+        int(GraphTokenType.STATE),
+        int(GraphTokenType.TURN),
+        int(GraphTokenType.STONE),
+        int(GraphTokenType.LEGAL),
+        int(GraphTokenType.WINDOW6),
+    }
+    for token_type in (
         GraphTokenType.STATE,
         GraphTokenType.TURN,
-        GraphTokenType.PLAYER,
         GraphTokenType.STONE,
         GraphTokenType.LEGAL,
         GraphTokenType.WINDOW6,
-        GraphTokenType.LINE,
-        GraphTokenType.COMPONENT,
-    ]:
+    ):
         assert int(token_type) in token_types
     assert graph.relation_type.shape == (graph.token_type.shape[0], graph.token_type.shape[0])
     assert graph.relation_bias.shape[1:] == graph.relation_type.shape
 
 
-def test_global_graph_features_expose_rich_token_family_fields():
+def test_global_graph_features_expose_minimal_token_family_fields():
     graph = build_graph_batch_from_history(_hist((0, 0, 0), (1, 1, 0), (1, 0, 1)))
-    assert graph.schema_version >= 2
-    assert graph.token_features.shape[1] >= 48
+    assert graph.schema_version >= 3
+    assert graph.token_features.shape[1] == GRAPH_FEATURE_DIM
     legal_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.LEGAL))
     assert legal_rows.size > 0
-    assert np.any(graph.token_features[legal_rows, 16:19] > 0.0)
+    assert np.any(graph.token_features[legal_rows, GRAPH_FEATURE_NEAREST_OWN] > 0.0)
+    assert np.any(graph.token_features[legal_rows, GRAPH_FEATURE_NEAREST_OPPONENT] > 0.0)
+    assert np.any(graph.token_features[legal_rows, GRAPH_FEATURE_LEGAL_WINDOW_COUNT] > 0.0)
     window_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.WINDOW6))
     assert window_rows.size > 0
-    assert np.any(graph.token_features[window_rows, 19:21] > 0.0)
-    line_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.LINE))
-    assert line_rows.size > 0
-    assert np.any(graph.token_features[line_rows, 21:25] > 0.0)
+    assert np.any(np.abs(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_OWNER_RELATIVE]) > 0.0)
+    assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_STONE_COUNT] > 0.0)
+    assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_EMPTY_COUNT] > 0.0)
+    assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_AXIS] > 0.0)
 
 
 def test_global_graph_capacity_report_fails_without_dropping_rows():
@@ -296,7 +313,7 @@ def test_global_graph_capacity_report_fails_without_dropping_rows():
     assert int(RelationType.SAME_LINE) in set(int(x) for x in graph.relation_type.reshape(-1).tolist())
 
 
-def test_global_graph_relation_bias_contract_includes_cover_pair_and_component_edges():
+def test_global_graph_relation_bias_contract_includes_minimal_edges():
     history = _hist(
         (0, 0, 0),
         (1, 0, 1),
@@ -311,12 +328,9 @@ def test_global_graph_relation_bias_contract_includes_cover_pair_and_component_e
         history,
         radius=2,
         pair_policy_target=[((3, 0), (4, 0), 1.0)],
-        materialize_pair_context_tokens=True,
     )
     relation_ids = set(int(x) for x in graph.relation_type.reshape(-1).tolist())
 
-    assert int(GraphTokenType.COVER_SET) in set(int(x) for x in graph.token_type.tolist())
-    assert int(GraphTokenType.PAIR_ACTION) in set(int(x) for x in graph.token_type.tolist())
     for relation in [
         RelationType.DISTANCE_BUCKET,
         RelationType.DIRECTION_BUCKET,
@@ -325,11 +339,6 @@ def test_global_graph_relation_bias_contract_includes_cover_pair_and_component_e
         RelationType.SAME_WINDOW6,
         RelationType.STONE_IN_WINDOW6,
         RelationType.LEGAL_IN_WINDOW6,
-        RelationType.LEGAL_IN_COVER_SET,
-        RelationType.WINDOW6_TO_COVER_SET,
-        RelationType.LINE_TO_WINDOW6,
-        RelationType.LEGAL_TO_PAIR_ACTION,
-        RelationType.SAME_COMPONENT,
         RelationType.AGE_ORDER_BUCKET,
         RelationType.RECENT_MOVE_RELATION,
         RelationType.FIRST_SECOND_PAIR_RELATION,
@@ -337,6 +346,16 @@ def test_global_graph_relation_bias_contract_includes_cover_pair_and_component_e
     ]:
         assert int(relation) in relation_ids
     assert np.isfinite(graph.relation_bias).all()
+
+
+def test_global_graph_rejects_materialized_pair_context_tokens():
+    with pytest.raises(ValueError, match="PAIR_ACTION context tokens were removed"):
+        build_graph_batch_from_history(
+            _hist((0, 0, 0)),
+            materialize_pair_context_tokens=True,
+            max_pair_rows=1,
+            allow_pair_truncation=True,
+        )
 
 
 def test_global_graph_legal_budget_preserves_positive_policy_rows():

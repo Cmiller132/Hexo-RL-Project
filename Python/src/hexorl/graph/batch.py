@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import IntEnum
-import itertools
 import struct
 from typing import Iterable, Sequence
 
@@ -18,39 +17,35 @@ import numpy as np
 from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
 
 
-GRAPH_SCHEMA_VERSION = 2
-GRAPH_FEATURE_DIM = 48
-GRAPH_FEATURE_PLACEMENTS_REMAINING = 6
-RELATION_SCHEMA_VERSION = 1
+GRAPH_SCHEMA_VERSION = 3
+GRAPH_FEATURE_DIM = 12
+GRAPH_FEATURE_PLACEMENTS_REMAINING = 0
+GRAPH_FEATURE_CURRENT_PLAYER = 1
+GRAPH_FEATURE_OWNER_RELATIVE = 2
+GRAPH_FEATURE_MOVE_AGE = 3
+GRAPH_FEATURE_NEAREST_OWN = 4
+GRAPH_FEATURE_NEAREST_OPPONENT = 5
+GRAPH_FEATURE_WINDOW_OWNER_RELATIVE = 6
+GRAPH_FEATURE_WINDOW_STONE_COUNT = 7
+GRAPH_FEATURE_WINDOW_EMPTY_COUNT = 8
+GRAPH_FEATURE_WINDOW_AXIS = 9
+GRAPH_FEATURE_LEGAL_WINDOW_COUNT = 10
+RELATION_SCHEMA_VERSION = 2
 PAIR_CHUNK_LIMIT = 4096
 GRAPH_IPC_TOKEN_CAPACITY = 4096
 GRAPH_IPC_ACTION_CAPACITY = 4096
 GRAPH_IPC_PAIR_CAPACITY = PAIR_CHUNK_LIMIT
 GRAPH_CAPACITY_STRATEGY = "preserve_legal_stone_tactical_rows_fail_or_chunk_context"
 HEX_DIRECTIONS: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
-NEIGHBOR_DIRECTIONS: tuple[tuple[int, int], ...] = (
-    (1, 0),
-    (1, -1),
-    (0, -1),
-    (-1, 0),
-    (-1, 1),
-    (0, 1),
-)
 WIN_LENGTH = 6
 
 
 class GraphTokenType(IntEnum):
     STATE = 0
     TURN = 1
-    PLAYER = 2
-    STONE = 3
-    LEGAL = 4
-    HOT_CELL = 5
-    WINDOW6 = 6
-    LINE = 7
-    COVER_SET = 8
-    COMPONENT = 9
-    PAIR_ACTION = 10
+    STONE = 2
+    LEGAL = 3
+    WINDOW6 = 4
 
 
 class RelationType(IntEnum):
@@ -62,12 +57,6 @@ class RelationType(IntEnum):
     SAME_WINDOW6 = 5
     STONE_IN_WINDOW6 = 6
     LEGAL_IN_WINDOW6 = 7
-    LEGAL_IN_COVER_SET = 8
-    WINDOW6_TO_COVER_SET = 9
-    LINE_TO_WINDOW6 = 10
-    LEGAL_TO_PAIR_ACTION = 11
-    PAIR_COVERS_THREAT_SET = 12
-    SAME_COMPONENT = 13
     AGE_ORDER_BUCKET = 14
     RECENT_MOVE_RELATION = 15
     FIRST_SECOND_PAIR_RELATION = 16
@@ -301,15 +290,6 @@ def legal_moves_for_stones(stones: dict[tuple[int, int], int], radius: int = 8) 
     return sorted(legal, key=lambda qr: (hex_distance(qr), qr[0], qr[1]))
 
 
-def _line_id(qr: tuple[int, int], axis: int) -> int:
-    q, r = qr
-    if axis == 0:
-        return r
-    if axis == 1:
-        return q
-    return q + r
-
-
 def _window_cells(start: tuple[int, int], axis: int) -> list[tuple[int, int]]:
     dq, dr = HEX_DIRECTIONS[axis]
     q, r = start
@@ -337,80 +317,8 @@ def _active_windows(stones: dict[tuple[int, int], int], legal: Sequence[tuple[in
     return out
 
 
-def _component_ids(stones: dict[tuple[int, int], int]) -> dict[tuple[int, int], int]:
-    remaining = set(stones)
-    comp: dict[tuple[int, int], int] = {}
-    cid = 0
-    while remaining:
-        root = remaining.pop()
-        stack = [root]
-        comp[root] = cid
-        while stack:
-            q, r = stack.pop()
-            for dq, dr in NEIGHBOR_DIRECTIONS:
-                nxt = (q + dq, r + dr)
-                if nxt in remaining:
-                    remaining.remove(nxt)
-                    comp[nxt] = cid
-                    stack.append(nxt)
-        cid += 1
-    return comp
-
-
-def _nearest_distance(
-    qr: tuple[int, int],
-    cells: Iterable[tuple[int, int]],
-    *,
-    default: int = 64,
-) -> int:
-    best = default
-    for cell in cells:
-        best = min(best, hex_distance(qr, cell))
-    return best
-
-
-def _line_stats(
-    qr: tuple[int, int],
-    axis: int,
-    stones: dict[tuple[int, int], int],
-    player: int,
-) -> tuple[int, int, int, int]:
-    """Return own/opponent counts and longest contiguous runs on one line."""
-    line = _line_id(qr, axis)
-    own = opp = 0
-    own_run = opp_run = 0
-    for cell, owner in stones.items():
-        if _line_id(cell, axis) != line:
-            continue
-        if owner == player:
-            own += 1
-        else:
-            opp += 1
-    for owner in (player, 1 - player):
-        best = 0
-        for cell, cell_owner in stones.items():
-            if cell_owner != owner or _line_id(cell, axis) != line:
-                continue
-            dq, dr = HEX_DIRECTIONS[axis]
-            prev = (cell[0] - dq, cell[1] - dr)
-            if stones.get(prev) == owner:
-                continue
-            run = 1
-            nxt = (cell[0] + dq, cell[1] + dr)
-            while stones.get(nxt) == owner:
-                run += 1
-                nxt = (nxt[0] + dq, nxt[1] + dr)
-            best = max(best, run)
-        if owner == player:
-            own_run = best
-        else:
-            opp_run = best
-    return own, opp, own_run, opp_run
-
-
 def _features(
     token_type: GraphTokenType,
-    qr: tuple[int, int],
     *,
     current_player: int,
     placements_remaining: int,
@@ -419,72 +327,31 @@ def _features(
     axis: int = -1,
     count_a: int = 0,
     count_b: int = 0,
-    legal_count: int = 0,
-    stone_count: int = 0,
-    own_stone_count: int = 0,
-    opp_stone_count: int = 0,
     nearest_own: int = 64,
     nearest_opp: int = 64,
-    nearest_any: int = 64,
     window_empty_count: int = 0,
-    window_legal_count: int = 0,
-    own_line_count: int = 0,
-    opp_line_count: int = 0,
-    own_line_run: int = 0,
-    opp_line_run: int = 0,
-    cover_size: int = 0,
-    cover_memberships: int = 0,
-    component_size: int = 0,
-    pair_distance: int = 0,
-    pair_reaches_win: bool = False,
-    pair_blocks_threat: bool = False,
-    is_win_now: bool = False,
-    is_forced_block: bool = False,
-    is_open_four: bool = False,
-    is_open_five: bool = False,
-    is_cover_cell: bool = False,
-    hot_window_count: int = 0,
+    legal_window_count: int = 0,
 ) -> np.ndarray:
-    q, r = qr
-    dist = hex_distance(qr)
     out = np.zeros(GRAPH_FEATURE_DIM, dtype=np.float32)
-    out[0] = float(token_type) / max(float(max(GraphTokenType)), 1.0)
-    out[1] = q / 64.0
-    out[2] = r / 64.0
-    out[3] = (q + r) / 64.0
-    out[4] = min(dist, 64) / 64.0
-    out[5] = float(current_player)
-    out[6] = float(placements_remaining) / 2.0
-    out[7] = -1.0 if owner is None else (1.0 if owner == current_player else 0.0)
-    out[8] = min(age, 64) / 64.0
-    out[9] = float(axis + 1) / 4.0
-    out[10] = count_a / 6.0
-    out[11] = count_b / 6.0
-    out[12] = min(legal_count, 2048) / 2048.0
-    out[13] = min(stone_count, 512) / 512.0
-    out[14] = min(own_stone_count, 256) / 256.0
-    out[15] = min(opp_stone_count, 256) / 256.0
-    out[16] = min(nearest_own, 64) / 64.0
-    out[17] = min(nearest_opp, 64) / 64.0
-    out[18] = min(nearest_any, 64) / 64.0
-    out[19] = min(window_empty_count, 6) / 6.0
-    out[20] = min(window_legal_count, 6) / 6.0
-    out[21] = min(own_line_count, 64) / 64.0
-    out[22] = min(opp_line_count, 64) / 64.0
-    out[23] = min(own_line_run, 6) / 6.0
-    out[24] = min(opp_line_run, 6) / 6.0
-    out[25] = min(cover_size, 16) / 16.0
-    out[26] = min(cover_memberships, 16) / 16.0
-    out[27] = min(component_size, 128) / 128.0
-    out[28] = min(pair_distance, 64) / 64.0
-    out[29] = 1.0 if pair_reaches_win else 0.0
-    out[30] = 1.0 if pair_blocks_threat else 0.0
-    out[31] = 1.0 if is_win_now else 0.0
-    out[32] = 1.0 if is_forced_block else 0.0
-    out[33] = 1.0 if is_open_four else 0.0
-    out[34] = 1.0 if is_open_five else 0.0
-    out[35] = 1.0 if is_cover_cell else 0.0
-    out[36] = min(hot_window_count, 16) / 16.0
+    out[GRAPH_FEATURE_PLACEMENTS_REMAINING] = float(placements_remaining) / 2.0
+    out[GRAPH_FEATURE_CURRENT_PLAYER] = float(current_player)
+    out[GRAPH_FEATURE_OWNER_RELATIVE] = 0.0 if owner is None else (1.0 if owner == current_player else -1.0)
+    out[GRAPH_FEATURE_MOVE_AGE] = min(max(age, 0), 64) / 64.0
+    out[GRAPH_FEATURE_NEAREST_OWN] = min(nearest_own, 64) / 64.0
+    out[GRAPH_FEATURE_NEAREST_OPPONENT] = min(nearest_opp, 64) / 64.0
+    if token_type == GraphTokenType.WINDOW6:
+        current_count = count_a if current_player == 0 else count_b
+        opponent_count = count_b if current_player == 0 else count_a
+        if current_count > 0:
+            out[GRAPH_FEATURE_WINDOW_OWNER_RELATIVE] = 1.0
+            out[GRAPH_FEATURE_WINDOW_STONE_COUNT] = min(current_count, WIN_LENGTH) / float(WIN_LENGTH)
+        elif opponent_count > 0:
+            out[GRAPH_FEATURE_WINDOW_OWNER_RELATIVE] = -1.0
+            out[GRAPH_FEATURE_WINDOW_STONE_COUNT] = min(opponent_count, WIN_LENGTH) / float(WIN_LENGTH)
+        out[GRAPH_FEATURE_WINDOW_EMPTY_COUNT] = min(window_empty_count, WIN_LENGTH) / float(WIN_LENGTH)
+        out[GRAPH_FEATURE_WINDOW_AXIS] = float(axis + 1) / 4.0
+    if token_type == GraphTokenType.LEGAL:
+        out[GRAPH_FEATURE_LEGAL_WINDOW_COUNT] = min(legal_window_count, 16) / 16.0
     return out
 
 
@@ -508,6 +375,8 @@ def build_graph_batch_from_history(
 ) -> GraphBatch:
     if int(radius) != 8:
         raise ValueError("global graph legal rows must preserve all Rust-legal moves; radius must be 8")
+    if materialize_pair_context_tokens:
+        raise ValueError("PAIR_ACTION context tokens were removed from the minimal global graph schema")
     moves = parse_history(history)
     stones = {(q, r): player for player, q, r in moves}
     current_player, placements_remaining = current_turn_state(moves)
@@ -596,7 +465,6 @@ def build_graph_batch_from_history(
         legal = [qr for qr in legal if qr in selected_set]
     legal_index = {qr: i for i, qr in enumerate(legal)}
     windows = _active_windows(stones, legal)
-    comp = _component_ids(stones)
 
     token_features: list[np.ndarray] = []
     token_type: list[int] = []
@@ -634,20 +502,15 @@ def build_graph_batch_from_history(
         nearest_cache[key] = cached
         return cached
 
-    hot_window_count_by_cell: dict[tuple[int, int], int] = {}
-    for cell_group in (
-        win_now_cells,
-        forced_cells,
-        open_four_cells,
-        open_five_cells,
-        cover_cells,
-    ):
-        for cell in cell_group:
-            hot_window_count_by_cell[cell] = hot_window_count_by_cell.get(cell, 0) + 1
+    legal_window_count_by_cell: dict[tuple[int, int], int] = {}
+    for axis, start, _own, _opp, _empties in windows:
+        for cell in _window_cells(start, axis):
+            if cell in legal_index:
+                legal_window_count_by_cell[cell] = legal_window_count_by_cell.get(cell, 0) + 1
 
     def add(tt: GraphTokenType, qr: tuple[int, int], **kwargs) -> int:
         idx = len(token_type)
-        nearest_own, nearest_opp, nearest_any = nearest_distances(qr)
+        nearest_own, nearest_opp, _nearest_any = nearest_distances(qr)
         token_type.append(int(tt))
         token_qr.append(qr)
         token_axis.append(int(kwargs.get("axis", -1)))
@@ -655,22 +518,11 @@ def build_graph_batch_from_history(
         token_features.append(
             _features(
                 tt,
-                qr,
                 current_player=current_player,
                 placements_remaining=placements_remaining,
-                legal_count=len(legal),
-                stone_count=len(stones),
-                own_stone_count=len(own_stones),
-                opp_stone_count=len(opp_stones),
                 nearest_own=nearest_own,
                 nearest_opp=nearest_opp,
-                nearest_any=nearest_any,
-                is_win_now=qr in win_now_cells,
-                is_forced_block=qr in forced_cells,
-                is_open_four=qr in open_four_cells,
-                is_open_five=qr in open_five_cells,
-                is_cover_cell=qr in cover_cells,
-                hot_window_count=hot_window_count_by_cell.get(qr, 0),
+                legal_window_count=legal_window_count_by_cell.get(qr, 0),
                 **kwargs,
             )
         )
@@ -678,22 +530,14 @@ def build_graph_batch_from_history(
 
     add(GraphTokenType.STATE, (0, 0))
     add(GraphTokenType.TURN, (0, 0))
-    add(GraphTokenType.PLAYER, (0, 0), owner=current_player)
-    add(GraphTokenType.PLAYER, (0, 0), owner=1 - current_player)
 
     if context_budget is None:
         stone_start = 0
         window_limit = None
-        line_limit = None
-        cover_limit = None
-        component_limit = None
     else:
         stone_limit = min(len(moves), max(16, context_budget // 2))
         stone_start = max(0, len(moves) - stone_limit)
         window_limit = max(16, context_budget // 4)
-        line_limit = max(12, context_budget // 8)
-        cover_limit = max(8, context_budget // 16)
-        component_limit = max(8, context_budget // 16)
 
     stone_token: dict[tuple[int, int], int] = {}
     for age, (player, q, r) in enumerate(moves):
@@ -705,21 +549,6 @@ def build_graph_batch_from_history(
     for qr in legal:
         legal_token_indices.append(add(GraphTokenType.LEGAL, qr))
 
-    hot_cells: set[tuple[int, int]] = {
-        cell
-        for cell in (
-            win_now_cells
-            | forced_cells
-            | open_four_cells
-            | open_five_cells
-            | cover_cells
-        )
-        if cell in legal_index
-    }
-    for qr in sorted(hot_cells):
-        add(GraphTokenType.HOT_CELL, qr)
-
-    window_token_by_key: dict[tuple[int, tuple[int, int]], int] = {}
     if window_limit is not None and len(windows) > window_limit:
         important_cells = win_now_cells | forced_cells | open_four_cells | open_five_cells | cover_cells
 
@@ -747,111 +576,8 @@ def build_graph_batch_from_history(
             count_a=own,
             count_b=opp,
             window_empty_count=len(empties),
-            window_legal_count=sum(1 for cell in empties if cell in legal_index),
         )
-        window_token_by_key[(axis, start)] = idx
         memberships[idx] = set(_window_cells(start, axis))
-
-    line_records = []
-    for axis, line in sorted(
-        {
-            (axis, _line_id(qr, axis))
-            for qr in itertools.chain(stones.keys(), legal)
-            for axis in range(3)
-        }
-    ):
-        qr = (0, line) if axis == 0 else (line, 0)
-        own_line, opp_line, own_run, opp_run = _line_stats(qr, axis, stones, current_player)
-        line_records.append((axis, line, qr, own_line, opp_line, own_run, opp_run))
-    if line_limit is not None and len(line_records) > line_limit:
-        line_records = sorted(
-            line_records,
-            key=lambda row: (
-                -max(int(row[5]), int(row[6])),
-                -max(int(row[3]), int(row[4])),
-                hex_distance(row[2]),
-                int(row[0]),
-                int(row[1]),
-            ),
-        )[:line_limit]
-    for axis, _line, qr, own_line, opp_line, own_run, opp_run in line_records:
-        add(
-            GraphTokenType.LINE,
-            qr,
-            axis=axis,
-            own_line_count=own_line,
-            opp_line_count=opp_line,
-            own_line_run=own_run,
-            opp_line_run=opp_run,
-        )
-
-    engine_cover_sets: list[set[tuple[int, int]]] = []
-    for a, b in getattr(oracle, "cover_pairs", ()):
-        cells = {(int(a[0]), int(a[1])), (int(b[0]), int(b[1]))}
-        cells = {cell for cell in cells if cell in legal_index}
-        if cells:
-            engine_cover_sets.append(cells)
-    cover_cells = {
-        (int(q), int(r))
-        for q, r in getattr(oracle, "cover_cells", ())
-        if (int(q), int(r)) in legal_index
-    }
-    forced_cells = {
-        (int(q), int(r))
-        for q, r in getattr(oracle, "forced_block_cells", ())
-        if (int(q), int(r)) in legal_index
-    }
-    winning_cells = {
-        (int(q), int(r))
-        for q, r in getattr(oracle, "win_now_cells", ())
-        if (int(q), int(r)) in legal_index
-    }
-    open_cells = {
-        (int(q), int(r))
-        for rows in (
-            getattr(oracle, "open_four_cells", ()),
-            getattr(oracle, "open_five_cells", ()),
-        )
-        for q, r in rows
-        if (int(q), int(r)) in legal_index
-    }
-    residual_cover = cover_cells | forced_cells | winning_cells | open_cells
-    if residual_cover:
-        engine_cover_sets.append(residual_cover)
-
-    if cover_limit is not None and len(engine_cover_sets) > cover_limit:
-        engine_cover_sets = sorted(
-            engine_cover_sets,
-            key=lambda cells: (
-                0 if cells & (winning_cells | forced_cells) else 1,
-                -len(cells & (cover_cells | open_cells)),
-                -len(cells),
-                min(hex_distance(cell) for cell in cells),
-            ),
-        )[:cover_limit]
-    for cells in engine_cover_sets:
-        if cells:
-            q = round(sum(c[0] for c in cells) / len(cells))
-            r = round(sum(c[1] for c in cells) / len(cells))
-            idx = add(
-                GraphTokenType.COVER_SET,
-                (q, r),
-                cover_size=len(cells),
-                cover_memberships=sum(1 for cell in cells if cell in cover_cells or cell in forced_cells),
-            )
-            memberships[idx] = set(cells)
-
-    component_rows = [(cid, [qr for qr, c in comp.items() if c == cid]) for cid in sorted(set(comp.values()))]
-    if component_limit is not None and len(component_rows) > component_limit:
-        component_rows = sorted(
-            component_rows,
-            key=lambda row: (-len(row[1]), min(hex_distance(cell) for cell in row[1]), int(row[0])),
-        )[:component_limit]
-    for cid, cells in component_rows:
-        q = round(sum(c[0] for c in cells) / len(cells))
-        r = round(sum(c[1] for c in cells) / len(cells))
-        idx = add(GraphTokenType.COMPONENT, (q, r), component_size=len(cells))
-        memberships[idx] = set(cells)
 
     pair_token_indices: list[int] = []
     pair_first_indices: list[int] = []
@@ -877,25 +603,7 @@ def build_graph_batch_from_history(
             for b_idx in range(a_idx + 1, len(legal)):
                 if len(pair_token_indices) >= pair_limit:
                     break
-                a = legal[a_idx]
-                b = legal[b_idx]
-                if materialize_pair_context_tokens:
-                    qr = (round((a[0] + b[0]) / 2), round((a[1] + b[1]) / 2))
-                    pair_cells = {a, b}
-                    tok = add(
-                        GraphTokenType.PAIR_ACTION,
-                        qr,
-                        pair_distance=hex_distance(a, b),
-                        pair_reaches_win=bool(pair_cells & win_now_cells),
-                        pair_blocks_threat=bool(pair_cells & (forced_cells | cover_cells)),
-                        cover_size=len(pair_cells & cover_cells),
-                    )
-                    memberships[tok] = {a, b}
-                    pair_token_indices.append(tok)
-                else:
-                    # Pair heads score references to LEGAL token vectors without
-                    # adding PAIR_ACTION tokens to the main attention context.
-                    pair_token_indices.append(-1)
+                pair_token_indices.append(-1)
                 pair_first_indices.append(legal_token_indices[a_idx])
                 pair_second_indices.append(legal_token_indices[b_idx])
             if len(pair_token_indices) >= pair_limit:
@@ -917,22 +625,8 @@ def build_graph_batch_from_history(
                 "explicit chunking path; silent pair loss is not allowed."
             )
         pair_limit = total_pair_rows if max_pair_rows is None else min(total_pair_rows, int(max_pair_rows))
-        for b_idx, second in enumerate(legal[:pair_limit]):
-            if materialize_pair_context_tokens:
-                qr = (round((pair_context_first[0] + second[0]) / 2), round((pair_context_first[1] + second[1]) / 2))
-                pair_cells = {pair_context_first, second}
-                tok = add(
-                    GraphTokenType.PAIR_ACTION,
-                    qr,
-                    pair_distance=hex_distance(pair_context_first, second),
-                    pair_reaches_win=second in win_now_cells,
-                    pair_blocks_threat=second in forced_cells or second in cover_cells,
-                    cover_size=len(pair_cells & cover_cells),
-                )
-                memberships[tok] = {pair_context_first, second}
-                pair_token_indices.append(tok)
-            else:
-                pair_token_indices.append(-1)
+        for b_idx, _second in enumerate(legal[:pair_limit]):
+            pair_token_indices.append(-1)
             pair_first_indices.append(first_token)
             pair_second_indices.append(legal_token_indices[b_idx])
 
@@ -1176,7 +870,7 @@ def graph_batch_with_reference_pair_rows(
     The transformer context keeps all legal action tokens but pair scoring can
     be O(A^2).  For replay training, represent pair rows by references to the
     relevant LEGAL/STONE token indices so the pair heads can train without
-    adding tens of thousands of PAIR_ACTION tokens.  When max_pair_rows is set,
+    adding pair tokens to the attention context.  When max_pair_rows is set,
     all positive search-observed target rows are preserved and deterministic
     legal negatives fill the remaining budget.
     """
@@ -1468,7 +1162,6 @@ def _build_relations(
     token_cell_keys = ((q + coord_bias) << np.int64(32)) | (
         (r + coord_bias) & np.int64(0xFFFFFFFF)
     )
-    qr_tuples = [tuple(int(x) for x in row) for row in token_qr_arr.tolist()]
     token_rows_by_cell_key: dict[int, list[int]] = {}
     for row, key in enumerate(token_cell_keys.tolist()):
         token_rows_by_cell_key.setdefault(int(key), []).append(int(row))
@@ -1531,33 +1224,12 @@ def _build_relations(
             dst = np.tile(rows, rows.size)
             assign_edges(src, dst, relation, symmetric=False)
 
-    def cell_membership_matrix(containers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        containers = np.asarray(containers, dtype=np.int64).reshape(-1)
-        key_arrays = [membership_keys.get(int(container), empty_i64) for container in containers]
-        non_empty = [keys for keys in key_arrays if keys.size]
-        if not non_empty:
-            return np.zeros((containers.size, 0), dtype=np.bool_), empty_i64
-        all_keys = np.unique(np.concatenate(non_empty))
-        matrix = np.zeros((containers.size, all_keys.size), dtype=np.bool_)
-        for row, keys in enumerate(key_arrays):
-            if keys.size:
-                matrix[row, np.searchsorted(all_keys, keys)] = True
-        return matrix, all_keys
-
     window_tokens = np.flatnonzero(token_type_arr == int(GraphTokenType.WINDOW6))
-    cover_tokens = np.flatnonzero(token_type_arr == int(GraphTokenType.COVER_SET))
-    line_tokens = np.flatnonzero(token_type_arr == int(GraphTokenType.LINE))
-    component_tokens = np.flatnonzero(token_type_arr == int(GraphTokenType.COMPONENT))
-    legal_like_mask = (
-        np.flatnonzero(
-            (token_type_arr == int(GraphTokenType.LEGAL))
-            | (token_type_arr == int(GraphTokenType.HOT_CELL))
-        )
-    )
+    legal_tokens = np.flatnonzero(token_type_arr == int(GraphTokenType.LEGAL))
     stone_mask = np.zeros(n, dtype=np.bool_)
-    legal_like_token_mask = np.zeros(n, dtype=np.bool_)
+    legal_token_mask = np.zeros(n, dtype=np.bool_)
     stone_mask[np.flatnonzero(token_type_arr == int(GraphTokenType.STONE))] = True
-    legal_like_token_mask[legal_like_mask] = True
+    legal_token_mask[legal_tokens] = True
 
     pair_first_arr = np.asarray(pair_first_indices, dtype=np.int64)
     pair_second_arr = np.asarray(pair_second_indices, dtype=np.int64)
@@ -1575,106 +1247,6 @@ def _build_relations(
         pair_edge_mask[second, first] = True
         assign(pair_edge_mask, RelationType.FIRST_SECOND_PAIR_RELATION)
 
-    pair_token_arr = np.asarray(pair_token_indices, dtype=np.int64)
-    valid_pair_refs_for_tokens = valid_pair_refs
-    if pair_token_arr.shape != valid_pair_refs.shape:
-        valid_pair_refs_for_tokens = np.zeros(pair_token_arr.shape, dtype=np.bool_)
-        upper = min(pair_token_arr.size, valid_pair_refs.size)
-        valid_pair_refs_for_tokens[:upper] = valid_pair_refs[:upper]
-    valid_materialized_pairs = (
-        (pair_token_arr >= 0)
-        & (pair_token_arr < n)
-        & valid_pair_refs_for_tokens
-    )
-    if np.any(valid_materialized_pairs):
-        toks = pair_token_arr[valid_materialized_pairs]
-        first = pair_first_arr[valid_materialized_pairs]
-        second = pair_second_arr[valid_materialized_pairs]
-        assign_edges(toks, first, RelationType.LEGAL_TO_PAIR_ACTION, symmetric=True)
-        assign_edges(toks, second, RelationType.LEGAL_TO_PAIR_ACTION, symmetric=True)
-        if cover_tokens.size:
-            pair_cells, pair_axis = cell_membership_matrix(toks)
-            cover_cells, cover_axis = cell_membership_matrix(cover_tokens)
-            if pair_cells.shape[1] and cover_cells.shape[1]:
-                all_axis = np.union1d(pair_axis, cover_axis)
-                pair_full = np.zeros((toks.size, all_axis.size), dtype=np.bool_)
-                cover_full = np.zeros((cover_tokens.size, all_axis.size), dtype=np.bool_)
-                pair_full[:, np.searchsorted(all_axis, pair_axis)] = pair_cells
-                cover_full[:, np.searchsorted(all_axis, cover_axis)] = cover_cells
-                cover_size = cover_full.sum(axis=1)
-                subset = (pair_full.astype(np.int16) @ cover_full.T.astype(np.int16)) == cover_size[None, :]
-                subset &= cover_size[None, :] > 0
-                pair_rows, cover_rows = np.nonzero(subset)
-                if pair_rows.size:
-                    assign_edges(
-                        toks[pair_rows],
-                        cover_tokens[cover_rows],
-                        RelationType.PAIR_COVERS_THREAT_SET,
-                        symmetric=True,
-                    )
-
-    if window_tokens.size and cover_tokens.size:
-        window_cells, window_axis_keys = cell_membership_matrix(window_tokens)
-        cover_cells, cover_axis_keys = cell_membership_matrix(cover_tokens)
-        if window_cells.shape[1] and cover_cells.shape[1]:
-            all_axis = np.union1d(window_axis_keys, cover_axis_keys)
-            window_full = np.zeros((window_tokens.size, all_axis.size), dtype=np.bool_)
-            cover_full = np.zeros((cover_tokens.size, all_axis.size), dtype=np.bool_)
-            window_full[:, np.searchsorted(all_axis, window_axis_keys)] = window_cells
-            cover_full[:, np.searchsorted(all_axis, cover_axis_keys)] = cover_cells
-            overlaps = window_full.astype(np.int16) @ cover_full.T.astype(np.int16)
-            win_rows, cover_rows = np.nonzero(overlaps > 0)
-            if win_rows.size:
-                assign_edges(
-                    window_tokens[win_rows],
-                    cover_tokens[cover_rows],
-                    RelationType.WINDOW6_TO_COVER_SET,
-                    symmetric=True,
-                )
-
-    if cover_tokens.size:
-        cover_member_rows = membership_token_matrix(cover_tokens)
-        cover_member_rows &= legal_like_token_mask[None, :]
-        cover_rows, legal_cols = np.nonzero(cover_member_rows)
-        if cover_rows.size:
-            assign_edges(
-                cover_tokens[cover_rows],
-                legal_cols.astype(np.int64),
-                RelationType.LEGAL_IN_COVER_SET,
-                symmetric=True,
-            )
-
-    if line_tokens.size and window_tokens.size:
-        line_axis_arr = token_axis_arr[line_tokens]
-        window_axis_arr = token_axis_arr[window_tokens]
-        line_ids = np.asarray(
-            [
-                _line_id(qr_tuples[int(token)], int(axis)) if int(axis) >= 0 else -(10**9)
-                for token, axis in zip(line_tokens, line_axis_arr)
-            ],
-            dtype=np.int64,
-        )
-        window_line_ids = np.asarray(
-            [
-                _line_id(qr_tuples[int(token)], int(axis)) if int(axis) >= 0 else -(10**9 + 1)
-                for token, axis in zip(window_tokens, window_axis_arr)
-            ],
-            dtype=np.int64,
-        )
-        line_window = (
-            (line_axis_arr[:, None] >= 0)
-            & (line_axis_arr[:, None] == window_axis_arr[None, :])
-            & (line_ids[:, None] == window_line_ids[None, :])
-        )
-        line_rows, window_rows = np.nonzero(line_window)
-        if line_rows.size:
-            assign_edges(
-                line_tokens[line_rows],
-                window_tokens[window_rows],
-                RelationType.LINE_TO_WINDOW6,
-                symmetric=True,
-            )
-
     if window_tokens.size:
         window_member_rows = membership_token_matrix(window_tokens)
         stone_edges = window_member_rows & stone_mask[None, :]
@@ -1686,7 +1258,7 @@ def _build_relations(
                 RelationType.STONE_IN_WINDOW6,
                 symmetric=True,
             )
-        legal_edges = window_member_rows & legal_like_token_mask[None, :]
+        legal_edges = window_member_rows & legal_token_mask[None, :]
         window_rows, legal_cols = np.nonzero(legal_edges)
         if window_rows.size:
             assign_edges(
@@ -1710,8 +1282,6 @@ def _build_relations(
         RelationType.AGE_ORDER_BUCKET,
     )
 
-    if component_tokens.size:
-        assign_same_membership(component_tokens, RelationType.SAME_COMPONENT)
     if window_tokens.size:
         assign_same_membership(window_tokens, RelationType.SAME_WINDOW6)
 
