@@ -55,6 +55,51 @@ PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
 PRIOR_SOURCE_DEFAULT = 3
 PRIOR_SOURCE_PAIR = 4
+
+
+def _sample_root_dirichlet_noise(
+    n_children: int,
+    alpha: float,
+    *,
+    worker_id: int | None = None,
+) -> np.ndarray:
+    """Sample finite root exploration noise, falling back when gamma underflows."""
+    n = max(int(n_children), 1)
+    alpha_value = float(alpha)
+    fallback = False
+    try:
+        if not np.isfinite(alpha_value) or alpha_value <= 0.0:
+            fallback = True
+        else:
+            noise = np.random.dirichlet(np.full(n, alpha_value, dtype=np.float64)).astype(
+                np.float32,
+                copy=False,
+            )
+            total = float(noise.sum(dtype=np.float64))
+            if (
+                noise.shape != (n,)
+                or not np.isfinite(total)
+                or total <= 0.0
+                or not np.all(np.isfinite(noise))
+                or np.any(noise < 0.0)
+            ):
+                fallback = True
+            else:
+                return (noise / total).astype(np.float32, copy=False)
+    except (FloatingPointError, OverflowError, ValueError):
+        fallback = True
+
+    if fallback:
+        logger.warning(
+            "Worker %s: root Dirichlet noise invalid for n_children=%s alpha=%.6g; "
+            "using uniform finite fallback",
+            worker_id if worker_id is not None else "?",
+            n,
+            alpha_value,
+        )
+    return np.full(n, 1.0 / float(n), dtype=np.float32)
+
+
 def _align_global_logits_to_rust_legal(
     graph_legal: np.ndarray,
     rust_legal: np.ndarray,
@@ -1568,11 +1613,13 @@ class SelfPlayWorker:
                 except Exception as exc:
                     logger.debug("Worker %s: root noise skipped: %s", self.worker_id, exc)
                     n_children = 20
-                noise = np.random.dirichlet(
-                    [self.dirichlet_alpha] * max(n_children, 1)
+                noise = _sample_root_dirichlet_noise(
+                    n_children,
+                    self.dirichlet_alpha,
+                    worker_id=self.worker_id,
                 )
                 engine.add_dirichlet_noise(
-                    noise.astype(np.float32), self.dirichlet_fraction
+                    noise, self.dirichlet_fraction
                 )
 
             while not engine.done():

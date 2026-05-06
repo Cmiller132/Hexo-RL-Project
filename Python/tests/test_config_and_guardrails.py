@@ -1,13 +1,18 @@
 import multiprocessing as mp
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from hexorl.buffer import RingBuffer
 from hexorl.config import Config
 from hexorl.runtime import HostProfile, autotune_config, _estimate_train_peak_gb
-from hexorl.selfplay.worker import SelfPlayWorker, _current_turn_first_qr
+from hexorl.selfplay.worker import (
+    SelfPlayWorker,
+    _current_turn_first_qr,
+    _sample_root_dirichlet_noise,
+)
 from hexorl.search.pair_strategy import build_pair_strategy
 from hexorl.train.ema import ModelEMA
 from hexorl.train.loss_plan import build_loss_plan
@@ -127,6 +132,22 @@ def test_selfplay_worker_game_ids_are_unique_across_workers():
     worker1 = SelfPlayWorker(1, cfg, record_queue=None)
 
     assert worker0._game_id() != worker1._game_id()
+
+
+def test_root_dirichlet_noise_falls_back_when_sampler_underflows(monkeypatch):
+    def bad_dirichlet(alpha):
+        return np.full(len(alpha), np.nan, dtype=np.float64)
+
+    monkeypatch.setattr(np.random, "dirichlet", bad_dirichlet)
+
+    noise = _sample_root_dirichlet_noise(4, 0.001, worker_id=7)
+
+    assert noise.dtype == np.float32
+    assert noise.shape == (4,)
+    assert np.all(np.isfinite(noise))
+    assert np.all(noise >= 0.0)
+    assert float(noise.sum()) == pytest.approx(1.0)
+    assert noise.tolist() == pytest.approx([0.25, 0.25, 0.25, 0.25])
 
 
 def test_selfplay_pcr_schedule_keeps_full_search_rows_inside_long_games():
