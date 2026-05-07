@@ -11,10 +11,11 @@ Build Hexo-RL around exact-simulator AlphaZero-style self-play where the
 post-opening searched action is an unordered two-placement pair. Use
 autoregressive and tactical structure to propose candidate pairs, but make the
 MCTS edge, backup, policy target, and runtime action contract the completed
-pair. Use Gumbel-style root admission, PUCT with progressive widening below the
-root, a minimal global graph encoder with active six-cell window objects, and a
-symmetric biaffine pair reranker trained with candidate-aware targets and dense
-auxiliary views.
+pair. Use a named `gumbel_sequential_halving_v1` root operator, proposal-aware
+PUCT with progressive widening below the root, a minimal global graph encoder
+with capped active six-cell window objects, and a mathematically symmetric
+biaffine pair reranker trained with candidate-aware targets and dense auxiliary
+views.
 
 This is not a plan for keeping every proposed path alive. The final system
 should have one mainline pair-action runtime. Sequential afterstate search,
@@ -64,8 +65,9 @@ post-opening action is an unordered two-stone pair.
 - The search never relies on exhaustive legal-pair enumeration.
 - Candidate generation combines model proposal, conditional proposal, tactical
   proposal, and structured exploration quotas.
-- Root candidate admission uses Gumbel-style sampling or an equivalent
-  simple-regret policy-improvement operator.
+- Root candidate admission uses `gumbel_sequential_halving_v1`, including
+  completed-Q target construction. Any replacement must be named, documented,
+  tested against the same target-construction contract, and ablated before use.
 - Interior nodes use PUCT over admitted pair children with progressive widening.
 - Pair rows are canonical, unordered, hashable, phase-aware, and D6-validated.
 - Pair outputs never affect MCTS by head-name presence alone; an explicit pair
@@ -78,8 +80,9 @@ post-opening action is an unordered two-stone pair.
   second-cell targets, softened pair targets, tactical auxiliaries, and
   proposal metadata.
 - Unsampled legal pairs are treated as unknown, not as negative examples.
-- The final architecture beats a fair sequential afterstate DAG baseline at
-  equal wall-clock on mature checkpoints.
+- The final architecture is accepted only after it demonstrates a statistically
+  meaningful equal-wall-clock win over a fair sequential afterstate DAG baseline
+  on mature checkpoints.
 
 ### Constraints
 
@@ -105,6 +108,8 @@ Every implementation phase must produce:
 - Artifacts produced under the appropriate docs or run artifact directory.
 - Performance and utilization evidence for search or model hot paths.
 - Contract examples or schema docs when boundaries change.
+- Schema-version and cross-language boundary evidence for Rust/Python replay,
+  inference, and search contracts.
 - An explicit statement that no skipped, deferred, or manual-only requirement is
   being claimed complete.
 
@@ -116,7 +121,11 @@ Stop before claiming completion if:
 - The engine cannot apply both placements atomically for a pair MCTS edge.
 - Pair strategy behavior cannot be separated from raw head-name checks.
 - Candidate metadata cannot store source, proposal weight, and search outcome.
+- Candidate metadata cannot store all source contributions and a combined
+  `beta` or inclusion estimate.
 - D6 transforms cannot preserve legal-row and pair-row identity.
+- Terminal pair semantics cannot be stated consistently between Rust rules,
+  search expansion, and training targets.
 - The equal-wall-clock sequential DAG baseline cannot be built or fairly
   measured.
 - Performance regressions make pair search non-viable without a documented
@@ -139,8 +148,8 @@ Rust exact simulator
   -> conditional second-cell pointer-style head
   -> symmetric biaffine joint-pair reranker
   -> sampled pair candidate set
-  -> Gumbel root admission
-  -> PUCT plus progressive widening below root
+  -> gumbel_sequential_halving_v1 root admission
+  -> proposal-aware PUCT plus progressive widening below root
   -> candidate-aware training targets
 ```
 
@@ -172,10 +181,12 @@ The hybrid design is the middle that actually fits the game:
   for the whole action space.
 
 The Gumbel paper is directly relevant because it addresses policy improvement
-when the search does not visit all root actions. Sampled MuZero is directly
-relevant because it formalizes planning over sampled action subsets. The useful
-lesson from Sampled MuZero is not learned dynamics; it is proposal-aware
-planning and target construction in large action spaces.
+when the search does not visit all root actions. The implementation must use a
+real root policy-improvement operator, not just add Gumbel noise to a top-k
+list. Sampled MuZero is directly relevant because it formalizes planning over
+sampled action subsets. The useful lesson from Sampled MuZero is not learned
+dynamics; it is proposal-aware planning and target construction in large action
+spaces.
 
 ## Decisions Adopted From Each Report
 
@@ -289,6 +300,53 @@ Required invariants:
   placement, or diagnostic-only.
 - The pair row carries row-table identity and hash metadata.
 - D6 transformations preserve pair identity after canonicalization.
+- The pair row carries a schema version shared across Rust/Python boundaries.
+- Terminal-equivalence metadata is available when one cell wins regardless of
+  the second cell.
+
+Atomic placement semantics are explicit: the MCTS edge applies both stones as a
+single macro-action, and terminal evaluation occurs after the full pair unless
+the Rust rules contract explicitly says the turn stops after the first winning
+placement. The chosen rule must be reflected identically in Rust transition
+code, search backpropagation, replay targets, and tactical fixtures.
+
+### Candidate Proposal Contract
+
+Every candidate pair is an object, not just a pair of coordinates. It must
+carry enough information to audit how it entered search and how it may affect
+training:
+
+```text
+candidate_id
+pair_key
+first_legal_row_id
+second_legal_row_id
+row_table_schema_version
+source_contributions[]
+combined_beta_or_inclusion_estimate
+forced_exploration_flag
+tactical_exact_flag
+terminal_equivalence_flag
+target_prune_flag
+admission_generation
+root_or_interior
+```
+
+`source_contributions[]` records every source that produced the candidate, not
+only the source that won deduplication:
+
+```text
+source_type
+source_rank
+source_weight
+local_probability_or_score
+quota_id
+```
+
+Deduplication combines source contributions into one canonical candidate and
+computes a combined `beta` or inclusion estimate. That estimate is required for
+proposal-aware priors and sampled training losses. A candidate with missing
+source metadata cannot enter search.
 
 ### Pair Strategy Authority
 
@@ -308,6 +366,7 @@ This strategy owns:
 - interior progressive widening,
 - pair-prior correction from proposal probabilities,
 - pair-search telemetry,
+- offline audit-oracle hooks for tiny or tactical positions,
 - and target metadata emission.
 
 The model architecture may declare pair-capable outputs. It may not decide that
@@ -320,10 +379,11 @@ At each full-turn node:
 1. Query Rust for legal cells and tactical state.
 2. Build or retrieve legal-row identity.
 3. Generate candidate pair proposals from source quotas.
-4. Canonicalize and deduplicate pairs.
-5. Store source and proposal weight for every admitted candidate.
-6. At the root, use Gumbel-Top-k or equivalent without-replacement admission.
-7. At non-root nodes, use PUCT over admitted children.
+4. Canonicalize pairs and deduplicate by canonical pair key.
+5. Store all source contributions, combined `beta`, forced flags, tactical
+   flags, terminal-equivalence flags, and target-prune flags.
+6. At the root, use `gumbel_sequential_halving_v1`.
+7. At non-root nodes, use proposal-aware PUCT over admitted children.
 8. Widen a node according to:
 
 ```text
@@ -332,6 +392,46 @@ allowed_children = min(total_legal_pairs, ceil(c_pw * visits ** alpha_pw))
 
 9. Expand a pair by applying both stones atomically through the exact engine.
 10. Back up value on the pair edge.
+
+`gumbel_sequential_halving_v1` has a mandatory algorithm contract:
+
+```text
+inputs:
+  candidate logits
+  candidate source contributions
+  combined beta or inclusion estimates
+  root simulation budget
+  legal-pair count
+  value estimate
+
+outputs:
+  admitted set
+  gumbel values or admission order
+  simulation allocation
+  visit counts
+  Q values
+  completed-Q values
+  improved policy target over admitted candidates
+  target-prune flags
+```
+
+The root target must be derived from the search operator's improved posterior,
+not from raw visit counts alone. If a different root operator is proposed, it
+must define the same output fields and pass the same target-construction tests
+before it can replace `gumbel_sequential_halving_v1`.
+
+Proposal-aware PUCT priors are required for sampled candidate sets. Raw model
+logits over a sampled set are forbidden unless the sampler is intentionally the
+model prior and that assumption is recorded in the target metadata. The default
+candidate prior should use a clipped proposal correction:
+
+```text
+prior_logit(a) = model_logit(a) - clip(log(beta(a)), min_beta_log, max_beta_log)
+P_C(a | s) = softmax(prior_logit(a) / prior_temperature)
+```
+
+The exact clipping and temperature parameters are tunable, but the correction
+cannot be omitted silently.
 
 Initial tuning range:
 
@@ -350,7 +450,8 @@ black-box sampler.
 
 Required sources:
 
-- `policy_pair`: pairs from the current joint-pair prior or reranker.
+- `policy_pair_rerank`: pairs reranked by the current joint-pair scorer after
+  non-exhaustive pre-candidate retrieval.
 - `policy_anchor_conditional`: first-cell samples plus conditional second-cell
   completions.
 - `tactical_exact`: immediate wins, immediate blocks, minimal covers,
@@ -365,11 +466,11 @@ Every candidate stores:
 pair_key
 first_legal_row_id
 second_legal_row_id
-source
-source_rank
-proposal_probability_or_weight
+source_contributions[]
+combined_beta_or_inclusion_estimate
 was_forced_exploration
 was_tactical_exact
+target_prune_flag
 admission_generation
 root_or_interior
 ```
@@ -377,6 +478,21 @@ root_or_interior
 The source quotas should anneal by training phase. The tactical quota should not
 vanish; the blind canary quota can shrink to near-zero but should remain
 available in diagnostic runs.
+
+`policy_pair_rerank` must not mean "score every unordered legal pair and take
+top-k" during normal runtime. It works in two steps:
+
+```text
+1. Retrieve a bounded pre-candidate pool from unary anchors, conditional
+   completions, tactical rows, structured rows, and optional approximate
+   bilinear retrieval.
+2. Score only that bounded pool with the pair reranker, then admit top-k or
+   diverse-k after canonical deduplication.
+```
+
+Dense all-pair scoring is allowed only for tiny diagnostic states, offline
+audit oracle runs, or explicitly capped tactical fixtures. It is not the normal
+self-play or evaluation path.
 
 ## Model Design
 
@@ -411,6 +527,21 @@ six-cell windows: four-with-two-empties, five-with-one-empty, overlapping cover
 sets, and overload pressure. This is the smallest exact tactical object that
 matches the win condition.
 
+Active window selection must be exact but capped. The engine or graph builder
+must include:
+
+- all hot own and opponent 4/5 windows,
+- all immediate one-placement and two-placement win/block windows,
+- windows touching current legal cells with enough occupied or legal-empty
+  support to matter tactically,
+- near-hot 3 windows that participate in overload or fork candidates,
+- windows referenced by tactical exact proposals,
+- and deterministic priority overflow telemetry when the cap is exceeded.
+
+The cap is part of the schema contract, not an incidental batch parameter. A
+state that overflows the active-window budget must report how many windows were
+omitted by priority class so tactical recall failures can be diagnosed.
+
 ### Relations
 
 Required relations:
@@ -430,7 +561,8 @@ The final model has these trainable outputs:
 
 ```text
 policy_place
-policy_pair_first
+policy_cell_marginal
+policy_pair_anchor
 policy_pair_second
 policy_pair_joint
 value
@@ -438,13 +570,29 @@ tactical_auxiliary_heads
 pair_regret_or_completed_q
 ```
 
+`policy_pair_first` is retired as a semantic name because it implies ordered
+pair training. If an existing implementation temporarily keeps that tensor
+name, the output contract must map it to `policy_cell_marginal` or
+`policy_pair_anchor`, and the old name must not appear as a permanent runtime
+semantic authority.
+
 The final pair scorer should have the shape:
 
 ```text
 score(i, j) =
-  biaffine(h_i, h_j)
+  symmetric_biaffine(h_i, h_j)
   + symmetric_mlp(state, h_i + h_j, abs(h_i - h_j), h_i * h_j, pair_features)
 ```
+
+The biaffine term must be mathematically order-invariant. Use one of:
+
+```text
+symmetric_biaffine(i, j) =
+  0.5 * (h_i^T U h_j + h_j^T U h_i)
+```
+
+or enforce `U = U^T` by parameterization. A naive `h_i^T U h_j` term is not
+acceptable for unordered joint pairs.
 
 Required pair features:
 
@@ -471,15 +619,20 @@ and how it became a target:
 
 ```text
 candidate_pairs
-candidate_sources
-proposal_weights
+candidate_source_contributions
+combined_beta_or_inclusion_estimates
+proposal_correction_parameters
 legal_pair_count
+legal_row_schema_version
+pair_row_schema_version
 root_gumbel_values_or_admission_order
+root_simulation_allocation
 visit_counts
 q_values
 completed_q_values
 forced_exploration_flags
 policy_target_prune_flags
+terminal_equivalence_flags
 selected_pair
 search_surprise_metrics
 ```
@@ -508,6 +661,30 @@ unsampled legal pair != negative pair
 
 Only admitted pairs judged weak by search, or explicitly sampled negatives with
 known proposal metadata, can contribute negative ranking signal.
+
+Terminal-equivalent pair targets require special handling. If a single legal
+cell wins under the exact rules, then every legal pair containing that cell may
+be equivalent with respect to the game outcome. In that case:
+
+- train the cell/tactical heads strongly on the winning cell,
+- mark pair rows containing that cell as terminal-equivalent,
+- either collapse the pair posterior over equivalent winning pairs or choose
+  deterministic second-cell tie-breaks from tactical criteria,
+- and do not teach arbitrary preferences among filler second cells as if they
+  were strategic pair differences.
+
+Conditional second-cell targets must be safe for unordered pair data. If an
+unordered pair `{i, j}` has target mass, training should create both conditional
+views where legal and meaningful:
+
+```text
+pi(second = j | first = i)
+pi(second = i | first = j)
+```
+
+The two views are weighted through the marginal or anchor target. Training only
+the canonical first cell is forbidden because it leaks row-order artifacts into
+the conditional head.
 
 ### Tactical Supervision
 
@@ -608,6 +785,8 @@ Success criteria:
 Required evidence:
 
 - Contract tests for row identity and D6.
+- Cross-language fuzz tests for Rust/Python legal rows, pair rows, tactical
+  oracle payloads, and replay serialization schema versions.
 - Negative tests for illegal pairs, duplicate pairs, and wrong phase.
 - Import/search audit showing no consumer guesses pair semantics from tensor
   shape alone.
@@ -627,20 +806,27 @@ Success criteria:
 
 - Candidate generator supports policy, conditional, tactical, structured
   exploration, and blind canary sources.
-- Every candidate stores source and proposal metadata.
+- Every candidate stores all source contributions, combined `beta` or inclusion
+  estimate, forced flags, tactical flags, and target-prune flags.
 - Tactical oracle labels are filtered to explicit legal rows.
 - Structured exploration replaces raw persistent uniform-over-all-pairs as the
   main exploration floor.
+- `policy_pair_rerank` scores only a bounded pre-candidate pool in normal
+  runtime.
 
 Required evidence:
 
-- Unit tests for source quotas, deduplication, legal filtering, and metadata.
+- Unit tests for source quotas, multi-source deduplication, legal filtering,
+  combined-beta accounting, and metadata.
 - Tactical benchmark fixtures for wins, blocks, covers, and overloads.
 - Artifact showing candidate-source mix on a fixed position set.
+- Offline audit-oracle artifact on tiny or tactical positions where exhaustive
+  pair scoring is allowed.
 
 Stop rules:
 
-- Stop if a candidate can enter search without source and proposal metadata.
+- Stop if a candidate can enter search without complete source, proposal,
+  forced/prune, and beta metadata.
 
 ### Phase 3: Sampled Joint-Pair MCTS
 
@@ -651,12 +837,14 @@ Make sampled pair macro-actions the main search runtime.
 Success criteria:
 
 - Pair child expansion applies both placements atomically.
-- Root admission uses Gumbel-style without-replacement candidate admission or an
-  equivalent tested policy-improvement operator.
-- Interior nodes use PUCT plus progressive widening.
+- Root admission uses `gumbel_sequential_halving_v1` with completed-Q target
+  construction.
+- Interior nodes use proposal-aware PUCT plus progressive widening.
 - Pair strategy, not model head presence, controls all pair runtime behavior.
 - Search telemetry includes candidate recall, source mix, visits, Q, widening,
   latency, and selected action.
+- Terminal-equivalent pairs are marked and handled consistently in search
+  targets.
 
 Required evidence:
 
@@ -664,6 +852,8 @@ Required evidence:
 - Fixed-position search traces.
 - Throughput profile for node expansions, pair scoring, inference latency, and
   candidate generation.
+- Proposal-correction artifact showing raw logits, beta-corrected priors, and
+  clipped correction parameters.
 - `rg` audit proving self-play no longer directly checks pair head names for
   behavior outside pair strategy code.
 
@@ -683,14 +873,18 @@ Success criteria:
 - Does not materialize PAIR_ACTION tokens in the main path.
 - Scores pair rows through a symmetric biaffine or low-rank bilinear term plus
   symmetric MLP features.
+- Enforces order-invariant biaffine math by symmetrized scoring or symmetric
+  parameterization.
 - Keeps known-first second head conditional and phase-gated.
 - Exposes output contracts for every runtime-consumed head.
+- Defines active `WINDOW6` inclusion priorities, caps, and overflow telemetry.
 
 Required evidence:
 
 - Model shape tests for all heads.
 - Symmetry tests for unordered joint scores.
 - Phase tests for known-first second rows.
+- Active-window cap and overflow tests.
 - Performance profile versus current pair MLP and graph controls.
 
 Stop rules:
@@ -709,12 +903,18 @@ Success criteria:
   and prune flags.
 - Pair target pruning removes forced exploration traffic where appropriate.
 - Marginal and conditional targets are generated from the pruned joint target.
+- Conditional second-cell targets include both unordered views where legal and
+  meaningful.
+- Terminal-equivalent one-cell wins do not train arbitrary filler-stone pair
+  preferences.
 - Unsampled legal pairs are never used as hard negatives.
 - Sampled ranking or sampled-softmax loss is proposal-aware.
 
 Required evidence:
 
 - Unit tests for target projection and pruning.
+- Unit tests for terminal-equivalent targets and unordered-safe conditional
+  targets.
 - Negative tests for unsampled-pair hard negatives.
 - Training smoke test with all target heads active.
 - Artifact comparing raw-count target entropy to pruned/completed-Q posterior.
@@ -745,11 +945,16 @@ Required evidence:
 - Replay distribution artifact.
 - Search-surprise and entropy dashboard output.
 - Fixed tactical suite results over checkpoints.
+- Distributed self-play/inference performance artifact covering batching, queue
+  backpressure, CPU candidate-generation time, GPU utilization, and
+  pair-scores/sec.
 
 Stop rules:
 
 - Stop if policy entropy collapses before candidate recall and tactical recall
   are healthy.
+- Stop if batching, queue backpressure, CPU candidate generation, GPU
+  utilization, or pair scoring throughput fails the phase budget.
 
 ### Phase 7: Fair Ablations And Cutover
 
@@ -827,8 +1032,10 @@ node_expansions_per_second
 pair_scores_per_second
 inference_latency_p50_p95
 queue_backpressure
+batch_fill_rate
 gpu_utilization
 cpu_candidate_generation_time
+candidate_generation_latency_p95
 tactical_suite_accuracy
 d6_policy_consistency
 d6_value_consistency
@@ -842,22 +1049,24 @@ candidate recall and tactical recall remain high."
 
 The mainline is accepted only when all of these are true:
 
-- Sampled joint-pair MCTS beats the sequential DAG baseline at equal wall-clock
-  on mature checkpoints.
-- Candidate recall contains the final best-search pair on the overwhelming
-  majority of roots.
-- Exact immediate winning pairs and mandatory block pairs have near-perfect
-  candidate recall.
+- Sampled joint-pair MCTS has a statistically meaningful equal-wall-clock Elo
+  win over the sequential DAG baseline on mature checkpoints.
+- Candidate recall contains the final best-search pair on at least 95% of roots
+  in the deep-search audit suite.
+- Exact immediate winning pairs have at least 99.5% candidate recall.
+- Mandatory block pairs have at least 99.0% candidate recall.
 - Pair target entropy does not collapse prematurely.
 - Search surprise decreases over training without eliminating tactical or
   structured source diversity.
 - D6 transforms preserve legal-row identity, pair-row identity, policy
-  consistency, and value consistency.
+  consistency, and value consistency within documented numeric tolerances.
 - Runtime pair behavior is controlled only by explicit pair strategy.
 - The model does not materialize all pair actions as attention tokens.
 - Unsampled legal pairs are never trained as negatives.
 - Performance evidence includes fixed-wall-clock strength, not only
   fixed-simulation strength.
+- Batching, queue backpressure, CPU candidate-generation time, GPU utilization,
+  and pair-scores/sec meet the phase performance budgets.
 - Obsolete paths are removed or quarantined with import and code-search proof.
 
 ## Failure Criteria
@@ -882,15 +1091,20 @@ The first build should not try to implement every advanced idea at once. It
 should create a thin but real vertical slice:
 
 1. Canonical pair contracts and D6 tests.
-2. Source-tagged candidate generator with tactical and structured sources.
-3. Root Gumbel candidate admission over sampled pair rows.
-4. Interior PUCT plus progressive widening.
+2. Candidate proposal contract with multi-source deduplication, combined beta,
+   prune flags, and structured/tactical sources.
+3. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
+4. Proposal-aware PUCT plus progressive widening.
 5. Existing graph trunk with non-materialized pair rows.
-6. Biaffine pair scorer behind one explicit architecture or strategy flag.
-7. Replay metadata for candidate source, proposal weight, visits, and Q.
-8. Pruned joint target plus marginal and conditional targets.
-9. Fixed tactical benchmark suite.
-10. Equal-wall-clock comparison against the current best baseline.
+6. Symmetric biaffine pair scorer behind one explicit architecture or strategy
+   flag.
+7. Active `WINDOW6` selection caps and overflow telemetry.
+8. Replay metadata for source contributions, beta, visits, Q, completed-Q, and
+   terminal-equivalence flags.
+9. Pruned joint target plus marginal, unordered-safe conditional, and
+   terminal-equivalent targets.
+10. Fixed tactical benchmark suite plus offline tiny-state audit oracle.
+11. Equal-wall-clock comparison against the current best baseline.
 
 That vertical slice gives fast evidence on the only question that matters:
 whether pair semantics can be made strong per wall-clock, not just elegant per
@@ -915,4 +1129,3 @@ It is a sharper version of both:
   explicit pair strategies,
 - and require equal-wall-clock evidence before the architecture is declared the
   winner.
-
