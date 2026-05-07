@@ -1,0 +1,300 @@
+## Verdict
+
+**Yes: the final plan is well reasoned, and it is the best of the three documents as an implementation direction.** It correctly synthesizes the two reports rather than averaging them. It keeps the most important shared recommendation: Hexo’s post-opening move should be represented as an **unordered two-placement pair** in search, while using autoregressive, tactical, and structured proposal machinery to avoid the quadratic action explosion. That is exactly the right high-level architecture for the strongest model. 
+
+**But no: as written, it does not yet guarantee a “complete full implementation with no compromises.”** It is a strong research-to-implementation plan, not a full technical spec. It still needs several concrete algorithmic contracts before it can be considered implementation-complete: proposal-probability correction, exact Gumbel/sequential-halving target construction, deduped multi-source candidate accounting, terminal-pair target handling, conditional-head target semantics, and non-exhaustive joint-pair retrieval details.
+
+My opinionated bottom line: **build this plan, but tighten it before coding the expensive parts.** I would not switch to sequential afterstate search, MuZero learned dynamics, fixed crops, or materialized pair tokens. I would, however, revise the final plan in a few places so that “sampled joint pair” does not accidentally become “half-specified sampled pair with biased training targets.”
+
+---
+
+## How the three documents compare
+
+### `deep-research-report(1).md`
+
+Report 1 argues for a hybrid: pair actions are the search-semantic object, but the network proposes pairs through single-cell and conditional-second structure. It explicitly recommends Gumbel-style root admission, progressive widening below the root, tactical proposal, pair marginals, conditional second-cell targets, sampled ranking losses, and a non-vanishing uniform floor. It also strongly emphasizes D6 augmentation/consistency, explicit six-cell window tokens, and equal-wall-clock ablations. 
+
+The strongest contribution from Report 1 is **operational discipline**: it says the project must not merely claim pair semantics are elegant; it must beat a sequential baseline at equal wall-clock and prove candidate recall, tactical recall, D6 consistency, and entropy health. The final plan correctly adopts this.
+
+Where I think Report 1 is weaker is its insistence on a persistent **uniform legal-pair floor**. Early on, some true uniform pair exploration is useful. Long-term, raw uniform-over-all-pairs becomes mostly wasted mass because the legal pair space grows quadratically. The final plan’s structured-exploration compromise is better.
+
+### `deep-research-report(2).md`
+
+Report 2 is sharper on target hygiene and exploration bias. It makes the crucial point that the exploration floor should live in **candidate-source quotas**, not as a large direct uniform-over-all-pairs distribution. It also emphasizes exact tactical pretraining, policy surprise replay, hard-state starts, and the rule that unsampled legal pairs are unknown rather than negative. 
+
+The strongest contribution from Report 2 is **bias control**: if the model only trains on the sampled support it already sees, it can self-confirm and collapse. The final plan correctly adopts pruned posteriors, proposal metadata, marginals, conditionals, softened targets, and sampled-negative/ranking losses.
+
+Where Report 2 is weaker is that it is less phase-by-phase operational than Report 1. It is decisive architecturally, but the final plan does a better job turning that into acceptance gates, stop rules, and implementation phases.
+
+### `FINAL_HEXORL_IMPLEMENTATION_PLAN.md`
+
+The final plan is the best synthesis. It chooses one mainline: exact-simulator AlphaZero-style self-play, sampled joint-pair MCTS, root Gumbel admission, interior PUCT plus progressive widening, global graph/window encoder, biaffine pair scorer, and candidate-aware training. It rejects exhaustive pair search, sequential afterstate search as the mainline, MuZero learned dynamics, materialized pair tokens, raw sparse pair-only training, and simple pair MLP as the final scorer. 
+
+The final plan’s strongest parts are its **runtime contract discipline**: explicit `sampled_joint_pair_v1`, no model-head-name-driven search behavior, canonical unordered pair rows, D6 validation, replay metadata, stop rules, equal-wall-clock evaluation, and legacy-path quarantine. Those are exactly the safeguards that prevent a research plan from turning into a confused hybrid implementation.
+
+---
+
+## Important claims: validation
+
+The final plan’s most important external claims are broadly valid.
+
+**Gumbel-style root planning is relevant.** The Gumbel AlphaZero paper explicitly says AlphaZero can fail to improve the policy network when root search does not visit all actions, and proposes sampling actions without replacement; it also reports improved prior performance under few simulations. That directly supports using Gumbel-style root admission in Hexo, where legal pair actions can massively outnumber simulations. ([OpenReview][1])
+
+**Sampled MuZero is relevant for sampled action subsets, not for learned dynamics.** The Sampled MuZero paper frames the problem as action spaces too large or complex for full enumeration, proposes policy evaluation/improvement over sampled subsets, and says the sampling procedure must be accounted for rather than ignored. This supports proposal-aware planning and training metadata. It does **not** imply that Hexo should use learned dynamics when exact Rust rules exist. ([arXiv][2])
+
+**Rejecting MuZero learned dynamics as mainline is reasonable.** MuZero is motivated by settings where the environment dynamics are unknown or unavailable; the MuZero paper contrasts that with chess and Go, where perfect simulators are available. If Hexo’s exact simulator is cheap, learned dynamics add risk without solving the real bottleneck: pair-action branching. ([arXiv][3])
+
+**Policy target pruning and auxiliary targets are well supported.** KataGo’s paper explicitly introduces playout cap randomization, policy target pruning, global pooling, and auxiliary policy/value targets; it also explains that policy target pruning decouples exploration from the learned policy target. That supports the final plan’s insistence that forced exploration traffic should not blindly become the policy target. ([ar5iv][4])
+
+**Graph/set encoders are a defensible choice.** Deep Sets establishes neural architectures for permutation-invariant set functions, and Set Transformer is explicitly designed to model interactions among elements in sets using attention. Hexo’s state is naturally a variable set of stones, legal cells, and active windows, so the graph/set direction is justified. ([arXiv][5])
+
+**Pointer-style conditional second-cell heads are relevant.** Pointer Networks were designed for variable-size output dictionaries where outputs correspond to positions in the input. That maps well to “choose a second legal cell from a variable legal-cell set, conditioned on the first.” ([arXiv][6])
+
+**Biaffine pair scoring is plausible, but not proven for Hexo.** The biaffine paper validates biaffine classifiers as an efficient pairwise relation scoring mechanism in dependency parsing. That supports the *form* of a pair scorer, but it does not prove it will beat a symmetric MLP in Hexo. The final plan is right to include a pair-head ablation and failure criterion. ([arXiv][7])
+
+**Connect6 tactical-search analogies are legitimate.** Connect6 literature uses threat-space and relevance-zone ideas because Connect6 is also a two-stone-per-turn sudden-death connection game. Two-Stage MCTS for Connect6 explicitly combines threat-space search with MCTS and reports higher efficiency than traditional MCTS on positions with threat-space solutions. That supports using a bounded tactical oracle/proof module for Hexo hot-window races, not as the whole planner but as an exact tactical sidecar. ([ResearchGate][8])
+
+---
+
+## Is the final plan complete?
+
+**Architecturally, mostly yes. Implementation-spec-wise, no.**
+
+It covers the right components:
+
+It defines the main action semantics, rejects conflicting runtime paths, defines candidate sources, specifies root and interior search families, chooses the graph/window model family, specifies pair heads and training targets, adds replay metadata, includes tactical supervision, defines phases, and includes acceptance/failure criteria. That is a strong plan. 
+
+But a plan that aims for “complete full implementation with no compromises” needs more exactness in these places:
+
+### 1. The Gumbel root operator is under-specified
+
+The plan says “Gumbel-Top-k or equivalent without-replacement admission.” That is not enough. Gumbel AlphaZero is not merely “sample candidates with Gumbel noise.” The important parts are how candidates are admitted, how simulations are allocated, how improved policy targets are constructed, and how completed-Q values are used. The plan should require a concrete algorithm spec:
+
+```text
+root_mode = gumbel_sequential_halving_v1
+inputs: candidate logits, candidate β/inclusion metadata, search budget
+outputs: admitted set, simulation allocation, completed-Q values, improved policy target
+```
+
+Otherwise, an implementation could check the “Gumbel” box while still producing biased raw visit targets.
+
+### 2. Proposal correction needs to be formal, not just logged
+
+The plan correctly says every candidate stores proposal weight and that pair-prior correction should happen. But it does not define how. For sampled candidate sets, the prior used inside PUCT should not be the raw model prior as if the set were unbiased. It should use a clipped correction such as:
+
+```text
+P_C(a | s) ∝ exp(logitθ(a | s) - clip(log β(a | s)))
+```
+
+or another explicitly tested Sampled-MuZero-style correction. The exact form can be tuned, but the plan should require one. Merely storing `proposal_probability_or_weight` is not sufficient.
+
+### 3. Multi-source deduplication needs better accounting
+
+A candidate can be proposed by policy, conditional, tactical, structured, and blind-canary sources. The final plan says each candidate stores `source`, but a candidate often has **multiple sources**. You need to store all source contributions, not just the winning source:
+
+```text
+sources = [
+  {source_type, source_rank, source_weight, local_probability}
+]
+combined_beta_or_inclusion_estimate
+forced_flags
+target_prune_flags
+```
+
+This matters because a tactical pair that also has high policy prior is different from a blind-canary pair that only appeared by chance.
+
+### 4. `policy_pair` candidate generation risks hidden exhaustive scoring
+
+The plan says `policy_pair` proposes pairs from the current joint-pair prior or reranker. That is dangerous unless it says how to do this without scoring all legal pairs. If `policy_pair` means “score every unordered pair and take top-k,” the implementation violates the plan’s own “never rely on exhaustive legal-pair enumeration” criterion.
+
+I would rewrite it as:
+
+```text
+policy_pair_rerank:
+  generate a pre-candidate pool from unary anchors, conditional completions,
+  tactical rows, structured rows, and optional approximate bilinear retrieval;
+  score only that pool with the pair reranker;
+  admit top-k/diverse-k after canonical deduplication.
+```
+
+Dense all-pair scoring should be allowed only for tiny diagnostic states or offline audits.
+
+### 5. The symmetric biaffine scorer must be mathematically symmetric
+
+The plan says the joint pair score must be order-invariant, but the displayed form `biaffine(h_i, h_j)` is not automatically symmetric. If implemented naïvely, `h_i^T U h_j` differs from `h_j^T U h_i` unless `U` is symmetric.
+
+Require one of:
+
+```text
+score_pair(i,j) = 0.5 * (h_i^T U h_j + h_j^T U h_i)
+```
+
+or
+
+```text
+U = U^T
+```
+
+plus symmetric pair features only. This is a correctness requirement, not a modeling preference.
+
+### 6. One-placement wins inside two-placement turns need special handling
+
+The plan includes immediate one-placement wins and immediate two-placement wins as tactical labels. That is good, but it misses a subtle target problem: if one cell already wins, then every pair containing that cell may be terminal-equivalent. Training a joint pair target over arbitrary “winning cell + random filler cell” pairs can inject noise into the pair head.
+
+I would add terminal-equivalence handling:
+
+```text
+If a single cell wins the full turn:
+  train the cell/tactical head strongly on that cell;
+  collapse pair target over equivalent winning pairs, or
+  choose second cells by a deterministic tactical tie-break,
+  and mark the target as terminal-equivalent.
+```
+
+Without this, the pair target can learn meaningless preferences among irrelevant second stones.
+
+### 7. Conditional second-cell targets need unordered-pair-safe semantics
+
+For unordered pair targets, the conditional second-cell head should not inherit canonical-order bias. If pair `{i,j}` has posterior mass, the conditional training should generally create both views:
+
+```text
+π(second=j | first=i)
+π(second=i | first=j)
+```
+
+weighted through the cell marginal. The plan says conditional targets are generated from meaningful first cells, but it should explicitly forbid “canonical first cell only” training. Otherwise the network learns row-order artifacts.
+
+### 8. Active `WINDOW6` selection needs a budget and exact criteria
+
+The plan correctly requires `WINDOW6`, but not every possible six-cell line window can become a token on an unbounded board. The plan should specify active-window inclusion rules:
+
+```text
+include windows with own_count + opp_count + legal_empty_count conditions,
+include windows touching legal cells,
+include hot 4/5 windows,
+include near-hot 3 windows if they create overload candidates,
+cap per-state windows with deterministic priority and overflow telemetry.
+```
+
+Otherwise `WINDOW6` can quietly become either too sparse to learn tactics or too large to run fast.
+
+### 9. Evaluation thresholds are too qualitative
+
+“Near-perfect candidate recall” and “overwhelming majority of roots” are good ideas but weak acceptance criteria. Before training, I would add numeric gates, even if initially provisional:
+
+```text
+exact winning-pair candidate recall: ≥ 99.5%
+mandatory block-pair candidate recall: ≥ 99.0%
+best deep-search pair in candidate set: ≥ 95% on audit suite
+D6 policy consistency max error: bounded by numeric tolerance
+equal-wall-clock Elo: statistically significant over sequential DAG baseline
+```
+
+The exact numbers can be revised, but there should be numbers.
+
+---
+
+## Is anything incorrect?
+
+I would not call the final plan fundamentally incorrect. The architecture is right. The main risk is **underspecification**, not wrong direction.
+
+The one claim I would downgrade is this: **“The final architecture beats a fair sequential afterstate DAG baseline at equal wall-clock.”** That should remain an acceptance criterion, not a predicted fact. Both reports admit that sequential afterstate search may be cheaper per expansion and may look better early. The final plan correctly requires a DAG baseline, but it should avoid sounding as if the outcome is known before mature proposal quality exists. 
+
+The other claim I would soften is **“Gumbel-style root admission or equivalent simple-regret operator.”** “Equivalent” is too loose. This is a place where implementation shortcuts can break the theory. Require either a faithful Gumbel/sequential-halving implementation or a documented replacement with a tested target-construction proof/ablation.
+
+---
+
+## What I would change in the final plan
+
+I would make these edits before implementation:
+
+1. **Add a formal candidate-proposal contract** with multi-source metadata, combined β/inclusion probability, dedup logic, forced flags, and target-prune flags.
+
+2. **Replace vague Gumbel wording** with a named root algorithm: `gumbel_sequential_halving_v1`, including completed-Q target construction.
+
+3. **Define proposal-aware PUCT priors** over candidate sets. Raw logits over a sampled set should be forbidden unless the sampler is intentionally the model prior and the target builder records that assumption.
+
+4. **Rename `policy_pair_first`** to avoid ordered-pair ambiguity. Use `policy_cell_marginal` or `policy_pair_anchor`. The plan already says semantics must be resolved; I would resolve it now.
+
+5. **Make conditional second-cell training symmetric** for unordered pair targets.
+
+6. **Add terminal-equivalence handling** for one-cell wins inside two-cell turns.
+
+7. **Clarify atomic placement semantics**: search edge applies both stones; terminal evaluation occurs after the full pair unless Hexo’s rules explicitly say the turn stops after the first winning placement.
+
+8. **Define active-window selection and caps** so `WINDOW6` is exact but not unbounded.
+
+9. **Specify non-exhaustive `policy_pair` retrieval** so the reranker never quietly scores all legal pairs in normal runtime.
+
+10. **Add schema versioning and cross-language fuzz tests** for Rust ↔ Python replay/inference/search boundaries.
+
+11. **Add distributed self-play/inference performance gates**: batching, queue backpressure, CPU candidate-generation time, GPU utilization, and pair-scores/sec should be phase blockers, not dashboard nice-to-haves.
+
+12. **Add an offline audit oracle** for tiny or tactical positions: exhaustive pair search where legal-pair count is small, plus exact tactical fixtures. This should never be the runtime mainline, but it is essential for candidate-recall calibration.
+
+---
+
+## Will it create the strongest possible model?
+
+**It is the best path among the three documents.** It is also the path I would choose if the goal is maximum final strength rather than quickest prototype.
+
+The reason is simple: Hexo’s real move is a two-stone set. Sequential afterstate search is computationally tempting, but it makes the search assign credit to an artificial first-stone decision. Full exhaustive pair search has correct semantics but impossible branching. The final plan’s hybrid design keeps the true pair as the backed-up action while using factorized proposal and candidate-aware learning to make it trainable. That matches both the game structure and the external literature on sampled action planning. 
+
+However, “strongest possible” depends on execution. The final plan will only outperform the sequential DAG baseline if candidate recall becomes excellent and pair scoring remains cheap enough at equal wall-clock. The plan knows this and makes it an acceptance criterion, which is good. It should not be treated as already proven.
+
+---
+
+## Will it lead to a complete full implementation with no compromises?
+
+**Not by itself.** It will lead to a complete implementation **if** the missing contracts above are added and the phase gates are enforced.
+
+Also, “no compromises” needs nuance. The final plan deliberately compromises on exhaustive optimality: it refuses to enumerate all legal pairs. That is the correct engineering compromise. It is uncompromising about **semantics**—the action is a completed unordered pair—but it is still an approximate sampled planner. So the honest answer is:
+
+**The plan can lead to a complete, principled, full mainline implementation with no semantic compromises. It cannot and should not promise exhaustive no-compromise search over all pairs.**
+
+That is the right tradeoff for this game.
+
+---
+
+## Final opinionated review
+
+I would approve the final plan as the project’s mainline, with one condition: **do not start the large training run until the Gumbel/proposal/target contracts are made exact.**
+
+The final plan’s core decisions are correct:
+
+```text
+exact Rust simulator
+unordered pair macro-actions
+sampled candidate admission
+Gumbel root search
+PUCT + progressive widening below root
+global graph/window encoder
+single + conditional proposal heads
+symmetric biaffine pair reranker
+candidate-aware targets
+no unsampled-pair negatives
+equal-wall-clock sequential DAG baseline
+```
+
+The biggest implementation risks are not “maybe pair actions are wrong.” The biggest risks are:
+
+```text
+candidate support collapse
+biased sampled-set PUCT
+raw visit-count target pollution
+hidden all-pair scoring
+D6 row identity bugs
+terminal-equivalent winning pair noise
+wall-clock underperformance
+```
+
+Fix those explicitly, and this is the strongest plan in the three-document set. Leave them implicit, and the project could still build a sophisticated system that trains on biased targets and loses to a simpler sequential DAG baseline at equal time.
+
+[1]: https://openreview.net/forum?id=bERaNdoegnO "Policy improvement by planning with Gumbel | OpenReview"
+[2]: https://arxiv.org/abs/2104.06303 "[2104.06303] Learning and Planning in Complex Action Spaces"
+[3]: https://arxiv.org/abs/1911.08265 "[1911.08265] Mastering Atari, Go, Chess and Shogi by Planning with a Learned Model"
+[4]: https://ar5iv.labs.arxiv.org/html/1902.10565 "[1902.10565] Accelerating Self-Play Learning in Go"
+[5]: https://arxiv.org/abs/1703.06114 "[1703.06114] Deep Sets"
+[6]: https://arxiv.org/abs/1506.03134 "[1506.03134] Pointer Networks"
+[7]: https://arxiv.org/abs/1611.01734 "[1611.01734] Deep Biaffine Attention for Neural Dependency Parsing"
+[8]: https://www.researchgate.net/publication/220437214_Two-Stage_Monte_Carlo_Tree_Search_for_Connect6?utm_source=chatgpt.com "Two-Stage Monte Carlo Tree Search for Connect6"
