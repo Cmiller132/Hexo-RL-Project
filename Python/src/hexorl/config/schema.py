@@ -7,11 +7,25 @@ from hexorl.models.registry import (
     architecture_ids,
     architecture_spec,
     deprecated_aliases,
+    global_graph_architecture_ids,
     normalize_architecture_id,
     resolve_model_spec,
 )
 from hexorl.models.specs import merge_resolved_loss_weights
 from hexorl.search.pair_strategy import build_pair_strategy
+
+
+AUTOTUNE_PAIR_STRATEGY_MODES = ("none", "root_pair_mcts", "full_pair_mcts")
+DEFAULT_AUTOTUNE_CANDIDATE_PLAN = (
+    "global_xattn_0:none",
+    "global_line_window_0:none",
+    "global_pair_twostage_0:none",
+    "global_graph_full_0:none",
+    "global_graph768_champion:none",
+    "global_pair_twostage_0:root_pair_mcts",
+    "global_pair_twostage_0:full_pair_mcts",
+    "global_graph_full_0:root_pair_mcts",
+)
 
 
 class RunConfig(BaseModel):
@@ -105,7 +119,6 @@ class ModelConfig(BaseModel):
             raise ValueError("model.sparse_prior_mix must be in [0, 1]")
         if not 0.0 <= self.pair_prior_mix <= 1.0:
             raise ValueError("model.pair_prior_mix must be in [0, 1]")
-        self.pair_strategy = self.pair_strategy.lower()
         build_pair_strategy(
             self.pair_strategy,
             max_pairs=self.pair_strategy_max_pairs,
@@ -202,6 +215,216 @@ class TrainConfig(BaseModel):
     })
 
 
+class AutotuneScoutConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool = True
+    max_candidates: int = 8
+    min_epochs: int = 12
+    estimated_epoch_seconds: int = 600
+    estimated_candidate_hours: int = 2
+    min_generated_selfplay_positions_per_epoch: int = 3000
+    target_phase_hours: int = 48
+    schedule_quantum_epochs: int = 2
+    include_dense_control: bool = False
+    candidate_plan: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_AUTOTUNE_CANDIDATE_PLAN)
+    )
+
+    @model_validator(mode="after")
+    def validate_scout_plan(self) -> "AutotuneScoutConfig":
+        if not 1 <= self.max_candidates <= 8:
+            raise ValueError("autotune.scout.max_candidates must be in [1, 8]")
+        positive_fields = {
+            "min_epochs": self.min_epochs,
+            "estimated_epoch_seconds": self.estimated_epoch_seconds,
+            "estimated_candidate_hours": self.estimated_candidate_hours,
+            "min_generated_selfplay_positions_per_epoch": self.min_generated_selfplay_positions_per_epoch,
+            "target_phase_hours": self.target_phase_hours,
+            "schedule_quantum_epochs": self.schedule_quantum_epochs,
+        }
+        invalid_positive = [name for name, value in positive_fields.items() if int(value) <= 0]
+        if invalid_positive:
+            raise ValueError(f"autotune.scout fields must be positive: {invalid_positive}")
+        if len(self.candidate_plan) > self.max_candidates:
+            raise ValueError(
+                "autotune.scout.candidate_plan must not exceed autotune.scout.max_candidates"
+            )
+        global_architectures = set(global_graph_architecture_ids())
+        normalized_plan: list[str] = []
+        for entry in self.candidate_plan:
+            parts = entry.split(":")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise ValueError(
+                    "autotune.scout.candidate_plan entries must use "
+                    "'<architecture_id>:<pair_strategy_mode>'"
+                )
+            architecture_id, pair_mode = parts[0].lower(), parts[1].lower()
+            normalized_plan.append(f"{architecture_id}:{pair_mode}")
+            if pair_mode not in AUTOTUNE_PAIR_STRATEGY_MODES:
+                raise ValueError(
+                    "autotune.scout.candidate_plan pair modes must be one of "
+                    f"{list(AUTOTUNE_PAIR_STRATEGY_MODES)}"
+                )
+            if not self.include_dense_control and architecture_id not in global_architectures:
+                raise ValueError(
+                    "autotune.scout.candidate_plan must be global-graph-only when "
+                    "autotune.scout.include_dense_control is false"
+                )
+        if len(set(normalized_plan)) != len(normalized_plan):
+            raise ValueError("autotune.scout.candidate_plan contains duplicate candidates")
+        if "global_graph768_champion:none" not in normalized_plan:
+            raise ValueError(
+                "autotune.scout.candidate_plan must include global_graph768_champion:none"
+            )
+        self.candidate_plan = normalized_plan
+        return self
+
+
+class AutotuneOptunaConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    storage: str = "sqlite:///runs/<run_id>/optuna.sqlite3"
+    phase1_sampler: str = "queued_tpe_shell"
+    phase1_pruner: str = "nop"
+    phase1_enqueue_candidate_plan: bool = True
+    phase3_sampler: str = "tpe"
+    tpe_multivariate: bool = True
+    tpe_group: bool = True
+    tpe_startup_trials: int = 8
+    phase3_pruner: str = "successive_halving_after_floor"
+    pruner_min_resource_epochs: int = 12
+    pruner_reduction_factor: int = 2
+
+    @model_validator(mode="after")
+    def validate_optuna_surface(self) -> "AutotuneOptunaConfig":
+        expected = {
+            "phase1_sampler": (self.phase1_sampler, "queued_tpe_shell"),
+            "phase1_pruner": (self.phase1_pruner, "nop"),
+            "phase3_sampler": (self.phase3_sampler, "tpe"),
+            "phase3_pruner": (self.phase3_pruner, "successive_halving_after_floor"),
+        }
+        invalid = [name for name, (actual, wanted) in expected.items() if actual != wanted]
+        if invalid:
+            raise ValueError(f"unsupported autotune.optuna values for Scout Foundation: {invalid}")
+        if self.tpe_startup_trials <= 0:
+            raise ValueError("autotune.optuna.tpe_startup_trials must be positive")
+        if self.pruner_min_resource_epochs <= 0:
+            raise ValueError("autotune.optuna.pruner_min_resource_epochs must be positive")
+        if self.pruner_reduction_factor <= 1:
+            raise ValueError("autotune.optuna.pruner_reduction_factor must be > 1")
+        return self
+
+
+class AutotuneRuntimeProbeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool = True
+    speed_quarantine_positions_per_sec: float = 2.0
+    measure: str = "generated_selfplay_positions_per_second"
+    mode: str = "calibrate_and_select"
+    behavior_invariant: bool = True
+
+    @model_validator(mode="after")
+    def validate_runtime_probe_surface(self) -> "AutotuneRuntimeProbeConfig":
+        if self.speed_quarantine_positions_per_sec <= 0.0:
+            raise ValueError("autotune.runtime_probe.speed_quarantine_positions_per_sec must be positive")
+        if self.measure != "generated_selfplay_positions_per_second":
+            raise ValueError("autotune.runtime_probe.measure must be generated_selfplay_positions_per_second")
+        if self.mode != "calibrate_and_select":
+            raise ValueError("autotune.runtime_probe.mode must be calibrate_and_select")
+        return self
+
+
+class AutotuneQuarantineConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    continue_after_quarantine: bool = True
+    allow_retest: bool = True
+    ready_for_retest: List[str] = Field(default_factory=list)
+
+
+class AutotunePairStrategyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    modes: List[str] = Field(default_factory=lambda: list(AUTOTUNE_PAIR_STRATEGY_MODES))
+    full_pair_mcts_enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_pair_modes(self) -> "AutotunePairStrategyConfig":
+        if len(set(self.modes)) != len(self.modes):
+            raise ValueError("autotune.pair_strategy.modes contains duplicate modes")
+        invalid = sorted(set(self.modes) - set(AUTOTUNE_PAIR_STRATEGY_MODES))
+        if invalid:
+            raise ValueError(
+                "autotune.pair_strategy.modes must be a subset of "
+                f"{list(AUTOTUNE_PAIR_STRATEGY_MODES)}; invalid={invalid}"
+            )
+        if "none" not in self.modes:
+            raise ValueError("autotune.pair_strategy.modes must include 'none'")
+        return self
+
+
+class AutotuneScoringConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_scalar: str = "classical_survival_lcb"
+    phase1_uses_model_tournament: bool = False
+    phase2_uses_model_tournament: bool = True
+
+    @model_validator(mode="after")
+    def validate_scoring_surface(self) -> "AutotuneScoringConfig":
+        if self.target_scalar != "classical_survival_lcb":
+            raise ValueError("autotune.scoring.target_scalar must be classical_survival_lcb")
+        if self.phase1_uses_model_tournament:
+            raise ValueError("autotune.scoring.phase1_uses_model_tournament must be false")
+        return self
+
+
+class AutotuneFinalEvalConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    classical_arena_games: int = 400
+    classical_opponent: str = "fixed_strong"
+
+    @model_validator(mode="after")
+    def validate_final_eval_surface(self) -> "AutotuneFinalEvalConfig":
+        if self.classical_arena_games <= 0:
+            raise ValueError("autotune.final_eval.classical_arena_games must be positive")
+        if self.classical_opponent != "fixed_strong":
+            raise ValueError("autotune.final_eval.classical_opponent must be fixed_strong")
+        return self
+
+
+class AutotuneConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    scout: AutotuneScoutConfig = Field(default_factory=AutotuneScoutConfig)
+    optuna: AutotuneOptunaConfig = Field(default_factory=AutotuneOptunaConfig)
+    runtime_probe: AutotuneRuntimeProbeConfig = Field(default_factory=AutotuneRuntimeProbeConfig)
+    quarantine: AutotuneQuarantineConfig = Field(default_factory=AutotuneQuarantineConfig)
+    pair_strategy: AutotunePairStrategyConfig = Field(default_factory=AutotunePairStrategyConfig)
+    scoring: AutotuneScoringConfig = Field(default_factory=AutotuneScoringConfig)
+    final_eval: AutotuneFinalEvalConfig = Field(default_factory=AutotuneFinalEvalConfig)
+
+    @model_validator(mode="after")
+    def validate_candidate_plan_modes(self) -> "AutotuneConfig":
+        configured_modes = set(self.pair_strategy.modes)
+        for entry in self.scout.candidate_plan:
+            pair_mode = entry.split(":", 1)[1].lower()
+            if pair_mode not in configured_modes:
+                raise ValueError(
+                    "autotune.scout.candidate_plan references a pair mode not listed in "
+                    f"autotune.pair_strategy.modes: {pair_mode!r}"
+                )
+            if pair_mode == "full_pair_mcts" and not self.pair_strategy.full_pair_mcts_enabled:
+                raise ValueError(
+                    "autotune.scout.candidate_plan includes full_pair_mcts while "
+                    "autotune.pair_strategy.full_pair_mcts_enabled is false"
+                )
+        return self
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -212,6 +435,7 @@ class Config(BaseModel):
     buffer: BufferConfig = Field(default_factory=BufferConfig)
     train: TrainConfig = Field(default_factory=TrainConfig)
     runtime: "RuntimeConfig" = Field(default_factory=lambda: RuntimeConfig())
+    autotune: AutotuneConfig = Field(default_factory=AutotuneConfig)
 
     @model_validator(mode="after")
     def validate_cross_section_consistency(self) -> "Config":

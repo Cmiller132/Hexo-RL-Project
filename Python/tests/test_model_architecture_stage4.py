@@ -264,12 +264,29 @@ def test_pair_strategy_is_required_for_pair_behavior():
     with pytest.raises(ValueError, match="pair behavior requires an explicit pair strategy"):
         none.require_enabled(context="unit")
 
-    strategy = build_pair_strategy("diagnostic_full_pair", max_pairs=16, prior_mix=0.25)
-    assert strategy.enabled
-    assert strategy.pair_rows_owned
-    assert "policy_pair_joint" in strategy.required_output_contracts
+    root = build_pair_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
+    assert root.enabled
+    assert root.pair_rows_owned
+    assert not root.leaf_pair_scoring_enabled
+    assert "policy_pair_joint" in root.required_output_contracts
     with pytest.raises(ValueError, match="known first"):
-        strategy.require_pair_phase(second_placement=True, known_first=False, context="unit")
+        root.require_pair_phase(second_placement=True, known_first=False, context="unit")
+
+    full = build_pair_strategy("full_pair_mcts", max_pairs=16, prior_mix=0.25)
+    assert full.leaf_pair_scoring_enabled
+
+
+def test_pair_strategy_rejects_non_finite_pair_logits():
+    strategy = build_pair_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
+    pair_qr = np.asarray([[0, 0, 1, 0]], dtype=np.int32)
+    legal = np.asarray([[0, 0], [1, 0]], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="finite"):
+        strategy.pair_logits_to_action_logits(
+            pair_qr,
+            np.asarray([np.nan], dtype=np.float32),
+            legal,
+        )
 
 
 def test_engine_adapter_validates_legal_order_and_value_range():

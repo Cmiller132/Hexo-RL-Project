@@ -34,7 +34,7 @@ from hexorl.graph.batch import GraphBatch, GraphIPCCapacityError, build_graph_ba
 from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import (
-    PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR,
+    PAIR_STRATEGY_FULL_PAIR_MCTS,
     PAIR_STRATEGY_NONE,
     PairStrategy,
     build_pair_strategy,
@@ -1045,13 +1045,17 @@ class SelfPlayWorker:
             self.near_radius = 8
         self.pair_prior_mix = float(getattr(cfg.model, "pair_prior_mix", 0.35))
         self._pair_strategy = build_pair_strategy(
-            str(getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)).lower(),
+            str(getattr(cfg.model, "pair_strategy", PAIR_STRATEGY_NONE)),
             max_pairs=int(getattr(cfg.model, "pair_strategy_max_pairs", 0)),
             prior_mix=self.pair_prior_mix,
         )
         self.pair_strategy = self._pair_strategy.name
         self.pair_strategy_max_pairs = self._pair_strategy.max_pairs
         self.pair_policy_enabled = self._pair_strategy.enabled
+        if self._pair_strategy.name == PAIR_STRATEGY_FULL_PAIR_MCTS:
+            if not self.global_graph_enabled:
+                raise ValueError("full_pair_mcts requires a global graph architecture")
+            self.global_graph_leaf_eval = True
         self._engine_adapter = EngineAdapter()
         self.candidate_budget = max(
             int(getattr(cfg.model, "candidate_budget", 256)),
@@ -1109,6 +1113,9 @@ class SelfPlayWorker:
             "pair_rows_possible": int(pair_rows_possible),
             "pair_rows_scored": int(pair_rows_scored),
         }
+
+    def _pair_prior_metrics_applicable(self, move_idx: int) -> bool:
+        return self._pair_strategy.enabled and int(move_idx) > 0
 
     def _use_pcr_for_turn(self, game_seed: int, move_idx: int) -> bool:
         """Deterministically interleave low-sim and full-sim roots within a game."""
@@ -1744,7 +1751,7 @@ class SelfPlayWorker:
                                 logits = np.asarray(graph_out["policy_place"], dtype=np.float32)
                                 source = np.full(graph_legal.shape[0], PRIOR_SOURCE_SPARSE, dtype=np.uint8)
                                 if (
-                                    self.pair_policy_enabled
+                                    self._pair_strategy.leaf_pair_scoring_enabled
                                     and graph_legal.shape[0] > 0
                                 ):
                                     if leaf_phase == 1:
@@ -2095,7 +2102,7 @@ class SelfPlayWorker:
                 open_four_cells=oracle.open_four_cells,
                 open_five_cells=oracle.open_five_cells,
             )
-            pair_prior_applicable = move_idx > 0
+            pair_prior_applicable = self._pair_prior_metrics_applicable(move_idx)
             pair_prior_hit_frac = _prior_source_fraction(prior_summary, "pair", "root")
             pair_fallback_prior_use = (
                 max(0.0, 1.0 - pair_prior_hit_frac)

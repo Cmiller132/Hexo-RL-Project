@@ -13,7 +13,13 @@ from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR
 
 
 PAIR_STRATEGY_NONE = "none"
-PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR = "diagnostic_full_pair"
+PAIR_STRATEGY_ROOT_PAIR_MCTS = "root_pair_mcts"
+PAIR_STRATEGY_FULL_PAIR_MCTS = "full_pair_mcts"
+PAIR_STRATEGY_MODES = (
+    PAIR_STRATEGY_NONE,
+    PAIR_STRATEGY_ROOT_PAIR_MCTS,
+    PAIR_STRATEGY_FULL_PAIR_MCTS,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,11 @@ class PairStrategy:
             raise ValueError(f"{context}: pair_strategy_max_pairs must be > 0")
         if self.prior_mix <= 0.0:
             raise ValueError(f"{context}: pair_prior_mix must be > 0")
+
+    def require_leaf_pair_scoring(self, *, context: str) -> None:
+        self.require_enabled(context=context)
+        if not self.leaf_pair_scoring_enabled:
+            raise ValueError(f"{context}: pair strategy {self.name!r} is root-only")
 
     def require_pair_phase(self, *, second_placement: bool, known_first: bool, context: str) -> None:
         self.require_enabled(context=context)
@@ -273,10 +284,13 @@ class PairStrategy:
             pair_indices.reshape(1, pair_indices.shape[0], 2),
             pair_mask.reshape(1, -1),
         )
-        return (
-            np.asarray(pair_rows, dtype=np.int32),
-            np.asarray(pair_logits[0, : pair_indices.shape[0]], dtype=np.float32),
+        rows = np.asarray(pair_rows, dtype=np.int32)
+        logits = _validate_logits(
+            pair_logits[0, : pair_indices.shape[0]],
+            rows.shape[0],
+            context="crop pair scoring",
         )
+        return rows, logits
 
     def filter_root_pair_rows(
         self,
@@ -287,7 +301,7 @@ class PairStrategy:
         second_placement: bool,
     ) -> tuple[np.ndarray, np.ndarray]:
         pair_rows = np.asarray(pair_qr, dtype=np.int32).reshape(-1, 4)
-        logits = np.asarray(pair_logits, dtype=np.float32).reshape(-1)[: pair_rows.shape[0]]
+        logits = _validate_logits(pair_logits, pair_rows.shape[0], context="root pair row filtering")
         if pair_rows.shape[0] == 0:
             return pair_rows, logits
         child_set = {(int(q), int(r)) for q, r in np.asarray(root_child_qr, dtype=np.int32).reshape(-1, 2)}
@@ -316,8 +330,7 @@ class PairStrategy:
         if legal.shape[0] == 0 or pair_qr.size == 0 or pair_logits.size == 0:
             return out
         legal_index = {(int(q), int(r)): idx for idx, (q, r) in enumerate(legal.tolist())}
-        logits = np.asarray(pair_logits, dtype=np.float32)[: np.asarray(pair_qr).shape[0]]
-        logits = np.nan_to_num(logits, nan=0.0, posinf=80.0, neginf=-80.0)
+        logits = _validate_logits(pair_logits, np.asarray(pair_qr).shape[0], context="pair action projection")
         exp = np.exp(logits - np.max(logits))
         denom = max(float(exp.sum()), 1e-12)
         mass = np.zeros(legal.shape[0], dtype=np.float32)
@@ -342,6 +355,8 @@ class PairStrategy:
             raise ValueError(f"pair logit blend shape mismatch: base={base.shape}, aux={aux.shape}")
         if base.size == 0:
             return base
+        _require_finite(base, context="base action logits for pair blend")
+        _require_finite(aux, context="pair action logits for pair blend")
         mix = float(np.clip(self.prior_mix, 0.0, 1.0))
         if mix <= 0.0:
             return base
@@ -357,8 +372,13 @@ class PairStrategy:
         pair_first_logits: np.ndarray,
     ) -> None:
         self.require_enabled(context="root pair-first priors")
+        logits = _validate_logits(
+            pair_first_logits,
+            np.asarray(pair_first_logits, dtype=np.float32).reshape(-1).shape[0],
+            context="root pair-first priors",
+        )
         engine.apply_root_pair_first_priors(
-            np.asarray(pair_first_logits, dtype=np.float32),
+            logits,
             self.prior_mix,
         )
 
@@ -376,7 +396,7 @@ class PairStrategy:
             context="root pair priors",
         )
         rows = np.asarray(pair_qr, dtype=np.int32).reshape(-1, 4)
-        logits = np.asarray(pair_logits, dtype=np.float32).reshape(-1)[: rows.shape[0]]
+        logits = _validate_logits(pair_logits, rows.shape[0], context="root pair priors")
         if rows.shape[0] == 0:
             return
         if int(placements_remaining) == 1:
@@ -404,19 +424,19 @@ class PairStrategy:
     def graph_pair_first_logits(outputs: dict[str, object], width: int) -> np.ndarray:
         if "policy_pair_first" not in outputs:
             raise ValueError("graph pair strategy requires policy_pair_first output")
-        return np.asarray(outputs["policy_pair_first"], dtype=np.float32)[: int(width)]
+        return _validate_logits(outputs["policy_pair_first"], int(width), context="graph pair-first logits")
 
     @staticmethod
     def graph_pair_joint_logits(outputs: dict[str, object], width: int) -> np.ndarray:
         if "policy_pair_joint" not in outputs:
             raise ValueError("graph pair strategy requires policy_pair_joint output")
-        return np.asarray(outputs["policy_pair_joint"], dtype=np.float32)[: int(width)]
+        return _validate_logits(outputs["policy_pair_joint"], int(width), context="graph pair-joint logits")
 
     @staticmethod
     def graph_pair_second_logits(outputs: dict[str, object], width: int) -> np.ndarray:
         if "policy_pair_second" not in outputs:
             raise ValueError("graph pair strategy requires policy_pair_second output")
-        return np.asarray(outputs["policy_pair_second"], dtype=np.float32)[: int(width)]
+        return _validate_logits(outputs["policy_pair_second"], int(width), context="graph pair-second logits")
 
 
 def build_pair_strategy(
@@ -425,12 +445,12 @@ def build_pair_strategy(
     max_pairs: int,
     prior_mix: float,
 ) -> PairStrategy:
-    normalized = str(name).lower()
+    normalized = str(name)
     if normalized == PAIR_STRATEGY_NONE:
         if int(max_pairs) != 0:
             raise ValueError("pair_strategy_max_pairs must be 0 when pair_strategy='none'")
         return PairStrategy(PairStrategyConfig(normalized, 0, 0.0))
-    if normalized == PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR:
+    if normalized in {PAIR_STRATEGY_ROOT_PAIR_MCTS, PAIR_STRATEGY_FULL_PAIR_MCTS}:
         strategy = PairStrategy(
             PairStrategyConfig(normalized, int(max_pairs), float(prior_mix)),
             required_output_contracts=(
@@ -440,13 +460,13 @@ def build_pair_strategy(
                 "policy_pair_second",
             ),
             pair_rows_owned=True,
-            leaf_pair_scoring_enabled=True,
+            leaf_pair_scoring_enabled=normalized == PAIR_STRATEGY_FULL_PAIR_MCTS,
         )
-        strategy.require_enabled(context="diagnostic_full_pair")
+        strategy.require_enabled(context=normalized)
         return strategy
     raise ValueError(
         f"model.pair_strategy must be one of "
-        f"{[PAIR_STRATEGY_NONE, PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR]}"
+        f"{list(PAIR_STRATEGY_MODES)}"
     )
 
 
@@ -483,7 +503,25 @@ def _candidate_forward_rows(
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
-    x = np.nan_to_num(np.asarray(logits, dtype=np.float64), nan=0.0, posinf=80.0, neginf=-80.0)
+    x = np.asarray(logits, dtype=np.float64)
+    _require_finite(x, context="softmax logits")
     x -= np.max(x)
     exp = np.exp(x)
     return exp / max(float(exp.sum()), 1e-12)
+
+
+def _validate_logits(values: object, width: int, *, context: str) -> np.ndarray:
+    logits = np.asarray(values, dtype=np.float32).reshape(-1)
+    expected = int(width)
+    if expected < 0:
+        raise ValueError(f"{context}: expected logit width must be non-negative")
+    if logits.shape[0] < expected:
+        raise ValueError(f"{context}: logits have {logits.shape[0]} rows for {expected} pair rows")
+    out = logits[:expected]
+    _require_finite(out, context=context)
+    return out
+
+
+def _require_finite(values: np.ndarray, *, context: str) -> None:
+    if not bool(np.all(np.isfinite(np.asarray(values)))):
+        raise ValueError(f"{context}: logits must be finite")

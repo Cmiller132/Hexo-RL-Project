@@ -65,7 +65,7 @@ PairOutputSpec(
     row_family="pair_joint",
     phase="first_placement_joint",
     ordering="unordered_canonical",
-    runtime_consumed_by=("diagnostic_full_pair", "pair_joint_marginal_blend"),
+    runtime_consumed_by=("root_pair_mcts", "full_pair_mcts", "pair_joint_marginal_blend"),
     trainable=True,
 )
 ```
@@ -76,7 +76,7 @@ PairOutputSpec(
     row_family="known_first_pair",
     phase="second_placement_known_first",
     ordering="ordered_known_first_then_second",
-    runtime_consumed_by=("diagnostic_full_pair", "pair_second_conditional_blend"),
+    runtime_consumed_by=("full_pair_mcts", "pair_second_conditional_blend"),
     trainable=True,
 )
 ```
@@ -134,7 +134,7 @@ InferenceRequest(
 
 ```python
 PairStrategyPlan(
-    strategy_id="diagnostic_full_pair",
+    strategy_id="full_pair_mcts",
     phase_support=("first_placement_joint", "second_placement_known_first"),
     required_outputs={
         "first_placement_joint": ("policy_pair_joint",),

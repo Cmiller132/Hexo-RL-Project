@@ -11,6 +11,29 @@ tuning. A single uncontrolled search space that mixes architecture, pair
 strategy, runtime settings, training schedule, and search knobs would be hard to
 interpret and would hide bugs behind noisy HPO scores.
 
+## Implementation Status
+
+The active package path is the Optuna sequential stack under `hexorl.autotune`
+and `hexorl.tuning`, with `scripts/run_phase1_optuna_scout.py` as the scout
+entrypoint. The scout CLI supports `--dry-run` for ledger/resume smoke tests
+and `--production` for real self-play/training epoch quanta through
+`EpochScoutEpochRunner`. The earlier `scripts/run_phase3_48h_autotune.py`
+ASHA/BOHB/PB2 supervisor is retained only as archived historical reproduction
+code and requires an explicit legacy flag before it can run from the command
+line.
+
+Final champion selection is owned by `hexorl.tuning.champion` and consumes
+persisted Hexo scorecards, hard gates, evidence paths, checkpoint lineage, and
+reproduction commands. Optuna values are trace metadata only; they are not the
+selection authority.
+
+Review and selection artifacts are reproducible from disk:
+
+```text
+python scripts/run_phase2_phase3_review.py --scorecard <path> --output-dir <review_dir> --phase3-storage-template sqlite:///<review_dir>/<candidate_id>.sqlite3
+python scripts/select_optuna_champion.py --scorecard <path> --output <champion_report.json> --reproduction-command "python scripts/run_phase1_optuna_scout.py --runs-root runs --run-id <run_id> --production"
+```
+
 ## Recommendation
 
 Use Optuna as the tested HPO control plane, not as the Hexo domain authority.

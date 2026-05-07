@@ -1,4 +1,4 @@
-"""Phase 3 48-hour autotuning supervisor.
+"""Archived Phase 3 48-hour autotuning supervisor.
 
 This implements the plan in Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md:
 
@@ -8,9 +8,9 @@ This implements the plan in Docs/AUTOTUNING_METHODS_AND_48H_PLAN_20260427.md:
 * Phase 3D protected champion training.
 * Phase 3E final arena/checkpoint selection.
 
-The code is intentionally a supervisor script. It reuses the production epoch
-runner for the expensive self-play/training path and keeps all trial decisions,
-mutation history, scorecards, and final reports in one run directory.
+This file is retained for historical reproduction of the old ASHA/BOHB/PB2
+path. The active production autotune path is the Optuna sequential scout and
+per-family tuning stack under ``hexorl.tuning``.
 """
 
 from __future__ import annotations
@@ -52,17 +52,13 @@ from hexorl.models.registry import (
 )
 from hexorl.runtime import autotune_config, configure_torch_runtime, detect_host
 from hexorl.selfplay.records import BOARD_AREA
-from hexorl.tuning import (
-    ASHARungTable,
-    BOHBSampler,
-    PB2Observation,
-    PB2Scheduler,
-    SearchSpace,
-    TrialObservation,
-)
+from hexorl.tuning.asha import ASHARungTable, TrialObservation
+from hexorl.tuning.bohb import BOHBSampler, SearchSpace
+from hexorl.tuning.pb2 import PB2Observation, PB2Scheduler
 
 
 LOGGER = logging.getLogger("phase3_autotune")
+LEGACY_NON_PRODUCTION_SUPERVISOR = True
 FULL_GLOBAL_POLICY_ROWS = BOARD_AREA
 REPLAY_POLICY_WIDTH_CAP = 512
 # Stage 3 deliberately scouts the four pre-champion global graph candidates.
@@ -400,6 +396,7 @@ class StaticRecipe:
     graph_layers: int = 1
     sparse_prior_stage: int = 0
     train_batch_size: int = 256
+    pair_strategy: str = "none"
 
 
 @dataclass
@@ -1062,8 +1059,13 @@ class Phase3Supervisor:
         cfg.model.candidate_budget = recipe.candidate_budget if (family.sparse_policy or family.graph) else 256
         cfg.model.heads = self._heads_for_recipe(family, recipe)
         if family.global_graph:
-            if set(cfg.model.heads) & GLOBAL_GRAPH_PAIR_HEADS:
-                cfg.model.pair_strategy = "diagnostic_full_pair"
+            pair_strategy = str(getattr(recipe, "pair_strategy", "none")).lower()
+            if pair_strategy != "none":
+                if not (set(cfg.model.heads) & GLOBAL_GRAPH_PAIR_HEADS):
+                    raise ValueError(
+                        f"pair strategy {pair_strategy!r} requires global graph pair heads"
+                    )
+                cfg.model.pair_strategy = pair_strategy
                 cfg.model.pair_strategy_max_pairs = min(256, max(1, int(recipe.graph_token_budget)))
             else:
                 cfg.model.pair_prior_mix = 0.0
@@ -1912,6 +1914,9 @@ class Phase3Supervisor:
             head_bundle = "graph_tactical"
         if family.global_graph and family.architecture in {"global_pair_twostage_0", "global_graph_full_0"}:
             head_bundle = "graph_tactical"
+            pair_strategy = "root_pair_mcts"
+        else:
+            pair_strategy = "none"
         if not family.graph and head_bundle == "graph_tactical":
             head_bundle = "full_aux_light"
         candidate_budget = graph_budget if family.graph else int(config.get("candidate_budget", 256))
@@ -1928,6 +1933,7 @@ class Phase3Supervisor:
             graph_layers=graph_layers,
             sparse_prior_stage=sparse_stage,
             train_batch_size=self._host_safe_train_batch_size(family, int(config.get("train_batch_size", 256))),
+            pair_strategy=pair_strategy,
         )
 
     def _graph_static_ladder(self) -> list[tuple[str, int, int, int]]:
@@ -1974,6 +1980,7 @@ class Phase3Supervisor:
                 graph_layers=1 if token_budget <= 384 else 2,
                 sparse_prior_stage=0,
                 train_batch_size=self._host_safe_train_batch_size(family, 128),
+                pair_strategy="root_pair_mcts" if pair_scout else "none",
             )
         if family.graph:
             return StaticRecipe(
@@ -1989,6 +1996,7 @@ class Phase3Supervisor:
                 graph_layers=1,
                 sparse_prior_stage=0,
                 train_batch_size=self._host_safe_train_batch_size(family, 256),
+                pair_strategy="none",
             )
         full_sims = self._host_safe_full_sims(family, 800)
         if family.sparse_policy:
@@ -2001,6 +2009,7 @@ class Phase3Supervisor:
                 temperature_family="slow_cool",
                 subtree_reuse=True,
                 train_batch_size=self._host_safe_train_batch_size(family, 256),
+                pair_strategy="none",
             )
         return StaticRecipe(
             full_sims=full_sims,
@@ -2011,6 +2020,7 @@ class Phase3Supervisor:
             temperature_family="slow_cool",
             subtree_reuse=True,
             train_batch_size=self._host_safe_train_batch_size(family, 256),
+            pair_strategy="none",
         )
 
     def _host_safe_full_sims(self, family: FamilySpec, requested: int) -> int:
@@ -3233,11 +3243,26 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated finalist names to run; omitted means the full Phase 3 pool.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-legacy-scheduler",
+        action="store_true",
+        help=(
+            "Run the archived ASHA/BOHB/PB2 supervisor for historical reproduction. "
+            "Production autotune uses scripts/run_phase1_optuna_scout.py and "
+            "hexorl.tuning.optuna_tuning."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if not args.allow_legacy_scheduler:
+        raise SystemExit(
+            "scripts/run_phase3_48h_autotune.py is archived non-production code. "
+            "Use scripts/run_phase1_optuna_scout.py for the Optuna scout path, or "
+            "pass --allow-legacy-scheduler only for historical reproduction."
+        )
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     random.seed(args.seed)
     np.random.seed(args.seed)

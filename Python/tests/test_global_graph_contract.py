@@ -569,7 +569,7 @@ def test_global_graph_pair_chunks_remove_ipc_pair_cap_as_semantic_limit():
                 break
         if len(pair_first) == 4096:
             break
-    strategy = build_pair_strategy("diagnostic_full_pair", max_pairs=4096, prior_mix=0.35)
+    strategy = build_pair_strategy("full_pair_mcts", max_pairs=4096, prior_mix=0.35)
     chunk = strategy.graph_batch_with_pair_rows(
         graph,
         np.asarray(pair_first, dtype=np.int64),

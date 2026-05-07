@@ -1,6 +1,8 @@
 import pytest
 
 from hexorl.eval.scorecard import (
+    ClassicalGameEvidence,
+    classical_survival_lcb,
     compute_phase3_scorecard,
     final_score_from_league_lcb,
     milestone_k_hard_gate_failures,
@@ -138,6 +140,18 @@ def test_scorecard_enforces_milestone_k_bug_sentinels():
 
 def test_final_score_uses_league_lcb():
     assert final_score_from_league_lcb({"rating_mean": 2000.0, "lcb": 1750.0}) == 1750.0
+
+
+def test_classical_survival_lcb_rewards_survival_draws_and_wins():
+    result = classical_survival_lcb(
+        [
+            ClassicalGameEvidence("loss", 25, 100, 0.0, "normal_95", "fixed_strong", 1),
+            ClassicalGameEvidence("draw", 100, 100, 0.0, "normal_95", "fixed_strong", 2),
+            ClassicalGameEvidence("win", 40, 100, 0.0, "normal_95", "fixed_strong", 3),
+        ]
+    )
+    assert result.per_game_scores == pytest.approx((0.25, 1.0, 1.15))
+    assert result.score < result.mean
 
 
 def test_short_health_rung_prunes_only_hard_failures():

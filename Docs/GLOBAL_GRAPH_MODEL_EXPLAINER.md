@@ -1681,8 +1681,8 @@ This distinction is important:
 Head exists != MCTS uses it
 ```
 
-MCTS pair influence requires an explicit `model.pair_strategy`, currently
-`diagnostic_full_pair`.
+MCTS pair influence requires an explicit `model.pair_strategy`: `none`,
+`root_pair_mcts`, or `full_pair_mcts`.
 
 ## Why Pair Heads Exist
 
@@ -1851,13 +1851,21 @@ Current pair strategy options:
 
 ```text
 none
-diagnostic_full_pair
+root_pair_mcts
+full_pair_mcts
 ```
 
 `none` means pair heads may exist for training or diagnostics, but search does
 not use them.
 
-`diagnostic_full_pair` means pair behavior is enabled. It requires:
+`root_pair_mcts` means pair priors are projected only at the root before MCTS
+expands the first search frontier.
+
+`full_pair_mcts` means pair priors apply at the root and at supported non-root
+search points. Unsupported model/search combinations are rejected before Rust
+MCTS calls.
+
+Both pair-enabled modes require:
 
 ```text
 pair_strategy_max_pairs > 0
@@ -1980,7 +1988,7 @@ MCTS ignores pair heads
 actual move selection uses normal policy/value/search
 ```
 
-With `pair_strategy = diagnostic_full_pair`:
+With `pair_strategy = root_pair_mcts` or `pair_strategy = full_pair_mcts`:
 
 ```text
 pair heads can contribute extra priors

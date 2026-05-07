@@ -11,7 +11,7 @@ resolved providers and executable pair strategies.
 | dense self-play root | `policy` | none | dense board row index maps through root offset/legal bytes | `expand_root` | legal bytes and crop offset identify legal dense logits | scalar in current-player perspective, `[-1,1]` | prior source dense/default, root stats | dense policy provider | direct dense branch in worker |
 | sparse self-play root/leaf | `policy`, `sparse_policy` | optional crop `pair_policy` only by strategy | candidate qr rows align with legal bytes; candidate row count <= 512 | `expand_root_with_sparse_priors`, `expand_and_backprop_with_sparse_sources` | candidate rows contain legal/tactical actions; fallback dense priors exist | same as dense | sparse candidate recall, sparse source fractions | candidate policy provider | sparse-prior-stage branch checks |
 | graph self-play root | `policy_place` | none by default | graph legal qr must match Rust legal bytes exactly, order may be realigned after set validation | `expand_root_with_global_priors` | graph legal rows are all Rust legal rows; duplicate/missing/extra rows fail | same scalar decode | global prior source metadata | global legal-row provider | `GlobalHexGraphNet.is_global_graph_architecture` branch |
-| graph pair first strategy | `policy_place`, `policy_pair_first` | legal-row pair-first logits | same legal table as root | `apply_root_pair_first_priors` | pair-first logits cover every root child | same as graph | root pair source fraction | `diagnostic_full_pair` or future pair-first strategy | raw `policy_pair_first` key check |
+| graph pair first strategy | `policy_place`, `policy_pair_first` | legal-row pair-first logits | same legal table as root | `apply_root_pair_first_priors` | pair-first logits cover every root child | same as graph | root pair source fraction | `root_pair_mcts` or `full_pair_mcts` | raw `policy_pair_first` key check |
 | graph pair joint strategy | `policy_pair_joint` chunks | pair qr rows `(q1,r1,q2,r2)` | unordered pair rows over current legal rows | `apply_root_pair_priors` or blend to action logits | pair rows must match legal-row table and strategy cap | n/a | root pair candidate count/source | executable pair strategy | `_score_graph_pair_chunks` direct call from worker |
 | graph pair second strategy | `policy_pair_second` chunks | known-first pair rows | first is previous stone token, second is legal row | `apply_root_pair_second_priors` | known-first matches current turn phase | n/a | second pair source | executable pair strategy with phase validation | direct second-placement branch |
 | crop pair strategy | `pair_policy` chunks | candidate pair logits | candidate row table plus pair row table | `apply_root_pair_priors`, `apply_root_pair_second_priors`, or blended action logits | candidate rows must include known first and legal seconds | n/a | pair source counters | crop pair strategy | `_score_crop_pair_chunks` direct call |
@@ -27,14 +27,19 @@ resolved providers and executable pair strategies.
 - Ignores pair outputs even if the architecture can produce them.
 - Fails if config asks for pair influence with no strategy.
 
-`diagnostic_full_pair`
+`root_pair_mcts`
 
 - Requires explicit `pair_strategy_max_pairs > 0` and `pair_prior_mix > 0`.
-- Requests pair chunks only at root positions where the strategy is configured
-  to observe or apply pair behavior.
+- Requests pair chunks only at root positions.
 - Records pair logits and source counters.
 - May blend into action priors only through the strategy, never by head
   presence.
+
+`full_pair_mcts`
+
+- Requires explicit `pair_strategy_max_pairs > 0` and `pair_prior_mix > 0`.
+- Applies root pair influence plus supported leaf/non-root pair scoring.
+- Rejects unsupported model/search combinations before Rust MCTS calls.
 
 Planned variants for later stages:
 

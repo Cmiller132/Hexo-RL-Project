@@ -662,6 +662,16 @@ def test_phase3_pair_policy_storage_is_only_for_global_pair_heads(tmp_path):
         temperature_family="slow_cool",
         train_batch_size=128,
     )
+    root_pair_recipe = module.StaticRecipe(
+        full_sims=384,
+        pcr_low_sims=128,
+        policy_top_k=96,
+        candidate_budget=256,
+        head_bundle="graph_tactical",
+        temperature_family="slow_cool",
+        train_batch_size=128,
+        pair_strategy="root_pair_mcts",
+    )
 
     hybrid_cfg = module.Phase3Supervisor._make_config(
         supervisor,
@@ -679,14 +689,24 @@ def test_phase3_pair_policy_storage_is_only_for_global_pair_heads(tmp_path):
         tmp_path / "global",
         "3A_calibration",
     )
+    root_pair_cfg = module.Phase3Supervisor._make_config(
+        supervisor,
+        pair_global,
+        root_pair_recipe,
+        module.DynamicParams(),
+        tmp_path / "global_root_pair",
+        "3A_calibration",
+    )
 
     assert "pair_policy" not in hybrid_cfg.model.heads
     assert not (set(hybrid_cfg.model.heads) & module.GLOBAL_GRAPH_PAIR_HEADS)
     assert hybrid_cfg.model.pair_strategy == "none"
     assert hybrid_cfg.model.pair_strategy_max_pairs == 0
     assert set(global_cfg.model.heads) & module.GLOBAL_GRAPH_PAIR_HEADS
-    assert global_cfg.model.pair_strategy == "diagnostic_full_pair"
-    assert global_cfg.model.pair_strategy_max_pairs == 256
+    assert global_cfg.model.pair_strategy == "none"
+    assert global_cfg.model.pair_strategy_max_pairs == 0
+    assert root_pair_cfg.model.pair_strategy == "root_pair_mcts"
+    assert root_pair_cfg.model.pair_strategy_max_pairs == 256
 
     hybrid_replay = module.Phase3Supervisor._make_replay_buffer(supervisor, hybrid_cfg, graph_hybrid)
     global_replay = module.Phase3Supervisor._make_replay_buffer(supervisor, global_cfg, pair_global)
@@ -1184,7 +1204,7 @@ def test_phase3_trial_created_log_summary_names_model_contract():
                 "pair_capabilities": ["graph_pair_first", "graph_pair_joint", "graph_pair_second"],
             },
             "pair_strategy": {
-                "strategy": "diagnostic_full_pair",
+                "strategy": "root_pair_mcts",
                 "max_pairs": 256,
             },
             "static": {
@@ -1201,7 +1221,7 @@ def test_phase3_trial_created_log_summary_names_model_contract():
     assert "family=global_pair_twostage_0" in summary
     assert "runtime_outputs=[policy_place, value, policy_pair_first" in summary
     assert "pair_capabilities=[graph_pair_first, graph_pair_joint, graph_pair_second]" in summary
-    assert "pair_strategy=diagnostic_full_pair" in summary
+    assert "pair_strategy=root_pair_mcts" in summary
     assert "max_pairs=256" in summary
 
 
