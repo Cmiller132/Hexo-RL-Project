@@ -10,8 +10,10 @@ state once they finish.
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import time
+from functools import partial
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -42,9 +44,116 @@ logger = logging.getLogger(__name__)
 GRAPH_PAIR_POLICY_HEADS = {"policy_pair_first", "policy_pair_second", "policy_pair_joint"}
 
 
+def _training_dataloader_worker_init(worker_id: int, *, torch_threads: int = 1) -> None:
+    """Keep graph DataLoader workers from each spawning a full BLAS thread pool."""
+    del worker_id
+    threads = max(1, int(torch_threads))
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["MKL_NUM_THREADS"] = str(threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+
+
+def _is_dataloader_worker_failure(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "dataloader worker",
+        "worker exited unexpectedly",
+        "multiprocessing",
+        "brokenpipe",
+        "eoferror",
+        "connection reset",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _uses_pair_policy_targets(cfg: Config) -> bool:
     heads = set(resolve_model_spec(cfg).outputs)
     return bool((heads & GRAPH_PAIR_POLICY_HEADS) or "pair_policy" in heads)
+
+
+def _make_training_dataset(
+    cfg: Config,
+    replay: RingBuffer,
+    *,
+    resolved_outputs: set[str] | None = None,
+    is_global_graph: bool | None = None,
+    worker_count: int = 0,
+) -> ReplayDataset:
+    outputs = resolved_outputs if resolved_outputs is not None else set(resolve_model_spec(cfg).outputs)
+    graph_model = (
+        bool(is_global_graph)
+        if is_global_graph is not None
+        else is_global_graph_architecture(getattr(cfg.model, "architecture", ""))
+    )
+    return ReplayDataset(
+        replay,
+        batch_size=cfg.train.batch_size,
+        recency_decay=cfg.buffer.recency_decay,
+        pcr_weight=cfg.buffer.pcr_weight,
+        use_symmetry=True,
+        lookahead_horizons=cfg.buffer.lookahead_horizons,
+        regret_fraction=cfg.buffer.regret_fraction,
+        include_axis_delta_norm="axis_delta_norm" in outputs,
+        include_sparse_policy=bool(
+            getattr(cfg.model, "sparse_policy", False)
+            or "sparse_policy" in outputs
+            or "pair_policy" in outputs
+        ),
+        include_pair_policy=_uses_pair_policy_targets(cfg),
+        include_graph_policy=graph_model,
+        candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
+        graph_context_tokens=int(getattr(cfg.model, "graph_token_budget", 512)),
+        graph_legal_rows=int(getattr(cfg.model, "candidate_budget", 256)),
+        max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
+    )
+
+
+def _make_training_dataloader(
+    cfg: Config,
+    replay: RingBuffer,
+    *,
+    resolved_outputs: set[str] | None = None,
+    is_global_graph: bool | None = None,
+    worker_count: int | None = None,
+    pin_memory: bool | None = None,
+) -> DataLoader:
+    graph_model = (
+        bool(is_global_graph)
+        if is_global_graph is not None
+        else is_global_graph_architecture(getattr(cfg.model, "architecture", ""))
+    )
+    workers = (
+        dataloader_worker_count(cfg, global_graph_model=graph_model)
+        if worker_count is None
+        else max(0, int(worker_count))
+    )
+    kwargs: dict[str, Any] = {
+        "batch_size": None,
+        "num_workers": workers,
+        "pin_memory": torch.cuda.is_available() if pin_memory is None else bool(pin_memory),
+        "persistent_workers": workers > 0,
+    }
+    if workers > 0:
+        kwargs["prefetch_factor"] = max(
+            1,
+            int(getattr(cfg.runtime, "dataloader_prefetch_factor", 2) or 2),
+        )
+        kwargs["worker_init_fn"] = partial(
+            _training_dataloader_worker_init,
+            torch_threads=max(1, int(getattr(cfg.runtime, "graph_worker_torch_threads", 1) or 1)),
+        )
+    return DataLoader(
+        _make_training_dataset(
+            cfg,
+            replay,
+            resolved_outputs=resolved_outputs,
+            is_global_graph=graph_model,
+            worker_count=workers,
+        ),
+        **kwargs,
+    )
 
 
 @dataclass
@@ -168,42 +277,45 @@ def run_epoch(
             replay.extend(_make_bootstrap_positions(cfg, games, start_game_id=replay.max_game_id + 1))
 
         resolved_outputs = set(resolve_model_spec(cfg).outputs)
-        dataset = ReplayDataset(
-            replay,
-            batch_size=cfg.train.batch_size,
-            recency_decay=cfg.buffer.recency_decay,
-            pcr_weight=cfg.buffer.pcr_weight,
-            use_symmetry=True,
-            lookahead_horizons=cfg.buffer.lookahead_horizons,
-            regret_fraction=cfg.buffer.regret_fraction,
-            include_axis_delta_norm="axis_delta_norm" in resolved_outputs,
-            include_sparse_policy=bool(
-                getattr(cfg.model, "sparse_policy", False)
-                or "sparse_policy" in resolved_outputs
-                or "pair_policy" in resolved_outputs
-            ),
-            include_pair_policy=_uses_pair_policy_targets(cfg),
-            include_graph_policy=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
-            defer_graph_collate=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
-            candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
-            graph_context_tokens=int(getattr(cfg.model, "graph_token_budget", 512)),
-            graph_legal_rows=int(getattr(cfg.model, "candidate_budget", 256)),
-            max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
-        )
-        num_workers = dataloader_worker_count(cfg)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=None,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers=num_workers > 0,
-        )
+        is_global_graph = is_global_graph_architecture(getattr(cfg.model, "architecture", ""))
+        num_workers = dataloader_worker_count(cfg, global_graph_model=is_global_graph)
+
+        def make_dataloader(worker_count: int) -> DataLoader:
+            return _make_training_dataloader(
+                cfg,
+                replay,
+                resolved_outputs=resolved_outputs,
+                is_global_graph=is_global_graph,
+                worker_count=worker_count,
+            )
+
+        dataloader = make_dataloader(num_workers)
         if trainer is None:
             trainer = Trainer(model, cfg, dataloader, device=device)
         else:
             trainer.dataloader = dataloader
             trainer.batches_per_epoch = cfg.train.batches_per_epoch
-        train_stats = trainer.train_epoch()
+        initial_global_step = int(getattr(trainer, "global_step", 0))
+        initial_epoch = int(getattr(trainer, "epoch", 0))
+        try:
+            train_stats = trainer.train_epoch()
+        except Exception as exc:
+            if (
+                num_workers > 0
+                and _is_dataloader_worker_failure(exc)
+                and int(getattr(trainer, "global_step", 0)) == initial_global_step
+            ):
+                logger.warning(
+                    "DataLoader worker path failed before optimizer progress; "
+                    "falling back to single-process loading: %s",
+                    exc,
+                )
+                trainer.epoch = initial_epoch
+                trainer.dataloader = make_dataloader(0)
+                train_stats = trainer.train_epoch()
+                train_stats["dataloader_worker_fallback"] = 1.0
+            else:
+                raise
 
         checkpoint_path = output_dir / f"epoch_{int(train_stats.get('epoch', 1)):04d}.pt"
         trainer.save_checkpoint(checkpoint_path)
@@ -312,30 +424,13 @@ def run_tiny_training_smoke(
     replay.extend(_make_bootstrap_positions(cfg, 16))
 
     resolved_outputs = set(resolve_model_spec(cfg).outputs)
-    dataset = ReplayDataset(
+    is_global_graph = is_global_graph_architecture(getattr(cfg.model, "architecture", ""))
+    dataloader = _make_training_dataloader(
+        cfg,
         replay,
-        batch_size=cfg.train.batch_size,
-        recency_decay=cfg.buffer.recency_decay,
-        pcr_weight=cfg.buffer.pcr_weight,
-        use_symmetry=True,
-        lookahead_horizons=cfg.buffer.lookahead_horizons,
-        regret_fraction=cfg.buffer.regret_fraction,
-        include_sparse_policy=bool(
-            getattr(cfg.model, "sparse_policy", False)
-            or "sparse_policy" in resolved_outputs
-            or "pair_policy" in resolved_outputs
-        ),
-        include_pair_policy=_uses_pair_policy_targets(cfg),
-        include_graph_policy=is_global_graph_architecture(getattr(cfg.model, "architecture", "")),
-        candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
-    )
-    num_workers = dataloader_worker_count(cfg)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=None,
-        num_workers=num_workers,
+        resolved_outputs=resolved_outputs,
+        is_global_graph=is_global_graph,
         pin_memory=False,
-        persistent_workers=num_workers > 0,
     )
     model = build_model_from_config(cfg, device=torch.device("cpu"), inference=False)
     trainer = Trainer(model, cfg, dataloader, device=torch.device("cpu"))

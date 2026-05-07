@@ -20,7 +20,7 @@ protocol/adapters while keeping shared memory as transport.
 - Dense crop tensor: `13x33x33` float32 per position.
 - Candidate capacity: `MAX_CANDIDATES = 512`.
 - Pair candidate capacity: `MAX_PAIR_CANDIDATES = 512`.
-- Graph capacities: `MAX_GRAPH_TOKENS = 4096`, `MAX_GRAPH_ACTIONS = 4096`,
+- Graph capacities: `MAX_GRAPH_TOKENS = 4096`, `MAX_GRAPH_ACTIONS = 8192`,
   `MAX_GRAPH_PAIRS = 4096`.
 - Graph relation tensors are large and must be copied by active prefix only.
 - Graph IPC currently supports exactly one graph position per worker request.

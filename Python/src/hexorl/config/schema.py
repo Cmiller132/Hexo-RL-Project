@@ -315,6 +315,9 @@ class RuntimeConfig(BaseModel):
     cpu_threads: int | None = None
     interop_threads: int | None = None
     dataloader_workers: int | None = None
+    graph_dataloader_workers: int | None = None
+    dataloader_prefetch_factor: int = 2
+    graph_worker_torch_threads: int = 1
     selfplay_workers: int | None = None
     selfplay_cpu_reserve: int = 4
     channels_last: bool = True

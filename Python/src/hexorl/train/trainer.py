@@ -20,9 +20,7 @@ from hexorl.models.assembly import is_global_graph_model
 from hexorl.models.loading import restore_model_weights
 from hexorl.models.registry import resolve_model_spec
 from hexorl.models.specs import merge_resolved_loss_weights
-from hexorl.graph.batch import collate_graph_batches
 from hexorl.replay.training_batch import (
-    graph_batch_training_targets,
     prepare_dense_training_batch,
     prepare_global_graph_training_batch,
 )
@@ -184,6 +182,7 @@ class Trainer:
 
         try:
             for batch_idx in range(self.batches_per_epoch):
+                wait_started = time.perf_counter()
                 try:
                     batch = next(batch_iter)
                 except StopIteration:
@@ -193,8 +192,10 @@ class Trainer:
                         max_prefetch=prefetch_batches,
                     )
                     batch = next(batch_iter)
+                dataloader_wait_s = time.perf_counter() - wait_started
 
                 loss_dict = self._train_step(batch, batch_idx)
+                self._attach_loader_runtime_metrics(loss_dict, dataloader_wait_s)
 
                 for k, v in loss_dict.items():
                     if k not in self._epoch_losses:
@@ -376,80 +377,50 @@ class Trainer:
         del tensors
         del policies
         batch_size = int(values.shape[0])
-        original_graph_batches = aux_targets.get("_graph_batches")
-        graph_batches = original_graph_batches
-        if graph_batches is None:
-            required = [
-                "token_features",
-                "token_type",
-                "token_qr",
-                "token_mask",
-                "legal_token_indices",
-                "legal_mask",
-                "relation_type",
-                "relation_bias",
-            ]
-            missing = [name for name in required if name not in aux_targets]
-            if missing:
-                raise ValueError(f"global graph training batch is missing graph tensors: {missing}")
-        elif len(graph_batches) != batch_size:
-            raise ValueError(
-                "deferred graph training batch size mismatch: "
-                f"graphs={len(graph_batches)} targets={batch_size}"
-            )
+        required = [
+            "token_features",
+            "token_type",
+            "token_qr",
+            "token_mask",
+            "legal_token_indices",
+            "legal_mask",
+            "relation_type",
+            "relation_bias",
+        ]
+        missing = [name for name in required if name not in aux_targets]
+        if missing:
+            raise ValueError(f"global graph training batch is missing graph tensors: {missing}")
 
         setup_timings: dict[str, float] = {}
-        effective_aux_targets = aux_targets
-        collated_once = False
-        graph_collate_fallback = 0.0
-        if graph_batches is not None:
-            try:
-                collated_graph = collate_graph_batches(graph_batches, timings=setup_timings)
-                graph_targets = graph_batch_training_targets(collated_graph)
-                effective_aux_targets = {
-                    key: value for key, value in aux_targets.items() if key != "_graph_batches"
-                }
-                effective_aux_targets.update(graph_targets)
-                graph_batches = None
-                collated_once = True
-            except MemoryError as exc:
-                graph_collate_fallback = 1.0
-                logger.warning(
-                    "global graph full-batch CPU collation failed; falling back to per-microbatch collation: %s",
-                    exc,
-                )
-
-        heuristic_size = self._graph_train_microbatch_heuristic(effective_aux_targets, batch_size, graph_batches)
+        heuristic_size = self._graph_train_microbatch_heuristic(aux_targets, batch_size)
         configured_microbatch = int(getattr(self.train_cfg, "graph_microbatch_size", 0) or 0) > 0
         microbatch_size = self._graph_train_microbatch_size(
-            effective_aux_targets,
+            aux_targets,
             batch_size,
-            graph_batches,
             heuristic_size=heuristic_size,
         )
         if not self._logged_graph_microbatch:
             logger.info(
                 "global graph training microbatch selected_size=%d heuristic_size=%d "
-                "effective_batch_size=%d collate_once=%s rejections=%s",
+                "effective_batch_size=%d rejections=%s",
                 microbatch_size,
                 heuristic_size,
                 batch_size,
-                collated_once,
                 "; ".join(self._graph_microbatch_rejections) or "none",
             )
             self._logged_graph_microbatch = True
 
         oom_retries = 0
         nonfinite_retries = 0
+        loader_timings = aux_targets.get("_loader_timings") or {}
         while True:
             try:
                 result = self._train_global_graph_step_once(
                     values=values,
                     lookahead_list=lookahead_list,
-                    aux_targets=effective_aux_targets,
+                    aux_targets=aux_targets,
                     batch_idx=batch_idx,
                     batch_size=batch_size,
-                    graph_batches=graph_batches,
                     microbatch_size=microbatch_size,
                     setup_timings=setup_timings,
                 )
@@ -461,8 +432,17 @@ class Trainer:
                 result["graph_microbatch_rejected_count"] = float(len(self._graph_microbatch_rejections))
                 result["graph_microbatch_oom_retries"] = float(oom_retries)
                 result["graph_microbatch_nonfinite_retries"] = float(nonfinite_retries)
-                result["graph_collate_once"] = float(collated_once)
-                result["graph_collate_fallback"] = graph_collate_fallback
+                for key in (
+                    "graph_loader_sample_s",
+                    "graph_loader_get_records_s",
+                    "graph_loader_tensor_encode_s",
+                    "graph_loader_candidate_s",
+                    "graph_loader_graph_base_s",
+                    "graph_loader_policy_overlay_s",
+                    "graph_loader_pair_rows_s",
+                    "graph_loader_collate_s",
+                ):
+                    result[key] = float(loader_timings.get(key, 0.0))
                 self._graph_microbatch_choice = microbatch_size
                 return result
             except RuntimeError as exc:
@@ -509,7 +489,6 @@ class Trainer:
         aux_targets: dict,
         batch_idx: int,
         batch_size: int,
-        graph_batches,
         microbatch_size: int,
         setup_timings: dict[str, float],
     ) -> Dict[str, float]:
@@ -532,10 +511,6 @@ class Trainer:
             micro_count = end - start
             micro_weight = micro_count / max(batch_size, 1)
             micro_aux_targets = self._slice_targets_for_batch(aux_targets, start, end, batch_size)
-            micro_graph_batches = None
-            if graph_batches is not None:
-                micro_graph_batches = graph_batches[start:end]
-                micro_aux_targets.pop("_graph_batches", None)
             micro_lookahead = [
                 self._slice_value_for_batch(value, start, end, batch_size)
                 for value in lookahead_list
@@ -552,7 +527,6 @@ class Trainer:
                     "train_policy_on_full_search_only",
                     True,
                 ),
-                graph_batches=micro_graph_batches,
                 timings=timings,
             )
             timings["graph_prepare_s"] = timings.get("graph_prepare_s", 0.0) + (
@@ -679,14 +653,13 @@ class Trainer:
         self,
         targets: dict,
         batch_size: int,
-        graph_batches=None,
         *,
         heuristic_size: int | None = None,
     ) -> int:
         configured = int(getattr(self.train_cfg, "graph_microbatch_size", 0) or 0)
         if configured > 0:
             return max(1, min(configured, batch_size))
-        heuristic = heuristic_size or self._graph_train_microbatch_heuristic(targets, batch_size, graph_batches)
+        heuristic = heuristic_size or self._graph_train_microbatch_heuristic(targets, batch_size)
         if self.device.type != "cuda":
             self._graph_microbatch_heuristic = heuristic
             self._graph_microbatch_rejections = []
@@ -699,32 +672,24 @@ class Trainer:
         selected, rejections = self._select_graph_microbatch_candidate(
             targets,
             batch_size,
-            graph_batches,
             heuristic,
         )
         self._graph_microbatch_heuristic = heuristic
         self._graph_microbatch_rejections = rejections
         return selected
 
-    def _graph_train_microbatch_heuristic(self, targets: dict, batch_size: int, graph_batches=None) -> int:
+    def _graph_train_microbatch_heuristic(self, targets: dict, batch_size: int) -> int:
         if self.device.type != "cuda":
             return max(1, batch_size)
 
-        if graph_batches is not None:
-            token_count = max(int(graph.token_features.shape[0]) for graph in graph_batches)
-        else:
-            token_count = int(self._as_tensor(targets["token_features"]).shape[1])
+        token_count = int(self._as_tensor(targets["token_features"]).shape[1])
         pair_width = 0
-        if graph_batches is not None:
-            for graph in graph_batches:
-                pair_width = max(pair_width, int(graph.pair_first_indices.shape[0]))
-        else:
-            for key in ("pair_first_indices", "pair_second_indices", "pair_token_indices"):
-                value = targets.get(key)
-                if value is not None:
-                    tensor = self._as_tensor(value)
-                    if tensor.ndim >= 2:
-                        pair_width = max(pair_width, int(tensor.shape[1]))
+        for key in ("pair_first_indices", "pair_second_indices", "pair_token_indices"):
+            value = targets.get(key)
+            if value is not None:
+                tensor = self._as_tensor(value)
+                if tensor.ndim >= 2:
+                    pair_width = max(pair_width, int(tensor.shape[1]))
         layers = max(1, int(getattr(self.cfg.model, "graph_layers", 1)))
 
         if token_count >= 1536:
@@ -747,7 +712,6 @@ class Trainer:
         self,
         targets: dict,
         batch_size: int,
-        graph_batches,
         heuristic: int,
     ) -> tuple[int, list[str]]:
         configured_max = int(getattr(self.train_cfg, "graph_microbatch_autotune_max_size", 32) or 32)
@@ -786,7 +750,7 @@ class Trainer:
         if not candidates:
             return heuristic, []
 
-        per_sample_bytes = self._estimated_graph_training_bytes_per_sample(targets, batch_size, graph_batches)
+        per_sample_bytes = self._estimated_graph_training_bytes_per_sample(targets, batch_size)
         rejections: list[str] = []
         for candidate in candidates:
             reason = self._graph_microbatch_memory_rejection(
@@ -801,16 +765,7 @@ class Trainer:
             return max(1, min(candidate, batch_size)), rejections
         return heuristic, rejections
 
-    def _estimated_graph_training_bytes_per_sample(self, targets: dict, batch_size: int, graph_batches) -> float:
-        if graph_batches is not None:
-            total_bytes = 0
-            for graph in graph_batches:
-                for value in graph.__dict__.values():
-                    nbytes = getattr(value, "nbytes", None)
-                    if nbytes is not None:
-                        total_bytes += int(nbytes)
-            return float(total_bytes) / max(float(len(graph_batches)), 1.0)
-
+    def _estimated_graph_training_bytes_per_sample(self, targets: dict, batch_size: int) -> float:
         keys = (
             "token_features",
             "token_type",
@@ -919,6 +874,46 @@ class Trainer:
             return torch.as_tensor(value)
         return value
 
+    def _attach_loader_runtime_metrics(self, loss_dict: Dict[str, float], dataloader_wait_s: float) -> None:
+        loss_dict["dataloader_wait_s"] = float(dataloader_wait_s)
+        workers = float(getattr(self.dataloader, "num_workers", 0) or 0)
+        loss_dict["graph_loader_workers"] = workers
+        loss_dict["graph_loader_prefetch_factor"] = float(
+            getattr(self.dataloader, "prefetch_factor", 0) or 0
+        )
+        if not self._is_global_graph_model:
+            return
+
+        timed_step = sum(
+            float(loss_dict.get(key, 0.0) or 0.0)
+            for key in (
+                "graph_prepare_s",
+                "graph_row_table_s",
+                "graph_to_device_s",
+                "graph_forward_s",
+                "graph_loss_s",
+                "graph_backward_s",
+                "graph_optimizer_s",
+            )
+        )
+        if dataloader_wait_s > max(0.05, timed_step * 1.25):
+            label = "cpu_graph_build" if workers <= 0.0 else "worker_ipc"
+        elif timed_step > max(0.05, dataloader_wait_s * 1.25):
+            label = "gpu_step"
+        else:
+            label = "balanced"
+        for candidate in ("cpu_graph_build", "worker_ipc", "gpu_step", "balanced"):
+            loss_dict[f"graph_bottleneck_{candidate}"] = 1.0 if label == candidate else 0.0
+
+    def _smooth_bottleneck_label(self) -> str:
+        labels = ("cpu_graph_build", "worker_ipc", "gpu_step", "balanced")
+        scored = [
+            (self._smooth(f"graph_bottleneck_{label}"), label)
+            for label in labels
+        ]
+        score, label = max(scored, key=lambda item: item[0])
+        return label if score > 0.0 else "unknown"
+
     def _log_step(self, batch_idx: int):
         current_lr = self.optimizer.param_groups[0]["lr"]
         elapsed = time.monotonic() - self._start_time
@@ -936,13 +931,20 @@ class Trainer:
             graph_suffix = (
                 f" | graph_mb={self._smooth('graph_microbatch_size'):.0f}"
                 f"/{self._smooth('graph_microbatch_count'):.0f}"
-                f" collate={self._smooth('graph_collate_s'):.3f}s"
+                f" workers={self._smooth('graph_loader_workers'):.0f}"
+                f" prefetch={self._smooth('graph_loader_prefetch_factor'):.0f}"
+                f" wait={self._smooth('dataloader_wait_s'):.3f}s"
+                f" loader={self._smooth('graph_loader_sample_s'):.3f}s"
+                f" base={self._smooth('graph_loader_graph_base_s'):.3f}s"
+                f" cand={self._smooth('graph_loader_candidate_s'):.3f}s"
+                f" collate={self._smooth('graph_loader_collate_s'):.3f}s"
                 f" h2d={self._smooth('graph_to_device_s'):.3f}s"
                 f" fwd={self._smooth('graph_forward_s'):.3f}s"
                 f" loss={self._smooth('graph_loss_s'):.3f}s"
                 f" bwd={self._smooth('graph_backward_s'):.3f}s"
                 f" opt={self._smooth('graph_optimizer_s'):.3f}s"
                 f" peak={self._smooth('graph_peak_cuda_allocated_mb'):.0f}MB"
+                f" bottleneck={self._smooth_bottleneck_label()}"
             )
 
         logger.info(

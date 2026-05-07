@@ -9,7 +9,6 @@ from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.regret_buffer import compute_regret
 from hexorl.buffer.sampler import (
     _py_apply_d6_symmetry,
-    _py_decode_compact_record,
     _hex_transform,
     _transform_pair_policy_v2,
     _transform_axis_maps,
@@ -66,19 +65,6 @@ class _FixedSymmetryRng:
 
     def shuffle(self, values):
         return None
-
-
-def test_python_decoder_returns_final_position_for_history():
-    history = _move(0, 0, 0)
-    decoded = _py_decode_compact_record(history)
-
-    assert decoded.shape == (2, 13, BOARD_SIZE, BOARD_SIZE)
-    assert decoded[0, 0].sum() == 0.0
-    assert decoded[0, 2].sum() == BOARD_SIZE * BOARD_SIZE
-    assert decoded[0, 3, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
-    assert decoded[0, 6].sum() == BOARD_SIZE * BOARD_SIZE
-    assert decoded[-1, 1, BOARD_SIZE // 2, BOARD_SIZE // 2] == 1.0
-    assert decoded[-1, 6].sum() == 0.0
 
 
 def test_policy_symmetry_transform_tracks_dense_target():
@@ -1026,7 +1012,8 @@ def test_graph_replay_budgets_first_placement_pair_rows_and_preserves_target():
     assert aux["pair_first_policy_target"][0, second_row] == pytest.approx(0.0)
 
 
-def test_graph_replay_can_defer_full_batch_collation_for_training():
+def test_graph_replay_emits_collated_graph_targets_for_training():
+    pytest.importorskip("_engine")
     rec = PositionRecord(
         move_history=_move(0, 0, 0),
         policy_target={action_to_board_index(1, 0): 1.0},
@@ -1043,18 +1030,19 @@ def test_graph_replay_can_defer_full_batch_collation_for_training():
         batch_size=2,
         use_symmetry=False,
         include_graph_policy=True,
-        defer_graph_collate=True,
     )
 
     _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
 
-    assert "_graph_batches" in aux
-    assert len(aux["_graph_batches"]) == 2
-    assert "relation_bias" not in aux
-    assert aux["_graph_batches"][0].policy_target.sum() == pytest.approx(1.0)
+    assert "token_features" in aux
+    assert "relation_bias" in aux
+    assert "policy_target" in aux
+    assert "_graph_batches" not in aux
+    assert aux["policy_target"].sum(axis=1).tolist() == pytest.approx([1.0, 1.0])
 
 
 def test_graph_replay_reuses_cached_base_graphs(monkeypatch):
+    pytest.importorskip("_engine")
     rec = PositionRecord(
         move_history=_move(0, 0, 0),
         policy_target={action_to_board_index(1, 0): 1.0},
@@ -1079,7 +1067,6 @@ def test_graph_replay_reuses_cached_base_graphs(monkeypatch):
         batch_size=2,
         use_symmetry=False,
         include_graph_policy=True,
-        defer_graph_collate=True,
         graph_context_tokens=64,
         graph_legal_rows=32,
         graph_cache_size=8,
@@ -1092,8 +1079,8 @@ def test_graph_replay_reuses_cached_base_graphs(monkeypatch):
     assert len(calls) == 1
     assert calls[0][1] == 64
     assert calls[0][2] == 32
-    assert first_aux["_graph_batches"][0].policy_target.sum() == pytest.approx(1.0)
-    assert second_aux["_graph_batches"][0].policy_target.sum() == pytest.approx(1.0)
+    assert first_aux["policy_target"][0].sum() == pytest.approx(1.0)
+    assert second_aux["policy_target"][0].sum() == pytest.approx(1.0)
 
 
 def test_pair_policy_d6_bijection_preserves_pair_identity():

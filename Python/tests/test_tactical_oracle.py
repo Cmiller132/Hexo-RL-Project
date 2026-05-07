@@ -109,5 +109,5 @@ def test_history_oracle_requires_engine_oracle_for_production(monkeypatch):
     with pytest.raises(RuntimeError, match="engine tactical oracle is required"):
         scan_tactical_oracle_from_history(b"")
 
-    result = scan_tactical_oracle_from_history(b"", allow_python_fallback=True)
+    result = scan_tactical_oracle({}, 0, [(0, 0)])
     assert result.win_now_cells == ()

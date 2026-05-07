@@ -16,6 +16,13 @@ from typing import Iterable, Sequence
 import numpy as np
 
 from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.graph.capacity import (
+    GRAPH_CAPACITY_STRATEGY,
+    GRAPH_IPC_ACTION_CAPACITY,
+    GRAPH_IPC_PAIR_CAPACITY,
+    GRAPH_IPC_TOKEN_CAPACITY,
+    PAIR_CHUNK_LIMIT,
+)
 
 
 GRAPH_SCHEMA_VERSION = 3
@@ -32,11 +39,6 @@ GRAPH_FEATURE_WINDOW_EMPTY_COUNT = 8
 GRAPH_FEATURE_WINDOW_AXIS = 9
 GRAPH_FEATURE_LEGAL_WINDOW_COUNT = 10
 RELATION_SCHEMA_VERSION = 2
-PAIR_CHUNK_LIMIT = 4096
-GRAPH_IPC_TOKEN_CAPACITY = 4096
-GRAPH_IPC_ACTION_CAPACITY = 4096
-GRAPH_IPC_PAIR_CAPACITY = PAIR_CHUNK_LIMIT
-GRAPH_CAPACITY_STRATEGY = "preserve_legal_stone_tactical_rows_fail_or_chunk_context"
 HEX_DIRECTIONS: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
 WIN_LENGTH = 6
 
@@ -299,19 +301,22 @@ def _window_cells(start: tuple[int, int], axis: int) -> list[tuple[int, int]]:
 
 def _active_windows(stones: dict[tuple[int, int], int], legal: Sequence[tuple[int, int]]) -> list[tuple[int, tuple[int, int], int, int, list[tuple[int, int]]]]:
     interesting = set(stones) | set(legal)
-    windows: dict[tuple[int, tuple[int, int]], tuple[int, int, list[tuple[int, int]]]] = {}
+    window_keys: set[tuple[int, tuple[int, int]]] = set()
     for q, r in interesting:
         for axis, (dq, dr) in enumerate(HEX_DIRECTIONS):
             for back in range(WIN_LENGTH):
-                start = (q - dq * back, r - dr * back)
-                cells = _window_cells(start, axis)
-                own = sum(1 for c in cells if stones.get(c) == 0)
-                opp = sum(1 for c in cells if stones.get(c) == 1)
-                if own + opp == 0:
-                    continue
-                if own > 0 and opp > 0:
-                    continue
-                windows[(axis, start)] = (own, opp, cells)
+                window_keys.add((axis, (q - dq * back, r - dr * back)))
+
+    windows: dict[tuple[int, tuple[int, int]], tuple[int, int, list[tuple[int, int]]]] = {}
+    for axis, start in window_keys:
+        cells = _window_cells(start, axis)
+        own = sum(1 for c in cells if stones.get(c) == 0)
+        opp = sum(1 for c in cells if stones.get(c) == 1)
+        if own + opp == 0:
+            continue
+        if own > 0 and opp > 0:
+            continue
+        windows[(axis, start)] = (own, opp, cells)
     out = []
     for (axis, start), (own, opp, cells) in sorted(windows.items(), key=lambda item: (item[0][0], item[0][1])):
         out.append((axis, start, own, opp, [c for c in cells if c not in stones]))
@@ -381,17 +386,11 @@ def build_graph_batch_from_history(
     moves = parse_history(history)
     stones = {(q, r): player for player, q, r in moves}
     current_player, placements_remaining = current_turn_state(moves)
-    engine_state = _engine_state_from_history(
+    legal, current_player, placements_remaining = _engine_state_from_history(
         history,
         radius=radius,
         constrain_threats=bool(constrain_threats) and legal_moves is None,
     )
-    if engine_state is not None:
-        legal, current_player, placements_remaining = engine_state
-    else:
-        legal = legal_moves_for_stones(stones, radius=radius)
-        if constrain_threats and legal_moves is None:
-            legal = _threat_constrained_fallback(history, legal)
     if legal_moves is not None:
         occupied_rows = [
             (int(qr[0]), int(qr[1]))
@@ -503,11 +502,47 @@ def build_graph_batch_from_history(
         nearest_cache[key] = cached
         return cached
 
+    def precompute_nearest_distances(cells: Iterable[tuple[int, int]]) -> None:
+        unique_cells = _unique_qr(cells)
+        if not unique_cells:
+            return
+        cell_arr = np.asarray(unique_cells, dtype=np.int64).reshape(-1, 2)
+
+        def nearest_many(ref: np.ndarray) -> np.ndarray:
+            if ref.size == 0:
+                return np.full(cell_arr.shape[0], 64, dtype=np.int64)
+            out = np.full(cell_arr.shape[0], 64, dtype=np.int64)
+            for start in range(0, cell_arr.shape[0], 1024):
+                chunk = cell_arr[start : start + 1024]
+                delta = chunk[:, None, :] - ref[None, :, :]
+                dq_arr = delta[..., 0]
+                dr_arr = delta[..., 1]
+                distances = np.maximum.reduce((np.abs(dq_arr), np.abs(dr_arr), np.abs(dq_arr + dr_arr)))
+                out[start : start + chunk.shape[0]] = np.minimum(64, distances.min(axis=1))
+            return out
+
+        own_nearest = nearest_many(own_stone_arr)
+        opp_nearest = nearest_many(opp_stone_arr)
+        any_nearest = nearest_many(any_stone_arr)
+        for idx, qr in enumerate(unique_cells):
+            nearest_cache[(int(qr[0]), int(qr[1]))] = (
+                int(own_nearest[idx]),
+                int(opp_nearest[idx]),
+                int(any_nearest[idx]),
+            )
+
     legal_window_count_by_cell: dict[tuple[int, int], int] = {}
     for axis, start, _own, _opp, _empties in windows:
         for cell in _window_cells(start, axis):
             if cell in legal_index:
                 legal_window_count_by_cell[cell] = legal_window_count_by_cell.get(cell, 0) + 1
+
+    precompute_nearest_distances(
+        [(0, 0)]
+        + [(int(q), int(r)) for _player, q, r in moves]
+        + list(legal)
+        + [_window_cells(start, axis)[WIN_LENGTH // 2] for axis, start, _own, _opp, _empties in windows]
+    )
 
     def add(tt: GraphTokenType, qr: tuple[int, int], **kwargs) -> int:
         idx = len(token_type)
@@ -1026,14 +1061,14 @@ def _engine_state_from_history(
     *,
     radius: int = 8,
     constrain_threats: bool = False,
-) -> tuple[list[tuple[int, int]], int, int] | None:
+) -> tuple[list[tuple[int, int]], int, int]:
     try:
         import _engine  # type: ignore
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError("Rust _engine extension is required for graph batch construction") from exc
     engine_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
     if engine_cls is None:
-        return None
+        raise RuntimeError("Rust _engine HexGame/PyHexGame class is required for graph batch construction")
     game = engine_cls()
     for player, q, r in parse_history(history):
         current = getattr(game, "current_player", player)
@@ -1050,6 +1085,8 @@ def _engine_state_from_history(
         legal = [(int(q), int(r)) for q, r in legal_arr.tolist()]
     elif constrain_threats and hasattr(game, "threat_constrained_moves"):
         legal = game.threat_constrained_moves(int(radius))
+    elif constrain_threats:
+        raise RuntimeError("Rust _engine threat-constrained legal rows are required for graph training")
     else:
         legal = getattr(game, "legal_moves", lambda: [])()
     current_player = getattr(game, "current_player", 0)
@@ -1063,27 +1100,6 @@ def _engine_state_from_history(
         int(current_player),
         int(placements_remaining),
     )
-
-
-def _threat_constrained_fallback(
-    history: bytes,
-    legal: Sequence[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    oracle = scan_tactical_oracle_from_history(
-        history,
-        legal,
-        near_radius=8,
-        allow_python_fallback=True,
-    )
-    win_now = {(int(q), int(r)) for q, r in getattr(oracle, "win_now_cells", ())}
-    forced = {(int(q), int(r)) for q, r in getattr(oracle, "forced_block_cells", ())}
-    if win_now:
-        allowed = win_now
-    elif forced:
-        allowed = forced
-    else:
-        return list(legal)
-    return [qr for qr in legal if qr in allowed]
 
 
 def _tactical_target_from_oracle(oracle) -> np.ndarray:
@@ -1241,12 +1257,9 @@ def _build_relations(
         & (pair_second_arr < n)
     )
     if np.any(valid_pair_refs):
-        pair_edge_mask = np.zeros((n, n), dtype=np.bool_)
         first = pair_first_arr[valid_pair_refs]
         second = pair_second_arr[valid_pair_refs]
-        pair_edge_mask[first, second] = True
-        pair_edge_mask[second, first] = True
-        assign(pair_edge_mask, RelationType.FIRST_SECOND_PAIR_RELATION)
+        assign_edges(first, second, RelationType.FIRST_SECOND_PAIR_RELATION, symmetric=True)
 
     if window_tokens.size:
         window_member_rows = membership_token_matrix(window_tokens)

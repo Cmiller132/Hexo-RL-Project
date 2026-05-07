@@ -1,10 +1,14 @@
 import struct
+import os
 
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from hexorl.config import Config
+from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.sampler import ReplayDataset
 from hexorl.eval.tactical_suite import phase3_tactical_suite_positions
 from hexorl.graph import (
     GRAPH_SCHEMA_VERSION,
@@ -34,6 +38,7 @@ from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
 from hexorl.models.assembly import build_model_from_config
 from hexorl.models.families.global_graph import GlobalHexGraphNet
 from hexorl.replay.training_batch import graph_batch_training_targets
+from hexorl.selfplay.records import PositionRecord, action_to_board_index
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import build_pair_strategy
 from hexorl.train.loss_plan import build_loss_plan
@@ -192,7 +197,7 @@ def test_global_graph_builder_honors_explicit_legal_rows():
 
 def test_global_graph_ipc_capacity_allows_full_legal_scout_requests():
     assert MAX_GRAPH_TOKENS >= 4096
-    assert MAX_GRAPH_ACTIONS >= 4096
+    assert MAX_GRAPH_ACTIONS >= 8192
 
 
 def test_global_graph_rejects_sub_rust_legal_radius():
@@ -696,10 +701,8 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
         }
     )
     model = build_model_from_config(cfg, device=torch.device("cpu"))
-    aux = {
-        "_graph_batches": graphs,
-        "policy_weight": torch.ones(3),
-    }
+    aux = graph_batch_training_targets(collate_graph_batches(graphs))
+    aux["policy_weight"] = torch.ones(3)
     batch = (
         torch.zeros(3, 13, 33, 33),
         torch.zeros(3, 1089),
@@ -716,9 +719,10 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
     assert losses["graph_microbatch_count"] == 2.0
     assert losses["graph_microbatch_configured"] == 1.0
     assert losses["graph_microbatch_autotuned"] == 0.0
-    assert losses["graph_collate_once"] == 1.0
     for key in (
-        "graph_collate_s",
+        "graph_phase_targets_s",
+        "graph_row_table_s",
+        "graph_prepare_s",
         "graph_to_device_s",
         "graph_forward_s",
         "graph_loss_s",
@@ -728,6 +732,101 @@ def test_global_graph_trainer_runs_graph_native_step_without_dense_policy():
     ):
         assert key in losses
         assert losses[key] >= 0.0
+    assert "graph_collate_once" not in losses
+    assert "graph_collate_fallback" not in losses
+    trainer._attach_loader_runtime_metrics(losses, 0.25)
+    assert losses["dataloader_wait_s"] == pytest.approx(0.25)
+    assert "graph_loader_workers" in losses
+    assert any(
+        losses.get(f"graph_bottleneck_{label}", 0.0) == 1.0
+        for label in ("cpu_graph_build", "worker_ipc", "gpu_step", "balanced")
+    )
+
+
+def test_graph_dataset_collation_matches_worker_loader_collation():
+    if os.name == "nt":
+        pytest.skip("Windows graph training keeps DataLoader workers disabled")
+    pytest.importorskip("_engine")
+    history = _hist((0, 0, 0))
+    base_graph = _build_graph_batch_from_history(history, include_pair_rows=False)
+    first = tuple(int(x) for x in base_graph.legal_qr[0].tolist())
+    second = tuple(int(x) for x in base_graph.legal_qr[1].tolist())
+    rec = PositionRecord(
+        move_history=history,
+        policy_target={action_to_board_index(first[0], first[1]): 1.0},
+        policy_target_v2=[(first[0], first[1], 1.0)],
+        opp_policy_target_v2=[(first[0], first[1], 1.0)],
+        opp_policy_legal_v2=[first, second],
+        pair_policy_target_v2=[(first, second, 1.0)],
+        pair_policy_complete=True,
+        root_value=0.0,
+        player=1,
+        outcome=1.0,
+        is_full_search=True,
+        lookahead_values=[0.0, 0.0, 0.0],
+    )
+    replay = RingBuffer(
+        capacity=2,
+        max_policy_entries=16,
+        max_policy_v2_entries=16,
+        num_lookahead=3,
+        store_opp_policy=True,
+        store_pair_policy=True,
+        store_sparse_diagnostics=True,
+    )
+    replay.append(rec)
+    common = {
+        "batch_size": 1,
+        "use_symmetry": False,
+        "include_sparse_policy": True,
+        "include_pair_policy": True,
+        "include_graph_policy": True,
+        "candidate_budget": 16,
+        "graph_context_tokens": 128,
+        "graph_legal_rows": 16,
+        "lookahead_horizons": [4, 12, 36],
+    }
+    main_collated = ReplayDataset(replay, **common)
+    worker_collated = DataLoader(
+        ReplayDataset(replay, **common),
+        batch_size=None,
+        num_workers=2,
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
+
+    _t, _p, _v, _l, expected_aux = next(iter(main_collated))
+    worker_iter = iter(worker_collated)
+    try:
+        _t2, _p2, _v2, _l2, collated_aux = next(worker_iter)
+    finally:
+        if hasattr(worker_iter, "_shutdown_workers"):
+            worker_iter._shutdown_workers()  # type: ignore[attr-defined]
+
+    for key in (
+        "token_features",
+        "token_type",
+        "token_qr",
+        "token_mask",
+        "legal_token_indices",
+        "legal_qr",
+        "legal_mask",
+        "pair_first_indices",
+        "pair_second_indices",
+        "relation_type",
+        "relation_bias",
+        "policy_target",
+        "opp_legal_qr",
+        "opp_legal_mask",
+        "opp_policy_target",
+        "pair_first_policy_target",
+        "pair_policy_target",
+        "pair_second_policy_target",
+        "placements_remaining",
+    ):
+        assert np.array_equal(np.asarray(collated_aux[key]), np.asarray(expected_aux[key]))
+    assert "_loader_timings" in collated_aux
+    assert collated_aux["_loader_timings"]["graph_loader_collate_s"] >= 0.0
 
 
 def test_graph_microbatch_autotune_rejects_memory_heavy_candidates(monkeypatch):
@@ -771,7 +870,7 @@ def test_graph_microbatch_autotune_rejects_memory_heavy_candidates(monkeypatch):
         "pair_token_indices": torch.zeros(8, 1024, dtype=torch.long),
     }
 
-    selected = trainer._graph_train_microbatch_size(targets, 8, None, heuristic_size=4)
+    selected = trainer._graph_train_microbatch_size(targets, 8, heuristic_size=4)
 
     assert selected == 4
     assert trainer._graph_microbatch_rejections

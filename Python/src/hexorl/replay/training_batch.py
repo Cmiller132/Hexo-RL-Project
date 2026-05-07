@@ -8,7 +8,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-from hexorl.graph.batch import GraphBatch, collate_graph_batches
+from hexorl.graph.batch import GraphBatch
 from hexorl.train.loss_plan import infer_row_tables
 
 
@@ -61,32 +61,22 @@ def prepare_global_graph_training_batch(
     lookahead_keys: Sequence[str],
     device: torch.device,
     train_policy_on_full_search_only: bool,
-    graph_batches: Sequence[GraphBatch] | None = None,
     timings: dict[str, float] | None = None,
 ) -> PreparedTrainingBatch:
     device_started = time.perf_counter()
     targets: dict[str, object] = {"value": _to_device(values, device)}
     _attach_lookahead_targets(targets, lookahead_keys, lookahead_list, device)
-    _attach_aux_targets(targets, aux_targets, device, skip_keys={"_graph_batches"})
+    _attach_aux_targets(targets, aux_targets, device, skip_keys={"_loader_timings"})
     if timings is not None:
         timings["graph_to_device_s"] = timings.get("graph_to_device_s", 0.0) + (
             time.perf_counter() - device_started
         )
-    if graph_batches is not None:
-        graph_batch = collate_graph_batches(graph_batches, timings=timings)
-        graph_device_started = time.perf_counter()
-        targets.update(_graph_batch_targets_for_device(graph_batch, device))
-        if timings is not None:
-            timings["graph_to_device_s"] = timings.get("graph_to_device_s", 0.0) + (
-                time.perf_counter() - graph_device_started
-            )
-    else:
-        phase_started = time.perf_counter()
-        _attach_graph_phase_targets(targets, device)
-        if timings is not None:
-            timings["graph_phase_targets_s"] = timings.get("graph_phase_targets_s", 0.0) + (
-                time.perf_counter() - phase_started
-            )
+    phase_started = time.perf_counter()
+    _attach_graph_phase_targets(targets, device)
+    if timings is not None:
+        timings["graph_phase_targets_s"] = timings.get("graph_phase_targets_s", 0.0) + (
+            time.perf_counter() - phase_started
+        )
     _ensure_sample_weights(targets, "policy_weight", targets["value"], train_policy_on_full_search_only)
     _ensure_sample_weights(targets, "value_weight", targets["value"], True)
     _ensure_sample_weights(targets, "pair_policy_weight", targets["value"], True)
@@ -158,20 +148,6 @@ def graph_batch_training_targets(graph_batch: GraphBatch) -> dict[str, object]:
         placements = torch.full((batch_size,), int(graph_batch.placements_remaining), dtype=torch.long)
     values["placements_remaining"] = placements
     return values
-
-
-def _graph_batch_targets_for_device(graph_batch: GraphBatch, device: torch.device) -> dict[str, torch.Tensor]:
-    values = graph_batch_training_targets(graph_batch)
-    out = {key: _to_device(value, device) for key, value in values.items()}
-    placements = getattr(graph_batch, "placements_remaining_by_sample", None)
-    if placements is None:
-        batch_size = int(out["value"].shape[0]) if "value" in out else int(out["legal_mask"].shape[0])
-        placements_tensor = torch.full((batch_size,), int(graph_batch.placements_remaining), dtype=torch.long, device=device)
-    else:
-        placements_tensor = _to_device(placements, device).long()
-    out["placements_remaining"] = placements_tensor
-    _attach_graph_phase_targets(out, device)
-    return out
 
 
 def _attach_graph_phase_targets(targets: dict[str, object], device: torch.device) -> None:

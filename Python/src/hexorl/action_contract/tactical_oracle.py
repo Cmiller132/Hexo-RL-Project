@@ -118,7 +118,6 @@ def scan_tactical_oracle_from_history(
     offset_q: int = -16,
     offset_r: int = -16,
     near_radius: int = TACTICAL_SCAN_RADIUS,
-    allow_python_fallback: bool = False,
 ) -> TacticalOracleResult:
     game = engine_game_from_history(history_bytes)
     if game is not None and hasattr(game, "tactical_oracle"):
@@ -129,19 +128,9 @@ def scan_tactical_oracle_from_history(
             offset_r=offset_r,
             near_radius=near_radius,
         )
-    if not allow_python_fallback:
-        if game is None:
-            raise RuntimeError("engine tactical oracle is required but the Rust engine is unavailable")
-        raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
-    stones, current_player, _placements_remaining = parse_history_state(history_bytes)
-    legal = legal_moves if legal_moves is not None else legal_moves_from_stones(stones, near_radius)
-    return scan_tactical_oracle(
-        stones,
-        current_player,
-        legal,
-        offset_q=offset_q,
-        offset_r=offset_r,
-    )
+    if game is None:
+        raise RuntimeError("engine tactical oracle is required but the Rust engine is unavailable")
+    raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
 
 
 def scan_tactical_oracle_from_game(
@@ -151,14 +140,8 @@ def scan_tactical_oracle_from_game(
     offset_q: int = -16,
     offset_r: int = -16,
     near_radius: int = TACTICAL_SCAN_RADIUS,
-    allow_python_fallback: bool = False,
 ) -> TacticalOracleResult:
     """Return the engine-backed tactical oracle for an already-restored game."""
-    pieces = getattr(game, "board_pieces", lambda: [])()
-    stones = {(int(q), int(r)): int(player) for q, r, player in pieces}
-    current_player = int(_attr_value(game, "current_player", 0))
-    placements_remaining = int(_attr_value(game, "placements_remaining", 1))
-
     if hasattr(game, "tactical_oracle"):
         payload = game.tactical_oracle(int(near_radius))
         result = _result_from_engine_payload(payload, offset_q=offset_q, offset_r=offset_r)
@@ -166,24 +149,7 @@ def scan_tactical_oracle_from_game(
             return result
         return _filter_result_to_legal(result, legal_moves)
 
-    if not allow_python_fallback:
-        raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
-
-    if legal_moves is None:
-        if hasattr(game, "legal_moves_near"):
-            legal_moves = game.legal_moves_near(int(near_radius))
-        elif hasattr(game, "legal_moves"):
-            legal_moves = game.legal_moves()
-        else:
-            legal_moves = legal_moves_from_stones(stones, near_radius)
-    return scan_tactical_oracle(
-        stones,
-        current_player,
-        legal_moves,
-        offset_q=offset_q,
-        offset_r=offset_r,
-        placements_remaining=placements_remaining,
-    )
+    raise RuntimeError("engine tactical_oracle method is required for production tactical labels")
 
 
 def _filter_result_to_legal(

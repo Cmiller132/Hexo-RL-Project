@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from hexorl.config import Config
-from hexorl.models.registry import architecture_spec, resolve_model_spec
+from hexorl.models.registry import architecture_spec, is_global_graph_architecture, resolve_model_spec
 
 
 @dataclass(frozen=True)
@@ -140,13 +140,27 @@ def configure_torch_runtime(cfg: Config, host: HostProfile | None = None) -> dic
     }
 
 
-def dataloader_worker_count(cfg: Config, host: HostProfile | None = None) -> int:
+def dataloader_worker_count(
+    cfg: Config,
+    host: HostProfile | None = None,
+    *,
+    global_graph_model: bool | None = None,
+) -> int:
     """Return a safe process-worker count for PyTorch DataLoader."""
     host = host or detect_host()
+    is_global_graph = (
+        bool(global_graph_model)
+        if global_graph_model is not None
+        else is_global_graph_architecture(getattr(cfg.model, "architecture", ""))
+    )
+    if is_global_graph and cfg.runtime.graph_dataloader_workers is not None:
+        return max(0, cfg.runtime.graph_dataloader_workers)
     if cfg.runtime.dataloader_workers is not None:
         return max(0, cfg.runtime.dataloader_workers)
     if host.system == "windows":
         return 0
+    if is_global_graph and host.cuda_available:
+        return min(8, max(2, host.physical_cpus - 4))
     return 0
 
 

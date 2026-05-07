@@ -3,13 +3,17 @@ import struct
 import pytest
 import torch
 
-from hexorl.graph.batch import build_graph_batch_from_history
+from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
 from hexorl.buffer.ring import RingBuffer
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.config import Config
 from hexorl.models.assembly import build_model_from_config
 from hexorl.selfplay.records import PositionRecord, action_to_board_index
-from hexorl.replay.training_batch import prepare_dense_training_batch, prepare_global_graph_training_batch
+from hexorl.replay.training_batch import (
+    graph_batch_training_targets,
+    prepare_dense_training_batch,
+    prepare_global_graph_training_batch,
+)
 from hexorl.train.loss_plan import LossContractError, build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.train.trainer import Trainer
@@ -208,11 +212,13 @@ def test_global_graph_adapter_emits_phase_metadata_without_dense_policy_target()
     prepared = prepare_global_graph_training_batch(
         values=torch.zeros(1),
         lookahead_list=[],
-        aux_targets={"policy_weight": torch.ones(1)},
+        aux_targets={
+            **graph_batch_training_targets(collate_graph_batches([graph])),
+            "policy_weight": torch.ones(1),
+        },
         lookahead_keys=[],
         device=torch.device("cpu"),
         train_policy_on_full_search_only=True,
-        graph_batches=[graph],
     )
 
     assert "policy" not in prepared.targets

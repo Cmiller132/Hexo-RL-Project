@@ -7,6 +7,7 @@ On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 
 from collections import OrderedDict
 import logging
+import time
 import numpy as np
 from typing import Dict, Iterator, Tuple, Optional, List
 
@@ -56,168 +57,6 @@ try:
 except ImportError:  # pragma: no cover - optional dashboard/axis lab dependency path
     HAS_AXIS_POLICY = False
 
-try:
-    import _engine
-    HAS_ENGINE = True
-except ImportError:
-    HAS_ENGINE = False
-
-
-def _py_encode_from_coords(
-    history_bytes: bytes,
-    stride: int,
-    num_moves: int,
-    near_radius: int,
-) -> np.ndarray:
-    """Encode a sequence of positions from coordinate history.
-
-    Sets channel 0/1 (stones), channel 2 (empty mask), channel 6 (player colour),
-    and channel 11 (distance from centre) based on coordinates.
-    """
-    half = BOARD_SIZE // 2
-    positions = np.zeros(
-        (num_moves + 1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE),
-        dtype=np.float32,
-    )
-    moves: List[Tuple[int, int, int]] = []
-    stones: dict[Tuple[int, int], int] = {}
-    current_player = 0
-    placements_remaining = 1
-
-    qi_grid = np.arange(BOARD_SIZE)[:, None] - half
-    rj_grid = np.arange(BOARD_SIZE)[None, :] - half
-    dist = np.maximum(
-        np.maximum(np.abs(qi_grid), np.abs(rj_grid)),
-        np.abs(qi_grid + rj_grid),
-    ).astype(np.float32)
-
-    for i in range(num_moves + 1):
-        _encode_position_fallback(
-            positions[i],
-            stones,
-            moves,
-            current_player,
-            placements_remaining,
-            dist / half,
-            near_radius=near_radius,
-        )
-        if i >= num_moves:
-            break
-
-        offset = i * stride
-        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
-        if player != current_player:
-            raise ValueError(
-                f"Invalid compact history: move {i} stores player {player}, "
-                f"expected {current_player}"
-            )
-        if (q, r) in stones:
-            raise ValueError(f"Invalid compact history: duplicate cell ({q}, {r})")
-
-        stones[(q, r)] = player
-        moves.append((player, q, r))
-        if placements_remaining > 1:
-            placements_remaining -= 1
-        else:
-            current_player = 1 - current_player
-            placements_remaining = 2
-
-    return positions
-
-
-def _encode_position_fallback(
-    out: np.ndarray,
-    stones: dict[Tuple[int, int], int],
-    moves: List[Tuple[int, int, int]],
-    current_player: int,
-    placements_remaining: int,
-    distance: np.ndarray,
-    near_radius: int,
-) -> None:
-    """Encode the non-tactical feature planes used by Python fallback tests."""
-    half = BOARD_SIZE // 2
-
-    for (gqi, grj), player in stones.items():
-            gi2, gj2 = gqi + half, grj + half
-            if 0 <= gi2 < BOARD_SIZE and 0 <= gj2 < BOARD_SIZE:
-                if player == current_player:
-                    out[0, gi2, gj2] = 1.0
-                else:
-                    out[1, gi2, gj2] = 1.0
-
-    out[2] = 1.0 - out[0] - out[1]
-    out[11] = distance
-    if current_player == 0:
-        out[6].fill(1.0)
-
-    if placements_remaining == 1 and moves:
-        out[4].fill(1.0)
-        _, q, r = moves[-1]
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            out[5, gi, gj] = 1.0
-
-    for q, r in _fallback_legal_moves(stones, near_radius):
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            out[3, gi, gj] = 1.0
-
-    opp = 1 - current_player
-    recent_opp: List[Tuple[int, int]] = []
-    for player, q, r in reversed(moves):
-        if player == current_player:
-            if recent_opp:
-                break
-            continue
-        if player == opp:
-            recent_opp.append((q, r))
-            if len(recent_opp) == 2:
-                break
-    for q, r in recent_opp:
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            out[12, gi, gj] = 1.0
-
-    move_count = len(moves)
-    for ply_idx, (player, q, r) in enumerate(moves):
-        gi, gj = q + half, r + half
-        if 0 <= gi < BOARD_SIZE and 0 <= gj < BOARD_SIZE:
-            recency = 1.0 / (1.0 + move_count - ply_idx)
-            out[7 if player == current_player else 8, gi, gj] = recency
-
-
-def _fallback_legal_moves(
-    stones: dict[Tuple[int, int], int],
-    near_radius: int,
-) -> List[Tuple[int, int]]:
-    if not stones:
-        return [(0, 0)]
-    radius = max(0, min(int(near_radius), 8))
-    legal: set[Tuple[int, int]] = set()
-    for q, r in stones:
-        for dq in range(-radius, radius + 1):
-            for dr in range(-radius, radius + 1):
-                if max(abs(dq), abs(dr), abs(dq + dr)) <= radius:
-                    candidate = (q + dq, r + dr)
-                    if candidate not in stones:
-                        legal.add(candidate)
-    return sorted(legal)
-
-
-def _history_stones(history_bytes: bytes) -> dict[Tuple[int, int], int]:
-    stones: dict[Tuple[int, int], int] = {}
-    if len(history_bytes) % 12 != 0:
-        return stones
-    for offset in range(0, len(history_bytes), 12):
-        player = int.from_bytes(history_bytes[offset:offset + 4], "little", signed=True)
-        q = int.from_bytes(history_bytes[offset + 4:offset + 8], "little", signed=True)
-        r = int.from_bytes(history_bytes[offset + 8:offset + 12], "little", signed=True)
-        stones[(q, r)] = player
-    return stones
-
-
 def _critical_actions_from_tensor(
     tensor: np.ndarray,
     legal: np.ndarray,
@@ -246,30 +85,6 @@ def _critical_actions_from_tensor(
             forced.append((q, r))
             cover.append((q, r))
     return winning, forced, cover
-
-
-def _py_decode_compact_record(
-    history_bytes: bytes,
-    near_radius: int = 8,
-) -> np.ndarray:
-    """Pure Python fallback for encode_compact_record.
-
-    Replays the move history on a fresh board and encodes each position.
-    Returns (N + 1, 13, 33, 33) float32 array.
-    """
-    if len(history_bytes) % 12 != 0:
-        raise ValueError(
-            f"history_bytes length {len(history_bytes)} is not a multiple of 12"
-        )
-    stride = 12
-    num_moves = len(history_bytes) // stride
-    positions = _py_encode_from_coords(
-        history_bytes[:num_moves * stride],
-        stride,
-        num_moves,
-        near_radius,
-    )
-    return positions
 
 
 def _hex_transform(qi: int, rj: int, sym: int) -> Tuple[int, int]:
@@ -496,7 +311,6 @@ class ReplayDataset(_IterableDataset):
         include_sparse_policy: bool = False,
         include_pair_policy: bool = False,
         include_graph_policy: bool = False,
-        defer_graph_collate: bool = False,
         candidate_budget: int = 256,
         max_game_turns: int = 256,
         graph_context_tokens: int | None = None,
@@ -510,7 +324,6 @@ class ReplayDataset(_IterableDataset):
         self.include_sparse_policy = bool(include_sparse_policy)
         self.include_pair_policy = bool(include_pair_policy)
         self.include_graph_policy = bool(include_graph_policy)
-        self.defer_graph_collate = bool(defer_graph_collate)
         self.candidate_budget = max(
             int(candidate_budget),
             int(getattr(buffer, "max_policy_v2_entries", int(candidate_budget))),
@@ -571,6 +384,8 @@ class ReplayDataset(_IterableDataset):
         """Sample one batch from the buffer. Returns None if insufficient data."""
         if len(self.buffer) < self.batch_size:
             return None
+        sample_started = time.perf_counter()
+        loader_timings: dict[str, float] = {}
 
         n_regret = int(round(self.batch_size * self.regret_fraction))
         n_base = self.batch_size - n_regret
@@ -593,7 +408,9 @@ class ReplayDataset(_IterableDataset):
             indices = np.concatenate([indices, extra])
         self._rng.shuffle(indices)
 
+        get_records_started = time.perf_counter()
         records = self.buffer.get_batch(indices)
+        loader_timings["graph_loader_get_records_s"] = time.perf_counter() - get_records_started
         if len(records) < self.batch_size:
             return None
 
@@ -614,7 +431,7 @@ class ReplayDataset(_IterableDataset):
         )
         policies = np.zeros((self.batch_size, BOARD_AREA), dtype=np.float32)
         values = np.zeros(self.batch_size, dtype=np.float32)
-        aux_targets: Dict[str, np.ndarray] = {
+        aux_targets: Dict[str, object] = {
             "opp_policy": np.zeros((self.batch_size, BOARD_AREA), dtype=np.float32),
             "regret_rank": np.zeros(self.batch_size, dtype=np.float32),
             "regret_value": np.zeros(self.batch_size, dtype=np.float32),
@@ -628,6 +445,7 @@ class ReplayDataset(_IterableDataset):
             "pair_policy_weight": np.ones(self.batch_size, dtype=np.float32),
             "opp_policy_weight": np.zeros(self.batch_size, dtype=np.float32),
         }
+        graph_batches: list[GraphBatch] = []
         if self.include_sparse_policy:
             budget = candidate_width
             aux_targets["candidate_qr"] = np.zeros((self.batch_size, budget, 2), dtype=np.int32)
@@ -693,7 +511,13 @@ class ReplayDataset(_IterableDataset):
                 axis_label = rec.axis_label
                 opp_legal_v2 = list(getattr(rec, "opp_policy_legal_v2", []))
 
+            tensor_started = time.perf_counter()
             tensor_i, offset_q, offset_r, legal_bytes = self._encode_tensor_meta(sample_history)
+            loader_timings["graph_loader_tensor_encode_s"] = (
+                loader_timings.get("graph_loader_tensor_encode_s", 0.0)
+                + time.perf_counter()
+                - tensor_started
+            )
             tensors[i] = tensor_i
 
             if policy_v2:
@@ -748,6 +572,7 @@ class ReplayDataset(_IterableDataset):
                 aux_targets["pair_policy_weight"][i] = 0.0
                 aux_targets["opp_policy_weight"][i] = 0.0
             if self.include_sparse_policy:
+                candidate_started = time.perf_counter()
                 legal = (
                     np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
                     if legal_bytes
@@ -914,6 +739,11 @@ class ReplayDataset(_IterableDataset):
                             )
                 elif self.include_pair_policy and critical_overflow:
                     aux_targets["pair_candidate_missing_mass"][i] = 1.0
+                loader_timings["graph_loader_candidate_s"] = (
+                    loader_timings.get("graph_loader_candidate_s", 0.0)
+                    + time.perf_counter()
+                    - candidate_started
+                )
             if self.include_graph_policy:
                 if opp_policy_v2 and not opp_legal_v2:
                     raise ValueError("graph training requires opp_policy_legal_v2 whenever opp_policy_target_v2 is present")
@@ -927,14 +757,27 @@ class ReplayDataset(_IterableDataset):
                         continue
                     required_graph_legal_rows.append((int(first[0]), int(first[1])))
                     required_graph_legal_rows.append((int(second[0]), int(second[1])))
+                graph_base_started = time.perf_counter()
+                graph_base = self._graph_base_for_history(
+                    sample_history,
+                    required_legal_rows=required_graph_legal_rows,
+                )
+                loader_timings["graph_loader_graph_base_s"] = (
+                    loader_timings.get("graph_loader_graph_base_s", 0.0)
+                    + time.perf_counter()
+                    - graph_base_started
+                )
+                policy_overlay_started = time.perf_counter()
                 graph = graph_batch_with_policy_targets(
-                    self._graph_base_for_history(
-                        sample_history,
-                        required_legal_rows=required_graph_legal_rows,
-                    ),
+                    graph_base,
                     policy_target=policy_v2,
                     opp_legal_moves=[(int(q), int(r)) for q, r in opp_legal_v2] if opp_legal_v2 else None,
                     opp_policy_target=opp_policy_v2,
+                )
+                loader_timings["graph_loader_policy_overlay_s"] = (
+                    loader_timings.get("graph_loader_policy_overlay_s", 0.0)
+                    + time.perf_counter()
+                    - policy_overlay_started
                 )
                 if (
                     aux_targets["opp_policy_weight"][i] > 0.0
@@ -957,10 +800,16 @@ class ReplayDataset(_IterableDataset):
                             1.0,
                         )
                 if pair_policy_v2:
+                    pair_rows_started = time.perf_counter()
                     graph = graph_batch_with_reference_pair_rows(
                         graph,
                         pair_policy_v2,
                         max_pair_rows=candidate_width,
+                    )
+                    loader_timings["graph_loader_pair_rows_s"] = (
+                        loader_timings.get("graph_loader_pair_rows_s", 0.0)
+                        + time.perf_counter()
+                        - pair_rows_started
                     )
                 if self.include_pair_policy and aux_targets["pair_policy_weight"][i] > 0.0:
                     if not pair_policy_v2 or not _graph_pair_targets_have_trainable_mass(graph):
@@ -970,8 +819,7 @@ class ReplayDataset(_IterableDataset):
                                 float(aux_targets["pair_candidate_missing_mass"][i]),
                                 1.0,
                             )
-                graph_batch = aux_targets.setdefault("_graph_batches", [])
-                graph_batch.append(graph)
+                graph_batches.append(graph)
             if self.include_axis_delta_norm:
                 axis_delta_norm = self._compute_axis_delta_norm(sample_history)
                 aux_targets["axis_delta_norm"][i] = axis_delta_norm
@@ -986,44 +834,48 @@ class ReplayDataset(_IterableDataset):
                     )
 
         if self.include_graph_policy:
-            graph_batches = aux_targets.pop("_graph_batches")
-            if self.defer_graph_collate:
-                aux_targets["_graph_batches"] = graph_batches
-            else:
-                graph_batch = collate_graph_batches(graph_batches)
-                aux_targets.update({
-                    "token_features": graph_batch.token_features,
-                    "token_type": graph_batch.token_type,
-                    "token_qr": graph_batch.token_qr,
-                    "token_mask": graph_batch.token_mask,
-                    "legal_token_indices": graph_batch.legal_token_indices,
-                    "legal_qr": graph_batch.legal_qr,
-                    "legal_mask": graph_batch.legal_mask,
-                    "pair_token_indices": graph_batch.pair_token_indices,
-                    "pair_first_indices": graph_batch.pair_first_indices,
-                    "pair_second_indices": graph_batch.pair_second_indices,
-                    "relation_type": graph_batch.relation_type,
-                    "relation_bias": graph_batch.relation_bias,
-                    "policy_target": graph_batch.policy_target,
-                    "legal_token_quality_target": graph_batch.policy_target,
-                    "opp_legal_qr": graph_batch.opp_legal_qr,
-                    "opp_legal_mask": graph_batch.opp_legal_mask,
-                    "opp_policy_target": graph_batch.opp_policy_target,
-                    "pair_first_policy_target": graph_batch.pair_first_policy_target,
-                    "pair_policy_target": graph_batch.pair_policy_target,
-                    "pair_second_policy_target": graph_batch.pair_second_policy_target,
-                    "tactical_target": graph_batch.tactical_target,
-                    "placements_remaining": graph_batch.placements_remaining_by_sample,
-                })
-                first = aux_targets["pair_first_indices"]
-                second = aux_targets["pair_second_indices"]
-                pair_row_mask = (first >= 0) & (second >= 0) & (first != second)
-                known_first = graph_batch.placements_remaining_by_sample == 1
-                unordered_first = graph_batch.placements_remaining_by_sample >= 2
-                aux_targets["pair_row_mask"] = pair_row_mask
-                aux_targets["pair_first_unordered"] = unordered_first
-                aux_targets["pair_second_known_first"] = known_first
-                aux_targets["pair_second_row_mask"] = pair_row_mask & known_first[:, None]
+            collate_started = time.perf_counter()
+            graph_batch = collate_graph_batches(graph_batches)
+            loader_timings["graph_loader_collate_s"] = (
+                loader_timings.get("graph_loader_collate_s", 0.0)
+                + time.perf_counter()
+                - collate_started
+            )
+            aux_targets.update({
+                "token_features": graph_batch.token_features,
+                "token_type": graph_batch.token_type,
+                "token_qr": graph_batch.token_qr,
+                "token_mask": graph_batch.token_mask,
+                "legal_token_indices": graph_batch.legal_token_indices,
+                "legal_qr": graph_batch.legal_qr,
+                "legal_mask": graph_batch.legal_mask,
+                "pair_token_indices": graph_batch.pair_token_indices,
+                "pair_first_indices": graph_batch.pair_first_indices,
+                "pair_second_indices": graph_batch.pair_second_indices,
+                "relation_type": graph_batch.relation_type,
+                "relation_bias": graph_batch.relation_bias,
+                "policy_target": graph_batch.policy_target,
+                "legal_token_quality_target": graph_batch.policy_target,
+                "opp_legal_qr": graph_batch.opp_legal_qr,
+                "opp_legal_mask": graph_batch.opp_legal_mask,
+                "opp_policy_target": graph_batch.opp_policy_target,
+                "pair_first_policy_target": graph_batch.pair_first_policy_target,
+                "pair_policy_target": graph_batch.pair_policy_target,
+                "pair_second_policy_target": graph_batch.pair_second_policy_target,
+                "tactical_target": graph_batch.tactical_target,
+                "placements_remaining": graph_batch.placements_remaining_by_sample,
+            })
+            first = aux_targets["pair_first_indices"]
+            second = aux_targets["pair_second_indices"]
+            pair_row_mask = (first >= 0) & (second >= 0) & (first != second)
+            known_first = graph_batch.placements_remaining_by_sample == 1
+            unordered_first = graph_batch.placements_remaining_by_sample >= 2
+            aux_targets["pair_row_mask"] = pair_row_mask
+            aux_targets["pair_first_unordered"] = unordered_first
+            aux_targets["pair_second_known_first"] = known_first
+            aux_targets["pair_second_row_mask"] = pair_row_mask & known_first[:, None]
+            loader_timings["graph_loader_sample_s"] = time.perf_counter() - sample_started
+            aux_targets["_loader_timings"] = loader_timings
         return tensors, policies, values, lookahead_arrays, aux_targets
 
     def _encode_tensor(self, history: bytes) -> np.ndarray:
@@ -1065,22 +917,11 @@ class ReplayDataset(_IterableDataset):
         if cached is not None:
             self._tensor_cache.move_to_end(history)
             return cached, -16, -16, b""
-        if HAS_ENGINE:
-            tensor, offset_q, offset_r, legal_bytes = encode_tensor_for_history(
-                history,
-                near_radius=self.near_radius,
-                constrain_threats=False,
-            )
-        else:
-            decoded = _py_decode_compact_record(history, self.near_radius)
-            tensor = decoded[-1] if decoded.ndim == 4 else decoded
-            offset_q, offset_r = -16, -16
-            legal = _fallback_legal_moves(_history_stones(history), self.near_radius)
-            buf = bytearray()
-            for q, r in legal:
-                buf.extend(int(q).to_bytes(4, "little", signed=True))
-                buf.extend(int(r).to_bytes(4, "little", signed=True))
-            legal_bytes = bytes(buf)
+        tensor, offset_q, offset_r, legal_bytes = encode_tensor_for_history(
+            history,
+            near_radius=self.near_radius,
+            constrain_threats=False,
+        )
         tensor = np.asarray(tensor, dtype=np.float32)
         self._tensor_cache[history] = tensor
         if len(self._tensor_cache) > self._tensor_cache_max:
