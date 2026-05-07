@@ -63,12 +63,16 @@ post-opening action is an unordered two-stone pair.
 
 - Pair macro-actions are the main MCTS action after the opening move.
 - The search never relies on exhaustive legal-pair enumeration.
+- Full Rust-legal placement rows remain the semantic legal table for self-play
+  and training; tactical logic may propose, boost, prune, solve, or label, but
+  it must not silently delete legal rows.
 - Candidate generation combines model proposal, conditional proposal, tactical
   proposal, and structured exploration quotas.
 - Root candidate admission uses `gumbel_sequential_halving_v1`, including
   completed-Q target construction. Any replacement must be named, documented,
   tested against the same target-construction contract, and ablated before use.
-- Interior nodes use PUCT over admitted pair children with progressive widening.
+- Interior nodes use proposal-aware PUCT over admitted pair children with
+  progressive widening.
 - Pair rows are canonical, unordered, hashable, phase-aware, and D6-validated.
 - Pair outputs never affect MCTS by head-name presence alone; an explicit pair
   strategy owns runtime behavior.
@@ -88,6 +92,8 @@ post-opening action is an unordered two-stone pair.
 
 - Keep Rust as the exact rules boundary for legality, transitions, terminal
   state, and tactical oracle labels.
+- Do not use hard threat filtering as the default legal-row source for flagship
+  neural self-play or training.
 - Do not introduce learned dynamics as the mainline.
 - Do not keep old and new runtime pair semantics alive together after cutover.
 - Do not materialize all pair actions as graph input tokens.
@@ -118,6 +124,9 @@ Every implementation phase must produce:
 Stop before claiming completion if:
 
 - Pair row identity cannot be validated across replay, inference, and search.
+- Full legal-row identity cannot be recovered after tactical processing.
+- A component cannot distinguish full legal rows from admitted candidate rows
+  and tactical proposal/label rows.
 - The engine cannot apply both placements atomically for a pair MCTS edge.
 - Pair strategy behavior cannot be separated from raw head-name checks.
 - Candidate metadata cannot store source, proposal weight, and search outcome.
@@ -279,6 +288,26 @@ architecture. The final pair head should include an explicit biaffine or
 low-rank bilinear interaction term because Hexo's policy quality depends on
 relations between two cells, not just the quality of each cell independently.
 
+### Rejected: Hard Threat Filtering As Main Legal Semantics
+
+Threat filtering is valuable as tactical knowledge, but it must not be the
+default legal-row source for flagship neural self-play or training. A row table
+called `LEGAL` must mean full Rust-legal placement rows, not a threat-censored
+subset. Hard threat-constrained rows can remain only as diagnostic baselines,
+classical-search helpers, or explicitly recorded exact solver overrides.
+
+The final row split is:
+
+```text
+LEGAL rows = full Rust-legal placement rows
+ADMITTED_SINGLE rows = optional sampled single-cell candidate rows
+ADMITTED_PAIR rows = sampled canonical pair candidate rows
+TACTICAL rows = labels, proposals, solver facts, and pruning metadata
+```
+
+No model, target builder, inference adapter, or search component may have to
+guess whether a `LEGAL` row table was threat-filtered.
+
 ## Runtime Design
 
 ### Pair Action Contract
@@ -309,6 +338,53 @@ single macro-action, and terminal evaluation occurs after the full pair unless
 the Rust rules contract explicitly says the turn stops after the first winning
 placement. The chosen rule must be reflected identically in Rust transition
 code, search backpropagation, replay targets, and tactical fixtures.
+
+### Legal Row Contract
+
+Full Rust-legal rows are the semantic legal table for self-play, replay,
+training, inference, and search. Tactical logic cannot silently replace them
+with a threat-constrained subset.
+
+Required row families:
+
+```text
+LEGAL
+ADMITTED_SINGLE
+ADMITTED_PAIR
+TACTICAL
+```
+
+`LEGAL` contains all full Rust-legal placement rows for the current state.
+`ADMITTED_SINGLE` and `ADMITTED_PAIR` contain sampled candidate rows used by
+proposal, search, and target construction. `TACTICAL` contains oracle facts,
+proposal rows, solver facts, and target-pruning metadata. Tactical rows may
+reference legal rows, but they are not themselves proof that other legal rows do
+not exist.
+
+Main self-play and training should use:
+
+```text
+selfplay.legal_row_mode = "full_rust_legal"
+selfplay.tactical_mode = "proposal_and_solver"
+```
+
+Any existing hard threat filter must be renamed or quarantined as:
+
+```text
+diagnostic_threat_filter_v0
+```
+
+Exact solver overrides are allowed only when recorded explicitly:
+
+```text
+solver_override = true
+solver_reason = "winning_turn" | "unblockable" | "unique_must_block" | ...
+full_legal_count = ...
+admitted_candidate_count = ...
+policy_target_pruned = true
+```
+
+They must not masquerade as ordinary MCTS over a smaller legal table.
 
 ### Candidate Proposal Contract
 
@@ -354,6 +430,16 @@ Create or promote one explicit runtime strategy:
 
 ```text
 sampled_joint_pair_v1
+```
+
+Existing modes such as `root_pair_mcts` or `full_pair_mcts` must not be treated
+as final pair-action MCTS unless they truly expand, apply, and back up unordered
+pair macro-actions. If they only convert pair logits back into single-placement
+policy mass, quarantine or rename them as:
+
+```text
+root_pair_prior_blend_v0
+leaf_pair_prior_blend_v0
 ```
 
 This strategy owns:
@@ -662,6 +748,19 @@ unsampled legal pair != negative pair
 Only admitted pairs judged weak by search, or explicitly sampled negatives with
 known proposal metadata, can contribute negative ranking signal.
 
+Pair target completeness must be explicit. A target builder may set
+`pair_policy_complete = true` only when one of these support contracts is true:
+
+```text
+support_type = "exhaustive_legal_pair_table"
+support_type = "admitted_candidate_set_with_explicit_negatives"
+support_type = "completed_q_candidate_posterior"
+```
+
+Otherwise, pair targets train only over admitted candidate rows, and every row
+must carry source and proposal metadata. Sparse positive rows alone do not imply
+that omitted legal pairs have zero target mass.
+
 Terminal-equivalent pair targets require special handling. If a single legal
 cell wins under the exact rules, then every legal pair containing that cell may
 be equivalent with respect to the game outcome. In that case:
@@ -692,6 +791,7 @@ Rust should remain the production source for tactical labels. Required labels:
 
 - immediate one-placement wins,
 - immediate two-placement wins,
+- terminal-equivalent winning pairs,
 - opponent immediate threats,
 - legal cells covering hot opponent windows,
 - pair covers of multiple threats,
@@ -700,11 +800,32 @@ Rust should remain the production source for tactical labels. Required labels:
 - bounded hot-window threat races,
 - overload and axis-diversity counts.
 
-Tactical labels are not hand-authored policy filters. They are:
+The Rust tactical oracle should produce a legal-row-keyed and pair-row-keyed
+proposal payload:
+
+```text
+TacticalProposalSet {
+  status
+  winning_single_cells
+  winning_pairs
+  terminal_equivalent_pairs
+  forced_block_cells
+  cover_pairs
+  open_four_cells
+  open_five_cells
+  overload_pairs
+  shared_pivot_pairs
+  hot_window_ids
+  impossible_to_cover
+}
+```
+
+Tactical labels are not hand-authored legal filters. They are:
 
 - auxiliary training targets,
 - candidate proposal sources,
 - tactical benchmark generators,
+- target-pruning metadata,
 - and near-terminal exact search triggers.
 
 ### Self-Play Curriculum
@@ -755,18 +876,64 @@ Success criteria:
 - Current pair strategies, pair heads, row contracts, target builders, and
   tactical oracle paths are listed.
 - Legacy paths that conflict with the final plan are named.
+- Current hard threat-filter entry points are listed and classified as
+  diagnostic, classical-search, exact-solver, or removal candidates.
+- Current `root_pair_mcts` and `full_pair_mcts` behavior is classified as
+  prior-blend baseline behavior unless it truly expands pair macro-actions.
 
 Required evidence:
 
 - `rg` audit for direct pair-head self-play consumption.
 - `rg` audit for pair target builders and pair strategy modes.
+- `rg` audit for `constrain_threats`, `threat_constrained_moves`,
+  `root_pair_mcts`, `full_pair_mcts`, and `pair_logits_to_action_logits`.
 - `git status --short`.
 
 Stop rules:
 
 - Stop if the current runtime pair authority cannot be identified.
+- Stop if current hard threat-filter paths cannot be separated from full legal
+  row construction.
 
-### Phase 1: Pair Contracts And Row Identity
+### Phase 1: Legal Rows And Threat-Filter Cutover
+
+Goal:
+
+Make full Rust legal rows the unambiguous semantic legal table and move threat
+logic out of hard legal filtering for main neural self-play and training.
+
+Success criteria:
+
+- Main neural self-play and training use full Rust-legal placement rows.
+- Hard threat filtering does not delete `LEGAL` rows in flagship training or
+  self-play.
+- Threat-constrained rows, if retained, are renamed or quarantined as
+  `diagnostic_threat_filter_v0`.
+- Tactical oracle outputs become legal-row-keyed labels, candidate proposals,
+  solver facts, benchmark facts, and target-pruning metadata.
+- Full legal count, admitted candidate count, and solver override metadata are
+  recorded separately.
+- Tests prove tactical oracle labels do not delete legal rows.
+
+Required evidence:
+
+- Unit tests for `LEGAL`, `ADMITTED_SINGLE`, `ADMITTED_PAIR`, and `TACTICAL`
+  row-family separation.
+- Tests proving `constrain_threats` is disabled or unavailable in flagship
+  neural self-play/training configs.
+- Tests proving exact solver overrides are explicitly flagged and include
+  `solver_reason`, `full_legal_count`, and `admitted_candidate_count`.
+- Code-search audit showing hard threat filtering is absent from main training
+  and self-play legal-row construction.
+
+Stop rules:
+
+- Stop if a training or self-play `LEGAL` row table can be threat-censored
+  without explicit diagnostic or solver metadata.
+- Stop if tactical candidate/proposal rows cannot be keyed back to full legal
+  rows.
+
+### Phase 2: Pair Contracts And Row Identity
 
 Goal:
 
@@ -796,7 +963,7 @@ Stop rules:
 - Stop if row identity cannot survive replay-to-training and inference-to-search
   boundaries.
 
-### Phase 2: Candidate Sources And Tactical Oracle Integration
+### Phase 3: Candidate Sources And Tactical Oracle Integration
 
 Goal:
 
@@ -828,7 +995,7 @@ Stop rules:
 - Stop if a candidate can enter search without complete source, proposal,
   forced/prune, and beta metadata.
 
-### Phase 3: Sampled Joint-Pair MCTS
+### Phase 4: Sampled Joint-Pair MCTS
 
 Goal:
 
@@ -861,7 +1028,7 @@ Stop rules:
 
 - Stop if pair search only works by keeping a parallel sequential runtime path.
 
-### Phase 4: Biaffine Pair Model
+### Phase 5: Biaffine Pair Model
 
 Goal:
 
@@ -891,7 +1058,7 @@ Stop rules:
 
 - Stop if pair rows inflate the attention token sequence in the main runtime.
 
-### Phase 5: Candidate-Aware Training Targets
+### Phase 6: Candidate-Aware Training Targets
 
 Goal:
 
@@ -924,7 +1091,7 @@ Stop rules:
 - Stop if replay cannot distinguish admitted, forced, sampled-negative, and
   unsampled pairs.
 
-### Phase 6: Self-Play Curriculum And Replay Control
+### Phase 7: Self-Play Curriculum And Replay Control
 
 Goal:
 
@@ -956,7 +1123,7 @@ Stop rules:
 - Stop if batching, queue backpressure, CPU candidate generation, GPU
   utilization, or pair scoring throughput fails the phase budget.
 
-### Phase 7: Fair Ablations And Cutover
+### Phase 8: Fair Ablations And Cutover
 
 Goal:
 
@@ -1011,8 +1178,12 @@ Minimum metrics:
 
 ```text
 legal_pair_count_per_root
+full_legal_row_count_per_root
 admitted_pair_count_per_root
+admitted_single_count_per_root
 candidate_source_mix
+solver_override_rate
+diagnostic_threat_filter_usage
 candidate_recall_best_search_pair
 candidate_recall_exact_win_pair
 candidate_recall_exact_block_pair
@@ -1051,6 +1222,8 @@ The mainline is accepted only when all of these are true:
 
 - Sampled joint-pair MCTS has a statistically meaningful equal-wall-clock Elo
   win over the sequential DAG baseline on mature checkpoints.
+- Flagship self-play and training preserve full Rust-legal row identity and do
+  not use hard threat-filtered `LEGAL` tables.
 - Candidate recall contains the final best-search pair on at least 95% of roots
   in the deep-search audit suite.
 - Exact immediate winning pairs have at least 99.5% candidate recall.
@@ -1084,27 +1257,30 @@ The final path should be reconsidered if:
 - Queue backpressure or pair scoring latency prevents useful self-play
   throughput.
 - Policy entropy collapses while value calibration is still poor.
+- Tactical filtering silently censors `LEGAL` rows in main self-play or
+  training.
 
 ## Practical First Build
 
 The first build should not try to implement every advanced idea at once. It
 should create a thin but real vertical slice:
 
-1. Canonical pair contracts and D6 tests.
-2. Candidate proposal contract with multi-source deduplication, combined beta,
+1. Full-legal-row and threat-filter cutover for main neural self-play/training.
+2. Canonical pair contracts and D6 tests.
+3. Candidate proposal contract with multi-source deduplication, combined beta,
    prune flags, and structured/tactical sources.
-3. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
-4. Proposal-aware PUCT plus progressive widening.
-5. Existing graph trunk with non-materialized pair rows.
-6. Symmetric biaffine pair scorer behind one explicit architecture or strategy
+4. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
+5. Proposal-aware PUCT plus progressive widening.
+6. Existing graph trunk with non-materialized pair rows.
+7. Symmetric biaffine pair scorer behind one explicit architecture or strategy
    flag.
-7. Active `WINDOW6` selection caps and overflow telemetry.
-8. Replay metadata for source contributions, beta, visits, Q, completed-Q, and
+8. Active `WINDOW6` selection caps and overflow telemetry.
+9. Replay metadata for source contributions, beta, visits, Q, completed-Q, and
    terminal-equivalence flags.
-9. Pruned joint target plus marginal, unordered-safe conditional, and
+10. Pruned joint target plus marginal, unordered-safe conditional, and
    terminal-equivalent targets.
-10. Fixed tactical benchmark suite plus offline tiny-state audit oracle.
-11. Equal-wall-clock comparison against the current best baseline.
+11. Fixed tactical benchmark suite plus offline tiny-state audit oracle.
+12. Equal-wall-clock comparison against the current best baseline.
 
 That vertical slice gives fast evidence on the only question that matters:
 whether pair semantics can be made strong per wall-clock, not just elegant per
