@@ -68,8 +68,10 @@ class SelfPlayOrchestrator:
         # Worker management
         self._workers: List[mp.Process] = []
         self._record_queue = mp.Queue(maxsize=5000)
+        self._diagnostic_queue = mp.Queue(maxsize=5000)
         self._stop_event = mp.Event()
         self._collector_thread: Optional[threading.Thread] = None
+        self._diagnostic_thread: Optional[threading.Thread] = None
         self._stopped = False
 
         # Stats
@@ -81,6 +83,7 @@ class SelfPlayOrchestrator:
         self._start_time = 0.0
         self._stats_lock = threading.Lock()
         self._rgsc_totals: dict[str, float] = {}
+        self._graph_ipc_overflow_totals: dict[str, float] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -104,6 +107,12 @@ class SelfPlayOrchestrator:
             daemon=True,
         )
         self._collector_thread.start()
+        self._diagnostic_thread = threading.Thread(
+            target=self._collect_diagnostics,
+            name="diagnostic-collector",
+            daemon=True,
+        )
+        self._diagnostic_thread.start()
 
         # 3. Spawn worker processes
         logger.info(f"Spawning {self.num_workers} workers")
@@ -134,6 +143,8 @@ class SelfPlayOrchestrator:
         # Wait for collector to drain records queued during worker shutdown.
         if self._collector_thread and self._collector_thread.is_alive():
             self._collector_thread.join(timeout=drain_timeout)
+        if self._diagnostic_thread and self._diagnostic_thread.is_alive():
+            self._diagnostic_thread.join(timeout=drain_timeout)
 
         # Stop inference server
         if self._server:
@@ -160,6 +171,7 @@ class SelfPlayOrchestrator:
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
             stop_event=self._stop_event,
+            diagnostic_queue=self._diagnostic_queue,
         )
 
         p = mp.Process(
@@ -181,6 +193,7 @@ class SelfPlayOrchestrator:
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
             stop_event=self._stop_event,
+            diagnostic_queue=self._diagnostic_queue,
         )
         p = mp.Process(
             target=worker.run,
@@ -209,6 +222,50 @@ class SelfPlayOrchestrator:
                 continue
             except Exception as e:
                 logger.warning("Record collector error: %s", e)
+
+    def _collect_diagnostics(self):
+        """Continuously aggregate worker diagnostics into self-play stats."""
+        while not self._stop_event.is_set() or not self._diagnostic_queue.empty():
+            try:
+                diagnostic = self._diagnostic_queue.get(timeout=0.5)
+                self._ingest_diagnostic(diagnostic)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.warning("Diagnostic collector error: %s", e)
+
+    def _ingest_diagnostic(self, diagnostic: dict):
+        event = str(diagnostic.get("event", "unknown"))
+        if event != "graph_ipc_overflow":
+            return
+        failures = diagnostic.get("failures", [])
+        if not isinstance(failures, list):
+            failures = [str(failures)]
+        phase = str(diagnostic.get("phase", "unknown"))
+        with self._stats_lock:
+            totals = self._graph_ipc_overflow_totals
+            totals["graph_ipc_overflow_count"] = totals.get("graph_ipc_overflow_count", 0.0) + 1.0
+            totals[f"graph_ipc_overflow_phase_{phase}"] = (
+                totals.get(f"graph_ipc_overflow_phase_{phase}", 0.0) + 1.0
+            )
+            for failure in failures:
+                key = f"graph_ipc_overflow_{failure}"
+                totals[key] = totals.get(key, 0.0) + 1.0
+            for observed_key in ("tokens", "legal", "opp_legal", "pairs", "relation_edges"):
+                value = diagnostic.get(observed_key)
+                if value is not None:
+                    key = f"graph_ipc_overflow_max_{observed_key}"
+                    totals[key] = max(totals.get(key, 0.0), float(value))
+        if self._recorder is not None:
+            try:
+                self._recorder.event(
+                    "graph_ipc_overflow",
+                    diagnostic,
+                    phase="selfplay",
+                    epoch=self._record_epoch,
+                )
+            except Exception as exc:
+                logger.debug("Failed to record graph IPC overflow event: %s", exc)
 
     def _ingest_game(self, game_record):
         """Process and store one completed game record."""
@@ -297,6 +354,7 @@ class SelfPlayOrchestrator:
                 }
             )
             stats.update(self._rgsc_totals)
+            stats.update(self._graph_ipc_overflow_totals)
             return stats
 
     @property

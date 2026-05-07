@@ -293,6 +293,7 @@ def run_epoch(
         if trainer is None:
             trainer = Trainer(model, cfg, dataloader, device=device)
         else:
+            trainer.close_dataloader()
             trainer.dataloader = dataloader
             trainer.batches_per_epoch = cfg.train.batches_per_epoch
         initial_global_step = int(getattr(trainer, "global_step", 0))
@@ -300,6 +301,7 @@ def run_epoch(
         try:
             train_stats = trainer.train_epoch()
         except Exception as exc:
+            trainer.close_dataloader()
             if (
                 num_workers > 0
                 and _is_dataloader_worker_failure(exc)
@@ -312,10 +314,15 @@ def run_epoch(
                 )
                 trainer.epoch = initial_epoch
                 trainer.dataloader = make_dataloader(0)
-                train_stats = trainer.train_epoch()
+                try:
+                    train_stats = trainer.train_epoch()
+                finally:
+                    trainer.close_dataloader()
                 train_stats["dataloader_worker_fallback"] = 1.0
             else:
                 raise
+        else:
+            trainer.close_dataloader()
 
         checkpoint_path = output_dir / f"epoch_{int(train_stats.get('epoch', 1)):04d}.pt"
         trainer.save_checkpoint(checkpoint_path)

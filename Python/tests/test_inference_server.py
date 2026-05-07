@@ -17,7 +17,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from hexorl.config import load_config
 from hexorl.inference.server import InferenceServer
 from hexorl.inference.client import InferenceClient
-from hexorl.inference.shm_queue import CANDIDATE_FEATURES, connect_inference_queue
+from hexorl.inference.shm_queue import (
+    CANDIDATE_FEATURES,
+    GRAPH_SLOT_SPECS,
+    connect_inference_queue,
+    create_inference_queue,
+)
 from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
 from hexorl.models.loading import build_runtime_model
 
@@ -39,6 +44,7 @@ class TestInferenceServer(unittest.TestCase):
         cls.cfg.model.blocks = 2
         cls.cfg.inference.max_batch_size = 16
         cls.cfg.inference.fp16 = False
+        cls.cfg.runtime.inference_start_timeout_s = 90.0
 
     def test_server_starts_and_stops(self):
         """Server starts and stops cleanly."""
@@ -213,6 +219,22 @@ class TestInferenceServer(unittest.TestCase):
         server.stop()
         server.join(timeout=5.0)
         server_q.close()
+
+    def test_graph_shared_memory_schema_exposes_sparse_relation_slots_only(self):
+        queue = create_inference_queue(1, 8)
+        try:
+            slot = queue.get_slot(0)
+            spec_names = {spec.attr for spec in GRAPH_SLOT_SPECS}
+            self.assertIn("req_graph_relation_src", spec_names)
+            self.assertIn("req_graph_relation_dst", spec_names)
+            self.assertIn("req_graph_relation_edge_type", spec_names)
+            self.assertIn("req_graph_relation_edge_bias", spec_names)
+            for suffix in ("type", "bias"):
+                self.assertFalse(hasattr(slot, f"req_graph_relation_{suffix}"))
+            self.assertEqual(slot.req_graph_meta.dtype, np.dtype(np.uint32))
+            self.assertEqual(slot.req_graph_batch_meta.dtype, np.dtype(np.uint32))
+        finally:
+            queue.close()
 
     def test_adaptive_batching_two_clients(self):
         """Two clients submitting simultaneously get correct results."""

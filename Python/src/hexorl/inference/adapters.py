@@ -431,14 +431,14 @@ def decode_global_graph_outputs(
 def decode_graph_slot_response(
     slot,
     graph_batches,
-    counts: list[tuple[int, int, int, int]],
+    counts: list[tuple[int, int, int, int, int]],
     offsets: list[tuple[int, int, int, int]],
     *,
     head_flags: int,
 ) -> list[dict[str, np.ndarray | dict[str, object]]]:
     results: list[dict[str, np.ndarray | dict[str, object]]] = []
     for row, (graph_batch, count_row, offset_row) in enumerate(zip(graph_batches, counts, offsets)):
-        token_count, legal_count, opp_count, pair_count = count_row
+        token_count, legal_count, opp_count, pair_count, relation_count = count_row
         _token_off, legal_off, opp_off, pair_off = offset_row
         observed_legal = np.array(
             slot.req_graph_legal_qr[legal_off : legal_off + legal_count],
@@ -464,6 +464,7 @@ def decode_graph_slot_response(
             "opp_legal_count": int(opp_count),
             "pair_count": int(pair_count),
             "token_count": int(token_count),
+            "relation_edge_count": int(relation_count),
             "head_flags": int(head_flags),
             "prior_source": "global_graph",
             "legal_qr": observed_legal,

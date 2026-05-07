@@ -7,7 +7,11 @@ import torch
 
 from hexorl.config import Config
 from hexorl.eval import model_provider
-from hexorl.graph.batch import build_graph_batch_from_history, collate_graph_batches
+from hexorl.graph.batch import (
+    build_graph_batch_from_history,
+    collate_graph_batches,
+    sparse_relation_edge_count,
+)
 from hexorl.inference.adapters import (
     decode_dense_outputs,
     decode_global_graph_outputs,
@@ -32,6 +36,16 @@ def _hist(*moves):
     for player, q, r in moves:
         data.extend(struct.pack("<iii", player, q, r))
     return bytes(data)
+
+
+def _graph_count_tuple(graph, legal_count: int | None = None, opp_count: int = 0, pair_count: int | None = None):
+    return (
+        int(graph.token_features.shape[0]),
+        int(graph.legal_qr.shape[0] if legal_count is None else legal_count),
+        int(opp_count),
+        int(graph.pair_first_indices.shape[0] if pair_count is None else pair_count),
+        int(sparse_relation_edge_count(graph)),
+    )
 
 
 def test_dense_inference_adapter_emits_value_decoder_metadata():
@@ -163,7 +177,7 @@ def test_graph_response_rejects_same_count_reordered_rows():
         decode_graph_slot_response(
             slot,
             [graph],
-            [(legal.shape[0], legal.shape[0], 0, 0)],
+            [_graph_count_tuple(graph, legal_count=legal.shape[0], pair_count=0)],
             [(0, 0, 0, 0)],
             head_flags=0,
         )
@@ -193,7 +207,7 @@ def test_graph_response_metadata_declares_pair_contracts_when_present():
     result = decode_graph_slot_response(
         slot,
         [graph],
-        [(graph.token_features.shape[0], legal.shape[0], 0, pair_count)],
+        [_graph_count_tuple(graph, legal_count=legal.shape[0], pair_count=pair_count)],
         [(0, 0, 0, 0)],
         head_flags=GRAPH_HEAD_PAIR_FIRST | GRAPH_HEAD_PAIR_JOINT,
     )[0]
@@ -233,7 +247,7 @@ def test_graph_response_metadata_declares_known_first_pair_contract():
     result = decode_graph_slot_response(
         slot,
         [graph],
-        [(graph.token_features.shape[0], legal.shape[0], 0, pair_count)],
+        [_graph_count_tuple(graph, legal_count=legal.shape[0], pair_count=pair_count)],
         [(0, 0, 0, 0)],
         head_flags=GRAPH_HEAD_PAIR_SECOND,
     )[0]

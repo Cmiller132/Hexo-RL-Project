@@ -108,6 +108,10 @@ class Trainer:
         self._graph_microbatch_heuristic: int | None = None
         self._graph_microbatch_rejections: list[str] = []
 
+    def close_dataloader(self) -> None:
+        """Release persistent DataLoader workers owned by the current loader."""
+        shutdown_dataloader_workers(self.dataloader)
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         lr = self.train_cfg.peak_lr
         wd = self.train_cfg.weight_decay
@@ -1065,6 +1069,7 @@ class _PrefetchIterator:
 
     def close(self):
         self._closed.set()
+        shutdown_dataloader_iterator(self._iterator)
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
@@ -1085,3 +1090,30 @@ def _uncompiled_state_dict(model: nn.Module) -> dict:
     """Return stable checkpoint keys even when torch.compile wraps the model."""
     original = getattr(model, "_orig_mod", model)
     return original.state_dict()
+
+
+def shutdown_dataloader_iterator(iterator) -> None:
+    """Shut down PyTorch multiprocessing workers behind an iterator, if any."""
+    if bool(getattr(iterator, "_hexorl_workers_shutdown", False)):
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+            try:
+                iterator._hexorl_workers_shutdown = True
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("DataLoader worker shutdown failed: %s", exc)
+
+
+def shutdown_dataloader_workers(dataloader) -> None:
+    """Release persistent workers cached on a PyTorch DataLoader."""
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is not None:
+        shutdown_dataloader_iterator(iterator)
+        try:
+            dataloader._iterator = None
+        except Exception:
+            pass

@@ -13,10 +13,11 @@ Plus two shared-memory doorbell bytes per worker (spawn-safe):
 
 import time as _time
 import contextlib
+from dataclasses import dataclass
 import numpy as np
 import logging
 from multiprocessing.shared_memory import SharedMemory
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from hexorl.action_contract.candidates import CANDIDATE_FEATURES
 from hexorl.graph.batch import (
@@ -28,6 +29,7 @@ from hexorl.graph.capacity import (
     GRAPH_IPC_ACTION_CAPACITY,
     GRAPH_IPC_BATCH_CAPACITY,
     GRAPH_IPC_PAIR_CAPACITY,
+    GRAPH_IPC_RELATION_EDGE_CAPACITY,
     GRAPH_IPC_TOKEN_CAPACITY,
 )
 
@@ -41,8 +43,20 @@ MAX_GRAPH_TOKENS = GRAPH_IPC_TOKEN_CAPACITY
 MAX_GRAPH_ACTIONS = GRAPH_IPC_ACTION_CAPACITY
 MAX_GRAPH_PAIRS = GRAPH_IPC_PAIR_CAPACITY
 MAX_GRAPH_BATCH = GRAPH_IPC_BATCH_CAPACITY
+MAX_GRAPH_RELATION_EDGES = GRAPH_IPC_RELATION_EDGE_CAPACITY
 TENSOR_ELEMENTS = NUM_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 13 * 33 * 33 = 14157
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SlotSpec:
+    base: str
+    attr: str
+    shape: Callable[[int], tuple[int, ...]]
+    dtype: np.dtype
+
+    def nbytes(self, max_batch: int) -> int:
+        return int(np.prod(self.shape(max_batch), dtype=np.int64)) * np.dtype(self.dtype).itemsize
 
 
 def _shm_name(base: str, worker_id: int) -> str:
@@ -79,8 +93,10 @@ def _shm_name(base: str, worker_id: int) -> str:
         "req_graph_pair_token_indices": "qgpi",
         "req_graph_pair_first_indices": "qgpf",
         "req_graph_pair_second_indices": "qgps",
-        "req_graph_relation_type": "qgrt",
-        "req_graph_relation_bias": "qgrb",
+        "req_graph_relation_src": "qgrs",
+        "req_graph_relation_dst": "qgrd",
+        "req_graph_relation_edge_type": "qgrt",
+        "req_graph_relation_edge_bias": "qgrb",
         "res_graph_meta": "rgm",
         "res_graph_place_logits": "rgpl",
         "res_graph_opp_logits": "rgol",
@@ -106,6 +122,50 @@ def _create_shm(name: str, size: int) -> SharedMemory:
         except FileNotFoundError:
             logger.debug("SharedMemory %s disappeared before cleanup", name)
         return SharedMemory(name=name, create=True, size=size)
+
+
+GRAPH_SLOT_SPECS: tuple[SlotSpec, ...] = (
+    SlotSpec("req_graph_meta", "req_graph_meta", lambda _max_batch: (10,), np.dtype(np.uint32)),
+    SlotSpec(
+        "req_graph_batch_meta",
+        "req_graph_batch_meta",
+        lambda _max_batch: (MAX_GRAPH_BATCH, 10),
+        np.dtype(np.uint32),
+    ),
+    SlotSpec(
+        "req_graph_token_features",
+        "req_graph_token_features",
+        lambda _max_batch: (MAX_GRAPH_TOKENS, GRAPH_FEATURE_DIM),
+        np.dtype(np.float32),
+    ),
+    SlotSpec("req_graph_token_type", "req_graph_token_type", lambda _max_batch: (MAX_GRAPH_TOKENS,), np.dtype(np.int16)),
+    SlotSpec("req_graph_token_qr", "req_graph_token_qr", lambda _max_batch: (MAX_GRAPH_TOKENS, 2), np.dtype(np.int32)),
+    SlotSpec("req_graph_token_mask", "req_graph_token_mask", lambda _max_batch: (MAX_GRAPH_TOKENS,), np.dtype(np.uint8)),
+    SlotSpec(
+        "req_graph_legal_token_indices",
+        "req_graph_legal_token_indices",
+        lambda _max_batch: (MAX_GRAPH_ACTIONS,),
+        np.dtype(np.int64),
+    ),
+    SlotSpec("req_graph_legal_qr", "req_graph_legal_qr", lambda _max_batch: (MAX_GRAPH_ACTIONS, 2), np.dtype(np.int32)),
+    SlotSpec("req_graph_legal_mask", "req_graph_legal_mask", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.uint8)),
+    SlotSpec("req_graph_opp_legal_qr", "req_graph_opp_legal_qr", lambda _max_batch: (MAX_GRAPH_ACTIONS, 2), np.dtype(np.int32)),
+    SlotSpec("req_graph_opp_legal_mask", "req_graph_opp_legal_mask", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.uint8)),
+    SlotSpec("req_graph_pair_token_indices", "req_graph_pair_token_indices", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.int64)),
+    SlotSpec("req_graph_pair_first_indices", "req_graph_pair_first_indices", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.int64)),
+    SlotSpec("req_graph_pair_second_indices", "req_graph_pair_second_indices", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.int64)),
+    SlotSpec("req_graph_relation_src", "req_graph_relation_src", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.int32)),
+    SlotSpec("req_graph_relation_dst", "req_graph_relation_dst", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.int32)),
+    SlotSpec("req_graph_relation_edge_type", "req_graph_relation_edge_type", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.int16)),
+    SlotSpec("req_graph_relation_edge_bias", "req_graph_relation_edge_bias", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.float32)),
+    SlotSpec("res_graph_meta", "res_graph_meta", lambda _max_batch: (8,), np.dtype(np.uint32)),
+    SlotSpec("res_graph_place_logits", "res_graph_place_logits", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.float32)),
+    SlotSpec("res_graph_opp_logits", "res_graph_opp_logits", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.float32)),
+    SlotSpec("res_graph_pair_first_logits", "res_graph_pair_first_logits", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.float32)),
+    SlotSpec("res_graph_pair_logits", "res_graph_pair_logits", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.float32)),
+    SlotSpec("res_graph_pair_second_logits", "res_graph_pair_second_logits", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.float32)),
+    SlotSpec("res_graph_regret_rank", "res_graph_regret_rank", lambda _max_batch: (MAX_GRAPH_BATCH,), np.dtype(np.float32)),
+)
 
 
 class SharedEvent:
@@ -227,10 +287,14 @@ class WorkerSlots:
         self.req_graph_pair_first_indices: Optional[np.ndarray] = None
         self.req_graph_pair_second_indices_shm: Optional[SharedMemory] = None
         self.req_graph_pair_second_indices: Optional[np.ndarray] = None
-        self.req_graph_relation_type_shm: Optional[SharedMemory] = None
-        self.req_graph_relation_type: Optional[np.ndarray] = None
-        self.req_graph_relation_bias_shm: Optional[SharedMemory] = None
-        self.req_graph_relation_bias: Optional[np.ndarray] = None
+        self.req_graph_relation_src_shm: Optional[SharedMemory] = None
+        self.req_graph_relation_src: Optional[np.ndarray] = None
+        self.req_graph_relation_dst_shm: Optional[SharedMemory] = None
+        self.req_graph_relation_dst: Optional[np.ndarray] = None
+        self.req_graph_relation_edge_type_shm: Optional[SharedMemory] = None
+        self.req_graph_relation_edge_type: Optional[np.ndarray] = None
+        self.req_graph_relation_edge_bias_shm: Optional[SharedMemory] = None
+        self.req_graph_relation_edge_bias: Optional[np.ndarray] = None
         self.res_graph_meta_shm: Optional[SharedMemory] = None
         self.res_graph_meta: Optional[np.ndarray] = None
         self.res_graph_place_logits_shm: Optional[SharedMemory] = None
@@ -386,8 +450,12 @@ class WorkerSlots:
 
     def _allocate_graph_slots(self):
         """Create one padded graph request/response slot for this worker."""
-        self.req_graph_meta_shm = _create_shm(_shm_name("req_graph_meta", self.worker_id), 8 * 2)
-        self.req_graph_meta = np.ndarray((8,), dtype=np.uint16, buffer=self.req_graph_meta_shm.buf)
+        for spec in GRAPH_SLOT_SPECS:
+            shm = _create_shm(_shm_name(spec.base, self.worker_id), spec.nbytes(self.max_batch))
+            arr = np.ndarray(spec.shape(self.max_batch), dtype=spec.dtype, buffer=shm.buf)
+            setattr(self, f"{spec.attr}_shm", shm)
+            setattr(self, spec.attr, arr)
+            arr.fill(0)
         self.req_graph_meta[:] = (
             GRAPH_SCHEMA_VERSION,
             RELATION_SCHEMA_VERSION,
@@ -395,144 +463,10 @@ class WorkerSlots:
             0,
             0,
             0,
+            0,
             MAX_GRAPH_TOKENS,
             MAX_GRAPH_ACTIONS,
-        )
-        self.req_graph_batch_meta_shm = _create_shm(
-            _shm_name("req_graph_batch_meta", self.worker_id),
-            MAX_GRAPH_BATCH * 8 * 2,
-        )
-        self.req_graph_batch_meta = np.ndarray(
-            (MAX_GRAPH_BATCH, 8),
-            dtype=np.uint16,
-            buffer=self.req_graph_batch_meta_shm.buf,
-        )
-        self.req_graph_batch_meta[:] = 0
-        self.req_graph_token_features_shm = _create_shm(
-            _shm_name("req_graph_token_features", self.worker_id),
-            MAX_GRAPH_TOKENS * GRAPH_FEATURE_DIM * 4,
-        )
-        self.req_graph_token_features = np.ndarray(
-            (MAX_GRAPH_TOKENS, GRAPH_FEATURE_DIM), dtype=np.float32, buffer=self.req_graph_token_features_shm.buf
-        )
-        self.req_graph_token_type_shm = _create_shm(
-            _shm_name("req_graph_token_type", self.worker_id), MAX_GRAPH_TOKENS * 2
-        )
-        self.req_graph_token_type = np.ndarray(
-            (MAX_GRAPH_TOKENS,), dtype=np.int16, buffer=self.req_graph_token_type_shm.buf
-        )
-        self.req_graph_token_qr_shm = _create_shm(
-            _shm_name("req_graph_token_qr", self.worker_id), MAX_GRAPH_TOKENS * 2 * 4
-        )
-        self.req_graph_token_qr = np.ndarray(
-            (MAX_GRAPH_TOKENS, 2), dtype=np.int32, buffer=self.req_graph_token_qr_shm.buf
-        )
-        self.req_graph_token_mask_shm = _create_shm(
-            _shm_name("req_graph_token_mask", self.worker_id), MAX_GRAPH_TOKENS
-        )
-        self.req_graph_token_mask = np.ndarray(
-            (MAX_GRAPH_TOKENS,), dtype=np.uint8, buffer=self.req_graph_token_mask_shm.buf
-        )
-        self.req_graph_legal_token_indices_shm = _create_shm(
-            _shm_name("req_graph_legal_token_indices", self.worker_id), MAX_GRAPH_ACTIONS * 8
-        )
-        self.req_graph_legal_token_indices = np.ndarray(
-            (MAX_GRAPH_ACTIONS,), dtype=np.int64, buffer=self.req_graph_legal_token_indices_shm.buf
-        )
-        self.req_graph_legal_qr_shm = _create_shm(
-            _shm_name("req_graph_legal_qr", self.worker_id), MAX_GRAPH_ACTIONS * 2 * 4
-        )
-        self.req_graph_legal_qr = np.ndarray(
-            (MAX_GRAPH_ACTIONS, 2), dtype=np.int32, buffer=self.req_graph_legal_qr_shm.buf
-        )
-        self.req_graph_legal_mask_shm = _create_shm(
-            _shm_name("req_graph_legal_mask", self.worker_id), MAX_GRAPH_ACTIONS
-        )
-        self.req_graph_legal_mask = np.ndarray(
-            (MAX_GRAPH_ACTIONS,), dtype=np.uint8, buffer=self.req_graph_legal_mask_shm.buf
-        )
-        self.req_graph_opp_legal_qr_shm = _create_shm(
-            _shm_name("req_graph_opp_legal_qr", self.worker_id), MAX_GRAPH_ACTIONS * 2 * 4
-        )
-        self.req_graph_opp_legal_qr = np.ndarray(
-            (MAX_GRAPH_ACTIONS, 2), dtype=np.int32, buffer=self.req_graph_opp_legal_qr_shm.buf
-        )
-        self.req_graph_opp_legal_mask_shm = _create_shm(
-            _shm_name("req_graph_opp_legal_mask", self.worker_id), MAX_GRAPH_ACTIONS
-        )
-        self.req_graph_opp_legal_mask = np.ndarray(
-            (MAX_GRAPH_ACTIONS,), dtype=np.uint8, buffer=self.req_graph_opp_legal_mask_shm.buf
-        )
-        self.req_graph_pair_token_indices_shm = _create_shm(
-            _shm_name("req_graph_pair_token_indices", self.worker_id), MAX_GRAPH_PAIRS * 8
-        )
-        self.req_graph_pair_token_indices = np.ndarray(
-            (MAX_GRAPH_PAIRS,), dtype=np.int64, buffer=self.req_graph_pair_token_indices_shm.buf
-        )
-        self.req_graph_pair_first_indices_shm = _create_shm(
-            _shm_name("req_graph_pair_first_indices", self.worker_id), MAX_GRAPH_PAIRS * 8
-        )
-        self.req_graph_pair_first_indices = np.ndarray(
-            (MAX_GRAPH_PAIRS,), dtype=np.int64, buffer=self.req_graph_pair_first_indices_shm.buf
-        )
-        self.req_graph_pair_second_indices_shm = _create_shm(
-            _shm_name("req_graph_pair_second_indices", self.worker_id), MAX_GRAPH_PAIRS * 8
-        )
-        self.req_graph_pair_second_indices = np.ndarray(
-            (MAX_GRAPH_PAIRS,), dtype=np.int64, buffer=self.req_graph_pair_second_indices_shm.buf
-        )
-        self.req_graph_relation_type_shm = _create_shm(
-            _shm_name("req_graph_relation_type", self.worker_id),
-            MAX_GRAPH_TOKENS * MAX_GRAPH_TOKENS * 2,
-        )
-        self.req_graph_relation_type = np.ndarray(
-            (MAX_GRAPH_TOKENS, MAX_GRAPH_TOKENS), dtype=np.int16, buffer=self.req_graph_relation_type_shm.buf
-        )
-        self.req_graph_relation_bias_shm = _create_shm(
-            _shm_name("req_graph_relation_bias", self.worker_id),
-            MAX_GRAPH_TOKENS * MAX_GRAPH_TOKENS * 4,
-        )
-        self.req_graph_relation_bias = np.ndarray(
-            (1, MAX_GRAPH_TOKENS, MAX_GRAPH_TOKENS), dtype=np.float32, buffer=self.req_graph_relation_bias_shm.buf
-        )
-        self.res_graph_meta_shm = _create_shm(_shm_name("res_graph_meta", self.worker_id), 8 * 2)
-        self.res_graph_meta = np.ndarray((8,), dtype=np.uint16, buffer=self.res_graph_meta_shm.buf)
-        self.res_graph_meta[:] = 0
-        self.res_graph_place_logits_shm = _create_shm(
-            _shm_name("res_graph_place_logits", self.worker_id), MAX_GRAPH_ACTIONS * 4
-        )
-        self.res_graph_place_logits = np.ndarray(
-            (MAX_GRAPH_ACTIONS,), dtype=np.float32, buffer=self.res_graph_place_logits_shm.buf
-        )
-        self.res_graph_opp_logits_shm = _create_shm(
-            _shm_name("res_graph_opp_logits", self.worker_id), MAX_GRAPH_ACTIONS * 4
-        )
-        self.res_graph_opp_logits = np.ndarray(
-            (MAX_GRAPH_ACTIONS,), dtype=np.float32, buffer=self.res_graph_opp_logits_shm.buf
-        )
-        self.res_graph_pair_first_logits_shm = _create_shm(
-            _shm_name("res_graph_pair_first_logits", self.worker_id), MAX_GRAPH_ACTIONS * 4
-        )
-        self.res_graph_pair_first_logits = np.ndarray(
-            (MAX_GRAPH_ACTIONS,), dtype=np.float32, buffer=self.res_graph_pair_first_logits_shm.buf
-        )
-        self.res_graph_pair_logits_shm = _create_shm(
-            _shm_name("res_graph_pair_logits", self.worker_id), MAX_GRAPH_PAIRS * 4
-        )
-        self.res_graph_pair_logits = np.ndarray(
-            (MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_logits_shm.buf
-        )
-        self.res_graph_pair_second_logits_shm = _create_shm(
-            _shm_name("res_graph_pair_second_logits", self.worker_id), MAX_GRAPH_PAIRS * 4
-        )
-        self.res_graph_pair_second_logits = np.ndarray(
-            (MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_second_logits_shm.buf
-        )
-        self.res_graph_regret_rank_shm = _create_shm(
-            _shm_name("res_graph_regret_rank", self.worker_id), MAX_GRAPH_BATCH * 4
-        )
-        self.res_graph_regret_rank = np.ndarray(
-            (MAX_GRAPH_BATCH,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf
+            MAX_GRAPH_RELATION_EDGES,
         )
 
     def _connect(self):
@@ -653,52 +587,11 @@ class WorkerSlots:
         self.res_ready = SharedEvent(_shm_name("res_ready", self.worker_id), create=False)
 
     def _connect_graph_slots(self):
-        self.req_graph_meta_shm = SharedMemory(name=_shm_name("req_graph_meta", self.worker_id), create=False)
-        self.req_graph_meta = np.ndarray((8,), dtype=np.uint16, buffer=self.req_graph_meta_shm.buf)
-        self.req_graph_batch_meta_shm = SharedMemory(name=_shm_name("req_graph_batch_meta", self.worker_id), create=False)
-        self.req_graph_batch_meta = np.ndarray((MAX_GRAPH_BATCH, 8), dtype=np.uint16, buffer=self.req_graph_batch_meta_shm.buf)
-        self.req_graph_token_features_shm = SharedMemory(name=_shm_name("req_graph_token_features", self.worker_id), create=False)
-        self.req_graph_token_features = np.ndarray((MAX_GRAPH_TOKENS, GRAPH_FEATURE_DIM), dtype=np.float32, buffer=self.req_graph_token_features_shm.buf)
-        self.req_graph_token_type_shm = SharedMemory(name=_shm_name("req_graph_token_type", self.worker_id), create=False)
-        self.req_graph_token_type = np.ndarray((MAX_GRAPH_TOKENS,), dtype=np.int16, buffer=self.req_graph_token_type_shm.buf)
-        self.req_graph_token_qr_shm = SharedMemory(name=_shm_name("req_graph_token_qr", self.worker_id), create=False)
-        self.req_graph_token_qr = np.ndarray((MAX_GRAPH_TOKENS, 2), dtype=np.int32, buffer=self.req_graph_token_qr_shm.buf)
-        self.req_graph_token_mask_shm = SharedMemory(name=_shm_name("req_graph_token_mask", self.worker_id), create=False)
-        self.req_graph_token_mask = np.ndarray((MAX_GRAPH_TOKENS,), dtype=np.uint8, buffer=self.req_graph_token_mask_shm.buf)
-        self.req_graph_legal_token_indices_shm = SharedMemory(name=_shm_name("req_graph_legal_token_indices", self.worker_id), create=False)
-        self.req_graph_legal_token_indices = np.ndarray((MAX_GRAPH_ACTIONS,), dtype=np.int64, buffer=self.req_graph_legal_token_indices_shm.buf)
-        self.req_graph_legal_qr_shm = SharedMemory(name=_shm_name("req_graph_legal_qr", self.worker_id), create=False)
-        self.req_graph_legal_qr = np.ndarray((MAX_GRAPH_ACTIONS, 2), dtype=np.int32, buffer=self.req_graph_legal_qr_shm.buf)
-        self.req_graph_legal_mask_shm = SharedMemory(name=_shm_name("req_graph_legal_mask", self.worker_id), create=False)
-        self.req_graph_legal_mask = np.ndarray((MAX_GRAPH_ACTIONS,), dtype=np.uint8, buffer=self.req_graph_legal_mask_shm.buf)
-        self.req_graph_opp_legal_qr_shm = SharedMemory(name=_shm_name("req_graph_opp_legal_qr", self.worker_id), create=False)
-        self.req_graph_opp_legal_qr = np.ndarray((MAX_GRAPH_ACTIONS, 2), dtype=np.int32, buffer=self.req_graph_opp_legal_qr_shm.buf)
-        self.req_graph_opp_legal_mask_shm = SharedMemory(name=_shm_name("req_graph_opp_legal_mask", self.worker_id), create=False)
-        self.req_graph_opp_legal_mask = np.ndarray((MAX_GRAPH_ACTIONS,), dtype=np.uint8, buffer=self.req_graph_opp_legal_mask_shm.buf)
-        self.req_graph_pair_token_indices_shm = SharedMemory(name=_shm_name("req_graph_pair_token_indices", self.worker_id), create=False)
-        self.req_graph_pair_token_indices = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.int64, buffer=self.req_graph_pair_token_indices_shm.buf)
-        self.req_graph_pair_first_indices_shm = SharedMemory(name=_shm_name("req_graph_pair_first_indices", self.worker_id), create=False)
-        self.req_graph_pair_first_indices = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.int64, buffer=self.req_graph_pair_first_indices_shm.buf)
-        self.req_graph_pair_second_indices_shm = SharedMemory(name=_shm_name("req_graph_pair_second_indices", self.worker_id), create=False)
-        self.req_graph_pair_second_indices = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.int64, buffer=self.req_graph_pair_second_indices_shm.buf)
-        self.req_graph_relation_type_shm = SharedMemory(name=_shm_name("req_graph_relation_type", self.worker_id), create=False)
-        self.req_graph_relation_type = np.ndarray((MAX_GRAPH_TOKENS, MAX_GRAPH_TOKENS), dtype=np.int16, buffer=self.req_graph_relation_type_shm.buf)
-        self.req_graph_relation_bias_shm = SharedMemory(name=_shm_name("req_graph_relation_bias", self.worker_id), create=False)
-        self.req_graph_relation_bias = np.ndarray((1, MAX_GRAPH_TOKENS, MAX_GRAPH_TOKENS), dtype=np.float32, buffer=self.req_graph_relation_bias_shm.buf)
-        self.res_graph_meta_shm = SharedMemory(name=_shm_name("res_graph_meta", self.worker_id), create=False)
-        self.res_graph_meta = np.ndarray((8,), dtype=np.uint16, buffer=self.res_graph_meta_shm.buf)
-        self.res_graph_place_logits_shm = SharedMemory(name=_shm_name("res_graph_place_logits", self.worker_id), create=False)
-        self.res_graph_place_logits = np.ndarray((MAX_GRAPH_ACTIONS,), dtype=np.float32, buffer=self.res_graph_place_logits_shm.buf)
-        self.res_graph_opp_logits_shm = SharedMemory(name=_shm_name("res_graph_opp_logits", self.worker_id), create=False)
-        self.res_graph_opp_logits = np.ndarray((MAX_GRAPH_ACTIONS,), dtype=np.float32, buffer=self.res_graph_opp_logits_shm.buf)
-        self.res_graph_pair_first_logits_shm = SharedMemory(name=_shm_name("res_graph_pair_first_logits", self.worker_id), create=False)
-        self.res_graph_pair_first_logits = np.ndarray((MAX_GRAPH_ACTIONS,), dtype=np.float32, buffer=self.res_graph_pair_first_logits_shm.buf)
-        self.res_graph_pair_logits_shm = SharedMemory(name=_shm_name("res_graph_pair_logits", self.worker_id), create=False)
-        self.res_graph_pair_logits = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_logits_shm.buf)
-        self.res_graph_pair_second_logits_shm = SharedMemory(name=_shm_name("res_graph_pair_second_logits", self.worker_id), create=False)
-        self.res_graph_pair_second_logits = np.ndarray((MAX_GRAPH_PAIRS,), dtype=np.float32, buffer=self.res_graph_pair_second_logits_shm.buf)
-        self.res_graph_regret_rank_shm = SharedMemory(name=_shm_name("res_graph_regret_rank", self.worker_id), create=False)
-        self.res_graph_regret_rank = np.ndarray((MAX_GRAPH_BATCH,), dtype=np.float32, buffer=self.res_graph_regret_rank_shm.buf)
+        for spec in GRAPH_SLOT_SPECS:
+            shm = SharedMemory(name=_shm_name(spec.base, self.worker_id), create=False)
+            arr = np.ndarray(spec.shape(self.max_batch), dtype=spec.dtype, buffer=shm.buf)
+            setattr(self, f"{spec.attr}_shm", shm)
+            setattr(self, spec.attr, arr)
 
     def close(self):
         """Close and unlink all shared memory segments."""
@@ -718,31 +611,17 @@ class WorkerSlots:
             "req_pair_indices_shm",
             "req_pair_mask_shm",
             "res_pair_logits_shm",
-            "req_graph_meta_shm",
-            "req_graph_batch_meta_shm",
-            "req_graph_token_features_shm",
-            "req_graph_token_type_shm",
-            "req_graph_token_qr_shm",
-            "req_graph_token_mask_shm",
-            "req_graph_legal_token_indices_shm",
-            "req_graph_legal_qr_shm",
-            "req_graph_legal_mask_shm",
-            "req_graph_opp_legal_qr_shm",
-            "req_graph_opp_legal_mask_shm",
-            "req_graph_pair_token_indices_shm",
-            "req_graph_pair_first_indices_shm",
-            "req_graph_pair_second_indices_shm",
-            "req_graph_relation_type_shm",
-            "req_graph_relation_bias_shm",
-            "res_graph_meta_shm",
-            "res_graph_place_logits_shm",
-            "res_graph_opp_logits_shm",
-            "res_graph_pair_first_logits_shm",
-            "res_graph_pair_logits_shm",
-            "res_graph_pair_second_logits_shm",
-            "res_graph_regret_rank_shm",
         ):
             shm = getattr(self, attr, None)
+            if shm is not None:
+                shm.close()
+                if self._create:
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        logger.debug("SharedMemory %s already unlinked", shm.name)
+        for spec in GRAPH_SLOT_SPECS:
+            shm = getattr(self, f"{spec.attr}_shm", None)
             if shm is not None:
                 shm.close()
                 if self._create:

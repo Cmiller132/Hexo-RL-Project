@@ -31,14 +31,18 @@ from hexorl.graph.batch import (
     GRAPH_FEATURE_WINDOW_EMPTY_COUNT,
     GRAPH_FEATURE_WINDOW_OWNER_RELATIVE,
     GRAPH_FEATURE_WINDOW_STONE_COUNT,
+    GraphIPCCapacityError,
+    dense_relations_from_sparse_edges,
     graph_capacity_report,
+    sparse_relation_edges_from_batch,
     validate_graph_ipc_capacity,
 )
-from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_TOKENS
+from hexorl.inference.shm_queue import MAX_GRAPH_ACTIONS, MAX_GRAPH_RELATION_EDGES, MAX_GRAPH_TOKENS
 from hexorl.models.assembly import build_model_from_config
 from hexorl.models.families.global_graph import GlobalHexGraphNet
 from hexorl.replay.training_batch import graph_batch_training_targets
 from hexorl.selfplay.records import PositionRecord, action_to_board_index
+from hexorl.selfplay.orchestrator import SelfPlayOrchestrator
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import build_pair_strategy
 from hexorl.train.loss_plan import build_loss_plan
@@ -198,6 +202,86 @@ def test_global_graph_builder_honors_explicit_legal_rows():
 def test_global_graph_ipc_capacity_allows_full_legal_scout_requests():
     assert MAX_GRAPH_TOKENS >= 4096
     assert MAX_GRAPH_ACTIONS >= 8192
+    assert MAX_GRAPH_RELATION_EDGES >= 524288
+
+
+def test_global_graph_sparse_relation_ipc_roundtrip_rebuilds_dense_relations():
+    graph = build_graph_batch_from_history(
+        _hist((0, 0, 0), (1, 1, 0), (1, 0, 1), (0, -1, 0)),
+        include_pair_rows=False,
+        max_legal_rows=64,
+        max_context_tokens=96,
+    )
+    src, dst, rel_type, rel_bias = sparse_relation_edges_from_batch(graph)
+    assert src.shape == dst.shape == rel_type.shape == rel_bias.shape
+    assert src.shape[0] < graph.relation_type.size
+    rebuilt_type, rebuilt_bias = dense_relations_from_sparse_edges(
+        graph.token_features,
+        graph.token_type,
+        graph.token_qr,
+        src,
+        dst,
+        rel_type,
+        rel_bias,
+    )
+    assert np.array_equal(rebuilt_type, graph.relation_type)
+    assert np.allclose(rebuilt_bias, graph.relation_bias)
+
+
+def test_global_graph_capacity_error_includes_sparse_relation_failure_details():
+    graph = build_graph_batch_from_history(_hist((0, 0, 0)), include_pair_rows=False)
+    report = graph_capacity_report(graph).__class__(
+        token_count=graph.token_features.shape[0],
+        legal_count=graph.legal_qr.shape[0],
+        opp_legal_count=graph.opp_legal_qr.shape[0],
+        pair_count=graph.pair_token_indices.shape[0],
+        relation_edge_count=MAX_GRAPH_RELATION_EDGES + 1,
+    )
+    assert "graph_relation_edge_capacity" in report.failures()
+    err = GraphIPCCapacityError(report)
+    diagnostics = err.report.to_diagnostics()
+    assert diagnostics["relation_edges"] == MAX_GRAPH_RELATION_EDGES + 1
+    assert "graph_relation_edge_capacity" in diagnostics["failures"]
+
+
+def test_graph_ipc_overflow_diagnostics_reach_selfplay_stats():
+    orchestrator = SelfPlayOrchestrator(Config(), buffer_capacity=8)
+    orchestrator._start_time = 1.0
+    orchestrator._ingest_diagnostic(
+        {
+            "event": "graph_ipc_overflow",
+            "phase": "root_inference",
+            "failures": ["graph_relation_edge_capacity"],
+            "tokens": 10,
+            "legal": 20,
+            "opp_legal": 0,
+            "pairs": 2,
+            "relation_edges": 999,
+        }
+    )
+    stats = orchestrator.stats
+    assert stats["graph_ipc_overflow_count"] == 1.0
+    assert stats["graph_ipc_overflow_phase_root_inference"] == 1.0
+    assert stats["graph_ipc_overflow_graph_relation_edge_capacity"] == 1.0
+    assert stats["graph_ipc_overflow_max_relation_edges"] == 999.0
+
+
+def test_global_graph_can_skip_opponent_policy_rows_for_inference_only_heads():
+    graph = build_graph_batch_from_history(
+        _hist((0, 0, 0), (1, 1, 0)),
+        include_pair_rows=False,
+        include_opp_policy_rows=False,
+    )
+    assert graph.opp_legal_qr.shape == (0, 2)
+    assert graph.opp_legal_mask.shape == (0,)
+    assert graph.opp_policy_target.shape == (0,)
+    with pytest.raises(ValueError, match="include_opp_policy_rows"):
+        build_graph_batch_from_history(
+            _hist((0, 0, 0), (1, 1, 0)),
+            include_pair_rows=False,
+            include_opp_policy_rows=False,
+            opp_legal_moves=[(2, 0)],
+        )
 
 
 def test_global_graph_rejects_sub_rust_legal_radius():

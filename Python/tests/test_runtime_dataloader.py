@@ -76,7 +76,57 @@ def test_legacy_graph_collate_in_worker_config_is_rejected():
         _graph_cfg(graph_collate_in_worker=True)
 
 
-def test_run_epoch_retries_single_process_on_dataloader_worker_failure(monkeypatch, tmp_path):
+def test_prefetch_iterator_close_shuts_down_pytorch_iterator():
+    from hexorl.train.trainer import _PrefetchIterator
+
+    class FakeIterator:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def _shutdown_workers(self):
+            self.shutdown_calls += 1
+
+    iterator = FakeIterator()
+    wrapper = _PrefetchIterator(iterator, max_prefetch=0)
+
+    wrapper.close()
+    wrapper.close()
+
+    assert iterator.shutdown_calls == 1
+
+
+def test_shutdown_dataloader_workers_resets_cached_iterator():
+    from hexorl.train.trainer import shutdown_dataloader_workers
+
+    class FakeIterator:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def _shutdown_workers(self):
+            self.shutdown_calls += 1
+
+    class FakeDataLoader:
+        def __init__(self):
+            self._iterator = FakeIterator()
+
+    dataloader = FakeDataLoader()
+    iterator = dataloader._iterator
+
+    shutdown_dataloader_workers(dataloader)
+
+    assert iterator.shutdown_calls == 1
+    assert dataloader._iterator is None
+
+
+def test_run_epoch_closes_existing_trainer_dataloader_before_replacement(monkeypatch, tmp_path):
+    from hexorl.train.trainer import shutdown_dataloader_workers
+
     cfg = Config.model_validate(
         {
             "model": {
@@ -98,11 +148,99 @@ def test_run_epoch_retries_single_process_on_dataloader_worker_failure(monkeypat
             "inference": {"fp16": False},
         }
     )
+    shutdown_events = []
+
+    class FakeIterator:
+        def __init__(self, label):
+            self.label = label
+
+        def _shutdown_workers(self):
+            shutdown_events.append(self.label)
+
+    class FakeDataLoader:
+        def __init__(self, _dataset=None, **kwargs):
+            self.num_workers = int(kwargs.get("num_workers", 0))
+            self._iterator = FakeIterator(f"new:{self.num_workers}")
+
+    class ExistingTrainer:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1)
+            self.dataloader = FakeDataLoader()
+            self.dataloader._iterator = FakeIterator("old")
+            self.batches_per_epoch = cfg.train.batches_per_epoch
+            self.global_step = 0
+            self.epoch = 0
+
+        def close_dataloader(self):
+            shutdown_dataloader_workers(self.dataloader)
+
+        def train_epoch(self):
+            assert self.dataloader.num_workers == 2
+            self.epoch += 1
+            self.global_step += 1
+            return {
+                "epoch": float(self.epoch),
+                "batches": float(self.batches_per_epoch),
+                "elapsed_s": 0.01,
+                "batches_per_sec": 100.0,
+            }
+
+        def save_checkpoint(self, path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fake")
+
+    monkeypatch.setattr(epoch_pipeline, "DataLoader", FakeDataLoader)
+    trainer = ExistingTrainer()
+
+    epoch_pipeline.run_epoch(
+        cfg,
+        trainer=trainer,
+        output_dir=tmp_path,
+        train=True,
+    )
+
+    assert "old" in shutdown_events
+    assert "new:2" in shutdown_events
+
+
+def test_run_epoch_retries_single_process_on_dataloader_worker_failure(monkeypatch, tmp_path):
+    from hexorl.train.trainer import shutdown_dataloader_workers
+
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_xattn_0",
+                "channels": 16,
+                "attention_heads": 4,
+                "heads": ["policy_place", "value"],
+            },
+            "train": {
+                "batch_size": 1,
+                "batches_per_epoch": 1,
+                "loss_weights": {
+                    "policy": 1.0,
+                    "policy_place": 1.0,
+                    "value": 1.0,
+                },
+            },
+            "runtime": {"graph_dataloader_workers": 2},
+            "inference": {"fp16": False},
+        }
+    )
+    shutdown_events = []
+
+    class FakeIterator:
+        def __init__(self, workers):
+            self.workers = workers
+
+        def _shutdown_workers(self):
+            shutdown_events.append(self.workers)
 
     class FakeDataLoader:
         def __init__(self, _dataset, **kwargs):
             self.num_workers = int(kwargs.get("num_workers", 0))
             self.prefetch_factor = int(kwargs.get("prefetch_factor", 0) or 0)
+            self._iterator = FakeIterator(self.num_workers)
 
     class FakeTrainer:
         def __init__(self, model, cfg, dataloader, device=None):
@@ -113,6 +251,9 @@ def test_run_epoch_retries_single_process_on_dataloader_worker_failure(monkeypat
             self.batches_per_epoch = cfg.train.batches_per_epoch
             self.global_step = 0
             self.epoch = 0
+
+        def close_dataloader(self):
+            shutdown_dataloader_workers(self.dataloader)
 
         def train_epoch(self):
             self.epoch += 1
@@ -141,3 +282,5 @@ def test_run_epoch_retries_single_process_on_dataloader_worker_failure(monkeypat
 
     assert result.train_stats["dataloader_worker_fallback"] == 1.0
     assert result.train_stats["epoch"] == 1.0
+    assert 2 in shutdown_events
+    assert 0 in shutdown_events

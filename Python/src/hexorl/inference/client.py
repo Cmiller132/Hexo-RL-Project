@@ -14,6 +14,7 @@ from hexorl.inference.shm_queue import (
     MAX_GRAPH_ACTIONS,
     MAX_GRAPH_BATCH,
     MAX_GRAPH_PAIRS,
+    MAX_GRAPH_RELATION_EDGES,
     MAX_GRAPH_TOKENS,
     MAX_PAIR_CANDIDATES,
     InferenceQueue,
@@ -267,14 +268,15 @@ class InferenceClient:
             raise RuntimeError("inference queue does not expose regret-rank responses")
         return np.array(self._slot.res_regret_rank[:count], copy=True)
 
-    def _validate_graph_request(self, graph_batch) -> tuple[int, int, int, int]:
+    def _validate_graph_request(self, graph_batch) -> tuple[int, int, int, int, int]:
         from hexorl.graph.batch import validate_graph_ipc_capacity
 
-        validate_graph_ipc_capacity(graph_batch)
+        report = validate_graph_ipc_capacity(graph_batch)
         token_count = int(np.asarray(graph_batch.token_features).shape[0])
         legal_count = int(np.asarray(graph_batch.legal_qr).shape[0])
         opp_count = int(np.asarray(graph_batch.opp_legal_qr).shape[0])
         pair_count = int(np.asarray(graph_batch.pair_token_indices).shape[0])
+        relation_count = int(report.relation_edge_count)
         if token_count > MAX_GRAPH_TOKENS:
             raise ValueError(f"graph token count {token_count} exceeds MAX_GRAPH_TOKENS {MAX_GRAPH_TOKENS}")
         if legal_count > MAX_GRAPH_ACTIONS:
@@ -283,16 +285,22 @@ class InferenceClient:
             raise ValueError(f"graph opponent legal row count {opp_count} exceeds MAX_GRAPH_ACTIONS {MAX_GRAPH_ACTIONS}")
         if pair_count > MAX_GRAPH_PAIRS:
             raise ValueError(f"graph pair row count {pair_count} exceeds MAX_GRAPH_PAIRS {MAX_GRAPH_PAIRS}")
-        return token_count, legal_count, opp_count, pair_count
+        if relation_count > MAX_GRAPH_RELATION_EDGES:
+            raise ValueError(
+                f"graph relation edge count {relation_count} exceeds "
+                f"MAX_GRAPH_RELATION_EDGES {MAX_GRAPH_RELATION_EDGES}"
+            )
+        return token_count, legal_count, opp_count, pair_count, relation_count
 
     @staticmethod
-    def _graph_totals_fit(totals: tuple[int, int, int, int]) -> bool:
-        token_total, legal_total, opp_total, pair_total = totals
+    def _graph_totals_fit(totals: tuple[int, int, int, int, int]) -> bool:
+        token_total, legal_total, opp_total, pair_total, relation_total = totals
         return (
             token_total <= MAX_GRAPH_TOKENS
             and legal_total <= MAX_GRAPH_ACTIONS
             and opp_total <= MAX_GRAPH_ACTIONS
             and pair_total <= MAX_GRAPH_PAIRS
+            and relation_total <= MAX_GRAPH_RELATION_EDGES
         )
 
     def submit_graph(self, graph_batch) -> dict[str, np.ndarray | dict[str, object]]:
@@ -307,19 +315,20 @@ class InferenceClient:
 
         results: list[dict[str, np.ndarray | dict[str, object]]] = []
         chunk = []
-        totals = (0, 0, 0, 0)
+        totals = (0, 0, 0, 0, 0)
         for graph_batch in batches:
             counts = self._validate_graph_request(graph_batch)
             next_totals = tuple(t + c for t, c in zip(totals, counts))
             if chunk and (len(chunk) >= MAX_GRAPH_BATCH or not self._graph_totals_fit(next_totals)):
                 results.extend(self.submit_graph_batch(chunk))
                 chunk = []
-                totals = (0, 0, 0, 0)
+                totals = (0, 0, 0, 0, 0)
                 next_totals = counts
             if not self._graph_totals_fit(next_totals):
                 raise ValueError(
                     "single graph request exceeds packed graph IPC totals: "
-                    f"tokens={counts[0]} legal={counts[1]} opp={counts[2]} pairs={counts[3]}"
+                    f"tokens={counts[0]} legal={counts[1]} opp={counts[2]} "
+                    f"pairs={counts[3]} relation_edges={counts[4]}"
                 )
             chunk.append(graph_batch)
             totals = next_totals
@@ -332,7 +341,7 @@ class InferenceClient:
         """Submit a packed batch of global graph requests from this worker.
 
         Graph requests are packed into one shared-memory slot by concatenating
-        token/action tables and storing each relation matrix as a block. This
+        token/action tables and storing sparse relation overlays. This
         lets one MCTS worker evaluate a selected leaf batch with one GPU forward
         instead of one forward per leaf.
         """
@@ -353,11 +362,13 @@ class InferenceClient:
         total_legal = sum(item[1] for item in counts)
         total_opp = sum(item[2] for item in counts)
         total_pairs = sum(item[3] for item in counts)
-        totals = (total_tokens, total_legal, total_opp, total_pairs)
+        total_relations = sum(item[4] for item in counts)
+        totals = (total_tokens, total_legal, total_opp, total_pairs, total_relations)
         if not self._graph_totals_fit(totals):
             raise ValueError(
                 "packed graph IPC totals exceed capacity: "
-                f"tokens={total_tokens} legal={total_legal} opp={total_opp} pairs={total_pairs}"
+                f"tokens={total_tokens} legal={total_legal} opp={total_opp} "
+                f"pairs={total_pairs} relation_edges={total_relations}"
             )
 
         self._slot.res_ready.clear()
@@ -372,30 +383,37 @@ class InferenceClient:
             total_legal,
             total_opp,
             total_pairs,
+            total_relations,
             MAX_GRAPH_TOKENS,
             MAX_GRAPH_ACTIONS,
+            MAX_GRAPH_RELATION_EDGES,
         )
         self._slot.req_graph_batch_meta[:] = 0
 
-        token_offset = legal_offset = opp_offset = pair_offset = 0
+        token_offset = legal_offset = opp_offset = pair_offset = relation_offset = 0
         offsets: list[tuple[int, int, int, int]] = []
-        for row, (graph_batch, (token_count, legal_count, opp_count, pair_count)) in enumerate(zip(batches, counts)):
+        from hexorl.graph.batch import sparse_relation_edges_from_batch
+
+        for row, (graph_batch, (token_count, legal_count, opp_count, pair_count, relation_count)) in enumerate(zip(batches, counts)):
             offsets.append((token_offset, legal_offset, opp_offset, pair_offset))
             self._slot.req_graph_batch_meta[row] = (
                 token_count,
                 legal_count,
                 opp_count,
                 pair_count,
+                relation_count,
                 token_offset,
                 legal_offset,
                 opp_offset,
                 pair_offset,
+                relation_offset,
             )
 
             token_slice = slice(token_offset, token_offset + token_count)
             legal_slice = slice(legal_offset, legal_offset + legal_count)
             opp_slice = slice(opp_offset, opp_offset + opp_count)
             pair_slice = slice(pair_offset, pair_offset + pair_count)
+            relation_slice = slice(relation_offset, relation_offset + relation_count)
             self._slot.req_graph_token_features[token_slice] = np.asarray(graph_batch.token_features, dtype=np.float32)
             self._slot.req_graph_token_type[token_slice] = np.asarray(graph_batch.token_type, dtype=np.int16)
             self._slot.req_graph_token_qr[token_slice] = np.asarray(graph_batch.token_qr, dtype=np.int32)
@@ -410,17 +428,20 @@ class InferenceClient:
                 self._slot.req_graph_pair_token_indices[pair_slice] = np.asarray(graph_batch.pair_token_indices, dtype=np.int64)
                 self._slot.req_graph_pair_first_indices[pair_slice] = np.asarray(graph_batch.pair_first_indices, dtype=np.int64)
                 self._slot.req_graph_pair_second_indices[pair_slice] = np.asarray(graph_batch.pair_second_indices, dtype=np.int64)
-            relation_type = np.asarray(graph_batch.relation_type, dtype=np.int16)
-            relation_bias = np.asarray(graph_batch.relation_bias, dtype=np.float32)
-            if relation_bias.ndim == 2:
-                relation_bias = relation_bias.reshape(1, token_count, token_count)
-            self._slot.req_graph_relation_type[token_slice, token_slice] = relation_type
-            self._slot.req_graph_relation_bias[:, token_slice, token_slice] = relation_bias
+            if relation_count:
+                src, dst, rel_type, rel_bias = sparse_relation_edges_from_batch(graph_batch)
+                if int(src.shape[0]) != relation_count:
+                    raise ValueError("sparse relation edge count changed during graph IPC packing")
+                self._slot.req_graph_relation_src[relation_slice] = src
+                self._slot.req_graph_relation_dst[relation_slice] = dst
+                self._slot.req_graph_relation_edge_type[relation_slice] = rel_type
+                self._slot.req_graph_relation_edge_bias[relation_slice] = rel_bias
 
             token_offset += token_count
             legal_offset += legal_count
             opp_offset += opp_count
             pair_offset += pair_count
+            relation_offset += relation_count
 
         self._slot.req_ready.set()
         t0 = time.monotonic()

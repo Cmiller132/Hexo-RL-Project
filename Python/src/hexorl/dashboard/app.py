@@ -1309,6 +1309,8 @@ def _graph_debug_payload(
             "max_tokens": capacity.max_tokens,
             "max_actions": capacity.max_actions,
             "max_pairs": capacity.max_pairs,
+            "max_relation_edges": capacity.max_relation_edges,
+            "relation_edges": capacity.relation_edge_count,
         },
         "token_count": int(graph.token_features.shape[0]),
         "token_counts": token_counts,

@@ -30,8 +30,8 @@ from hexorl.action_contract.tactical_oracle import (
     scan_tactical_oracle_from_history,
 )
 from hexorl.inference.client import InferenceClient
-from hexorl.graph.batch import GraphBatch, build_graph_batch_from_history
-from hexorl.models.registry import is_global_graph_architecture
+from hexorl.graph.batch import GraphBatch, GraphIPCCapacityError, build_graph_batch_from_history
+from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import (
     PAIR_STRATEGY_DIAGNOSTIC_FULL_PAIR,
@@ -1008,10 +1008,12 @@ class SelfPlayWorker:
         num_workers: int = 24,
         max_batch_size: int = 128,
         stop_event: Optional[mp.Event] = None,
+        diagnostic_queue: Optional[mp.Queue] = None,
     ):
         self.worker_id = worker_id
         self.cfg = cfg
         self.record_queue = record_queue
+        self.diagnostic_queue = diagnostic_queue
         self.stop_event = stop_event
         self.num_workers = num_workers
         self.max_batch = max_batch_size
@@ -1033,9 +1035,11 @@ class SelfPlayWorker:
         self.sparse_prior_stage = int(getattr(cfg.model, "sparse_prior_stage", 0))
         self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
         self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
+        resolved_model = resolve_model_spec(cfg)
         self.global_graph_enabled = is_global_graph_architecture(
             getattr(cfg.model, "architecture", "")
         )
+        self.opp_policy_enabled = "opp_policy" in set(resolved_model.outputs)
         self.global_graph_leaf_eval = bool(getattr(cfg.model, "global_graph_leaf_eval", False))
         if self.global_graph_enabled:
             self.near_radius = 8
@@ -1066,6 +1070,29 @@ class SelfPlayWorker:
         self._engine_factory = MockMCTSEngine if not HAS_ENGINE else RealMCTSEngine
         self._game_counter = 0
         self._crash_count = 0
+
+    def _emit_graph_ipc_overflow(
+        self,
+        exc: BaseException,
+        *,
+        phase: str,
+        move_index: int | None = None,
+        root: bool | None = None,
+    ) -> None:
+        if not isinstance(exc, GraphIPCCapacityError) or self.diagnostic_queue is None:
+            return
+        payload = {
+            "event": "graph_ipc_overflow",
+            "worker_id": int(self.worker_id),
+            "phase": str(phase),
+            "root": None if root is None else bool(root),
+            "move_index": None if move_index is None else int(move_index),
+            **exc.report.to_diagnostics(),
+        }
+        try:
+            self.diagnostic_queue.put_nowait(payload)
+        except Exception:
+            logger.debug("Worker %s: failed to enqueue graph IPC overflow diagnostic", self.worker_id)
 
     def pair_strategy_summary(
         self,
@@ -1271,6 +1298,7 @@ class SelfPlayWorker:
                             constrain_threats=self.constrain_threats,
                             max_pair_rows=0,
                             include_pair_rows=False,
+                            include_opp_policy_rows=self.opp_policy_enabled,
                             max_legal_rows=self.candidate_budget,
                             max_context_tokens=self.candidate_budget,
                         )
@@ -1568,6 +1596,12 @@ class SelfPlayWorker:
                                 p, root_value, offset_q, offset_r, legal_bytes, root_generation
                             )
                 except Exception as exc:
+                    self._emit_graph_ipc_overflow(
+                        exc,
+                        phase="root_inference",
+                        move_index=move_idx,
+                        root=True,
+                    )
                     logger.warning(
                         "Worker %s: root inference failed at move %s: %s",
                         self.worker_id,
@@ -1677,11 +1711,14 @@ class SelfPlayWorker:
                                 graph_batch = build_graph_batch_from_history(
                                     bytes(leaf_history_bytes),
                                     legal_moves=[(int(q), int(r)) for q, r in legal],
-                                    opp_legal_moves=[(int(q), int(r)) for q, r in legal],
+                                    opp_legal_moves=[
+                                        (int(q), int(r)) for q, r in legal
+                                    ] if self.opp_policy_enabled else None,
                                     radius=8,
                                     constrain_threats=self.constrain_threats,
                                     max_pair_rows=0,
                                     include_pair_rows=False,
+                                    include_opp_policy_rows=self.opp_policy_enabled,
                                     max_legal_rows=self.candidate_budget,
                                     max_context_tokens=self.candidate_budget,
                                 )
@@ -1886,6 +1923,12 @@ class SelfPlayWorker:
                             batch_generation,
                         )
                 except Exception as exc:
+                    self._emit_graph_ipc_overflow(
+                        exc,
+                        phase="leaf_inference",
+                        move_index=move_idx,
+                        root=False,
+                    )
                     logger.warning(
                         "Worker %s: leaf expansion failed at move %s: %s",
                         self.worker_id,
@@ -1963,6 +2006,7 @@ class SelfPlayWorker:
                                 constrain_threats=self.constrain_threats,
                                 max_pair_rows=0,
                                 include_pair_rows=False,
+                                include_opp_policy_rows=self.opp_policy_enabled,
                                 max_legal_rows=self.candidate_budget,
                                 max_context_tokens=self.candidate_budget,
                             )
@@ -1982,6 +2026,12 @@ class SelfPlayWorker:
                             score_source="graph_regret_rank",
                         )
                 except Exception as exc:
+                    self._emit_graph_ipc_overflow(
+                        exc,
+                        phase="rgsc_tree_scoring",
+                        move_index=move_idx,
+                        root=None,
+                    )
                     logger.debug("Worker %s: RGSC tree extraction skipped: %s", self.worker_id, exc)
 
             temp = get_temperature(move_idx, self.temperature_schedule)

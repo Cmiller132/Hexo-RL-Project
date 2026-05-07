@@ -41,12 +41,14 @@ from hexorl.inference.shm_queue import (
     GRAPH_SCHEMA_VERSION,
     MAX_GRAPH_ACTIONS,
     MAX_GRAPH_PAIRS,
+    MAX_GRAPH_RELATION_EDGES,
     MAX_GRAPH_TOKENS,
     MAX_PAIR_CANDIDATES,
     RELATION_SCHEMA_VERSION,
     create_inference_queue,
     connect_inference_queue,
 )
+from hexorl.graph.batch import dense_relations_from_sparse_edges
 
 
 def _graph_pair_request_is_second_placement(graph_inputs: dict[str, torch.Tensor]) -> bool:
@@ -486,14 +488,14 @@ class InferenceServer:
                     f"got ({int(meta[0])}, {int(meta[1])}), "
                     f"expected ({GRAPH_SCHEMA_VERSION}, {RELATION_SCHEMA_VERSION})"
                 )
-            token_count, legal_count, opp_count, pair_count = map(int, meta[2:6])
+            token_count, legal_count, opp_count, pair_count, relation_count = map(int, meta[2:7])
             if token_count > MAX_GRAPH_TOKENS or legal_count > MAX_GRAPH_ACTIONS:
                 raise ValueError("graph request exceeds shared-memory token/legal capacity")
             if opp_count > MAX_GRAPH_ACTIONS or pair_count > MAX_GRAPH_PAIRS:
                 raise ValueError("graph request exceeds shared-memory opponent/pair capacity")
+            if relation_count > MAX_GRAPH_RELATION_EDGES:
+                raise ValueError("graph request exceeds shared-memory sparse relation capacity")
             batch_meta = np.array(slot.req_graph_batch_meta[:request_count], copy=True)
-            if request_count == 1 and not batch_meta[0].any():
-                batch_meta[0] = (token_count, legal_count, opp_count, pair_count, 0, 0, 0, 0)
             for local_row in range(request_count):
                 row_meta.append((worker_id, local_row, batch_meta[local_row]))
         total = len(row_meta)
@@ -521,15 +523,18 @@ class InferenceServer:
         row_sources: list[tuple[int, int]] = []
         for row, (worker_id, local_row, meta) in enumerate(row_meta):
             slot = self._queue.get_slot(worker_id)
-            t, a, o, p, token_off, legal_off, opp_off, pair_off = map(int, meta[:8])
+            t, a, o, p, rel, token_off, legal_off, opp_off, pair_off, rel_off = map(int, meta[:10])
             if token_off + t > MAX_GRAPH_TOKENS or legal_off + a > MAX_GRAPH_ACTIONS:
                 raise ValueError("graph batch row exceeds packed token/legal capacity")
             if opp_off + o > MAX_GRAPH_ACTIONS or pair_off + p > MAX_GRAPH_PAIRS:
                 raise ValueError("graph batch row exceeds packed opponent/pair capacity")
+            if rel_off + rel > MAX_GRAPH_RELATION_EDGES:
+                raise ValueError("graph batch row exceeds packed sparse relation capacity")
             token_slice = slice(token_off, token_off + t)
             legal_slice = slice(legal_off, legal_off + a)
             opp_slice = slice(opp_off, opp_off + o)
             pair_slice = slice(pair_off, pair_off + p)
+            relation_slice = slice(rel_off, rel_off + rel)
             token_features[row, :t] = slot.req_graph_token_features[token_slice]
             token_type[row, :t] = slot.req_graph_token_type[token_slice].astype(np.int64)
             token_qr[row, :t] = slot.req_graph_token_qr[token_slice]
@@ -543,8 +548,17 @@ class InferenceServer:
                 pair_token_indices[row, :p] = slot.req_graph_pair_token_indices[pair_slice]
                 pair_first_indices[row, :p] = slot.req_graph_pair_first_indices[pair_slice]
                 pair_second_indices[row, :p] = slot.req_graph_pair_second_indices[pair_slice]
-            relation_type[row, :t, :t] = slot.req_graph_relation_type[token_slice, token_slice]
-            relation_bias[row, :, :t, :t] = slot.req_graph_relation_bias[:, token_slice, token_slice]
+            dense_type, dense_bias = dense_relations_from_sparse_edges(
+                token_features[row, :t],
+                token_type[row, :t],
+                token_qr[row, :t],
+                slot.req_graph_relation_src[relation_slice],
+                slot.req_graph_relation_dst[relation_slice],
+                slot.req_graph_relation_edge_type[relation_slice],
+                slot.req_graph_relation_edge_bias[relation_slice],
+            )
+            relation_type[row, :t, :t] = dense_type
+            relation_bias[row, :, :t, :t] = dense_bias
             row_sources.append((worker_id, local_row))
 
         return (
@@ -833,11 +847,18 @@ class InferenceServer:
         for row, (worker_id, local_row) in enumerate(row_sources):
             slot = self._queue.get_slot(worker_id)
             meta = np.array(slot.req_graph_batch_meta[local_row], copy=True)
-            if local_row == 0 and not meta.any():
-                token_count, legal_count, opp_count, pair_count = map(int, slot.req_graph_meta[2:6])
-                token_off = legal_off = opp_off = pair_off = 0
-            else:
-                token_count, legal_count, opp_count, pair_count, token_off, legal_off, opp_off, pair_off = map(int, meta[:8])
+            (
+                token_count,
+                legal_count,
+                opp_count,
+                pair_count,
+                _relation_count,
+                token_off,
+                legal_off,
+                opp_off,
+                pair_off,
+                _relation_off,
+            ) = map(int, meta[:10])
             if legal_count > place_logits.shape[1]:
                 raise ValueError("graph place logits shorter than legal row table")
             if pair_count and pair_joint_logits is None and pair_second_logits is None:

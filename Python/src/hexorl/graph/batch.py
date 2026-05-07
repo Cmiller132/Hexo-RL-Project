@@ -20,6 +20,7 @@ from hexorl.graph.capacity import (
     GRAPH_CAPACITY_STRATEGY,
     GRAPH_IPC_ACTION_CAPACITY,
     GRAPH_IPC_PAIR_CAPACITY,
+    GRAPH_IPC_RELATION_EDGE_CAPACITY,
     GRAPH_IPC_TOKEN_CAPACITY,
     PAIR_CHUNK_LIMIT,
 )
@@ -66,6 +67,17 @@ class RelationType(IntEnum):
     D6_ORBIT_RELATION = 17
 
 
+SPARSE_IPC_DERIVED_RELATION_TYPES = frozenset(
+    {
+        int(RelationType.D6_ORBIT_RELATION),
+        int(RelationType.SAME_AXIS),
+        int(RelationType.SAME_LINE),
+        int(RelationType.DISTANCE_BUCKET),
+        int(RelationType.DIRECTION_BUCKET),
+    }
+)
+
+
 @dataclass(frozen=True)
 class GraphBatch:
     """Single-position graph/action contract.
@@ -107,9 +119,11 @@ class GraphCapacityReport:
     legal_count: int
     opp_legal_count: int
     pair_count: int
+    relation_edge_count: int = 0
     max_tokens: int = GRAPH_IPC_TOKEN_CAPACITY
     max_actions: int = GRAPH_IPC_ACTION_CAPACITY
     max_pairs: int = GRAPH_IPC_PAIR_CAPACITY
+    max_relation_edges: int = GRAPH_IPC_RELATION_EDGE_CAPACITY
     strategy: str = GRAPH_CAPACITY_STRATEGY
 
     @property
@@ -119,6 +133,7 @@ class GraphCapacityReport:
             and self.legal_count <= self.max_actions
             and self.opp_legal_count <= self.max_actions
             and self.pair_count <= self.max_pairs
+            and self.relation_edge_count <= self.max_relation_edges
         )
 
     def failures(self) -> tuple[str, ...]:
@@ -131,7 +146,41 @@ class GraphCapacityReport:
             failures.append("graph_opp_legal_action_capacity")
         if self.pair_count > self.max_pairs:
             failures.append("graph_pair_chunk_capacity")
+        if self.relation_edge_count > self.max_relation_edges:
+            failures.append("graph_relation_edge_capacity")
         return tuple(failures)
+
+    def to_diagnostics(self) -> dict[str, object]:
+        return {
+            "tokens": self.token_count,
+            "legal": self.legal_count,
+            "opp_legal": self.opp_legal_count,
+            "pairs": self.pair_count,
+            "relation_edges": self.relation_edge_count,
+            "max_tokens": self.max_tokens,
+            "max_actions": self.max_actions,
+            "max_pairs": self.max_pairs,
+            "max_relation_edges": self.max_relation_edges,
+            "failures": list(self.failures()),
+            "strategy": self.strategy,
+        }
+
+
+class GraphIPCCapacityError(ValueError):
+    """Raised when a graph request cannot fit the canonical sparse IPC slot."""
+
+    def __init__(self, report: GraphCapacityReport):
+        self.report = report
+        super().__init__(
+            "global graph IPC capacity exceeded; "
+            f"tokens={report.token_count}/{report.max_tokens}, "
+            f"legal={report.legal_count}/{report.max_actions}, "
+            f"opp_legal={report.opp_legal_count}/{report.max_actions}, "
+            f"pairs={report.pair_count}/{report.max_pairs}, "
+            f"relation_edges={report.relation_edge_count}/{report.max_relation_edges}. "
+            f"failures={','.join(report.failures()) or 'none'}; "
+            f"strategy={report.strategy}; semantic rows were not dropped."
+        )
 
 
 def graph_capacity_report(graph_batch: GraphBatch) -> GraphCapacityReport:
@@ -140,6 +189,7 @@ def graph_capacity_report(graph_batch: GraphBatch) -> GraphCapacityReport:
         legal_count=int(np.asarray(graph_batch.legal_qr).shape[0]),
         opp_legal_count=int(np.asarray(graph_batch.opp_legal_qr).shape[0]),
         pair_count=int(np.asarray(graph_batch.pair_token_indices).shape[0]),
+        relation_edge_count=int(sparse_relation_edge_count(graph_batch)),
     )
 
 
@@ -147,16 +197,114 @@ def validate_graph_ipc_capacity(graph_batch: GraphBatch) -> GraphCapacityReport:
     """Validate the graph IPC capacity policy without dropping semantic rows."""
     report = graph_capacity_report(graph_batch)
     if not report.fits_ipc:
-        raise ValueError(
-            "global graph IPC capacity exceeded; "
-            f"tokens={report.token_count}/{report.max_tokens}, "
-            f"legal={report.legal_count}/{report.max_actions}, "
-            f"opp_legal={report.opp_legal_count}/{report.max_actions}, "
-            f"pairs={report.pair_count}/{report.max_pairs}. "
-            f"strategy={report.strategy}; lower max-game length, bucket/microbatch this position, "
-            "or score pair rows through chunks. Semantic legal, stone, and tactical rows were not dropped."
-        )
+        raise GraphIPCCapacityError(report)
     return report
+
+
+def sparse_relation_edges_from_batch(
+    graph_batch: GraphBatch,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Encode only non-derived relation overlays for sparse IPC.
+
+    The inference server derives geometry-only relation types and the dense
+    distance bias from token coordinates, then applies this overlay.  That keeps
+    the model-facing dense tensors identical without sending dense relation
+    matrices through shared memory.
+    """
+    relation_type = np.asarray(graph_batch.relation_type, dtype=np.int16)
+    relation_bias = np.asarray(graph_batch.relation_bias, dtype=np.float32)
+    if relation_type.ndim != 2:
+        raise ValueError("graph relation_type must be rank-2 before sparse IPC encoding")
+    if relation_bias.ndim == 3:
+        bias_view = relation_bias[0]
+    elif relation_bias.ndim == 2:
+        bias_view = relation_bias
+    else:
+        raise ValueError("graph relation_bias must have shape (T,T) or (1,T,T)")
+    if bias_view.shape != relation_type.shape:
+        raise ValueError("graph relation_bias shape must match relation_type")
+    overlay_mask = relation_type != int(RelationType.NONE)
+    for rel in SPARSE_IPC_DERIVED_RELATION_TYPES:
+        overlay_mask &= relation_type != int(rel)
+    src, dst = np.nonzero(overlay_mask)
+    if src.size == 0:
+        empty_i32 = np.zeros(0, dtype=np.int32)
+        return empty_i32, empty_i32, np.zeros(0, dtype=np.int16), np.zeros(0, dtype=np.float32)
+    return (
+        src.astype(np.int32, copy=False),
+        dst.astype(np.int32, copy=False),
+        relation_type[src, dst].astype(np.int16, copy=False),
+        bias_view[src, dst].astype(np.float32, copy=False),
+    )
+
+
+def sparse_relation_edge_count(graph_batch: GraphBatch) -> int:
+    src, _dst, _typ, _bias = sparse_relation_edges_from_batch(graph_batch)
+    return int(src.shape[0])
+
+
+def dense_relations_from_sparse_edges(
+    token_features: np.ndarray,
+    token_type: np.ndarray,
+    token_qr: np.ndarray,
+    relation_src: np.ndarray,
+    relation_dst: np.ndarray,
+    relation_edge_type: np.ndarray,
+    relation_edge_bias: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rebuild dense model relation tensors from canonical sparse IPC edges."""
+    features = np.asarray(token_features, dtype=np.float32)
+    types = np.asarray(token_type, dtype=np.int64).reshape(-1)
+    qr = np.asarray(token_qr, dtype=np.int64).reshape(-1, 2)
+    n = int(types.shape[0])
+    if features.shape[0] != n or qr.shape[0] != n:
+        raise ValueError("token feature/type/qr rows must agree for relation reconstruction")
+    q = qr[:, 0]
+    r = qr[:, 1]
+    dq = q[:, None] - q[None, :]
+    dr = r[:, None] - r[None, :]
+    dist = np.maximum.reduce((np.abs(dq), np.abs(dr), np.abs(dq + dr)))
+    relation_type = np.zeros((n, n), dtype=np.int16)
+    relation_bias = (1.0 / (1.0 + dist.astype(np.float32)))[None, :, :]
+    np.fill_diagonal(relation_type, int(RelationType.D6_ORBIT_RELATION))
+
+    axis_feature = features[:, GRAPH_FEATURE_WINDOW_AXIS] if n else np.zeros(0, dtype=np.float32)
+    token_axis = np.full(n, -1, dtype=np.int64)
+    window_mask = types == int(GraphTokenType.WINDOW6)
+    if np.any(window_mask):
+        token_axis[window_mask] = np.rint(axis_feature[window_mask] * 4.0 - 1.0).astype(np.int64)
+        token_axis[~np.isin(token_axis, np.asarray([0, 1, 2], dtype=np.int64))] = -1
+
+    def assign(mask: np.ndarray, relation: RelationType) -> None:
+        relation_type[(relation_type == int(RelationType.NONE)) & mask] = int(relation)
+
+    assign(
+        (token_axis[:, None] >= 0)
+        & (token_axis[:, None] == token_axis[None, :]),
+        RelationType.SAME_AXIS,
+    )
+    same_line = (
+        (r[:, None] == r[None, :])
+        | (q[:, None] == q[None, :])
+        | ((q + r)[:, None] == (q + r)[None, :])
+    )
+    assign(same_line, RelationType.SAME_LINE)
+    assign(dist <= 2, RelationType.DISTANCE_BUCKET)
+    assign(dist > 0, RelationType.DIRECTION_BUCKET)
+
+    src = np.asarray(relation_src, dtype=np.int64).reshape(-1)
+    dst = np.asarray(relation_dst, dtype=np.int64).reshape(-1)
+    edge_type = np.asarray(relation_edge_type, dtype=np.int16).reshape(-1)
+    edge_bias = np.asarray(relation_edge_bias, dtype=np.float32).reshape(-1)
+    if not (src.shape == dst.shape == edge_type.shape == edge_bias.shape):
+        raise ValueError("sparse relation edge arrays must have matching lengths")
+    if src.size:
+        valid = (src >= 0) & (src < n) & (dst >= 0) & (dst < n)
+        if not np.all(valid):
+            raise ValueError("sparse relation edge index outside token table")
+        relation_type[src, dst] = edge_type
+        relation_bias[:, src, dst] = edge_bias.reshape(1, -1)
+    return relation_type, relation_bias
 
 
 def hex_distance(a: tuple[int, int], b: tuple[int, int] = (0, 0)) -> int:
@@ -374,6 +522,7 @@ def build_graph_batch_from_history(
     max_pair_rows: int = PAIR_CHUNK_LIMIT,
     allow_pair_truncation: bool = False,
     include_pair_rows: bool = True,
+    include_opp_policy_rows: bool = True,
     materialize_pair_context_tokens: bool = False,
     max_legal_rows: int | None = None,
     max_context_tokens: int | None = None,
@@ -678,12 +827,18 @@ def build_graph_batch_from_history(
     )
 
     policy = _target_for_legal(legal, policy_target, label="policy_target")
-    if opp_policy_target and opp_legal_moves is None:
+    if not include_opp_policy_rows:
+        if opp_policy_target:
+            raise ValueError("opp_policy_target requires include_opp_policy_rows=True")
+        if opp_legal_moves is not None:
+            raise ValueError("opp_legal_moves requires include_opp_policy_rows=True")
+        opp_legal: list[tuple[int, int]] = []
+    elif opp_policy_target and opp_legal_moves is None:
         raise ValueError(
             "opp_policy_target requires an independently keyed opp_legal_moves table; "
             "training it on the source legal rows is not allowed."
         )
-    if opp_legal_moves is None:
+    elif opp_legal_moves is None:
         opp_legal = _opponent_legal_after_passive_turn(stones, legal, current_player, placements_remaining, radius)
     else:
         occupied = set(stones)
@@ -731,7 +886,7 @@ def build_graph_batch_from_history(
         relation_bias=relation_bias,
         relation_type=relation_type,
         policy_target=policy,
-        opp_legal_qr=np.asarray(opp_legal, dtype=np.int32),
+        opp_legal_qr=np.asarray(opp_legal, dtype=np.int32).reshape(-1, 2),
         opp_legal_mask=np.ones(len(opp_legal), dtype=np.bool_),
         opp_policy_target=opp_policy,
         pair_first_policy_target=pair_first_target,
