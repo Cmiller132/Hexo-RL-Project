@@ -1,542 +1,362 @@
-You’re right to challenge that. My wording was too tied to the current branch’s head names.
+According to the current plan document from **May 7, 2026**, the architecture has moved in the right direction: full legal rows, terminal-only tactical facts, a graph/set encoder, legal-cell embeddings, cell-marginal and conditional proposal views, cheap pair retrieval, a rich biaffine pair scorer, sampled pair candidates, Gumbel root admission, progressive widening, and candidate-aware targets. That broadly matches the research-report intent: **search acts on unordered pairs, while the network uses factorized structure to propose pairs and a symmetric scorer to rank them.** 
 
-For a **new best-possible model**, I would **not** describe the plan as “use the current `policy_place` and `policy_pair_first` heads.” I would describe it as:
+My critical review: **direct pair retrieval is a good idea, but only if it is treated as a recall-oriented candidate source, not as the final policy and not as a reason to score all pairs naively.** The current branch’s actual pair machinery is still much weaker than the plan: it has pair heads and pair-row scoring, but current pair candidate generation can still devolve into legal-order first-N pair scoring, which the latest plan correctly rejects.  
 
-```text
-The new model has:
-  cell_marginal_proposal
-  anchor_conditioned_completion
-  symmetric_joint_pair_score
-```
+## 1. Current state of the model architecture and pairs
 
-Those may map to similar tensor shapes as the current branch’s `policy_place`, `policy_pair_first`, and `policy_pair_second`, but conceptually they are **new model components**, not old single-move policy heads.
+The current graph direction is correct. The model represents the state as variable-size objects: `STATE`, `TURN`, `STONE`, `LEGAL`, and `WINDOW6`. That is the right abstraction for an unbounded board where legal actions are row-table objects rather than crop pixels. The docs also correctly say pair actions should not become graph attention tokens by default because legal pairs are `O(A²)` for `A` legal actions; pair rows should reference existing legal-cell token vectors instead. 
 
-## Are you misunderstanding my intent?
-
-Partly, but the confusion is my fault.
-
-I did **not** mean:
+The current branch’s pair heads are:
 
 ```text
-Use the existing old model heads as-is.
-Keep a single-placement policy as the real policy.
-Let policy_place define search behavior.
+policy_pair_first:
+  one logit per legal first-placement row
+
+policy_pair_joint:
+  one logit per canonical unordered first-placement pair row
+
+policy_pair_second:
+  one logit per known-first second-placement row
 ```
 
-I meant:
+The current `policy_pair_joint` is a symmetric MLP over features like `state`, `h_i + h_j`, `|h_i - h_j|`, and `h_i * h_j`. That is a reasonable baseline, but not the final architecture. The research context itself flags a stronger design: a full legal-row interaction scorer, such as biaffine or pointer-style scoring. 
+
+The current code agrees with that picture. `GlobalHexGraphNet` has `policy_place`, `policy_pair_first`, `policy_pair_joint`, and `policy_pair_second`; the joint pair scorer concatenates symmetric features and sends them through an MLP. It is symmetric at the feature level, but it does not yet have the explicit low-rank biaffine relation term the final plan wants. 
+
+The current pair strategy is also not yet true pair-action MCTS. `PairStrategy.score_graph_pair_chunks` can score pair rows, but when it builds full-turn pairs it walks legal rows in nested-loop order and stops at `max_pairs`. That makes the candidate set depend on legal-row ordering. It is a debug scaffold, not a strong pair candidate selector. 
+
+The latest plan correctly rejects that current behavior:
 
 ```text
-The new model should still have a legal-cell proposal/marginal head,
-because pure pair-only learning is too sparse and pair candidate generation
-needs cheap cell-level structure.
+Rejected: Legal-Order First-N Pair Scoring As Candidate Selection
 ```
 
-That is directly aligned with the research reports. One report explicitly says the best model is **three-headed**: a single-cell proposal head, an autoregressive conditional second-cell head, and a symmetric joint pair reranker; it also explicitly says not to make the pair head the only head because pure sparse pair supervision undertrains the representation. 
+That rejection is important. The pair scorer may score a supplied pair set, but it should not define that set by first-N legal-order enumeration in self-play or evaluation. 
 
-The other report says the same thing in different words: search should think in pairs, but the network should propose pairs through factorized structure and score them with a symmetric pair reranker. 
+## 2. Is direct pair retrieval a good idea?
 
-So the right correction is not “remove unary/conditional proposal.” The right correction is **rename and redefine them so they are clearly part of the new pair model, not legacy single-action policy.**
+**Yes, but with caveats.**
 
----
+Direct pair retrieval solves a real weakness of marginal/conditional proposal: some strong pairs are not composed of two individually obvious cells. In Hexo, a pair may matter because of the relationship between the two cells: covering two threats, completing a 4-window, creating a double threat, or linking two windows. The research report explicitly says many important decisions are not “which single cell is best?” but “which two cells together create, complete, or cover the right set of windows?” 
 
-## The naming I would change immediately
-
-Current plan says the final model outputs:
+So I like the plan’s direct-pair-retrieval idea:
 
 ```text
-policy_place
-policy_pair_first
-policy_pair_second
-policy_pair_joint
-value
-tactical_auxiliary_heads
-pair_regret_or_completed_q
+h_i = legal_cell_embedding(i)
+u_i = W_u h_i
+v_i = W_v h_i
+
+s_prop(i, j) =
+  0.5 * (u_i · v_j + u_j · v_i)
+  + cheap_pair_features(i, j)
 ```
 
-That is too close to the current branch and too easy to misread as a single-placement model. The plan should instead say:
+The plan is also right to say this is a **retrieval signal**, not the final policy. It should form a bounded candidate set; the richer `pair_joint_logits` scorer and MCTS decide among admitted pair candidates. 
+
+The applicable external template is biaffine relation scoring. Dozat and Manning’s biaffine parser is not a game-playing paper, but it is strong evidence that learned bilinear/biaffine scoring is a mature way to score pairwise relations between variable elements. Hexo pair scoring is a relation-scoring problem over legal cells, so the analogy is valid. ([OpenReview][1])
+
+Maximum-inner-product retrieval is also relevant as an implementation pattern: low-rank retrieval can find large entries in products of two vector tables more efficiently than arbitrary pair MLP scoring. That supports direct pair retrieval as a **candidate generator**, especially if legal rows grow large. ([University of Mannheim][2])
+
+But I would **not** make direct pair retrieval the dominant or sole source at the start. It can collapse just like any model-led source. Early retrieval vectors will be poorly trained. If the selector becomes “top-k by direct retrieval,” the system can permanently hide good pairs from search. The plan already recognizes candidate-source quotas and small canary/diversity sources as support-collapse protection. 
+
+My verdict:
+
+```text
+direct_pair_retrieval = good as a primary model-led candidate source
+direct_pair_retrieval = bad as the only candidate source
+direct_pair_retrieval = bad if it silently becomes exhaustive all-pair scoring
+direct_pair_retrieval = bad if its sampled support is trained as if complete
+```
+
+## 3. Is the candidate building pipeline optimal?
+
+**No. It is directionally right, but not yet optimal.**
+
+The latest plan has the right components:
+
+```text
+terminal_exact_v1
+direct_pair_retrieval
+policy_pair_rerank
+anchor_conditioned_completion
+structured_exploration
+blind_canary
+```
+
+It also correctly requires pair candidate metadata: source contributions, beta/inclusion estimates, forced flags, tactical flags, terminal-equivalence flags, and target-prune flags. 
+
+But I would refine the pipeline in three ways.
+
+### Change 1: separate retrieval, reranking, and search
+
+The plan currently says `direct_pair_retrieval`, `policy_pair_rerank`, and `anchor_conditioned_completion`. That is right, but the boundaries need to be sharper:
+
+```text
+PairCandidateSelector:
+  builds candidate rows and source metadata
+
+PairScorer:
+  scores supplied rows with cheap retrieval and rich joint scores
+
+SampledJointPairStrategy:
+  consumes admitted candidates in Gumbel/PUCT/MCTS
+```
+
+This separation prevents a repeat of the current branch problem where pair scoring and candidate construction are intertwined. The current `PairStrategy` is too close to doing both. 
+
+### Change 2: direct retrieval should be two-tiered
+
+I would use:
+
+```text
+cheap_pair_retrieval_score:
+  high-recall candidate discovery
+
+rich_pair_joint_score:
+  expensive final pair prior over admitted rows
+```
+
+The cheap retrieval score should be low-rank and GPU-friendly. The rich scorer should use a stronger biaffine-plus-feature architecture:
+
+```text
+pair_joint_logit(i,j) =
+  cell_marginal_i
+  + cell_marginal_j
+  + symmetric_biaffine(h_i, h_j)
+  + MLP(pair_features, state_context)
+```
+
+This `m_i + m_j + R_ij` decomposition is important. It lets the model learn “this cell matters” from dense marginal signal while separately learning “these two cells have synergy.” The research notes explicitly warn that pure sparse pair training can starve the single-cell representation and collapse onto sampled candidates. 
+
+### Change 3: candidate selection should optimize recall, not just score
+
+For the candidate selector, the metric should not be “does the model’s top pair look good?” It should be:
+
+```text
+candidate recall of the best pair search would want
+```
+
+Concretely, evaluate:
+
+```text
+terminal pair recall
+large-budget audit-search best-pair recall
+top-N exhaustive small-state recall
+D6 consistency of selected pair sets
+source-specific hit rates
+wall-clock pair candidates per second
+final MCTS value improvement from each source
+```
+
+The candidate selector’s job is not to be the final policy. Its job is to keep the true good pair inside the candidate set often enough that search can improve it.
+
+## 4. Is the move selection pipeline optimal?
+
+**Not yet.**
+
+The final move selection must be:
+
+```text
+root search posterior over unordered pairs
+-> choose pair
+-> apply both stones atomically
+```
+
+The current branch still has code that can project pair logits back onto single-action logits via `pair_logits_to_action_logits`. That is fine as a diagnostic or auxiliary marginal, but it should not be the final move-selection path. 
+
+The plan’s pair action contract is right: after the opening, the search action is an unordered canonical pair of two distinct legal cells, with stable row identity, D6 validation, and terminal-equivalence metadata. 
+
+I would strengthen the move-selection contract with this explicit rule:
+
+```text
+The selected root object is PairAction.
+Cell marginals may be logged, displayed, or trained as auxiliary targets.
+They may not be used to independently choose the two placements after pair search.
+```
+
+If the implementation has to call Rust `place(a)` then `place(b)` because of API shape, that is an execution detail. The decision must already be fixed as `{a,b}` before the first placement is sent.
+
+## 5. Studies that are directly applicable
+
+Several studies are relevant, but they support different parts of the plan.
+
+**Gumbel AlphaZero / Gumbel MuZero** supports the root-admission decision. The paper’s key point is that AlphaZero can fail to improve its policy when the search does not visit all root actions; it proposes sampling actions without replacement and reports improvements when planning with few simulations. That maps directly to Hexo’s sampled pair-root problem. ([OpenReview][3])
+
+**Sampled MuZero** supports proposal-aware sampled action subsets. The ICML paper frames exactly the issue here: action spaces may be too large to enumerate, so policy evaluation/improvement must work over sampled subsets. The important lesson is not learned dynamics; it is that sampled-action planning needs proposal-aware correction and target construction. ([Proceedings of Machine Learning Research][4])
+
+**Set Transformer** supports the object/set encoder direction. It is designed for permutation-invariant set inputs and models interactions among set elements with attention, including scalable attention variants. Hexo’s stones, legal cells, and windows are naturally variable-size set/graph objects. ([Proceedings of Machine Learning Research][5])
+
+**Pointer Networks** support the anchor-conditioned completion head. Pointer Nets were designed for variable-size output dictionaries where outputs correspond to positions in the input sequence. That is exactly the shape of “choose a completion cell from the legal-cell table conditioned on an anchor.” ([NeurIPS Papers][6])
+
+**Deep biaffine attention** supports the pair scorer. It is a mature example of scoring relations between pairs of variable elements with a biaffine classifier. This does not prove it will beat all alternatives in Hexo, but it is a strong architectural prior for a legal-cell pair scorer. ([OpenReview][1])
+
+**Action branching / factored action-space work** is relevant mostly as a caution. Action branching scales high-dimensional discrete actions by decomposing the action into branches, but Hexo’s pair value is often coupled. That literature supports factorized proposal views, not replacing pair-value backup with independent cell decisions. ([Mendeley][7])
+
+**Factored MCTS** is also cautionary. It explicitly addresses large factored state/action spaces and combines MCTS with product-of-marginals approximations, but the paper itself frames the method as scalable and sometimes heuristic under strong technical assumptions. In Hexo, where pair synergy is central, pure factorization should be a helper, not the main semantics. ([AAAI Publications][8])
+
+## 6. My strongest critique of the current plan
+
+The current plan is broadly correct, but it risks overloading the candidate selector.
+
+Right now, `direct_pair_retrieval`, `anchor_conditioned_completion`, `policy_pair_rerank`, `structured_exploration`, and `terminal_exact_v1` are all listed as sources. That is good. But the plan should specify the **dataflow order** more rigidly:
+
+```text
+1. Full legal rows
+2. Encode graph once
+3. Produce legal-cell embeddings
+4. Produce cell marginal / completion / retrieval scores
+5. Build broad pre-candidate pool from sources
+6. Canonicalize and deduplicate
+7. Score pre-candidates with rich pair_joint scorer
+8. Select final candidate set by quotas + score
+9. Root Gumbel admission or interior progressive widening
+10. Pair-action MCTS
+11. Candidate-aware target emission
+```
+
+Without this order, an implementation can accidentally let `pair_joint` define candidates by scoring first-N pairs, or let direct retrieval score too many pairs, or let marginal heads choose the final move.
+
+The plan should also explicitly say:
+
+```text
+direct_pair_retrieval is a recall source, not a policy target source.
+```
+
+The policy target comes from search improvement over admitted pair candidates, with proposal metadata and pruning. The latest plan already requires proposal-aware PUCT and forbids raw model logits over a sampled set unless the sampling assumption is recorded. 
+
+## 7. What I would change in the plan
+
+### A. Rename `policy_pair_rerank`
+
+I would rename it to:
+
+```text
+rich_pair_rerank
+```
+
+or:
+
+```text
+pair_joint_rerank
+```
+
+The word `policy` is too easy to confuse with “this is the final action distribution.” It is not. It is the rich pair scorer over a candidate row set.
+
+### B. Make direct retrieval exact-blockwise before approximate
+
+Do not start with approximate nearest-neighbor or complex MIPS infrastructure. Start with:
+
+```text
+blockwise exact top-k over legal-cell embedding products
+```
+
+For typical debug sizes, a blockwise matrix product is easier to test, easier to D6-validate, and less likely to have silent retrieval bugs. Approximate retrieval should be a later optimization if profiling proves it is necessary.
+
+### C. Add retrieval-specific tests
+
+Required tests:
+
+```text
+D6 transform preserves retrieved pair set up to canonical transform.
+Diagonal pairs i=i are impossible.
+(a,b) and (b,a) never both survive dedup.
+Terminal pairs are protected even if retrieval score is low.
+Late-legal-row winning pair is retrieved or protected.
+Direct retrieval does not depend on legal-row order except tie-breaks.
+Top retrieved pairs are stable under batching/chunking.
+```
+
+### D. Add retrieval recall metrics
+
+Add these metrics to artifacts:
+
+```text
+direct_retrieval_recall@K_vs_exhaustive_small_state
+direct_retrieval_recall@K_vs_large_budget_search
+candidate_pool_recall_by_source
+terminal_protection_recall
+pair_rerank_gain_after_retrieval
+source_ablation_Elo_or_winrate
+```
+
+### E. Keep cell marginal and completion heads, but demote their names
+
+The model should still have dense cell and conditional proposal views, because the reports say the best model is three-headed: single-cell proposal, conditional second-cell proposal, symmetric joint pair reranker. But the plan should keep the final names away from legacy single-move semantics. Use:
 
 ```text
 cell_marginal_logits
 pair_completion_logits
 pair_joint_logits
-value
-terminal_tactical_v1
-pair_q_or_completed_q
-uncertainty_or_regret
-```
-
-Where:
-
-```text
-cell_marginal_logits:
-  one logit per legal cell.
-  Trained from pair posterior marginals and terminal cell labels.
-  Used for candidate proposal only.
-  Not the final action policy.
-
-pair_completion_logits:
-  score legal cell b conditioned on anchor cell a.
-  Used to propose pair completions.
-  Trained symmetrically from unordered pair targets.
-
-pair_joint_logits:
-  symmetric score for unordered pair {a,b}.
-  This is the main policy/search prior over admitted pair candidates.
-
-value:
-  state value from current player perspective.
-
-terminal_tactical_v1:
-  minimal win-in-one / lose-in-one auxiliary labels.
-
-pair_q_or_completed_q:
-  optional head to help target construction, ranking, and search.
-```
-
-I would remove `policy_pair_first` as a required named head. It is conceptually dangerous because the true move is unordered. A cell can be an **anchor** for proposal, but not a true “first move” in the main semantics.
-
-I would also avoid the name `policy_place` in the final model. Use `cell_marginal_logits` or `cell_proposal_logits` instead.
-
----
-
-## Why include a cell-level proposal head at all?
-
-Because without it, pair candidate selection has only bad options:
-
-```text
-Option 1:
-  score all legal pairs exhaustively every time
-
-Option 2:
-  sample pairs mostly randomly
-
-Option 3:
-  rely only on terminal tactical rules
-
-Option 4:
-  use a pair scorer only on a weak hand-built candidate set
-```
-
-None of those is the strongest design.
-
-The reports are clear that the model should not be pair-only. They recommend a single-cell proposal head because it gives dense supervision through pair marginals, tactical saliency, and reusable proposal structure; pair-only learning is too sparse. 
-
-That does **not** mean the final policy is single-cell. It means the model has a dense auxiliary/proposal view over legal cells so the pair candidate generator is not blind.
-
-In the final model:
-
-```text
-cell_marginal_logits != action policy
-cell_marginal_logits == proposal/marginal/auxiliary head
-```
-
-The actual searched action remains:
-
-```text
-unordered pair {a,b}
-```
-
----
-
-## Why include a conditional completion head?
-
-Same reason: candidate generation.
-
-A pure joint pair scorer can score candidate rows, but it does not by itself tell you which rows to create unless you either enumerate all pairs or have a retrieval mechanism. The reports recommend autoregressive/factored proposal specifically because it avoids the quadratic action explosion while keeping pair actions as the search-semantic object. 
-
-But the final plan should define this carefully:
-
-```text
-pair_completion_logits(anchor=a, candidate=b)
 ```
 
 not:
 
 ```text
-policy_pair_second(first_move=a, second_move=b)
-```
-
-The head is an **anchor-conditioned proposal function**, not a statement that the game is sequential.
-
-Training should use both unordered views:
-
-```text
-pair {a,b} creates:
-  completion target b | anchor a
-  completion target a | anchor b
-```
-
-The latest plan already has the right idea that conditional targets must not train only the canonical first cell, because that leaks row-order artifacts. 
-
----
-
-## The stronger new-model candidate selector
-
-I would rewrite the “Pair Candidate Selection” section around the **new model**, not current branch head names.
-
-### Pair Candidate Selector V1, corrected
-
-```text
-Goal:
-  Build a source-tagged candidate set of unordered pair rows for sampled
-  joint-pair MCTS without relying on legal-order first-N enumeration.
-```
-
-### Inputs
-
-```text
-full LEGAL row table
-legal-cell embeddings h_i
-cell_marginal_logits over legal rows
-pair_completion_logits(anchor, candidate)
-cheap low-rank pair proposal score, if available
-rich pair_joint_logits over candidate pair rows
-terminal_tactical_v1 facts
-structured exploration sampler
-deterministic seed
-```
-
-### Outputs
-
-```text
-canonical candidate pair rows
-source-contribution metadata
-proposal beta / inclusion estimate
-protected terminal flags
-joint pair prior logits
-candidate row-table hash
-```
-
-### Candidate sources
-
-```text
-1. terminal_exact_v1
-2. direct_pair_retrieval
-3. anchor_completion
-4. cell_marginal_cross
-5. structured_diversity
-6. blind_canary
-```
-
-This is better than my previous wording because it makes the **new model’s joint pair machinery** central.
-
----
-
-## Add direct pair retrieval
-
-This is the biggest improvement I would make to the candidate-selection plan.
-
-The candidate selector should not be only:
-
-```text
-cell marginal -> anchor -> conditional completion
-```
-
-It should also use the new model’s pair interaction structure directly.
-
-For example, the model can produce legal-cell embeddings:
-
-```text
-h_i
-```
-
-Then produce low-rank proposal vectors:
-
-```text
-u_i = W_u h_i
-v_i = W_v h_i
-```
-
-and a cheap symmetric pair proposal score:
-
-```text
-s_prop(i,j) =
-  0.5 * (u_i · v_j + u_j · v_i)
-  + cheap_pair_features(i,j)
-```
-
-Then retrieve top candidate pairs from this score matrix.
-
-This does **not** mean materializing pair tokens in the graph encoder. The plan already correctly rejects pair actions as attention tokens because pair rows should reference legal token vectors rather than inflating the token sequence. 
-
-It also does **not** mean exhaustive pair MCTS. It means the model may use efficient pair scoring/retrieval to choose candidates, and then MCTS searches only the admitted subset.
-
-So the source list should become:
-
-```text
-direct_pair_retrieval:
-  candidate pairs from cheap symmetric low-rank pair proposal score.
-
-anchor_completion:
-  candidate pairs from cell_marginal anchors plus conditional completions.
-
-cell_marginal_cross:
-  unordered pairs from top marginal cells, mainly for stability/debug.
-
-terminal_exact_v1:
-  protected immediate win/block pairs.
-
-structured_diversity:
-  legal-row / geometry / distance / window coverage diversity.
-
-blind_canary:
-  tiny diagnostic source.
-```
-
-This is stronger than relying on `policy_pair_first` and `policy_place`.
-
----
-
-## Updated model stack
-
-I would update the plan’s architecture stack from this:
-
-```text
-Rust exact simulator
-  -> legal rows and active tactical windows
-  -> graph/set encoder over STATE, TURN, STONE, LEGAL, WINDOW6
-  -> single-cell unary head
-  -> conditional second-cell pointer-style head
-  -> symmetric biaffine joint-pair reranker
-  -> sampled pair candidate set
-  -> gumbel_sequential_halving_v1 root admission
-  -> proposal-aware PUCT plus progressive widening below root
-  -> candidate-aware training targets
-```
-
-to this:
-
-```text
-Rust exact simulator
-  -> full LEGAL rows + terminal_tactical_v1 facts
-  -> graph/set encoder over STATE, TURN, STONE, LEGAL, WINDOW6
-  -> legal-cell embeddings h_i
-  -> cell_marginal_proposal head
-  -> anchor_conditioned_completion head
-  -> cheap symmetric pair-retrieval score
-  -> rich symmetric biaffine joint-pair scorer
-  -> source-tagged sampled pair candidate set
-  -> gumbel_sequential_halving_v1 root admission
-  -> proposal-aware PUCT plus progressive widening over pair children
-  -> candidate-aware pair targets, marginals, conditionals, and completed-Q targets
-```
-
-That better matches your intent: **new model + new search architecture**, not “patch current heads.”
-
----
-
-## Does the plan broadly match the research report intent?
-
-Yes, broadly. The core thesis matches very well.
-
-The reports say the best path is not full exhaustive pair MCTS and not fully sequential search. They recommend unordered joint-pair search after the opening, with factorized/autoregressive proposal inside candidate generation, Gumbel-style root admission, progressive widening, candidate-aware targets, and a symmetric pair reranker. 
-
-The final plan says the same main thing: post-opening MCTS action is an unordered pair; full exhaustive pair enumeration is rejected; sequential afterstate search is a baseline, not the main planner; pair rows are canonical and D6-validated; pair outputs cannot control runtime by head-name presence; and unsampled legal pairs are unknown, not negatives. 
-
-The plan also correctly adopts the report’s model direction: graph/set encoder over legal cells and windows, not fixed crop and not pair tokens. 
-
-So the broad plan is right.
-
-But the plan needs three clarifications to fully match your intended “completely new best model” framing.
-
----
-
-## Correction 1: remove current-code head names from the architecture thesis
-
-Replace:
-
-```text
 policy_place
 policy_pair_first
 policy_pair_second
-policy_pair_joint
 ```
 
-with:
+The research report explicitly says the single-cell head is for proposal and auxiliary signal, not the final move. 
+
+## 8. Final opinion
+
+**Direct pair retrieval should stay in the plan.** It is probably the most important addition beyond marginal/conditional proposal because it gives the model a pair-native way to surface pairs where neither cell is a top standalone move.
+
+But the final architecture should not be:
 
 ```text
-cell_marginal_logits
-pair_completion_logits
-pair_joint_logits
+direct retrieval chooses the move
 ```
 
-And explicitly say:
+It should be:
 
 ```text
-These are new-model output contracts. They are not legacy runtime heads.
-The cell marginal and completion outputs are proposal and auxiliary-learning
-views. They do not define the searched action.
+direct retrieval improves candidate recall
+rich pair scorer ranks candidates
+Gumbel/PUCT search improves candidates
+candidate-aware targets train the model
 ```
 
-This fixes the confusion.
+The current candidate-building and move-selection pipeline is **not optimal yet** if it remains close to the branch’s legal-order first-N pair scoring or pair-to-single marginal projection. The latest plan is much better because it rejects legal-order first-N, separates full `LEGAL` rows from `ADMITTED_PAIR` rows, and introduces direct pair retrieval plus proposal-aware search. 
 
----
-
-## Correction 2: make pair candidate selection more pair-native
-
-The previous candidate section I proposed overemphasized unary anchors. It should instead be:
+My final recommendation:
 
 ```text
-Pair candidate selection is driven first by pair-native retrieval and
-joint pair scoring, with unary/conditional heads as proposal accelerators.
+Keep:
+  global graph/window encoder
+  legal-cell embeddings
+  cell marginal auxiliary/proposal head
+  anchor-conditioned completion head
+  direct pair retrieval
+  rich symmetric biaffine pair scorer
+  terminal_exact_v1 only
+  source quotas
+  Gumbel root admission
+  progressive widening
+  proposal-aware targets
+
+Change:
+  make direct retrieval blockwise-exact and recall-measured first
+  rename policy_pair_rerank -> rich_pair_rerank
+  separate CandidateSelector from PairStrategy
+  forbid pair-to-single projection for final move choice
+  require retrieval recall metrics and source ablation evidence
+
+Reject:
+  current legal-order first-N pair candidate generation
+  direct retrieval as a sole top-k policy
+  pair-only sparse target training
+  approximate retrieval before exact retrieval is debugged
 ```
 
-Recommended source priority:
+That gives you a new model/search architecture that is faithful to the research reports and significantly stronger than the current code path.
 
-```text
-protected:
-  terminal_exact_v1
-
-primary model source:
-  direct_pair_retrieval from cheap symmetric pair score
-
-secondary model source:
-  anchor_conditioned_completion
-
-stability source:
-  cell_marginal_cross
-
-exploration source:
-  structured_diversity
-
-diagnostic source:
-  blind_canary
-```
-
-This better fits “new best model.”
-
----
-
-## Correction 3: keep tactical v1 minimal but leave model windows intact
-
-Your instinct that the tactical oracle should only care about win-in-1 / lose-in-1 is good for v1.
-
-But the **model** should still see `WINDOW6` tokens. That is not the same as a complex tactical oracle. The reports strongly recommend window objects because Hexo tactics are naturally represented through six-cell windows and legal-cell/window relations. 
-
-So the update should be:
-
-```text
-Runtime tactical oracle v1:
-  only terminal win-in-one / lose-in-one.
-
-Model input:
-  still includes active WINDOW6 objects.
-
-Tactical auxiliary labels v1:
-  terminal only.
-
-Tactical auxiliary labels v2:
-  overloads, forks, bounded races, etc.
-```
-
-Do not remove window tokens just because the tactical oracle is minimal.
-
----
-
-## The updated “Pair Candidate Selection” section I would use
-
-Here is the section I would actually put in the plan.
-
-```text
-### Pair Candidate Selection
-
-The final model is not a single pair-only head and it is not a legacy
-single-placement policy model. It is a pair-action model with auxiliary proposal
-views.
-
-The searched action is always an unordered pair after the opening. Candidate
-selection uses model-derived proposal functions only to avoid exhaustive pair
-enumeration and to improve candidate recall.
-
-#### New Model Outputs Used For Candidate Selection
-
-cell_marginal_logits:
-  One logit per full legal row. This is trained from pair posterior marginals
-  and terminal cell labels. It is not the final policy.
-
-pair_completion_logits(anchor, candidate):
-  Conditional completion score for a second cell given an anchor cell. Because
-  the true pair is unordered, this is trained and used symmetrically in both
-  orientations.
-
-pair_proposal_score(i, j):
-  Cheap symmetric low-rank pair score used for direct top-k pair retrieval.
-  This may be computed as a biaffine or dot-product retrieval score over legal
-  cell embeddings.
-
-pair_joint_logits(i, j):
-  Rich symmetric biaffine pair score over admitted candidate rows. This is the
-  main model prior consumed by sampled joint-pair MCTS.
-
-#### Candidate Sources
-
-1. terminal_exact_v1
-   Exact win-in-one and lose-in-one protection. Includes immediate winning
-   pairs, terminal-equivalent winning pairs, and pairs that block all opponent
-   immediate win requirements. These candidates are protected and cannot be
-   evicted.
-
-2. direct_pair_retrieval
-   Retrieve high-scoring unordered pairs from the cheap symmetric pair proposal
-   score. This is the primary model-led source.
-
-3. anchor_conditioned_completion
-   Select anchor cells from cell_marginal_logits and/or pair proposal summaries.
-   For each anchor, use pair_completion_logits to propose completions. Add both
-   unordered orientations or use logsumexp over both orientations.
-
-4. cell_marginal_cross
-   Add a capped cross-product of top marginal cells. This source is secondary
-   and exists for stability, not as the main policy.
-
-5. structured_diversity
-   Add geometry/diversity candidates by legal-row bucket, distance bucket,
-   axis/sector, and window participation. This prevents support collapse.
-
-6. blind_canary
-   Add a tiny deterministic diagnostic sample to measure candidate blind spots.
-
-#### Final Selection
-
-All candidate pairs are canonicalized, deduplicated, source-merged, and assigned
-metadata. Protected terminal candidates are kept first. Remaining slots are
-filled by source quotas and pair_joint_logits. No candidate may enter search
-without source metadata, proposal metadata, and pair-row identity.
-
-Legal-order first-N pair enumeration is forbidden as normal runtime candidate
-selection. It is allowed only as a diagnostic baseline.
-```
-
-That section matches the research report more tightly than my earlier version.
-
----
-
-## Final answer
-
-You are right that the plan should be framed as a **new model and search architecture**, not as adding behavior around current heads.
-
-But the new model still should have **cell-level and conditional proposal outputs**. The reports explicitly recommend that. The mistake is using old names like `policy_place` and `policy_pair_first`, which make it sound like the plan is preserving the current single-placement model.
-
-The best correction is:
-
-```text
-Remove:
-  policy_place
-  policy_pair_first
-
-Replace with:
-  cell_marginal_logits
-  pair_completion_logits
-  pair_proposal_score
-  pair_joint_logits
-```
-
-And make this explicit:
-
-```text
-Only pair_joint_logits over admitted unordered pair rows is the main action
-policy for search. Cell marginal and completion heads are proposal and
-auxiliary-learning views.
-```
-
-With that change, the plan matches the research reports broadly and becomes clearer: **new global graph/window model, new pair-native candidate selector, new sampled joint-pair MCTS, new candidate-aware training stack.**
+[1]: https://openreview.net/forum?id=Hk95PK9le&utm_source=chatgpt.com "Deep Biaffine Attention for Neural Dependency Parsing | OpenReview"
+[2]: https://www.uni-mannheim.de/dws/research/resources/lemp/?utm_source=chatgpt.com "LEMP | Universität Mannheim"
+[3]: https://openreview.net/forum?id=bERaNdoegnO&utm_source=chatgpt.com "Policy improvement by planning with Gumbel | OpenReview"
+[4]: https://proceedings.mlr.press/v139/hubert21a.html?utm_source=chatgpt.com "Learning and Planning in Complex Action Spaces"
+[5]: https://proceedings.mlr.press/v97/lee19d?utm_source=chatgpt.com "Set Transformer: A Framework for Attention-based Permutation-Invariant Neural Networks"
+[6]: https://papers.neurips.cc/paper/5866-pointer-networks?utm_source=chatgpt.com "Pointer Networks"
+[7]: https://www.mendeley.com/catalogue/d34f4890-5f4d-3bb5-9233-29fcc8da2bab/?utm_source=chatgpt.com "Action branching architectures fo... preview & related info | Mendeley"
+[8]: https://ojs.aaai.org/index.php/AAAI/article/view/9661?utm_source=chatgpt.com "Factored MCTS for Large Scale Stochastic Planning | Proceedings of the AAAI Conference on Artificial Intelligence"

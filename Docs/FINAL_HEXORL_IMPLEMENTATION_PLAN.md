@@ -178,20 +178,23 @@ Rust exact simulator
   -> full legal rows
   -> minimal terminal tactical facts: win-in-1 / lose-in-1
   -> graph/set encoder over STATE, TURN, STONE, LEGAL, WINDOW6
-  -> single-cell unary head
-  -> conditional second-cell pointer-style head
+  -> legal-cell embeddings h_i
+  -> cell_marginal_proposal head
+  -> anchor_conditioned_completion head
+  -> cheap symmetric pair-retrieval score
   -> pair_candidate_selector_v1
-  -> symmetric biaffine joint-pair reranker
-  -> sampled pair candidate set
+  -> rich symmetric biaffine joint-pair scorer
+  -> source-tagged sampled pair candidate set
   -> gumbel_sequential_halving_v1 root admission
-  -> proposal-aware PUCT plus progressive widening below root
-  -> candidate-aware training targets
+  -> proposal-aware PUCT plus progressive widening over pair children
+  -> candidate-aware pair targets, marginals, conditionals, and completed-Q targets
 ```
 
 The action selected by self-play and evaluation after the opening is always the
-completed pair. The single-cell and conditional heads exist to make candidate
-generation and learning efficient. They are not allowed to redefine the game as
-two independent search plies.
+completed pair. Cell-marginal and completion outputs exist to make candidate
+generation and learning efficient. They are new-model proposal and auxiliary
+views, not legacy single-placement policy heads, and they are not allowed to
+redefine the game as two independent search plies.
 
 ### Why This Wins
 
@@ -591,11 +594,15 @@ Required sources:
 - `terminal_exact_v1`: exact own win-in-one pairs, exact
   terminal-equivalent winning pairs, exact opponent loss-in-one block pairs,
   and exact impossible-to-block flag.
+- `direct_pair_retrieval`: candidate pairs retrieved from a cheap symmetric
+  low-rank pair proposal score over legal-cell embeddings.
 - `policy_pair_rerank`: pairs reranked by the current joint-pair scorer after
   non-exhaustive pre-candidate retrieval.
-- `policy_anchor_conditional`: first-cell samples plus conditional second-cell
+- `anchor_conditioned_completion`: anchor-cell samples plus conditional
+  second-cell
   completions.
-- `unary_cross`: capped unordered cross-product of top unary cells.
+- `cell_marginal_cross`: capped unordered cross-product of top cell-marginal
+  cells.
 - `structured_explore`: uniform anchors, distance buckets, active windows,
   cover sets, axis diversity, and novelty sampling.
 - `blind_canary`: very small capped diagnostic sampling from legal pairs.
@@ -630,9 +637,9 @@ quota can shrink to near-zero but should remain available in diagnostic runs.
 top-k" during normal runtime. It works in two steps:
 
 ```text
-1. Retrieve a bounded pre-candidate pool from unary anchors, conditional
-   completions, tactical rows, structured rows, and optional approximate
-   bilinear retrieval.
+1. Retrieve a bounded pre-candidate pool from direct pair retrieval,
+   anchor-conditioned completions, terminal rows, structured rows, and canary
+   rows.
 2. Score only that bounded pool with the pair reranker, then admit top-k or
    diverse-k after canonical deduplication.
 ```
@@ -650,10 +657,11 @@ Inputs:
 
 ```text
 full legal rows
-model policy_place logits
-model policy_cell_marginal or policy_pair_anchor logits, if available
-model policy_pair_second scorer, if available
-model policy_pair_joint scorer, if available
+legal-cell embeddings h_i
+cell_marginal_logits over legal rows
+pair_completion_logits(anchor, candidate)
+cheap symmetric pair_proposal_score(i, j), if available
+rich pair_joint_logits over candidate pair rows, if available
 terminal_tactical_set_v1
 root_or_interior budget
 deterministic RNG seed
@@ -667,6 +675,7 @@ per-candidate source contributions
 protected terminal flags
 initial proposal scores
 combined beta or inclusion estimates
+candidate row-table hash
 ```
 
 Candidate sources:
@@ -674,16 +683,16 @@ Candidate sources:
 1. `terminal_exact_v1`
    Always include own winning pairs. If no own winning pair exists, include
    exact block-loss pairs. Protected terminal candidates cannot be evicted.
-2. `model_anchor_conditional`
-   Select promising anchor cells from `policy_pair_anchor`,
-   `policy_cell_marginal`, and `policy_place`. For each anchor, score bounded
-   second-cell rows and add top conditional completions.
-3. `unary_cross`
-   Take top `policy_place` cells and add their unordered cross-product, capped
-   by quota.
-4. `joint_rerank_pool`
-   Score only the bounded pre-candidate pool with `policy_pair_joint`. Never
-   score first-N legal-order pairs as the main selector.
+2. `direct_pair_retrieval`
+   Retrieve high-scoring unordered pairs from the cheap symmetric pair proposal
+   score. This is the primary model-led source.
+3. `anchor_conditioned_completion`
+   Select anchor cells from `cell_marginal_logits` or pair proposal summaries.
+   For each anchor, use `pair_completion_logits` to propose completions. Add
+   both unordered orientations or use `logsumexp` over both orientations.
+4. `cell_marginal_cross`
+   Add a capped cross-product of top marginal cells. This source is secondary
+   and exists for stability and debugging, not as the main policy.
 5. `structured_diversity`
    Add non-tactical coverage from distance buckets, coordinate-sector diversity,
    legal-row bucket diversity, and top unary cells paired with diverse seconds.
@@ -701,6 +710,43 @@ keep protected terminal pairs
 fill remaining budget by source quotas plus joint rerank score
 record why every candidate entered
 ```
+
+#### Direct Pair Retrieval
+
+`direct_pair_retrieval` is the pair-native candidate source. It lets the model
+retrieve pairs whose relationship looks strong even when neither cell is a top
+standalone marginal.
+
+The graph encoder produces one embedding per legal cell:
+
+```text
+h_i = legal_cell_embedding(i)
+```
+
+A cheap retrieval head projects those embeddings:
+
+```text
+u_i = W_u h_i
+v_i = W_v h_i
+```
+
+and scores unordered pairs with a symmetric low-rank proposal score:
+
+```text
+s_prop(i, j) =
+  0.5 * (u_i dot v_j + u_j dot v_i)
+  + cheap_pair_features(i, j)
+```
+
+This score is a retrieval signal, not the final policy. It is used to form a
+bounded candidate set. The richer `pair_joint_logits` scorer and MCTS still
+decide among admitted pair candidates.
+
+Direct pair retrieval does not materialize pair tokens in the graph encoder and
+does not make MCTS exhaustive over all pairs. It may use batched matrix
+operations, approximate top-k retrieval, row buckets, or chunked scoring to
+retrieve a bounded set. Normal runtime must still respect candidate budgets and
+record source/proposal metadata.
 
 ## Model Design
 
@@ -768,21 +814,26 @@ Required relations:
 The final model has these trainable outputs:
 
 ```text
-policy_place
-policy_cell_marginal
-policy_pair_anchor
-policy_pair_second
-policy_pair_joint
+cell_marginal_logits
+pair_completion_logits
+pair_proposal_score
+pair_joint_logits
 value
-tactical_auxiliary_heads
-pair_regret_or_completed_q
+terminal_tactical_v1
+pair_q_or_completed_q
+uncertainty_or_regret
 ```
 
-`policy_pair_first` is retired as a semantic name because it implies ordered
-pair training. If an existing implementation temporarily keeps that tensor
-name, the output contract must map it to `policy_cell_marginal` or
-`policy_pair_anchor`, and the old name must not appear as a permanent runtime
-semantic authority.
+These are new-model output contracts. They are not legacy runtime heads.
+`cell_marginal_logits` and `pair_completion_logits` are proposal and auxiliary
+learning views; they do not define the searched action. `pair_joint_logits`
+over admitted unordered pair rows is the main model policy prior consumed by
+sampled joint-pair MCTS.
+
+`policy_place` and `policy_pair_first` are retired as semantic names for the
+final model. If an existing implementation temporarily keeps those tensor
+names, output contracts must map them to the new concepts above, and the old
+names must not appear as permanent runtime semantic authority.
 
 The final pair scorer should have the shape:
 
@@ -930,9 +981,10 @@ pi(second = j | first = i)
 pi(second = i | first = j)
 ```
 
-The two views are weighted through the marginal or anchor target. Training only
-the canonical first cell is forbidden because it leaks row-order artifacts into
-the conditional head.
+The two views train `pair_completion_logits(anchor, candidate)` and are weighted
+through the cell marginal or anchor target. Training only the canonical first
+cell is forbidden because it leaks row-order artifacts into the conditional
+head.
 
 ### Tactical Supervision
 
@@ -1003,7 +1055,8 @@ Bootstrap phase:
 - high candidate diversity,
 - large `terminal_exact_v1` protection,
 - high structured exploration quota,
-- high model-anchor and conditional quota once the heads exist,
+- high direct-pair-retrieval, anchor-completion, and cell-marginal-cross quota
+  once the heads exist,
 - small blind canary quota,
 - larger root candidate set,
 - aggressive widening,
@@ -1114,8 +1167,9 @@ Success criteria:
 - Duplicate, illegal, stale, same-count-reordered, and wrong-phase pair rows are
   hard errors.
 - D6 transforms preserve pair row identity after canonicalization.
-- `policy_pair_first` semantics are resolved: unordered marginal target or
-  diagnostic-only. It must not pretend unordered targets are ordered.
+- Legacy `policy_pair_first` semantics are resolved and mapped to
+  `cell_marginal_logits`, `pair_anchor` diagnostics, or deletion. It must not
+  pretend unordered targets are ordered.
 
 Required evidence:
 
@@ -1144,7 +1198,8 @@ Success criteria:
 - `terminal_exact_v1` computes only win-in-one, block-loss-in-one,
   terminal-equivalent pairs, and impossible-to-block flags.
 - Candidate generator supports `terminal_exact_v1`,
-  `model_anchor_conditional`, `unary_cross`, `joint_rerank_pool`,
+  `direct_pair_retrieval`, `anchor_conditioned_completion`,
+  `cell_marginal_cross`, `joint_rerank_pool`,
   `structured_diversity`, and `blind_canary`.
 - Protected terminal pairs cannot be evicted.
 - Pair candidates are canonicalized and deduplicated.
@@ -1153,7 +1208,7 @@ Success criteria:
 - Tactical oracle labels are filtered to explicit legal rows.
 - Structured exploration replaces raw persistent uniform-over-all-pairs as the
   main exploration floor.
-- `policy_pair_joint` scores only the bounded candidate pool in normal
+- `pair_joint_logits` scores only the bounded candidate pool in normal
   runtime.
 - Legal-order first-N pair scoring is quarantined as diagnostic only.
 
@@ -1168,6 +1223,8 @@ Required evidence:
 - Unit tests where no two-cell block exists and `impossible_to_block` is true.
 - D6 tests for `terminal_exact_v1` and candidate selection.
 - Source quota tests showing non-model sources survive early bad policies.
+- Tests proving `direct_pair_retrieval` can admit a high-scoring pair whose
+  cells are not top-ranked by `cell_marginal_logits`.
 - Regression test proving normal runtime does not use first-N legal-pair
   enumeration.
 - Tactical benchmark fixtures for wins and blocks.
@@ -1446,6 +1503,8 @@ The final path should be reconsidered if:
   fair tuning. V2 overload-state recall is a required ablation before adding
   overload features to the mainline.
 - `pair_candidate_selector_v1` cannot protect exact terminal win/block pairs.
+- `direct_pair_retrieval` cannot improve pair candidate recall over unary and
+  conditional sources after fair tuning.
 - Tactical performance depends entirely on the tactical proposer and the model
   does not internalize window/cover structure.
 - D6 consistency fails under pair-row transforms.
@@ -1463,8 +1522,9 @@ should create a thin but real vertical slice:
 1. Full-legal-row and threat-filter cutover for main neural self-play/training.
 2. Canonical pair contracts and D6 tests.
 3. `pair_candidate_selector_v1` with `terminal_exact_v1`,
-   `model_anchor_conditional`, `unary_cross`, `joint_rerank_pool`,
-   `structured_diversity`, and `blind_canary`.
+   `direct_pair_retrieval`, `anchor_conditioned_completion`,
+   `cell_marginal_cross`, `joint_rerank_pool`, `structured_diversity`, and
+   `blind_canary`.
 4. Candidate proposal contract with multi-source deduplication, combined beta,
    prune flags, and terminal protection.
 5. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
@@ -1489,14 +1549,15 @@ simulation.
 
 Proceed with sampled joint-pair MCTS as the mainline. Keep pair actions as the
 semantic unit of search and training, but make pair discovery cheap through
-autoregressive proposal, terminal exact proposal, joint reranking, and
-structured exploration. V1 does not attempt a rich tactical oracle; it builds
-the strongest possible minimal pair candidate selector. V2 tactical sources can
-expand into overloads, pivots, forks, and bounded hot-window races after V1
-candidate recall, row identity, target correctness, and pair-search runtime are
-stable. Use the minimal global graph token schema, do not materialize all pair
-actions as input tokens, and upgrade the pair head from a symmetric MLP baseline
-to a biaffine reranker with explicit pair features.
+direct pair retrieval, anchor-conditioned completion, terminal exact proposal,
+cell-marginal support, joint reranking, and structured exploration. V1 does not
+attempt a rich tactical oracle; it builds the strongest possible minimal
+pair-native candidate selector. V2 tactical sources can expand into overloads,
+pivots, forks, and bounded hot-window races after V1 candidate recall, row
+identity, target correctness, and pair-search runtime are stable. Use the
+minimal global graph token schema, do not materialize all pair actions as input
+tokens, and upgrade the pair head from a symmetric MLP baseline to a biaffine
+reranker with explicit pair features.
 
 The strongest combined plan is not a compromise that averages the two reports.
 It is a sharper version of both:
