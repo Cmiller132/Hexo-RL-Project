@@ -17,6 +17,30 @@ with capped active six-cell window objects, and a mathematically symmetric
 biaffine pair reranker trained with candidate-aware targets and dense auxiliary
 views.
 
+Implementation staging is explicit:
+
+```text
+V1 mainline:
+  sampled joint-pair MCTS
+  terminal-only tactical source
+  pair_candidate_selector_v1 first
+  no overload, fork, shared-pivot, or bounded hot-window race oracle
+
+V2 expansion:
+  richer tactical proposal sources
+  overloads, shared pivots, fork labels, bounded tactical races
+```
+
+The first implementation priority is not a rich tactical oracle. The first
+implementation priority is a debuggable, source-tagged, pair-native candidate
+selector. V1 tactical logic exists only to protect exact terminal facts:
+
+```text
+win this turn
+prevent opponent win next turn
+impossible to prevent opponent win next turn
+```
+
 This is not a plan for keeping every proposed path alive. The final system
 should have one mainline pair-action runtime. Sequential afterstate search,
 fixed-crop models, materialized pair tokens, raw uniform-over-all-pairs
@@ -151,10 +175,12 @@ Use this stack:
 
 ```text
 Rust exact simulator
-  -> legal rows and active tactical windows
+  -> full legal rows
+  -> minimal terminal tactical facts: win-in-1 / lose-in-1
   -> graph/set encoder over STATE, TURN, STONE, LEGAL, WINDOW6
   -> single-cell unary head
   -> conditional second-cell pointer-style head
+  -> pair_candidate_selector_v1
   -> symmetric biaffine joint-pair reranker
   -> sampled pair candidate set
   -> gumbel_sequential_halving_v1 root admission
@@ -222,7 +248,8 @@ spaces.
 - Replay should be stratified by tactical density, game phase, search surprise,
   pair-space size, and uncertainty.
 - A tactical subsearch/proof-style trigger is valuable for sharp hot-window
-  races, but it must stay bounded and exact.
+  races, but it belongs in the V2 expansion path and must not block
+  `sampled_joint_pair_v1`.
 
 ### Deliberate Synthesis
 
@@ -238,7 +265,7 @@ small structured exploration floor that samples from meaningful sources:
 - uniform active windows,
 - cover sets,
 - distance buckets,
-- tactical motifs,
+- terminal tactical facts,
 - model-surprise states,
 - and rare blind canary samples.
 
@@ -307,6 +334,18 @@ TACTICAL rows = labels, proposals, solver facts, and pruning metadata
 
 No model, target builder, inference adapter, or search component may have to
 guess whether a `LEGAL` row table was threat-filtered.
+
+### Rejected: Legal-Order First-N Pair Scoring As Candidate Selection
+
+A pair selector must not generate normal runtime candidates by walking legal
+rows in nested-loop order and stopping at `max_pairs`. That method is simple
+and deterministic, but it is biased toward early legal-row anchors and can miss
+important pairs whose cells occur later in the legal table.
+
+Legal-order first-N pair scoring is allowed only as a unit-test baseline or
+diagnostic smoke test. The final pair scorer may score a supplied pair row set.
+It must not define that set by first-N legal-order enumeration in normal
+self-play or evaluation.
 
 ## Runtime Design
 
@@ -401,7 +440,7 @@ row_table_schema_version
 source_contributions[]
 combined_beta_or_inclusion_estimate
 forced_exploration_flag
-tactical_exact_flag
+terminal_exact_flag
 terminal_equivalence_flag
 target_prune_flag
 admission_generation
@@ -426,9 +465,10 @@ source metadata cannot enter search.
 
 ### Pair Strategy Authority
 
-Create or promote one explicit runtime strategy:
+Create or promote two explicit runtime components:
 
 ```text
+pair_candidate_selector_v1
 sampled_joint_pair_v1
 ```
 
@@ -442,14 +482,25 @@ root_pair_prior_blend_v0
 leaf_pair_prior_blend_v0
 ```
 
-This strategy owns:
+`PairCandidateSelectorV1` owns:
 
-- pair row generation,
-- candidate source quotas,
+- candidate generation,
+- source quotas,
+- canonicalization,
+- deduplication,
+- protected terminal candidate handling,
+- source metadata,
+- pre-rerank pools,
+- and candidate selector telemetry.
+
+`SampledJointPairStrategyV1` consumes selected candidates and owns:
+
 - model output requests,
 - pair prior construction,
 - root Gumbel admission,
 - interior progressive widening,
+- pair expansion,
+- pair backpropagation,
 - pair-prior correction from proposal probabilities,
 - pair-search telemetry,
 - offline audit-oracle hooks for tiny or tactical positions,
@@ -464,7 +515,8 @@ At each full-turn node:
 
 1. Query Rust for legal cells and tactical state.
 2. Build or retrieve legal-row identity.
-3. Generate candidate pair proposals from source quotas.
+3. Use `pair_candidate_selector_v1` to generate candidate pair proposals from
+   source quotas.
 4. Canonicalize pairs and deduplicate by canonical pair key.
 5. Store all source contributions, combined `beta`, forced flags, tactical
    flags, terminal-equivalence flags, and target-prune flags.
@@ -536,15 +588,24 @@ black-box sampler.
 
 Required sources:
 
+- `terminal_exact_v1`: exact own win-in-one pairs, exact
+  terminal-equivalent winning pairs, exact opponent loss-in-one block pairs,
+  and exact impossible-to-block flag.
 - `policy_pair_rerank`: pairs reranked by the current joint-pair scorer after
   non-exhaustive pre-candidate retrieval.
 - `policy_anchor_conditional`: first-cell samples plus conditional second-cell
   completions.
-- `tactical_exact`: immediate wins, immediate blocks, minimal covers,
-  overload-creating pairs, shared-pivot forks, and hot-window races.
+- `unary_cross`: capped unordered cross-product of top unary cells.
 - `structured_explore`: uniform anchors, distance buckets, active windows,
   cover sets, axis diversity, and novelty sampling.
 - `blind_canary`: very small capped diagnostic sampling from legal pairs.
+
+V1 tactical logic deliberately does not generate overload pairs, shared-pivot
+forks, multi-axis pressure pairs, bounded hot-window races, or non-terminal
+attack motifs. Those are V2 tactical proposal features. V1 tactical logic exists
+only to prevent candidate selection from missing forced terminal actions. All
+non-terminal pair quality should be discovered through model proposal,
+conditional proposal, joint reranking, structured diversity, and search.
 
 Every candidate stores:
 
@@ -555,15 +616,15 @@ second_legal_row_id
 source_contributions[]
 combined_beta_or_inclusion_estimate
 was_forced_exploration
-was_tactical_exact
+was_terminal_exact
 target_prune_flag
 admission_generation
 root_or_interior
 ```
 
-The source quotas should anneal by training phase. The tactical quota should not
-vanish; the blind canary quota can shrink to near-zero but should remain
-available in diagnostic runs.
+The source quotas should anneal by training phase. `terminal_exact_v1` is
+non-optional; protected terminal candidates cannot be evicted. The blind canary
+quota can shrink to near-zero but should remain available in diagnostic runs.
 
 `policy_pair_rerank` must not mean "score every unordered legal pair and take
 top-k" during normal runtime. It works in two steps:
@@ -579,6 +640,67 @@ top-k" during normal runtime. It works in two steps:
 Dense all-pair scoring is allowed only for tiny diagnostic states, offline
 audit oracle runs, or explicitly capped tactical fixtures. It is not the normal
 self-play or evaluation path.
+
+### Pair Candidate Selection
+
+`pair_candidate_selector_v1` is the first real pair candidate generator. It
+replaces legal-order first-N pair scoring as the main pair proposal method.
+
+Inputs:
+
+```text
+full legal rows
+model policy_place logits
+model policy_cell_marginal or policy_pair_anchor logits, if available
+model policy_pair_second scorer, if available
+model policy_pair_joint scorer, if available
+terminal_tactical_set_v1
+root_or_interior budget
+deterministic RNG seed
+```
+
+Outputs:
+
+```text
+source-tagged canonical pair candidates
+per-candidate source contributions
+protected terminal flags
+initial proposal scores
+combined beta or inclusion estimates
+```
+
+Candidate sources:
+
+1. `terminal_exact_v1`
+   Always include own winning pairs. If no own winning pair exists, include
+   exact block-loss pairs. Protected terminal candidates cannot be evicted.
+2. `model_anchor_conditional`
+   Select promising anchor cells from `policy_pair_anchor`,
+   `policy_cell_marginal`, and `policy_place`. For each anchor, score bounded
+   second-cell rows and add top conditional completions.
+3. `unary_cross`
+   Take top `policy_place` cells and add their unordered cross-product, capped
+   by quota.
+4. `joint_rerank_pool`
+   Score only the bounded pre-candidate pool with `policy_pair_joint`. Never
+   score first-N legal-order pairs as the main selector.
+5. `structured_diversity`
+   Add non-tactical coverage from distance buckets, coordinate-sector diversity,
+   legal-row bucket diversity, and top unary cells paired with diverse seconds.
+6. `blind_canary`
+   Add a tiny deterministic-seeded sample for diagnostics and support-collapse
+   checks.
+
+Final selection:
+
+```text
+canonicalize every pair
+deduplicate by pair key
+merge all source contributions
+keep protected terminal pairs
+fill remaining budget by source quotas plus joint rerank score
+record why every candidate entered
+```
 
 ## Model Design
 
@@ -620,8 +742,8 @@ must include:
 - all immediate one-placement and two-placement win/block windows,
 - windows touching current legal cells with enough occupied or legal-empty
   support to matter tactically,
-- near-hot 3 windows that participate in overload or fork candidates,
-- windows referenced by tactical exact proposals,
+- windows referenced by `terminal_exact_v1`,
+- capped near-hot windows needed for legal-cell context,
 - and deterministic priority overflow telemetry when the cap is exceeded.
 
 The cap is part of the schema contract, not an incidental batch parameter. A
@@ -680,18 +802,30 @@ symmetric_biaffine(i, j) =
 or enforce `U = U^T` by parameterization. A naive `h_i^T U h_j` term is not
 acceptable for unordered joint pairs.
 
-Required pair features:
+Required V1 pair features:
 
 - axial distance,
 - same-axis indicator,
+- same-line indicator,
 - same-window indicator,
-- number of self hot windows completed,
-- number of opponent hot windows covered,
-- overlap cover count,
-- fork or overload count,
-- axis diversity,
-- tactical source flags,
+- terminal exact win flag,
+- terminal-equivalent win flag,
+- terminal exact block flag,
+- blocks-all-opponent-win-requirements flag,
+- impossible-to-block state flag,
+- source-contribution bitset,
 - legal-row phase flags.
+
+V2 pair feature expansion:
+
+- overload count,
+- shared-pivot count,
+- fork count,
+- axis-diversity pressure score,
+- bounded tactical-race score,
+- non-terminal hot-window creation score,
+- opponent hot-window cover count,
+- overlap cover count.
 
 The joint pair score must be invariant to pair order. The known-first second
 head remains ordered and conditional.
@@ -705,6 +839,8 @@ and how it became a target:
 
 ```text
 candidate_pairs
+candidate_selector_version
+terminal_tactical_v1
 candidate_source_contributions
 combined_beta_or_inclusion_estimates
 proposal_correction_parameters
@@ -719,6 +855,7 @@ completed_q_values
 forced_exploration_flags
 policy_target_prune_flags
 terminal_equivalence_flags
+candidate_selection_reason
 selected_pair
 search_surprise_metrics
 ```
@@ -747,6 +884,18 @@ unsampled legal pair != negative pair
 
 Only admitted pairs judged weak by search, or explicitly sampled negatives with
 known proposal metadata, can contribute negative ranking signal.
+
+Terminal exact candidates receive protection in candidate admission, but raw
+terminal protection must not pollute ordinary policy targets:
+
+- If own win-in-one exists, the improved target may collapse to
+  terminal-winning candidates. Terminal-equivalent pairs must be collapsed or
+  tie-broken deterministically.
+- If opponent lose-in-one exists and own win-in-one does not, non-blocking pairs
+  may be target-pruned or marked negative only if the terminal proof says they
+  fail to block all opponent immediate win requirements.
+- If `impossible_to_block` is true, do not fabricate a winning defensive
+  target. Record tactical status and let value/search handle the losing state.
 
 Pair target completeness must be explicit. A target builder may set
 `pair_policy_complete = true` only when one of these support contracts is true:
@@ -787,36 +936,35 @@ the conditional head.
 
 ### Tactical Supervision
 
-Rust should remain the production source for tactical labels. Required labels:
+Rust should remain the production source for tactical labels. V1 tactical
+supervision is terminal-only. V2 expands tactical supervision after V1
+candidate recall, row identity, target correctness, and pair-search runtime are
+stable.
+
+### Tactical Supervision V1
+
+Required V1 labels:
 
 - immediate one-placement wins,
 - immediate two-placement wins,
 - terminal-equivalent winning pairs,
-- opponent immediate threats,
-- legal cells covering hot opponent windows,
-- pair covers of multiple threats,
-- own hot-window creation,
-- impossible-to-cover opponent positions,
-- bounded hot-window threat races,
-- overload and axis-diversity counts.
+- opponent immediate win requirements,
+- pair blocks all opponent immediate win requirements,
+- impossible-to-block opponent immediate win.
 
 The Rust tactical oracle should produce a legal-row-keyed and pair-row-keyed
 proposal payload:
 
 ```text
-TacticalProposalSet {
+TerminalTacticalSetV1 {
   status
+  status = quiet | win_in_one | must_block_loss_in_one | loss_in_one_unblockable
   winning_single_cells
   winning_pairs
   terminal_equivalent_pairs
-  forced_block_cells
-  cover_pairs
-  open_four_cells
-  open_five_cells
-  overload_pairs
-  shared_pivot_pairs
-  hot_window_ids
-  impossible_to_cover
+  opponent_win_requirements
+  block_loss_pairs
+  impossible_to_block
 }
 ```
 
@@ -828,6 +976,22 @@ Tactical labels are not hand-authored legal filters. They are:
 - target-pruning metadata,
 - and near-terminal exact search triggers.
 
+### Tactical Supervision V2
+
+V2 tactical labels:
+
+- own hot-window creation,
+- overload creation,
+- shared pivot,
+- multi-axis fork,
+- bounded hot-window race,
+- non-terminal pressure score,
+- axis-diversity count.
+
+V2 labels are not required for `sampled_joint_pair_v1` completion. They may be
+added after the V1 candidate selector and pair-search runtime are stable, and
+they should be ablated before becoming part of the mainline.
+
 ### Self-Play Curriculum
 
 Use a curriculum over search budget, candidate budget, replay mix, and tactical
@@ -837,29 +1001,33 @@ curriculum because it changes the action semantics.
 Bootstrap phase:
 
 - high candidate diversity,
-- large tactical quota,
+- large `terminal_exact_v1` protection,
 - high structured exploration quota,
+- high model-anchor and conditional quota once the heads exist,
+- small blind canary quota,
 - larger root candidate set,
 - aggressive widening,
 - high visit temperature,
-- tactical label pretraining or mixed supervised bootstrap.
+- synthetic fixtures for win-in-one and lose-in-one candidate recall.
 
 Growth phase:
 
 - increase model-led proposal share,
-- keep tactical source alive,
+- keep `terminal_exact_v1` always active,
 - reduce blind canary source,
+- add V2 tactical labels only after V1 selector/search stability,
 - introduce surprise-weighted replay,
 - gradually raise simulation budget.
 
 Mature phase:
 
 - mostly model-led candidate admission,
-- persistent tactical and structured novelty quotas,
+- `terminal_exact_v1` remains non-optional,
+- structured novelty remains small but present,
 - lower action temperature,
 - hard-state replay,
 - equal-wall-clock arena evaluation,
-- periodic candidate-source ablations.
+- V2 tactical sources may be ablated before inclusion.
 
 ## Implementation Phases
 
@@ -963,29 +1131,46 @@ Stop rules:
 - Stop if row identity cannot survive replay-to-training and inference-to-search
   boundaries.
 
-### Phase 3: Candidate Sources And Tactical Oracle Integration
+### Phase 3: Pair Candidate Selector V1
 
 Goal:
 
-Implement source-tagged candidate generation and exact tactical proposal.
+Implement a source-tagged, pair-native candidate selector that replaces
+legal-order first-N pair scoring in normal runtime.
 
 Success criteria:
 
-- Candidate generator supports policy, conditional, tactical, structured
-  exploration, and blind canary sources.
+- Full legal rows are preserved.
+- `terminal_exact_v1` computes only win-in-one, block-loss-in-one,
+  terminal-equivalent pairs, and impossible-to-block flags.
+- Candidate generator supports `terminal_exact_v1`,
+  `model_anchor_conditional`, `unary_cross`, `joint_rerank_pool`,
+  `structured_diversity`, and `blind_canary`.
+- Protected terminal pairs cannot be evicted.
+- Pair candidates are canonicalized and deduplicated.
 - Every candidate stores all source contributions, combined `beta` or inclusion
   estimate, forced flags, tactical flags, and target-prune flags.
 - Tactical oracle labels are filtered to explicit legal rows.
 - Structured exploration replaces raw persistent uniform-over-all-pairs as the
   main exploration floor.
-- `policy_pair_rerank` scores only a bounded pre-candidate pool in normal
+- `policy_pair_joint` scores only the bounded candidate pool in normal
   runtime.
+- Legal-order first-N pair scoring is quarantined as diagnostic only.
 
 Required evidence:
 
 - Unit tests for source quotas, multi-source deduplication, legal filtering,
   combined-beta accounting, and metadata.
-- Tactical benchmark fixtures for wins, blocks, covers, and overloads.
+- Unit tests where a winning pair appears late in legal-row order and is still
+  included.
+- Unit tests where opponent has multiple immediate win requirements and only
+  valid block pairs are protected.
+- Unit tests where no two-cell block exists and `impossible_to_block` is true.
+- D6 tests for `terminal_exact_v1` and candidate selection.
+- Source quota tests showing non-model sources survive early bad policies.
+- Regression test proving normal runtime does not use first-N legal-pair
+  enumeration.
+- Tactical benchmark fixtures for wins and blocks.
 - Artifact showing candidate-source mix on a fixed position set.
 - Offline audit-oracle artifact on tiny or tactical positions where exhaustive
   pair scoring is allowed.
@@ -994,6 +1179,11 @@ Stop rules:
 
 - Stop if a candidate can enter search without complete source, proposal,
   forced/prune, and beta metadata.
+- Stop if a terminal win/block pair can be evicted by model ranking.
+- Stop if the selector depends on legal-row order except for deterministic
+  tie-breaks.
+- Stop if the selector cannot prove which candidates were terminal, model-led,
+  conditional, diversity, or canary.
 
 ### Phase 4: Sampled Joint-Pair MCTS
 
@@ -1143,9 +1333,9 @@ Success criteria:
   - final proposal plus reranker.
 - Candidate-source ablation:
   - policy only,
-  - policy plus raw uniform,
-  - policy plus tactical,
-  - policy plus tactical plus structured exploration.
+  - policy plus terminal exact,
+  - policy plus structured diversity,
+  - policy plus terminal exact plus structured diversity.
 - Target-stack ablation:
   - raw visit counts,
   - pruned posterior,
@@ -1154,8 +1344,8 @@ Success criteria:
 - Tactical-object ablation:
   - no window tokens,
   - window tokens only,
-  - window tokens plus auxiliaries,
-  - full tactical proposal path.
+  - window tokens plus V1 terminal auxiliaries,
+  - V2 tactical proposal path.
 
 Required evidence:
 
@@ -1182,6 +1372,8 @@ full_legal_row_count_per_root
 admitted_pair_count_per_root
 admitted_single_count_per_root
 candidate_source_mix
+candidate_selector_version
+terminal_tactical_v1_status_mix
 solver_override_rate
 diagnostic_threat_filter_usage
 candidate_recall_best_search_pair
@@ -1208,6 +1400,7 @@ gpu_utilization
 cpu_candidate_generation_time
 candidate_generation_latency_p95
 tactical_suite_accuracy
+terminal_candidate_recall
 d6_policy_consistency
 d6_value_consistency
 ```
@@ -1249,8 +1442,10 @@ The final path should be reconsidered if:
 - Pair macro-search loses to the sequential DAG baseline at equal wall-clock
   after proposal quality matures.
 - The best tactical pair is frequently outside the admitted candidate set.
-- The biaffine reranker does not improve overloaded-state pair recall over the
-  simpler MLP after fair tuning.
+- The biaffine reranker does not improve pair recall over the simpler MLP after
+  fair tuning. V2 overload-state recall is a required ablation before adding
+  overload features to the mainline.
+- `pair_candidate_selector_v1` cannot protect exact terminal win/block pairs.
 - Tactical performance depends entirely on the tactical proposer and the model
   does not internalize window/cover structure.
 - D6 consistency fails under pair-row transforms.
@@ -1267,20 +1462,24 @@ should create a thin but real vertical slice:
 
 1. Full-legal-row and threat-filter cutover for main neural self-play/training.
 2. Canonical pair contracts and D6 tests.
-3. Candidate proposal contract with multi-source deduplication, combined beta,
-   prune flags, and structured/tactical sources.
-4. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
-5. Proposal-aware PUCT plus progressive widening.
-6. Existing graph trunk with non-materialized pair rows.
-7. Symmetric biaffine pair scorer behind one explicit architecture or strategy
+3. `pair_candidate_selector_v1` with `terminal_exact_v1`,
+   `model_anchor_conditional`, `unary_cross`, `joint_rerank_pool`,
+   `structured_diversity`, and `blind_canary`.
+4. Candidate proposal contract with multi-source deduplication, combined beta,
+   prune flags, and terminal protection.
+5. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
+6. Proposal-aware PUCT plus progressive widening.
+7. Existing graph trunk with non-materialized pair rows.
+8. Symmetric biaffine pair scorer behind one explicit architecture or strategy
    flag.
-8. Active `WINDOW6` selection caps and overflow telemetry.
-9. Replay metadata for source contributions, beta, visits, Q, completed-Q, and
+9. Active `WINDOW6` selection caps and overflow telemetry.
+10. Replay metadata for source contributions, beta, visits, Q, completed-Q, and
    terminal-equivalence flags.
-10. Pruned joint target plus marginal, unordered-safe conditional, and
+11. Pruned joint target plus marginal, unordered-safe conditional, and
    terminal-equivalent targets.
-11. Fixed tactical benchmark suite plus offline tiny-state audit oracle.
-12. Equal-wall-clock comparison against the current best baseline.
+12. Fixed terminal tactical benchmark suite plus offline tiny-state audit
+    oracle.
+13. Equal-wall-clock comparison against the current best baseline.
 
 That vertical slice gives fast evidence on the only question that matters:
 whether pair semantics can be made strong per wall-clock, not just elegant per
@@ -1290,10 +1489,14 @@ simulation.
 
 Proceed with sampled joint-pair MCTS as the mainline. Keep pair actions as the
 semantic unit of search and training, but make pair discovery cheap through
-autoregressive proposal, exact tactical proposal, and structured exploration.
-Use the minimal global graph token schema, do not materialize all pair actions
-as input tokens, and upgrade the pair head from a symmetric MLP baseline to a
-biaffine reranker with explicit tactical features.
+autoregressive proposal, terminal exact proposal, joint reranking, and
+structured exploration. V1 does not attempt a rich tactical oracle; it builds
+the strongest possible minimal pair candidate selector. V2 tactical sources can
+expand into overloads, pivots, forks, and bounded hot-window races after V1
+candidate recall, row identity, target correctness, and pair-search runtime are
+stable. Use the minimal global graph token schema, do not materialize all pair
+actions as input tokens, and upgrade the pair head from a symmetric MLP baseline
+to a biaffine reranker with explicit pair features.
 
 The strongest combined plan is not a compromise that averages the two reports.
 It is a sharper version of both:

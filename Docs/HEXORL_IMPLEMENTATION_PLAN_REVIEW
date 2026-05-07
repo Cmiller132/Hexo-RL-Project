@@ -1,48 +1,295 @@
-I would update the plan by making a **v1/v2 split**:
+You’re right to challenge that. My wording was too tied to the current branch’s head names.
+
+For a **new best-possible model**, I would **not** describe the plan as “use the current `policy_place` and `policy_pair_first` heads.” I would describe it as:
 
 ```text
-v1 mainline:
-  sampled joint-pair MCTS
-  minimal terminal-only tactical source
-  pair candidate selection first
-  no overload / fork / hot-window race oracle
-
-v2 optional expansion:
-  richer tactical proposal sources
-  overloads, shared pivots, fork labels, bounded tactical races
+The new model has:
+  cell_marginal_proposal
+  anchor_conditioned_completion
+  symmetric_joint_pair_score
 ```
 
-The plan should still be ambitious about the final model, pair-action MCTS, Gumbel root admission, proposal-aware PUCT, and candidate-aware targets. But it should become much more conservative about the tactical oracle. The current uploaded plan still asks `tactical_exact` to include immediate wins, immediate blocks, minimal covers, overload-creating pairs, shared-pivot forks, and hot-window races, which is too much for the first implementation. 
+Those may map to similar tensor shapes as the current branch’s `policy_place`, `policy_pair_first`, and `policy_pair_second`, but conceptually they are **new model components**, not old single-move policy heads.
 
-The update should be: **make tactical minimal, make candidate selection explicit, and explicitly reject first-N legal-pair scoring as a non-final method.**
+## Are you misunderstanding my intent?
+
+Partly, but the confusion is my fault.
+
+I did **not** mean:
+
+```text
+Use the existing old model heads as-is.
+Keep a single-placement policy as the real policy.
+Let policy_place define search behavior.
+```
+
+I meant:
+
+```text
+The new model should still have a legal-cell proposal/marginal head,
+because pure pair-only learning is too sparse and pair candidate generation
+needs cheap cell-level structure.
+```
+
+That is directly aligned with the research reports. One report explicitly says the best model is **three-headed**: a single-cell proposal head, an autoregressive conditional second-cell head, and a symmetric joint pair reranker; it also explicitly says not to make the pair head the only head because pure sparse pair supervision undertrains the representation. 
+
+The other report says the same thing in different words: search should think in pairs, but the network should propose pairs through factorized structure and score them with a symmetric pair reranker. 
+
+So the right correction is not “remove unary/conditional proposal.” The right correction is **rename and redefine them so they are clearly part of the new pair model, not legacy single-action policy.**
 
 ---
 
-## The most important plan change
+## The naming I would change immediately
 
-Add this principle near the top:
+Current plan says the final model outputs:
 
 ```text
-The first implementation priority is not a rich tactical oracle.
-The first implementation priority is a debuggable, source-tagged,
-pair-native candidate selector.
-
-The tactical source for v1 is limited to exact terminal facts:
-  - win this turn
-  - prevent opponent win next turn
-  - impossible to prevent opponent win next turn
-
-All overload, fork, pivot, hot-window-race, and multi-turn tactical proposals
-are deferred to v2 and must not block sampled_joint_pair_v1.
+policy_place
+policy_pair_first
+policy_pair_second
+policy_pair_joint
+value
+tactical_auxiliary_heads
+pair_regret_or_completed_q
 ```
 
-This preserves the core plan: post-opening actions are unordered pairs, hard threat filtering cannot delete full legal rows, Gumbel/root and progressive widening still apply, and unsampled legal pairs remain unknown rather than negatives. Those are already core success criteria in the current plan. 
+That is too close to the current branch and too easy to misread as a single-placement model. The plan should instead say:
+
+```text
+cell_marginal_logits
+pair_completion_logits
+pair_joint_logits
+value
+terminal_tactical_v1
+pair_q_or_completed_q
+uncertainty_or_regret
+```
+
+Where:
+
+```text
+cell_marginal_logits:
+  one logit per legal cell.
+  Trained from pair posterior marginals and terminal cell labels.
+  Used for candidate proposal only.
+  Not the final action policy.
+
+pair_completion_logits:
+  score legal cell b conditioned on anchor cell a.
+  Used to propose pair completions.
+  Trained symmetrically from unordered pair targets.
+
+pair_joint_logits:
+  symmetric score for unordered pair {a,b}.
+  This is the main policy/search prior over admitted pair candidates.
+
+value:
+  state value from current player perspective.
+
+terminal_tactical_v1:
+  minimal win-in-one / lose-in-one auxiliary labels.
+
+pair_q_or_completed_q:
+  optional head to help target construction, ranking, and search.
+```
+
+I would remove `policy_pair_first` as a required named head. It is conceptually dangerous because the true move is unordered. A cell can be an **anchor** for proposal, but not a true “first move” in the main semantics.
+
+I would also avoid the name `policy_place` in the final model. Use `cell_marginal_logits` or `cell_proposal_logits` instead.
 
 ---
 
-## Update the architecture decision
+## Why include a cell-level proposal head at all?
 
-Current plan says:
+Because without it, pair candidate selection has only bad options:
+
+```text
+Option 1:
+  score all legal pairs exhaustively every time
+
+Option 2:
+  sample pairs mostly randomly
+
+Option 3:
+  rely only on terminal tactical rules
+
+Option 4:
+  use a pair scorer only on a weak hand-built candidate set
+```
+
+None of those is the strongest design.
+
+The reports are clear that the model should not be pair-only. They recommend a single-cell proposal head because it gives dense supervision through pair marginals, tactical saliency, and reusable proposal structure; pair-only learning is too sparse. 
+
+That does **not** mean the final policy is single-cell. It means the model has a dense auxiliary/proposal view over legal cells so the pair candidate generator is not blind.
+
+In the final model:
+
+```text
+cell_marginal_logits != action policy
+cell_marginal_logits == proposal/marginal/auxiliary head
+```
+
+The actual searched action remains:
+
+```text
+unordered pair {a,b}
+```
+
+---
+
+## Why include a conditional completion head?
+
+Same reason: candidate generation.
+
+A pure joint pair scorer can score candidate rows, but it does not by itself tell you which rows to create unless you either enumerate all pairs or have a retrieval mechanism. The reports recommend autoregressive/factored proposal specifically because it avoids the quadratic action explosion while keeping pair actions as the search-semantic object. 
+
+But the final plan should define this carefully:
+
+```text
+pair_completion_logits(anchor=a, candidate=b)
+```
+
+not:
+
+```text
+policy_pair_second(first_move=a, second_move=b)
+```
+
+The head is an **anchor-conditioned proposal function**, not a statement that the game is sequential.
+
+Training should use both unordered views:
+
+```text
+pair {a,b} creates:
+  completion target b | anchor a
+  completion target a | anchor b
+```
+
+The latest plan already has the right idea that conditional targets must not train only the canonical first cell, because that leaks row-order artifacts. 
+
+---
+
+## The stronger new-model candidate selector
+
+I would rewrite the “Pair Candidate Selection” section around the **new model**, not current branch head names.
+
+### Pair Candidate Selector V1, corrected
+
+```text
+Goal:
+  Build a source-tagged candidate set of unordered pair rows for sampled
+  joint-pair MCTS without relying on legal-order first-N enumeration.
+```
+
+### Inputs
+
+```text
+full LEGAL row table
+legal-cell embeddings h_i
+cell_marginal_logits over legal rows
+pair_completion_logits(anchor, candidate)
+cheap low-rank pair proposal score, if available
+rich pair_joint_logits over candidate pair rows
+terminal_tactical_v1 facts
+structured exploration sampler
+deterministic seed
+```
+
+### Outputs
+
+```text
+canonical candidate pair rows
+source-contribution metadata
+proposal beta / inclusion estimate
+protected terminal flags
+joint pair prior logits
+candidate row-table hash
+```
+
+### Candidate sources
+
+```text
+1. terminal_exact_v1
+2. direct_pair_retrieval
+3. anchor_completion
+4. cell_marginal_cross
+5. structured_diversity
+6. blind_canary
+```
+
+This is better than my previous wording because it makes the **new model’s joint pair machinery** central.
+
+---
+
+## Add direct pair retrieval
+
+This is the biggest improvement I would make to the candidate-selection plan.
+
+The candidate selector should not be only:
+
+```text
+cell marginal -> anchor -> conditional completion
+```
+
+It should also use the new model’s pair interaction structure directly.
+
+For example, the model can produce legal-cell embeddings:
+
+```text
+h_i
+```
+
+Then produce low-rank proposal vectors:
+
+```text
+u_i = W_u h_i
+v_i = W_v h_i
+```
+
+and a cheap symmetric pair proposal score:
+
+```text
+s_prop(i,j) =
+  0.5 * (u_i · v_j + u_j · v_i)
+  + cheap_pair_features(i,j)
+```
+
+Then retrieve top candidate pairs from this score matrix.
+
+This does **not** mean materializing pair tokens in the graph encoder. The plan already correctly rejects pair actions as attention tokens because pair rows should reference legal token vectors rather than inflating the token sequence. 
+
+It also does **not** mean exhaustive pair MCTS. It means the model may use efficient pair scoring/retrieval to choose candidates, and then MCTS searches only the admitted subset.
+
+So the source list should become:
+
+```text
+direct_pair_retrieval:
+  candidate pairs from cheap symmetric low-rank pair proposal score.
+
+anchor_completion:
+  candidate pairs from cell_marginal anchors plus conditional completions.
+
+cell_marginal_cross:
+  unordered pairs from top marginal cells, mainly for stability/debug.
+
+terminal_exact_v1:
+  protected immediate win/block pairs.
+
+structured_diversity:
+  legal-row / geometry / distance / window coverage diversity.
+
+blind_canary:
+  tiny diagnostic source.
+```
+
+This is stronger than relying on `policy_pair_first` and `policy_place`.
+
+---
+
+## Updated model stack
+
+I would update the plan’s architecture stack from this:
 
 ```text
 Rust exact simulator
@@ -57,568 +304,239 @@ Rust exact simulator
   -> candidate-aware training targets
 ```
 
-I would change it to:
+to this:
 
 ```text
 Rust exact simulator
-  -> full legal rows
-  -> minimal terminal tactical facts: win-in-1 / lose-in-1
+  -> full LEGAL rows + terminal_tactical_v1 facts
   -> graph/set encoder over STATE, TURN, STONE, LEGAL, WINDOW6
-  -> single-cell unary head
-  -> conditional second-cell pointer-style head
-  -> explicit pair_candidate_selector_v1
-  -> symmetric biaffine joint-pair reranker
-  -> sampled pair candidate set
+  -> legal-cell embeddings h_i
+  -> cell_marginal_proposal head
+  -> anchor_conditioned_completion head
+  -> cheap symmetric pair-retrieval score
+  -> rich symmetric biaffine joint-pair scorer
+  -> source-tagged sampled pair candidate set
   -> gumbel_sequential_halving_v1 root admission
-  -> proposal-aware PUCT plus progressive widening below root
-  -> candidate-aware training targets
+  -> proposal-aware PUCT plus progressive widening over pair children
+  -> candidate-aware pair targets, marginals, conditionals, and completed-Q targets
 ```
 
-The key new named component is:
-
-```text
-pair_candidate_selector_v1
-```
-
-This component should be promoted to a first-class part of the plan, not buried inside tactical logic or `PairStrategy`.
+That better matches your intent: **new model + new search architecture**, not “patch current heads.”
 
 ---
 
-## Replace the tactical source section
+## Does the plan broadly match the research report intent?
 
-The current plan’s tactical proposal payload is too broad. It includes:
+Yes, broadly. The core thesis matches very well.
 
-```text
-winning_single_cells
-winning_pairs
-terminal_equivalent_pairs
-forced_block_cells
-cover_pairs
-open_four_cells
-open_five_cells
-overload_pairs
-shared_pivot_pairs
-hot_window_ids
-impossible_to_cover
-```
+The reports say the best path is not full exhaustive pair MCTS and not fully sequential search. They recommend unordered joint-pair search after the opening, with factorized/autoregressive proposal inside candidate generation, Gumbel-style root admission, progressive widening, candidate-aware targets, and a symmetric pair reranker. 
 
-I would replace it with this for v1:
+The final plan says the same main thing: post-opening MCTS action is an unordered pair; full exhaustive pair enumeration is rejected; sequential afterstate search is a baseline, not the main planner; pair rows are canonical and D6-validated; pair outputs cannot control runtime by head-name presence; and unsampled legal pairs are unknown, not negatives. 
 
-```text
-TerminalTacticalSetV1 {
-  status:
-    quiet
-    win_in_one
-    must_block_loss_in_one
-    loss_in_one_unblockable
+The plan also correctly adopts the report’s model direction: graph/set encoder over legal cells and windows, not fixed crop and not pair tokens. 
 
-  winning_single_cells
-  winning_pairs
-  terminal_equivalent_pairs
+So the broad plan is right.
 
-  opponent_win_requirements
-  block_loss_pairs
-
-  impossible_to_block
-}
-```
-
-Definitions:
-
-```text
-winning_single_cells:
-  legal cells that win immediately by completing a 5-window.
-
-winning_pairs:
-  legal unordered pairs that win this turn by completing a 4-window
-  or by including a winning single cell.
-
-terminal_equivalent_pairs:
-  pairs whose outcome is identical because one member wins regardless
-  of the second cell.
-
-opponent_win_requirements:
-  sets of cells the opponent could fill next turn to win.
-  A 5-window requirement has size 1.
-  A 4-window requirement has size 2.
-
-block_loss_pairs:
-  legal unordered pairs that intersect every opponent immediate
-  win requirement.
-
-impossible_to_block:
-  true when no legal two-cell pair intersects every opponent immediate
-  win requirement.
-```
-
-This keeps the exact terminal protection you need without trying to solve Hexo tactics in the candidate generator.
+But the plan needs three clarifications to fully match your intended “completely new best model” framing.
 
 ---
 
-## Rewrite `tactical_exact`
+## Correction 1: remove current-code head names from the architecture thesis
 
-In the `Candidate Sources` section, replace this:
+Replace:
 
 ```text
-tactical_exact:
-  immediate wins, immediate blocks, minimal covers,
-  overload-creating pairs, shared-pivot forks, and hot-window races
+policy_place
+policy_pair_first
+policy_pair_second
+policy_pair_joint
 ```
 
 with:
 
 ```text
-terminal_exact_v1:
-  exact own win-in-one pairs,
-  exact terminal-equivalent winning pairs,
-  exact opponent loss-in-one block pairs,
-  exact impossible-to-block flag.
+cell_marginal_logits
+pair_completion_logits
+pair_joint_logits
 ```
 
-Then add:
+And explicitly say:
 
 ```text
-The v1 tactical source deliberately does not generate overload pairs,
-shared-pivot forks, multi-axis pressure pairs, bounded hot-window races,
-or non-terminal attack motifs. Those are v2 tactical proposal features.
-
-v1 tactical logic exists only to prevent candidate selection from missing
-forced terminal actions. All non-terminal pair quality should be discovered
-through model proposal, conditional proposal, joint reranking, structured
-exploration, and search.
+These are new-model output contracts. They are not legacy runtime heads.
+The cell marginal and completion outputs are proposal and auxiliary-learning
+views. They do not define the searched action.
 ```
 
-This is the right simplification.
+This fixes the confusion.
 
 ---
 
-## Add a new `Pair Candidate Selection` section
+## Correction 2: make pair candidate selection more pair-native
 
-This is the most important addition. I would insert it immediately after `Candidate Sources`.
-
-### Pair Candidate Selector V1
+The previous candidate section I proposed overemphasized unary anchors. It should instead be:
 
 ```text
-pair_candidate_selector_v1 is the first real pair candidate generator.
-It replaces legal-order first-N pair scoring as the main pair proposal method.
+Pair candidate selection is driven first by pair-native retrieval and
+joint pair scoring, with unary/conditional heads as proposal accelerators.
 ```
 
-Algorithm:
+Recommended source priority:
 
 ```text
-inputs:
-  full legal rows
-  model policy_place logits
-  model policy_pair_first logits, if available
-  model policy_pair_second scorer, if available
-  model policy_pair_joint scorer, if available
-  terminal_tactical_set_v1
-  root_or_interior budget
-  deterministic RNG seed
+protected:
+  terminal_exact_v1
 
-outputs:
-  source-tagged canonical pair candidates
-  per-candidate source contributions
-  protected terminal flags
-  initial proposal scores
-  optional beta / inclusion estimates
+primary model source:
+  direct_pair_retrieval from cheap symmetric pair score
+
+secondary model source:
+  anchor_conditioned_completion
+
+stability source:
+  cell_marginal_cross
+
+exploration source:
+  structured_diversity
+
+diagnostic source:
+  blind_canary
 ```
 
-Candidate sources:
+This better fits “new best model.”
+
+---
+
+## Correction 3: keep tactical v1 minimal but leave model windows intact
+
+Your instinct that the tactical oracle should only care about win-in-1 / lose-in-1 is good for v1.
+
+But the **model** should still see `WINDOW6` tokens. That is not the same as a complex tactical oracle. The reports strongly recommend window objects because Hexo tactics are naturally represented through six-cell windows and legal-cell/window relations. 
+
+So the update should be:
 
 ```text
+Runtime tactical oracle v1:
+  only terminal win-in-one / lose-in-one.
+
+Model input:
+  still includes active WINDOW6 objects.
+
+Tactical auxiliary labels v1:
+  terminal only.
+
+Tactical auxiliary labels v2:
+  overloads, forks, bounded races, etc.
+```
+
+Do not remove window tokens just because the tactical oracle is minimal.
+
+---
+
+## The updated “Pair Candidate Selection” section I would use
+
+Here is the section I would actually put in the plan.
+
+```text
+### Pair Candidate Selection
+
+The final model is not a single pair-only head and it is not a legacy
+single-placement policy model. It is a pair-action model with auxiliary proposal
+views.
+
+The searched action is always an unordered pair after the opening. Candidate
+selection uses model-derived proposal functions only to avoid exhaustive pair
+enumeration and to improve candidate recall.
+
+#### New Model Outputs Used For Candidate Selection
+
+cell_marginal_logits:
+  One logit per full legal row. This is trained from pair posterior marginals
+  and terminal cell labels. It is not the final policy.
+
+pair_completion_logits(anchor, candidate):
+  Conditional completion score for a second cell given an anchor cell. Because
+  the true pair is unordered, this is trained and used symmetrically in both
+  orientations.
+
+pair_proposal_score(i, j):
+  Cheap symmetric low-rank pair score used for direct top-k pair retrieval.
+  This may be computed as a biaffine or dot-product retrieval score over legal
+  cell embeddings.
+
+pair_joint_logits(i, j):
+  Rich symmetric biaffine pair score over admitted candidate rows. This is the
+  main model prior consumed by sampled joint-pair MCTS.
+
+#### Candidate Sources
+
 1. terminal_exact_v1
-   Always include own winning pairs.
-   If no own winning pair exists, include exact block-loss pairs.
-   Protected terminal candidates cannot be evicted.
+   Exact win-in-one and lose-in-one protection. Includes immediate winning
+   pairs, terminal-equivalent winning pairs, and pairs that block all opponent
+   immediate win requirements. These candidates are protected and cannot be
+   evicted.
 
-2. model_anchor_conditional
-   Select promising anchor cells from policy_pair_first and policy_place.
-   For each anchor, score bounded second-cell rows.
-   Add top conditional completions.
+2. direct_pair_retrieval
+   Retrieve high-scoring unordered pairs from the cheap symmetric pair proposal
+   score. This is the primary model-led source.
 
-3. unary_cross
-   Take top policy_place cells and add their unordered cross-product,
-   capped by quota.
+3. anchor_conditioned_completion
+   Select anchor cells from cell_marginal_logits and/or pair proposal summaries.
+   For each anchor, use pair_completion_logits to propose completions. Add both
+   unordered orientations or use logsumexp over both orientations.
 
-4. joint_rerank_pool
-   Score only the bounded pre-candidate pool with policy_pair_joint.
-   Never score the first K legal-order pairs as the main selector.
+4. cell_marginal_cross
+   Add a capped cross-product of top marginal cells. This source is secondary
+   and exists for stability, not as the main policy.
 
 5. structured_diversity
-   Add simple non-tactical coverage:
-     - distance buckets
-     - coordinate-sector diversity
-     - legal-row bucket diversity
-     - top unary cell paired with diverse seconds
+   Add geometry/diversity candidates by legal-row bucket, distance bucket,
+   axis/sector, and window participation. This prevents support collapse.
 
 6. blind_canary
-   Tiny deterministic-seeded sample for diagnostics and support-collapse checks.
+   Add a tiny deterministic diagnostic sample to measure candidate blind spots.
+
+#### Final Selection
+
+All candidate pairs are canonicalized, deduplicated, source-merged, and assigned
+metadata. Protected terminal candidates are kept first. Remaining slots are
+filled by source quotas and pair_joint_logits. No candidate may enter search
+without source metadata, proposal metadata, and pair-row identity.
+
+Legal-order first-N pair enumeration is forbidden as normal runtime candidate
+selection. It is allowed only as a diagnostic baseline.
 ```
 
-Final selection:
-
-```text
-- canonicalize every pair
-- deduplicate by pair key
-- merge all source contributions
-- keep protected terminal pairs
-- fill remaining budget by source quotas plus joint rerank score
-- record why every candidate entered
-```
-
-This is stronger than the current method and still much easier to debug than a rich tactical oracle.
+That section matches the research report more tightly than my earlier version.
 
 ---
 
-## Explicitly reject the current first-N pair method
+## Final answer
 
-Add this under `Rejected Mainlines` or `Candidate Sources`:
+You are right that the plan should be framed as a **new model and search architecture**, not as adding behavior around current heads.
 
-```text
-Rejected: legal-order first-N pair scoring as candidate selection
+But the new model still should have **cell-level and conditional proposal outputs**. The reports explicitly recommend that. The mistake is using old names like `policy_place` and `policy_pair_first`, which make it sound like the plan is preserving the current single-placement model.
 
-A pair selector must not generate candidates by walking legal rows in nested
-loop order and stopping at max_pairs. That method is deterministic and simple,
-but it is biased toward early legal-row anchors and can miss important pairs
-whose cells occur later in the legal table. It is allowed only as a unit-test
-baseline or diagnostic smoke test.
-
-The final pair scorer may score a supplied pair row set. It must not define
-that set by first-N legal-order enumeration in normal runtime.
-```
-
-This matters because the current branch’s pair scoring path does exactly that: it walks legal rows in nested-loop order and stops once `max_pairs` is reached. That is a scoring scaffold, not a good candidate selector. 
-
----
-
-## Update the `Pair Strategy Authority` section
-
-Current plan says `sampled_joint_pair_v1` owns pair row generation, source quotas, model requests, root admission, widening, telemetry, and target metadata. 
-
-I would split that into two named components:
+The best correction is:
 
 ```text
-PairCandidateSelectorV1:
-  owns candidate generation, source quotas, canonicalization, deduplication,
-  protected terminal candidate handling, source metadata, and pre-rerank pools.
+Remove:
+  policy_place
+  policy_pair_first
 
-SampledJointPairStrategyV1:
-  owns how admitted candidates are consumed by search:
-  root Gumbel admission, proposal-aware PUCT, progressive widening,
-  pair expansion, backpropagation, and search target emission.
+Replace with:
+  cell_marginal_logits
+  pair_completion_logits
+  pair_proposal_score
+  pair_joint_logits
 ```
 
-This is cleaner because the current code already has a `PairStrategy`, but it is not the right place to hide all candidate-selection logic. The strategy should consume selected candidates; the selector should build them.
-
----
-
-## Update tactical supervision
-
-The current plan still asks tactical supervision to include things like own hot-window creation, impossible-to-cover positions, bounded hot-window races, overload, and axis-diversity counts. 
-
-For the updated plan, split it into v1 and v2.
-
-### Tactical Supervision V1
+And make this explicit:
 
 ```text
-Required v1 labels:
-  immediate one-placement win cell
-  immediate two-placement winning pair
-  terminal-equivalent winning pair
-  opponent immediate win requirements
-  pair blocks all opponent immediate win requirements
-  impossible-to-block opponent immediate win
+Only pair_joint_logits over admitted unordered pair rows is the main action
+policy for search. Cell marginal and completion heads are proposal and
+auxiliary-learning views.
 ```
 
-### Tactical Supervision V2
-
-```text
-Deferred v2 labels:
-  own hot-window creation
-  overload creation
-  shared pivot
-  multi-axis fork
-  bounded hot-window race
-  non-terminal pressure score
-  axis-diversity count
-```
-
-Then add:
-
-```text
-v2 labels are not required for sampled_joint_pair_v1 completion.
-They may be added only after v1 candidate recall, row identity,
-target correctness, and pair-search runtime are stable.
-```
-
-This prevents the plan from getting stuck on a tactical oracle before the pair candidate system works.
-
----
-
-## Update pair features
-
-The current plan requires pair features like number of self hot windows completed, opponent hot windows covered, overlap cover count, fork/overload count, axis diversity, tactical source flags, and legal-row phase flags. 
-
-I would change the feature list to v1/v2.
-
-### Required v1 pair features
-
-```text
-axial distance
-same-axis indicator
-same-line indicator
-same-window indicator
-terminal_exact_win flag
-terminal_equivalent_win flag
-terminal_exact_block flag
-blocks_all_opponent_win_requirements flag
-impossible_to_block flag at state level
-legal-row phase flags
-source-contribution bitset
-```
-
-### Deferred v2 pair features
-
-```text
-overload count
-shared-pivot count
-fork count
-axis-diversity pressure score
-bounded tactical-race score
-non-terminal hot-window creation score
-```
-
-That keeps the model pair scorer tactically aware without requiring a complex tactical engine.
-
----
-
-## Update replay metadata
-
-Current replay metadata already asks for candidate pairs, candidate sources, proposal weights, legal pair count, Gumbel/admission data, visits, Q values, completed-Q values, forced exploration flags, prune flags, selected pair, and surprise metrics. 
-
-Add these fields:
-
-```text
-terminal_tactical_v1:
-  status
-  winning_single_cells
-  winning_pairs
-  terminal_equivalent_pairs
-  opponent_win_requirements
-  block_loss_pairs
-  impossible_to_block
-
-candidate_selector_version:
-  pair_candidate_selector_v1
-
-candidate_source_contributions:
-  terminal_exact_v1
-  model_anchor_conditional
-  unary_cross
-  joint_rerank_pool
-  structured_diversity
-  blind_canary
-
-candidate_selection_reason:
-  protected_terminal
-  quota_fill
-  joint_rerank_top
-  diversity_fill
-  canary
-```
-
-This makes debugging much easier. You can answer, for every searched pair:
-
-```text
-Did this enter because it was terminal?
-Did it enter because the model liked it?
-Did it enter because conditional proposal liked it?
-Did it enter only through exploration?
-Did search later prove it valuable?
-```
-
----
-
-## Update training target rules
-
-Keep the existing rule:
-
-```text
-unsampled legal pair != negative pair
-```
-
-The current plan already says sparse positive rows do not imply omitted pairs have zero mass, and only admitted weak pairs or explicitly sampled negatives may contribute negative ranking signal. 
-
-Add a terminal-specific rule:
-
-```text
-Terminal exact candidates receive protection in candidate admission,
-but raw terminal protection must not pollute ordinary policy targets.
-
-If own win-in-one exists:
-  the improved target may collapse to terminal-winning candidates.
-  terminal-equivalent pairs must be collapsed or tie-broken deterministically.
-
-If opponent lose-in-one exists and own win-in-one does not:
-  non-blocking pairs may be marked target-pruned or negative only if
-  the terminal proof says they fail to block all opponent immediate wins.
-
-If impossible_to_block is true:
-  do not fabricate a winning defensive target.
-  record tactical status and let value/search handle the losing state.
-```
-
-This is important because terminal exact logic should be allowed to override candidate selection, but not create noisy arbitrary pair preferences.
-
----
-
-## Update implementation phases
-
-The current plan has a Phase 3 called “Candidate Sources And Tactical Oracle Integration,” with success criteria that include policy, conditional, tactical, structured exploration, and blind canary sources. It also expects tactical oracle integration broadly. 
-
-I would rename and narrow it:
-
-```text
-Phase 3: Pair Candidate Selector V1
-```
-
-### New Phase 3 goal
-
-```text
-Implement a source-tagged, pair-native candidate selector that replaces
-legal-order first-N pair scoring in normal runtime.
-```
-
-### New Phase 3 success criteria
-
-```text
-- Full legal rows are preserved.
-- terminal_exact_v1 computes only win-in-one, block-loss-in-one,
-  terminal-equivalent pairs, and impossible-to-block flags.
-- Candidate generator supports:
-    terminal_exact_v1
-    model_anchor_conditional
-    unary_cross
-    joint_rerank_pool
-    structured_diversity
-    blind_canary
-- Protected terminal pairs cannot be evicted.
-- Pair candidates are canonicalized and deduplicated.
-- Every candidate stores all source contributions.
-- policy_pair_joint scores only the bounded candidate pool.
-- Legal-order first-N pair scoring is quarantined as diagnostic only.
-```
-
-### New Phase 3 required evidence
-
-```text
-- Unit tests where a winning pair appears late in legal-row order and is still included.
-- Unit tests where opponent has multiple immediate win requirements and only valid block pairs are protected.
-- Unit tests where no two-cell block exists and impossible_to_block is true.
-- D6 tests for terminal_exact_v1 and candidate selection.
-- Source quota tests showing non-model sources survive early bad policies.
-- Regression test proving normal runtime does not use first-N legal-pair enumeration.
-- Artifact showing candidate source mix and terminal recall on a fixed position suite.
-```
-
-### New Phase 3 stop rules
-
-```text
-- Stop if a terminal win/block pair can be evicted by model ranking.
-- Stop if a candidate can enter without source metadata.
-- Stop if the selector depends on legal-row order except for deterministic tie-breaks.
-- Stop if the selector cannot prove which candidates were terminal, model-led,
-  conditional, diversity, or canary.
-```
-
-Then Phase 4 becomes sampled joint-pair MCTS, Phase 5 model, etc.
-
----
-
-## Update the self-play curriculum
-
-Current plan says bootstrap should use a large tactical quota and tactical label pretraining or mixed supervised bootstrap. 
-
-Change that to:
-
-```text
-Bootstrap phase:
-  - high candidate diversity
-  - large terminal_exact_v1 protection
-  - high structured exploration quota
-  - high model_anchor_conditional quota once the head exists
-  - small blind canary quota
-  - no overload/fork tactical curriculum required
-  - synthetic fixtures only for win-in-one and lose-in-one candidate recall
-```
-
-Growth phase:
-
-```text
-- increase model-led proposal share
-- keep terminal_exact_v1 always active
-- reduce blind canary
-- add optional v2 tactical labels only after v1 selector/search stability
-```
-
-Mature phase:
-
-```text
-- mostly model-led candidate admission
-- terminal_exact_v1 remains non-optional
-- structured novelty remains small but present
-- v2 tactical sources may be ablated before inclusion
-```
-
----
-
-## What I would remove or downgrade from the plan
-
-I would not permanently delete the rich tactical ideas, but I would move them out of v1.
-
-Downgrade from required to deferred:
-
-```text
-overload-creating pairs
-shared-pivot forks
-hot-window races
-own hot-window creation labels
-axis-diversity tactical counts
-bounded tactical subsearch
-large tactical pretraining suite
-```
-
-Keep required:
-
-```text
-immediate one-placement wins
-immediate two-placement wins
-terminal-equivalent winning pairs
-opponent immediate win requirements
-block-loss-in-one pairs
-impossible-to-block flag
-```
-
-That is the better first implementation.
-
----
-
-## Updated plan thesis
-
-I would rewrite the thesis like this:
-
-```text
-The mainline remains sampled joint-pair MCTS. The first implementation does
-not attempt a rich tactical oracle. Instead, it builds the strongest possible
-minimal pair candidate selector.
-
-Tactical logic in v1 is terminal-only: exact win-in-one and exact lose-in-one.
-All other pair discovery must come from model proposals, conditional proposals,
-joint reranking, structured diversity, and search.
-
-This makes the system easier to debug while preserving the no-compromise
-semantic goal: after the opening, search acts on unordered pair macro-actions.
-```
-
-That is the update I would make. The plan becomes **more implementable and more testable** without becoming weaker. In fact, it becomes stronger because it identifies the real first bottleneck: **pair candidate selection quality**, not tactical-oracle sophistication.
+With that change, the plan matches the research reports broadly and becomes clearer: **new global graph/window model, new pair-native candidate selector, new sampled joint-pair MCTS, new candidate-aware training stack.**
