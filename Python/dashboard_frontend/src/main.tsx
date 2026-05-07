@@ -25,6 +25,7 @@ type AnyRow = Record<string, any>;
 const tabs = [
   { id: "suite", label: "Suite", icon: Trophy },
   { id: "charts", label: "Charts", icon: BarChart3 },
+  { id: "examples", label: "Examples", icon: Bot },
   { id: "games", label: "Games", icon: FileSearch },
   { id: "replay", label: "Replay", icon: Eye },
   { id: "play", label: "Play", icon: Gamepad2 },
@@ -62,6 +63,7 @@ function App() {
   const [bestCheckpoints, setBestCheckpoints] = useState<AnyRow[]>([]);
   const [suiteEvents, setSuiteEvents] = useState<AnyRow[]>([]);
   const [suiteGames, setSuiteGames] = useState<AnyRow[]>([]);
+  const [gameExamples, setGameExamples] = useState<AnyRow[]>([]);
   const [error, setError] = useState<string>("");
   const [refreshNonce, setRefreshNonce] = useState(0);
   const loadInFlight = useRef(false);
@@ -72,7 +74,7 @@ function App() {
     loadInFlight.current = true;
     try {
       setError("");
-      const [h, r, a, p, s, t, b, e, sg] = await Promise.all([
+      const [h, r, a, p, s, t, b, e, sg, gx] = await Promise.all([
         api<AnyRow>("/api/health"),
         api<AnyRow[]>("/api/runs"),
         api<AnyRow[]>("/api/arena/history"),
@@ -81,7 +83,8 @@ function App() {
         api<AnyRow[]>("/api/suite/trials"),
         api<AnyRow[]>("/api/suite/best-checkpoints"),
         api<AnyRow[]>("/api/suite/events?limit=64"),
-        api<AnyRow[]>("/api/games?limit=32")
+        api<AnyRow[]>("/api/games?limit=32"),
+        api<AnyRow[]>("/api/suite/game-examples?limit=96")
       ]);
       setHealth(h);
       setRuns(r);
@@ -92,6 +95,7 @@ function App() {
       setBestCheckpoints(b);
       setSuiteEvents(e);
       setSuiteGames(sg);
+      setGameExamples(gx);
       if (!selectedRun && r.length) setSelectedRun(r[0].run_id);
     } catch (e: any) {
       setError(e.message);
@@ -235,6 +239,7 @@ function App() {
         />
       )}
       {active === "charts" && <Charts metrics={metrics} />}
+      {active === "examples" && <ExamplesPanel examples={gameExamples} />}
       {active === "games" && (
         <Games
           games={games}
@@ -635,6 +640,104 @@ function Games({ games, selectedGame, openReplay }: {
         selected={(row) => row.game_id === selectedGame}
       />
     </Panel>
+  );
+}
+
+function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
+  const replayable = examples.filter((row) => row.replay_available);
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [replay, setReplay] = useState<AnyRow | null>(null);
+  const [position, setPosition] = useState<AnyRow | null>(null);
+  const [turn, setTurn] = useState(0);
+  const [autoplay, setAutoplay] = useState(false);
+  const selected = replayable.find((row) => row.example_id === selectedId) || replayable[0];
+  const moves = replay?.moves || [];
+
+  useEffect(() => {
+    if (!selectedId && replayable.length) setSelectedId(String(replayable[0].example_id));
+  }, [selectedId, replayable]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    setAutoplay(false);
+    setTurn(0);
+    api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/replay`)
+      .then((data) => {
+        setReplay(data);
+        return api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/0`);
+      })
+      .then(setPosition)
+      .catch(() => {
+        setReplay(null);
+        setPosition(null);
+      });
+  }, [selectedId]);
+
+  const loadTurn = (next: number) => {
+    if (!selectedId) return;
+    const nextTurn = clamp(Math.round(next), 0, moves.length);
+    setTurn(nextTurn);
+    api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/${nextTurn}`).then(setPosition);
+  };
+
+  useEffect(() => {
+    if (!autoplay || !selectedId) return;
+    const handle = window.setInterval(() => {
+      setTurn((current) => {
+        const next = current + 1;
+        if (next > moves.length) {
+          setAutoplay(false);
+          return current;
+        }
+        api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/${next}`)
+          .then(setPosition)
+          .catch(() => setAutoplay(false));
+        return next;
+      });
+    }, 650);
+    return () => window.clearInterval(handle);
+  }, [autoplay, selectedId, moves.length]);
+
+  return (
+    <section className="examplesGrid">
+      <Panel title="Game Examples" hint="Replayable self-play and fixed-classical examples from the current Phase 3 run.">
+        <div className="exampleSummary">
+          <MetricCard icon={<Bot size={15} />} label="Replayable" value={replayable.length} />
+          <MetricCard icon={<Gamepad2 size={15} />} label="Self-play" value={examples.filter((row) => row.kind === "selfplay").length} />
+          <MetricCard icon={<Swords size={15} />} label="Classical" value={examples.filter((row) => row.kind === "fixed_classical").length} />
+          <MetricCard icon={<Trophy size={15} />} label="Selected" value={selected?.trial_id || "-"} />
+        </div>
+        <Table
+          rows={examples}
+          columns={["kind", "trial_id", "game_id", "source", "epoch", "outcome", "move_count", "terminal_reason", "opponent_id", "replay_available"]}
+          onRow={(row) => row.replay_available && setSelectedId(String(row.example_id))}
+          selected={(row) => row.example_id === selectedId}
+          className="exampleTable"
+        />
+      </Panel>
+      <Panel title="Example Replay" hint="Use the timeline to inspect how the selected model plays through the game.">
+        <div className="toolbar compact">
+          <button onClick={() => setAutoplay((v) => !v)} disabled={!moves.length || !selectedId}>
+            {autoplay ? <Pause size={15} /> : <Play size={15} />}
+            {autoplay ? "Pause" : "Autoplay"}
+          </button>
+          <button onClick={() => loadTurn(Math.max(0, turn - 1))} disabled={!selectedId || turn <= 0}>Prev</button>
+          <button onClick={() => loadTurn(Math.min(moves.length, turn + 1))} disabled={!selectedId || turn >= moves.length}>Next</button>
+          <span className="timelineStatus">Turn {turn}/{moves.length}</span>
+        </div>
+        <Board position={position} viewKey={selectedId} />
+      </Panel>
+      <Panel title="Moves">
+        <div className="moveList">
+          <button className={turn === 0 ? "active" : ""} onClick={() => loadTurn(0)}>Start</button>
+          {moves.map((m: AnyRow, i: number) => (
+            <button key={i} className={turn === i + 1 ? "active" : ""} onClick={() => loadTurn(i + 1)}>
+              {i + 1}. P{m.player} ({m.q},{m.r})
+            </button>
+          ))}
+        </div>
+      </Panel>
+    </section>
   );
 }
 

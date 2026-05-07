@@ -35,6 +35,7 @@ class MatchResult:
     time_ms: float
     opening_is_black: bool  # which colour side A played
     reason: str = ""
+    move_history: List[Tuple[int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -272,6 +273,7 @@ def _play_engine_match(
         time_ms=0.0,
         opening_is_black=a_is_black,
         reason=reason,
+        move_history=list(move_history),
     )
 
 
@@ -334,4 +336,5 @@ def _play_fallback_match(
         time_ms=0.0,
         opening_is_black=a_is_black,
         reason=reason,
+        move_history=list(move_history),
     )

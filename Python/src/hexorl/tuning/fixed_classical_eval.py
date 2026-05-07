@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -336,7 +339,7 @@ def _evidence_row(
 ) -> dict[str, Any]:
     outcome = _outcome_from_result(result)
     penalty = _illegal_or_crash_penalty(result)
-    return {
+    row = {
         "candidate_id": candidate_id,
         "checkpoint_id": checkpoint_path.name,
         "checkpoint_path": str(checkpoint_path),
@@ -354,6 +357,20 @@ def _evidence_row(
         "time_ms": float(result.time_ms),
         "winner": int(result.winner),
     }
+    if result.move_history:
+        row["final_history_b64"] = _move_history_b64(result.move_history)
+        row["move_history"] = [
+            {"player": int(player), "q": int(q), "r": int(r)}
+            for player, q, r in result.move_history
+        ]
+    return row
+
+
+def _move_history_b64(moves: Iterable[tuple[int, int, int]]) -> str:
+    out = bytearray()
+    for player, q, r in moves:
+        out.extend(struct.pack("<iii", int(player), int(q), int(r)))
+    return base64.b64encode(bytes(out)).decode("ascii")
 
 
 def _outcome_from_result(result: MatchResult) -> str:
@@ -446,5 +463,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    line = json.dumps(payload, sort_keys=True) + "\n"
+    for attempt in range(6):
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.25 * (attempt + 1))

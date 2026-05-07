@@ -351,6 +351,45 @@ def create_app(
             return []
         return _jsonl_tail(suite_root / "events.jsonl", limit=max(1, min(limit, 1000)))
 
+    @app.get("/api/suite/game-examples")
+    def suite_game_examples(limit: int = 80) -> list[dict[str, Any]]:
+        if suite_root is None:
+            return []
+        return _suite_game_examples(suite_root, limit=max(1, min(limit, 500)))
+
+    @app.get("/api/suite/game-examples/{example_id}/replay")
+    def suite_game_example_replay(example_id: str) -> dict[str, Any]:
+        if suite_root is None:
+            raise HTTPException(404, "Suite run root is not configured")
+        row = _suite_example_by_id(suite_root, example_id)
+        if not row or not row.get("final_history_b64"):
+            raise HTTPException(404, f"Replay not found: {example_id}")
+        history = _decode_history_value(row["final_history_b64"])
+        public_row = dict(row)
+        public_row.pop("final_history_b64", None)
+        return {
+            "game": public_row,
+            "moves": [
+                {"player": int(player), "q": int(q), "r": int(r)}
+                for player, q, r in get_replay_position(history, turn_index=None).moves
+            ],
+            "positions": [],
+        }
+
+    @app.get("/api/suite/game-examples/{example_id}/position/{turn_index}")
+    def suite_game_example_position(example_id: str, turn_index: int) -> dict[str, Any]:
+        if suite_root is None:
+            raise HTTPException(404, "Suite run root is not configured")
+        row = _suite_example_by_id(suite_root, example_id)
+        if not row or not row.get("final_history_b64"):
+            raise HTTPException(404, f"Position not found: {example_id}")
+        return position_payload(
+            get_replay_position(
+                _decode_history_value(row["final_history_b64"]),
+                turn_index=turn_index,
+            )
+        )
+
     @app.post("/api/session/create")
     def session_create(req: CreateSessionRequest) -> dict[str, Any]:
         session = create_session(store, run_id=req.run_id, payload=req.payload)
@@ -702,6 +741,151 @@ def _suite_games(run_root: Path, *, run_id: str | None = None, limit: int = 200)
             rows.append(row)
     rows.sort(key=lambda row: float(row.get("created_at") or 0.0), reverse=True)
     return rows[:limit]
+
+
+def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    for row in _suite_games(run_root, limit=max(1, min(limit, 200))):
+        examples.append(
+            {
+                "example_id": f"selfplay|{row.get('run_id')}|{row.get('game_id')}",
+                "kind": "selfplay",
+                "trial_id": row.get("trial_id") or row.get("run_id"),
+                "run_id": row.get("run_id"),
+                "game_id": row.get("game_id"),
+                "source": row.get("source", "selfplay"),
+                "epoch": row.get("epoch"),
+                "outcome": row.get("outcome"),
+                "move_count": row.get("move_count"),
+                "terminal_reason": (row.get("payload_json") or {}).get("terminal_reason", ""),
+                "created_at": row.get("created_at"),
+                "replay_available": bool(row.get("final_history_b64")),
+            }
+        )
+
+    run_dir = run_root.parent
+    phase3_trials = run_dir / "phase3_trials"
+    if phase3_trials.exists():
+        for trial_dir in sorted(path for path in phase3_trials.iterdir() if path.is_dir()):
+            for evidence_path in sorted(trial_dir.glob("fixed_classical_epoch_*_games.jsonl")):
+                for row in _jsonl_tail(evidence_path, limit=24):
+                    example_id = f"classical|{trial_dir.name}|{row.get('game_index')}"
+                    examples.append(
+                        {
+                            "example_id": example_id,
+                            "kind": "fixed_classical",
+                            "trial_id": trial_dir.name,
+                            "run_id": trial_dir.name,
+                            "game_id": row.get("game_index"),
+                            "source": "fixed_classical",
+                            "epoch": _epoch_from_fixed_classical_path(evidence_path),
+                            "outcome": row.get("outcome"),
+                            "move_count": row.get("moves"),
+                            "terminal_reason": row.get("reason", ""),
+                            "created_at": _mtime(evidence_path),
+                            "replay_available": bool(row.get("final_history_b64")),
+                            "opponent_id": row.get("opponent_id", ""),
+                            "opening_is_black": row.get("opening_is_black"),
+                            "checkpoint_id": row.get("checkpoint_id", ""),
+                        }
+                    )
+
+    examples.sort(
+        key=lambda row: (
+            bool(row.get("replay_available")),
+            float(row.get("created_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    return examples[:limit]
+
+
+def _suite_example_by_id(run_root: Path, example_id: str) -> dict[str, Any] | None:
+    parts = example_id.split("|")
+    if len(parts) < 3:
+        return None
+    kind = parts[0]
+    if kind == "selfplay":
+        run_id = parts[1]
+        try:
+            game_id = int(parts[2])
+        except ValueError:
+            return None
+        trial_store = _suite_store_for_run(run_root, run_id)
+        if trial_store is None:
+            return None
+        rows = trial_store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        history = row.get("final_history_b64", "")
+        row = _game_summary(row)
+        row["example_id"] = example_id
+        row["kind"] = "selfplay"
+        row["replay_available"] = True
+        row["final_history_b64"] = history
+        return row
+    if kind != "classical":
+        return None
+    trial_id = parts[1]
+    try:
+        target_index = int(parts[2])
+    except ValueError:
+        return None
+    trial_dir = run_root.parent / "phase3_trials" / trial_id
+    for evidence_path in sorted(trial_dir.glob("fixed_classical_epoch_*_games.jsonl")):
+        for row in _read_jsonl_lenient(evidence_path):
+            if int(row.get("game_index", -1)) != target_index:
+                continue
+            row = dict(row)
+            row.update(
+                {
+                    "example_id": example_id,
+                    "kind": "fixed_classical",
+                    "trial_id": trial_id,
+                    "run_id": trial_id,
+                    "game_id": target_index,
+                    "source": "fixed_classical",
+                    "epoch": _epoch_from_fixed_classical_path(evidence_path),
+                    "move_count": row.get("moves"),
+                    "terminal_reason": row.get("reason", ""),
+                    "created_at": _mtime(evidence_path),
+                    "replay_available": bool(row.get("final_history_b64")),
+                }
+            )
+            return row
+    return None
+
+
+def _read_jsonl_lenient(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def _decode_history_value(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    return decode_bytes(str(value or ""))
+
+
+def _epoch_from_fixed_classical_path(path: Path) -> int | None:
+    match = re.search(r"epoch_(\d+)_games", path.name)
+    return int(match.group(1)) if match else None
 
 
 def _suite_checkpoints(run_root: Path, *, run_id: str | None = None) -> list[dict[str, Any]]:
