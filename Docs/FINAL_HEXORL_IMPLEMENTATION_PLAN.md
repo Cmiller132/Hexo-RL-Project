@@ -23,7 +23,8 @@ Implementation staging is explicit:
 V1 mainline:
   sampled joint-pair MCTS
   terminal-only tactical source
-  pair_candidate_selector_v1 first
+  pair_candidate_selector_v1 plus pair_scorer_v1 first
+  blockwise-exact direct_pair_retrieval before approximate retrieval
   no overload, fork, shared-pivot, or bounded hot-window race oracle
 
 V2 expansion:
@@ -33,7 +34,8 @@ V2 expansion:
 
 The first implementation priority is not a rich tactical oracle. The first
 implementation priority is a debuggable, source-tagged, pair-native candidate
-selector. V1 tactical logic exists only to protect exact terminal facts:
+selector and bounded pair scorer. V1 tactical logic exists only to protect
+exact terminal facts:
 
 ```text
 win this turn
@@ -179,10 +181,11 @@ Rust exact simulator
   -> minimal terminal tactical facts: win-in-1 / lose-in-1
   -> graph/set encoder over STATE, TURN, STONE, LEGAL, WINDOW6
   -> legal-cell embeddings h_i
-  -> cell_marginal_proposal head
-  -> anchor_conditioned_completion head
-  -> cheap symmetric pair-retrieval score
+  -> cell_marginal_logits proposal/auxiliary head
+  -> pair_completion_logits proposal/auxiliary head
+  -> cheap symmetric blockwise-exact pair-retrieval score
   -> pair_candidate_selector_v1
+  -> pair_scorer_v1 over the bounded pre-candidate pool
   -> rich symmetric biaffine joint-pair scorer
   -> source-tagged sampled pair candidate set
   -> gumbel_sequential_halving_v1 root admission
@@ -468,10 +471,11 @@ source metadata cannot enter search.
 
 ### Pair Strategy Authority
 
-Create or promote two explicit runtime components:
+Create or promote three explicit runtime components:
 
 ```text
 pair_candidate_selector_v1
+pair_scorer_v1
 sampled_joint_pair_v1
 ```
 
@@ -496,6 +500,20 @@ leaf_pair_prior_blend_v0
 - pre-rerank pools,
 - and candidate selector telemetry.
 
+`PairScorerV1` owns:
+
+- cheap pair retrieval scores over supplied legal-cell embeddings,
+- blockwise exact top-k retrieval for `direct_pair_retrieval`,
+- rich pair reranking over bounded candidate rows,
+- pair proposal score calibration,
+- score batching and chunking behavior,
+- and scoring telemetry.
+
+`PairScorerV1` does not own candidate-source semantics, source quotas, search
+admission, or final move choice. It scores legal cells or supplied pair rows;
+it must not define the normal runtime candidate universe by legal-row order or
+by exhaustive all-pair scoring.
+
 `SampledJointPairStrategyV1` consumes selected candidates and owns:
 
 - model output requests,
@@ -512,27 +530,41 @@ leaf_pair_prior_blend_v0
 The model architecture may declare pair-capable outputs. It may not decide that
 MCTS consumes them. The pair strategy decides that.
 
+The final root decision object is always a canonical unordered `PairAction`.
+Cell marginals, pair completions, retrieval scores, and pair-to-single
+projections may be logged, displayed, audited, or trained as auxiliary views.
+They may not independently choose the two placements after pair search. If the
+engine API must execute `place(a)` and then `place(b)`, that is only an
+execution detail; the selected pair `{a, b}` must already be fixed before the
+first placement is sent.
+
 ### Search Algorithm
 
 At each full-turn node:
 
 1. Query Rust for legal cells and tactical state.
 2. Build or retrieve legal-row identity.
-3. Use `pair_candidate_selector_v1` to generate candidate pair proposals from
+3. Encode the graph once and produce legal-cell embeddings plus proposal
+   outputs.
+4. Use `pair_candidate_selector_v1` to build a broad pre-candidate pool from
    source quotas.
-4. Canonicalize pairs and deduplicate by canonical pair key.
-5. Store all source contributions, combined `beta`, forced flags, tactical
+5. Canonicalize pairs and deduplicate by canonical pair key.
+6. Store all source contributions, combined `beta`, forced flags, tactical
    flags, terminal-equivalence flags, and target-prune flags.
-6. At the root, use `gumbel_sequential_halving_v1`.
-7. At non-root nodes, use proposal-aware PUCT over admitted children.
-8. Widen a node according to:
+7. Use `pair_scorer_v1` to score only the bounded pre-candidate pool with
+   `pair_joint_logits`.
+8. Select the final admitted set by protected terminal inclusion, source
+   quotas, recall-oriented diversity, and rich rerank score.
+9. At the root, use `gumbel_sequential_halving_v1`.
+10. At non-root nodes, use proposal-aware PUCT over admitted children.
+11. Widen a node according to:
 
 ```text
 allowed_children = min(total_legal_pairs, ceil(c_pw * visits ** alpha_pw))
 ```
 
-9. Expand a pair by applying both stones atomically through the exact engine.
-10. Back up value on the pair edge.
+12. Expand a pair by applying both stones atomically through the exact engine.
+13. Back up value on the pair edge.
 
 `gumbel_sequential_halving_v1` has a mandatory algorithm contract:
 
@@ -596,8 +628,6 @@ Required sources:
   and exact impossible-to-block flag.
 - `direct_pair_retrieval`: candidate pairs retrieved from a cheap symmetric
   low-rank pair proposal score over legal-cell embeddings.
-- `policy_pair_rerank`: pairs reranked by the current joint-pair scorer after
-  non-exhaustive pre-candidate retrieval.
 - `anchor_conditioned_completion`: anchor-cell samples plus conditional
   second-cell
   completions.
@@ -606,6 +636,12 @@ Required sources:
 - `structured_explore`: uniform anchors, distance buckets, active windows,
   cover sets, axis diversity, and novelty sampling.
 - `blind_canary`: very small capped diagnostic sampling from legal pairs.
+
+Required scoring stage:
+
+- `rich_pair_rerank`: the bounded pre-candidate pool is scored by the current
+  rich joint-pair scorer. This stage improves ranking and admission; it is not
+  a standalone candidate source and must not decide the final move.
 
 V1 tactical logic deliberately does not generate overload pairs, shared-pivot
 forks, multi-axis pressure pairs, bounded hot-window races, or non-terminal
@@ -633,8 +669,8 @@ The source quotas should anneal by training phase. `terminal_exact_v1` is
 non-optional; protected terminal candidates cannot be evicted. The blind canary
 quota can shrink to near-zero but should remain available in diagnostic runs.
 
-`policy_pair_rerank` must not mean "score every unordered legal pair and take
-top-k" during normal runtime. It works in two steps:
+`rich_pair_rerank` must not mean "score every unordered legal pair and take
+top-k" during normal runtime. It works only after recall-oriented retrieval:
 
 ```text
 1. Retrieve a bounded pre-candidate pool from direct pair retrieval,
@@ -647,6 +683,12 @@ top-k" during normal runtime. It works in two steps:
 Dense all-pair scoring is allowed only for tiny diagnostic states, offline
 audit oracle runs, or explicitly capped tactical fixtures. It is not the normal
 self-play or evaluation path.
+
+The candidate selector is optimized for recall before final score. Its job is
+to keep strong tactical, audit-search, and model-synergy pairs inside the
+candidate set often enough that search can improve them. It is a failure if a
+selector has high top-1 proposal quality but frequently excludes the best pair
+found by exhaustive tiny-state search or large-budget audit search.
 
 ### Pair Candidate Selection
 
@@ -685,7 +727,7 @@ Candidate sources:
    exact block-loss pairs. Protected terminal candidates cannot be evicted.
 2. `direct_pair_retrieval`
    Retrieve high-scoring unordered pairs from the cheap symmetric pair proposal
-   score. This is the primary model-led source.
+   score. This is the primary model-led recall source, not the final policy.
 3. `anchor_conditioned_completion`
    Select anchor cells from `cell_marginal_logits` or pair proposal summaries.
    For each anchor, use `pair_completion_logits` to propose completions. Add
@@ -707,9 +749,14 @@ canonicalize every pair
 deduplicate by pair key
 merge all source contributions
 keep protected terminal pairs
-fill remaining budget by source quotas plus joint rerank score
+fill remaining budget by source quotas plus rich rerank score
 record why every candidate entered
 ```
+
+`rich_pair_rerank` is applied after the source pool exists. It may change which
+non-protected candidates fill the remaining budget, but it cannot create a
+normal runtime pool by itself, cannot evict protected terminal pairs, and cannot
+replace source metadata or proposal probabilities.
 
 #### Direct Pair Retrieval
 
@@ -743,10 +790,28 @@ bounded candidate set. The richer `pair_joint_logits` scorer and MCTS still
 decide among admitted pair candidates.
 
 Direct pair retrieval does not materialize pair tokens in the graph encoder and
-does not make MCTS exhaustive over all pairs. It may use batched matrix
-operations, approximate top-k retrieval, row buckets, or chunked scoring to
-retrieve a bounded set. Normal runtime must still respect candidate budgets and
-record source/proposal metadata.
+does not make MCTS exhaustive over all pairs. V1 retrieval must start as
+blockwise exact top-k scoring over legal-cell embedding products:
+
+```text
+for legal-cell blocks B_i, B_j:
+  compute s_prop(B_i, B_j)
+  mask diagonal pairs i = j
+  canonicalize unordered pairs
+  maintain deterministic top-k plus diversity buckets
+```
+
+This is exact with respect to the cheap retrieval score, not exact with respect
+to game value. It is chosen first because it is easier to test, easier to
+D6-validate, easier to reproduce across batching modes, and less likely to hide
+silent retrieval bugs than approximate nearest-neighbor infrastructure.
+
+Approximate MIPS or ANN retrieval is a later performance optimization only. It
+may enter the mainline after the blockwise-exact retriever has recall,
+chunking, legal-row-order, D6, diagonal-mask, and deduplication proof, and only
+if profiling shows exact blockwise retrieval cannot meet the self-play budget.
+Normal runtime must still respect candidate budgets and record source/proposal
+metadata.
 
 ## Model Design
 
@@ -838,10 +903,18 @@ names must not appear as permanent runtime semantic authority.
 The final pair scorer should have the shape:
 
 ```text
-score(i, j) =
-  symmetric_biaffine(h_i, h_j)
+pair_joint_logit(i, j) =
+  cell_marginal_logit(i)
+  + cell_marginal_logit(j)
+  + symmetric_biaffine(h_i, h_j)
   + symmetric_mlp(state, h_i + h_j, abs(h_i - h_j), h_i * h_j, pair_features)
 ```
+
+The `m_i + m_j + R_ij` decomposition is intentional. The dense marginal terms
+teach the model which cells matter individually, while the biaffine and pair
+feature terms learn synergy between cells. This protects the representation
+from sparse pair-only target starvation without letting cell marginals define
+the searched move.
 
 The biaffine term must be mathematically order-invariant. Use one of:
 
@@ -1199,8 +1272,11 @@ Success criteria:
   terminal-equivalent pairs, and impossible-to-block flags.
 - Candidate generator supports `terminal_exact_v1`,
   `direct_pair_retrieval`, `anchor_conditioned_completion`,
-  `cell_marginal_cross`, `joint_rerank_pool`,
-  `structured_diversity`, and `blind_canary`.
+  `cell_marginal_cross`, `structured_diversity`, and `blind_canary`.
+- `rich_pair_rerank` scores only the bounded pre-candidate pool after source
+  generation, canonicalization, and deduplication.
+- `direct_pair_retrieval` uses blockwise exact top-k retrieval before any
+  approximate retrieval optimization.
 - Protected terminal pairs cannot be evicted.
 - Pair candidates are canonicalized and deduplicated.
 - Every candidate stores all source contributions, combined `beta` or inclusion
@@ -1225,6 +1301,18 @@ Required evidence:
 - Source quota tests showing non-model sources survive early bad policies.
 - Tests proving `direct_pair_retrieval` can admit a high-scoring pair whose
   cells are not top-ranked by `cell_marginal_logits`.
+- Retrieval-specific tests proving diagonal pairs `i = i` are impossible,
+  `(a, b)` and `(b, a)` do not both survive deduplication, late-legal-row
+  winning pairs are retrieved or terminal-protected, retrieval output is
+  independent of legal-row order except deterministic tie-breaks, and top
+  retrieved pairs are stable under batching and chunking.
+- D6 retrieval tests proving transformed boards preserve the retrieved pair set
+  up to canonical transform.
+- Recall artifacts for direct retrieval and the final candidate pool against
+  exhaustive tiny-state search and large-budget audit search.
+- Source ablation artifact measuring terminal protection, direct retrieval,
+  anchor completion, cell-marginal cross, structured diversity, blind canary,
+  and rich rerank contribution.
 - Regression test proving normal runtime does not use first-N legal-pair
   enumeration.
 - Tactical benchmark fixtures for wins and blocks.
@@ -1241,6 +1329,10 @@ Stop rules:
   tie-breaks.
 - Stop if the selector cannot prove which candidates were terminal, model-led,
   conditional, diversity, or canary.
+- Stop if approximate retrieval is used before the blockwise-exact retriever
+  has recall, D6, diagonal-mask, deduplication, row-order, and chunking proof.
+- Stop if retrieval top-k quality is used as a substitute for candidate recall
+  against audit search.
 
 ### Phase 4: Sampled Joint-Pair MCTS
 
@@ -1251,6 +1343,8 @@ Make sampled pair macro-actions the main search runtime.
 Success criteria:
 
 - Pair child expansion applies both placements atomically.
+- Root selection returns one canonical unordered `PairAction`; cell marginals
+  and pair-to-single projections cannot choose the final placements.
 - Root admission uses `gumbel_sequential_halving_v1` with completed-Q target
   construction.
 - Interior nodes use proposal-aware PUCT plus progressive widening.
@@ -1274,6 +1368,8 @@ Required evidence:
 Stop rules:
 
 - Stop if pair search only works by keeping a parallel sequential runtime path.
+- Stop if the implementation must project pair logits back to independent
+  single-cell logits to choose the final move.
 
 ### Phase 5: Biaffine Pair Model
 
@@ -1287,6 +1383,9 @@ Success criteria:
 - Does not materialize PAIR_ACTION tokens in the main path.
 - Scores pair rows through a symmetric biaffine or low-rank bilinear term plus
   symmetric MLP features.
+- Combines dense cell marginal terms with the pair relation term as
+  `cell_marginal_i + cell_marginal_j + R_ij`, while keeping cell marginals
+  auxiliary to final pair search.
 - Enforces order-invariant biaffine math by symmetrized scoring or symmetric
   parameterization.
 - Keeps known-first second head conditional and phase-gated.
@@ -1436,6 +1535,14 @@ diagnostic_threat_filter_usage
 candidate_recall_best_search_pair
 candidate_recall_exact_win_pair
 candidate_recall_exact_block_pair
+direct_retrieval_recall_at_k_vs_exhaustive_small_state
+direct_retrieval_recall_at_k_vs_large_budget_search
+candidate_pool_recall_by_source
+terminal_protection_recall
+pair_rerank_gain_after_retrieval
+source_ablation_winrate
+retrieval_d6_consistency
+retrieval_chunking_stability
 normalized_pair_target_entropy
 visit_count_gini
 search_surprise_kl
@@ -1478,12 +1585,20 @@ The mainline is accepted only when all of these are true:
   in the deep-search audit suite.
 - Exact immediate winning pairs have at least 99.5% candidate recall.
 - Mandatory block pairs have at least 99.0% candidate recall.
+- Direct pair retrieval improves final candidate-pool recall over unary and
+  conditional-only sources in the fixed audit suite, with source-specific recall
+  reported.
+- Blockwise-exact retrieval passes D6, diagonal-mask, deduplication,
+  legal-row-order, and chunking-stability tests before approximate retrieval is
+  allowed in normal runtime.
 - Pair target entropy does not collapse prematurely.
 - Search surprise decreases over training without eliminating tactical or
   structured source diversity.
 - D6 transforms preserve legal-row identity, pair-row identity, policy
   consistency, and value consistency within documented numeric tolerances.
 - Runtime pair behavior is controlled only by explicit pair strategy.
+- Root move selection returns a canonical unordered `PairAction`; pair-to-single
+  projection is not used for final move choice.
 - The model does not materialize all pair actions as attention tokens.
 - Unsampled legal pairs are never trained as negatives.
 - Performance evidence includes fixed-wall-clock strength, not only
@@ -1505,9 +1620,13 @@ The final path should be reconsidered if:
 - `pair_candidate_selector_v1` cannot protect exact terminal win/block pairs.
 - `direct_pair_retrieval` cannot improve pair candidate recall over unary and
   conditional sources after fair tuning.
+- Direct retrieval only improves its own top-k score ranking but not final
+  candidate recall against exhaustive tiny-state or large-budget audit search.
 - Tactical performance depends entirely on the tactical proposer and the model
   does not internalize window/cover structure.
 - D6 consistency fails under pair-row transforms.
+- Pair-to-single projection or independent marginal selection is required for
+  final move choice.
 - Queue backpressure or pair scoring latency prevents useful self-play
   throughput.
 - Policy entropy collapses while value calibration is still poor.
@@ -1522,9 +1641,9 @@ should create a thin but real vertical slice:
 1. Full-legal-row and threat-filter cutover for main neural self-play/training.
 2. Canonical pair contracts and D6 tests.
 3. `pair_candidate_selector_v1` with `terminal_exact_v1`,
-   `direct_pair_retrieval`, `anchor_conditioned_completion`,
-   `cell_marginal_cross`, `joint_rerank_pool`, `structured_diversity`, and
-   `blind_canary`.
+   blockwise-exact `direct_pair_retrieval`, `anchor_conditioned_completion`,
+   `cell_marginal_cross`, `structured_diversity`, and `blind_canary`, followed
+   by bounded `rich_pair_rerank`.
 4. Candidate proposal contract with multi-source deduplication, combined beta,
    prune flags, and terminal protection.
 5. `gumbel_sequential_halving_v1` root admission over sampled pair rows.
