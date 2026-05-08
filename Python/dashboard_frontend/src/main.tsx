@@ -189,8 +189,8 @@ function App() {
         setGames(nextGames);
         setCheckpoints(nextCheckpoints);
         setSelectedGame((current) => {
-          if (current && nextGames.some((game) => game.game_id === current)) return current;
-          return nextGames[0]?.game_id ?? null;
+          if (current && nextGames.some((game) => game.game_id === current && game.replay_available !== false)) return current;
+          return nextGames.find((game) => game.replay_available !== false)?.game_id ?? nextGames[0]?.game_id ?? null;
         });
       })
       .catch((e) => setError(e.message))
@@ -220,7 +220,10 @@ function App() {
         if (data && replayLoadSeq.current === requestId) setPosition(data);
       })
       .catch((e) => {
-        if (replayLoadSeq.current === requestId) setError(e.message);
+        if (replayLoadSeq.current !== requestId) return;
+        setError(e.message);
+        setReplay(null);
+        setPosition(null);
       });
   }, [selectedGame, selectedRun]);
 
@@ -942,8 +945,8 @@ function Games({ games, selectedGame, openReplay }: {
     <Panel title="Game Browser">
       <Table
         rows={games}
-        columns={["game_id", "trial_id", "source", "epoch", "move_count", "terminal_reason", "truncated", "outcome", "created_at"]}
-        onRow={(row) => openReplay(row.game_id)}
+        columns={["game_id", "trial_id", "source", "epoch", "move_count", "terminal_reason", "truncated", "outcome", "replay_available", "replay_error", "created_at"]}
+        onRow={(row) => row.replay_available !== false && openReplay(row.game_id)}
         selected={(row) => row.game_id === selectedGame}
       />
     </Panel>
@@ -1064,6 +1067,7 @@ function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
       .catch((e) => {
         if (positionSeq.current !== requestId) return;
         setPositionError(e.message || "Failed to load example position");
+        setPosition(null);
         setAutoplay(false);
       })
       .finally(() => {
@@ -1139,7 +1143,7 @@ function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
         </div>
         <Table
           rows={filteredExamples}
-          columns={["kind", "model_label", "opponent_label", "trial_id", "game_id", "epoch", "outcome", "move_count", "terminal_reason", "replay_available"]}
+          columns={["kind", "model_label", "opponent_label", "trial_id", "game_id", "epoch", "outcome", "move_count", "terminal_reason", "replay_available", "replay_error"]}
           onRow={(row) => row.replay_available && setSelectedId(String(row.example_id))}
           selected={(row) => row.example_id === selectedId}
           className="exampleTable"
@@ -1216,6 +1220,7 @@ function Replay({ replay, position, setPosition, selectedGame, runId }: {
       .catch((e) => {
         if (positionSeq.current !== requestId) return;
         setPositionError(e.message || "Failed to load replay position");
+        setPosition(null);
         setAutoplay(false);
       })
       .finally(() => {

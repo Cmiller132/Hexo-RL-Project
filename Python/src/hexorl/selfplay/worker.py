@@ -1696,7 +1696,7 @@ class SelfPlayWorker:
 
     def _v1_apply_to_tracking_game(
         self,
-        _game,
+        game,
         applied: Mapping[str, Any],
         *,
         player: int,
@@ -1706,6 +1706,7 @@ class SelfPlayWorker:
         if first is None:
             raise ValueError("V1 applied action is missing first placement")
         q, r = int(first[0]), int(first[1])
+        game.place(q, r)
         _append_move_history_row(move_history, player=player, q=q, r=r)
         applied_count = 1
         if int(applied.get("placements_applied", 1)) >= 2:
@@ -1713,6 +1714,7 @@ class SelfPlayWorker:
             if second is None:
                 raise ValueError("V1 pair applied action is missing second placement")
             q2, r2 = int(second[0]), int(second[1])
+            game.place(q2, r2)
             _append_move_history_row(move_history, player=player, q=q2, r=r2)
             applied_count = 2
         return applied_count

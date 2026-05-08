@@ -10,7 +10,7 @@ from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint
-from hexorl.dashboard.app import _suite_games, _suite_runs, _suite_store_for_run
+from hexorl.dashboard.app import _suite_game_examples, _suite_games, _suite_runs, _suite_store_for_run
 from hexorl.dashboard.db import DashboardStore
 from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical_fixtures
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
@@ -129,6 +129,51 @@ def test_suite_games_include_direct_phase3_trial_dashboards(tmp_path):
         "global_graph768_champion__none__v1__phase3_t0000",
         "global_xattn_0__none__v1",
     }
+
+
+def test_suite_game_examples_disable_invalid_duplicate_replay_histories(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "global_pair_biaffine_0__sampled_joint_pair_v1__v1"
+    trial_dir.mkdir(parents=True)
+    store = DashboardStore(trial_dir / "dashboard.sqlite3")
+    run_id = "production_v1_pair"
+    valid_history = _move(0, 0, 0) + _move(1, 1, 0)
+    valid_game_id = store.insert_game(
+        run_id=run_id,
+        game_id="good-history",
+        source="selfplay",
+        final_move_history=valid_history,
+        payload={"terminal_reason": "terminal"},
+    )
+    duplicate_history = _move(0, 0, 0) + _move(0, 0, 0)
+    invalid_game_id = 0
+    for index in range(20):
+        invalid_game_id = store.insert_game(
+            run_id=run_id,
+            game_id=f"bad-v1-history-{index}",
+            source="selfplay",
+            final_move_history=duplicate_history,
+            payload={"terminal_reason": "max_game_moves"},
+        )
+
+    examples = _suite_game_examples(run_root, limit=10)
+    assert examples[0]["game_id"] == valid_game_id
+    assert examples[0]["replay_available"] is True
+    invalid_examples = [row for row in examples if row["game_id"] == invalid_game_id]
+    assert invalid_examples
+    assert invalid_examples[0]["replay_available"] is False
+    assert "duplicate placement" in invalid_examples[0]["replay_error"]
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+    replay = client.get(f"/api/games/{invalid_game_id}/replay?run_id={run_id}")
+    assert replay.status_code == 422
+    assert "duplicate placement" in replay.json()["detail"]
 
 
 def test_run_recorder_dashboard_write_failure_does_not_crash_training(tmp_path):
