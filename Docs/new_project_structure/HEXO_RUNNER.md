@@ -130,6 +130,12 @@ Model packages should provide player adapters, inference clients, policy wrapper
 
 Training packages should consume runner output rather than being embedded in the runner. The runner can produce self-play games, events, replay records, and model-supplied decision diagnostics, but model packages should decide how those records become training samples. Shared replay loaders, samplers, queues, and batch schedulers belong in `hexo-utils`; loss computation, target construction, optimization, curriculum logic, and checkpoint management belong to the model package.
 
+The runner applies the shared resource profile during execution. It owns
+coarse-grained process counts for self-play and evaluation, starts central
+inference services, configures bounded queues for records and diagnostics, and
+reports queue/backpressure telemetry. It should not create a custom CPU
+scheduler or let player/model packages bypass configured resource limits.
+
 The runner should therefore distinguish between:
 
 - game/replay facts it owns, such as action history, players, seeds, timings,

@@ -49,6 +49,21 @@ The intended data flow is:
 
 This keeps training infrastructure reusable without forcing Dense CNN, ResNet, Global Graph, V1, or future models to share tensor layouts, targets, replay filtering rules, or search metadata semantics.
 
+### Resource Profiles And Queue Limits
+
+`hexo-utils` should provide shared resource-profile contracts rather than a
+general CPU job scheduler. These contracts should describe host capabilities,
+Torch thread settings, Rust thread settings, DataLoader worker counts, inference
+batch limits, prefetch depth, queue limits, and memory guardrails.
+
+Consumers should use standard execution tools that fit their workload:
+Rust/Rayon for branchy game and search work, PyTorch DataLoader workers for
+training replay pipelines, multiprocessing for self-play workers, and small
+thread/process pools for background artifacts.
+
+The utility layer centralizes limits, defaults, and telemetry names. It should
+not own the work itself or route every CPU task through one generic queue.
+
 ### Replay Serialization Utilities
 
 Shared replay utilities can cover stable serialization and deserialization support for replay records, compact payloads, round-trip validation, schema tags, compatibility checks, and inspection helpers.

@@ -29,6 +29,12 @@ The engine boundary should not provide:
 - Dashboard, plotting, or experiment-inspection UI.
 - Experiment orchestration, sweep management, scheduling, or run lifecycle ownership.
 
+The engine may use Rust-side parallelism for rules-owned batch operations such
+as state mutation, legal row generation, tactical analysis, fixture generation,
+and search-support utilities. It should expose compact batch APIs where useful,
+while leaving model tensor construction and training batch preparation outside
+the engine boundary.
+
 ## Rust Rules Engine
 
 Rust should remain the canonical implementation of Hexo rules. The Rust side is responsible for enforcing legal placement, player-to-move behavior, placements remaining, undo/replay semantics, terminal detection, and invariant checks around malformed or stale inputs.

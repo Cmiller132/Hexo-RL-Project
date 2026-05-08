@@ -60,6 +60,24 @@ shared `hexo-utils` mechanics for replay indexing, sampling, CPU transforms,
 pinned-memory staging, GPU batch scheduling, and backpressure. This avoids each
 model reimplementing the same high-throughput data path.
 
+## CPU Multithreading Model
+
+Use centralized resource policy and decentralized execution. `hexo-utils`
+provides host/resource profiles, queue limits, memory guardrails, and telemetry
+helpers; individual subsystems use the standard executor that fits their
+workload.
+
+Expected lanes:
+
+- Rust game/search lane for mutation, legal rows, tactical scans, and MCTS.
+- Runner process lane for self-play and evaluation workers.
+- Training replay lane using PyTorch DataLoader workers and model adapters.
+- Background lane for compression, dashboards, reports, and artifacts.
+
+The design should avoid one universal CPU scheduler. The shared profile exists
+to prevent oversubscription and memory blowups while preserving simple,
+standard execution tools.
+
 ## Memory Strategy
 
 With 32 GB RAM and a 4070 Ti, avoid storing fully materialized tensors unless

@@ -161,6 +161,23 @@ schema validation, and telemetry. Model packages should plug into those
 mechanics through adapters that define how records become examples, how
 examples become batches, and how batches produce losses or inference results.
 
+## Resource And CPU Boundary
+
+CPU parallelism should use centralized resource policy and decentralized
+execution.
+
+`hexo-utils` defines host profiles, thread-budget settings, queue limits, memory
+guardrails, and telemetry helpers. `hexo-runner` applies those settings to
+self-play, evaluation, inference services, and replay pipelines. `hexo-engine`
+uses Rust-side parallelism for rules-owned game, search, and mutation-heavy
+work. `hexo-model-*` packages use the shared profile for DataLoader workers,
+adapter batch prep, and model-specific search.
+
+The goal is not a universal CPU scheduler. The goal is to keep worker counts,
+queue sizes, prefetch depth, Torch thread settings, Rust thread settings, and
+GPU batching visible in one resource profile so split packages do not silently
+oversubscribe the machine.
+
 ## Feasibility
 
 This transition is feasible, but it should be staged. The main difficulty is

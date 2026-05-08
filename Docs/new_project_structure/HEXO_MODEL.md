@@ -107,6 +107,13 @@ batched inference outputs. `hexo-utils` supplies the replay store, sampler,
 worker pools, queueing, pinned-memory staging, GPU batch scheduling, and
 telemetry around those methods.
 
+Model packages should respect the shared resource profile when creating replay
+loaders, batch-prep workers, inference adapters, or model-specific search
+workers. A model may define its preferred worker needs, but it should not create
+unbounded private pools. CPU-heavy preprocessing should use DataLoader workers
+or shared Rust/Python utilities where compatible, then hand compact batches to
+GPU execution.
+
 Training data may be constructed eagerly during self-play when a model needs
 metadata captured at decision time, or lazily during sampling when raw game
 events are enough. The package should make that choice explicit:

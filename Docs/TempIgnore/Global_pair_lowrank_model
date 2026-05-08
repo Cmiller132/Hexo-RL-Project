@@ -1,0 +1,2176 @@
+# Dense Low-Rank Pair Policy + Pair-MCTS Architecture Spec
+
+## 0. Purpose
+
+This spec defines a new model/search path:
+
+```text
+model_family = global_pair_lowrank_0
+search_mode  = sampled_joint_pair_lowrank_v1
+```
+
+It preserves the V1 pair-action search contract, but replaces the expensive “proposal pass + admitted-pair graph scoring pass” with a **dense low-rank pair policy surface**:
+
+[
+L(i,j)
+======
+
+M_i + M_j
++
+\operatorname{PairDot}(i,j)
++
+\operatorname{PairFeatureBias}(i,j)
+]
+
+where (i,j) are start-of-turn legal cells.
+
+The model does **not** materialize all pair tokens as graph inputs. Instead, it emits per-legal-cell embeddings and scalar marginal logits. Pair scores are computed on demand, or blockwise, from those per-cell outputs.
+
+The key design principle:
+
+> The low-rank matrix gives a dense **pair-prior parameterization**. It does not magically give a dense **MCTS training target**. Search targets remain candidate-conditional unless the legal pair set is exhaustively searched.
+
+The existing V1 architecture already requires unordered pair actions, full Rust legal rows, candidate metadata, tactical support as proposals/labels rather than hard solvers, and candidate-aware replay targets. This spec keeps those contracts intact. 
+
+---
+
+# 1. Non-negotiable runtime contracts
+
+## 1.1 Pair action semantics
+
+The runtime action after the opening is:
+
+```text
+PairAction = unordered canonical pair of two distinct start-of-turn legal cells
+```
+
+For a normal two-placement turn:
+
+```text
+PairAction {i, j}
+```
+
+must satisfy:
+
+```text
+i != j
+i is in the full Rust start-of-turn legal row table
+j is in the full Rust start-of-turn legal row table
+{i, j} has exactly one canonical pair key
+```
+
+The pair key must be independent of order:
+
+```text
+pair_key(i, j) == pair_key(j, i)
+```
+
+The first placement inside the turn must not expand, shrink, reorder, or otherwise change the legal table from which the second placement is drawn. This is required for unordered pair-action MCTS to match the game abstraction.
+
+Hexo’s actual game rule is that after the opening, every turn consists of two placements by the same player; the game is played on an infinite hex grid with a placement radius, and the win condition is six in a row. The two-placement rule is what makes both 5-windows and 4-windows immediate win-in-one-turn threats. 
+
+## 1.2 Rust authority
+
+Rust owns:
+
+```text
+legal row construction
+legal row hash / schema identity
+tactical payload construction
+game state transition
+pair application
+terminal detection
+MCTS tree traversal
+PUCT / Gumbel / widening
+backup
+final action selection
+```
+
+Python owns:
+
+```text
+graph construction from Rust-provided state data
+model inference
+low-rank pair score computation
+candidate reservoir construction
+source metadata construction
+training target construction
+```
+
+Python never chooses the final move directly. It only supplies candidate rows, logits, value estimates, and metadata. This follows the current V1 implementation boundary where Rust owns legal-row identity, tree traversal, PUCT, progressive widening, backup, and final action choice, while Python supplies inference and candidate reservoirs. 
+
+## 1.3 Tactical support is not a solver
+
+Exact tactical facts are required candidate-support facts and training labels. They are not allowed to censor the legal table or force normal two-placement actions.
+
+On normal two-placement turns:
+
+```text
+legal_row_mode = full_rust_legal
+tactical_mode  = proposal_and_label
+search_required = true
+```
+
+Hardcoded non-search actions are allowed only for true structural exceptions:
+
+```text
+opening_single
+engine_declared_single_placement_terminal_exception
+terminal
+```
+
+A normal post-opening 5-window or 4-window state must still go through pair search, though tactical completion pairs must be protected from candidate eviction.
+
+## 1.4 Unsampled pairs are not negatives
+
+The search target is never allowed to assume:
+
+```text
+legal pair not admitted => bad pair
+```
+
+Training must distinguish:
+
+```text
+searched candidate
+explicit searched weak candidate
+explicit sampled negative with valid metadata
+tactical-protected candidate
+diagnostic canary
+unadmitted legal pair
+```
+
+The low-rank model can score every pair, but unless search or an oracle produced target support over every pair, the loss must remain candidate-conditional.
+
+---
+
+# 2. High-level architecture
+
+```text
+Rust exact state
+  -> full start-of-turn LEGAL rows
+  -> Rust tactical payload
+  -> Python graph/set encoder
+  -> per-LEGAL hidden states H_i
+  -> cell marginal logits M_i
+  -> low-rank pair embeddings Q_i, K_i
+  -> dense queryable pair surface L(i,j)
+  -> candidate_selector_lowrank_v1
+  -> bounded candidate reservoir with metadata
+  -> optional admitted-candidate residual rerank
+  -> Rust sampled pair MCTS
+  -> root improved candidate-conditional target
+  -> replay
+  -> candidate-aware training losses
+```
+
+The model should expose a dense pair-prior API, but search should still operate on a bounded reservoir:
+
+```text
+C(s) subset of all legal unordered pairs
+```
+
+The central target object is:
+
+[
+\pi^*_C(a \mid s), \quad a \in C(s)
+]
+
+not:
+
+[
+\pi^*(a \mid s), \quad a \in \mathcal A(s)
+]
+
+unless the pair set is exhaustive.
+
+---
+
+# 3. Model spec: `global_pair_lowrank_0`
+
+## 3.1 Input objects
+
+The graph/set encoder consumes the same logical object families as V1:
+
+```text
+STATE
+TURN
+STONE
+LEGAL
+WINDOW6
+```
+
+### STATE object
+
+One per position.
+
+Required features:
+
+```text
+current_player
+ply_index
+turn_index
+phase
+num_stones_player_0
+num_stones_player_1
+legal_row_count
+active_window_count
+terminal_status
+```
+
+Optional but recommended:
+
+```text
+last_move_age_summary
+board_span_q
+board_span_r
+board_span_s
+root_player_if_search_context
+```
+
+### TURN object
+
+One per current turn.
+
+Required features:
+
+```text
+current_player
+placements_remaining
+is_opening_single
+is_normal_two_placement
+is_terminal
+```
+
+For normal Hexo after opening:
+
+```text
+placements_remaining = 2
+```
+
+### STONE objects
+
+One per occupied cell.
+
+Required features:
+
+```text
+axial_q
+axial_r
+owner_player
+relative_to_current_player
+move_age_bucket
+distance_to_last_move_bucket
+```
+
+Recommended positional features:
+
+```text
+cube_s = -q-r
+relative_q_centered
+relative_r_centered
+relative_s_centered
+D6 transform id during augmentation
+```
+
+### LEGAL objects
+
+One per full Rust-legal placement row.
+
+Required features:
+
+```text
+legal_row_id
+axial_q
+axial_r
+cube_s
+distance_to_nearest_stone_bucket
+distance_to_last_move_bucket
+is_center
+phase_flags
+```
+
+Tactical support features may be attached, but must be interpreted as labels/proposal support, not as legal filters:
+
+```text
+is_own_winning_single_cell
+is_opponent_required_cover_cell
+num_own_hot_windows_touched
+num_opponent_hot_windows_touched
+```
+
+### WINDOW6 objects
+
+One per active 6-cell line window.
+
+Required features:
+
+```text
+axis_id
+owner_0_count
+owner_1_count
+empty_count
+current_player_count
+opponent_count
+is_dead
+is_current_player_5_window
+is_current_player_4_window
+is_opponent_5_window
+is_opponent_4_window
+```
+
+Window objects are important because Hexo strategy is dominated by hot windows, immediate completions, covers, and stacked threats. 
+
+## 3.2 Required relations
+
+The encoder must support at least these sparse relations:
+
+```text
+STONE -> WINDOW6
+LEGAL -> WINDOW6
+WINDOW6 -> LEGAL
+WINDOW6 -> WINDOW6 overlap
+LEGAL -> nearby LEGAL offset bucket
+LEGAL -> nearby STONE proximity bucket
+LEGAL -> same-axis LEGAL
+LEGAL -> same-line LEGAL
+```
+
+The model must not create full pair tokens for all legal pairs.
+
+Allowed:
+
+```text
+LEGAL-to-LEGAL sparse local relations
+LEGAL-to-WINDOW relations
+blockwise pair score computation outside attention
+candidate-only pair residual MLP
+```
+
+Forbidden for mainline:
+
+```text
+all legal pairs as graph tokens
+O(N^2) pair-token attention
+legal-order first-N pair generation
+threat-filtered LEGAL rows
+```
+
+---
+
+# 4. Encoder
+
+## 4.1 Recommended encoder shape
+
+Default implementation:
+
+```text
+d_model = 256
+num_layers = 6
+num_attention_heads = 8
+ffn_dim = 1024
+dropout = 0.0 to 0.1
+activation = SiLU or GELU
+normalization = pre-LayerNorm
+```
+
+The encoder can be implemented as either:
+
+```text
+sparse graph transformer
+heterogeneous message-passing network
+set transformer with relation biases
+```
+
+Minimum requirement:
+
+```text
+input LEGAL rows -> output H_legal[N, d_model]
+input STATE/TURN/WINDOW/STONE context -> global state embedding G[d_model]
+```
+
+Outputs:
+
+```text
+H_legal: float[N, d_model]
+G_state: float[d_model]
+H_window: optional float[W, d_model]
+```
+
+## 4.2 Global pooling
+
+The global state vector should be built from:
+
+```text
+STATE token hidden state
+TURN token hidden state
+attention-pool over LEGAL rows
+attention-pool over active WINDOW6 rows
+attention-pool over recent STONE rows
+```
+
+Recommended:
+
+[
+G =
+\operatorname{MLP}
+(
+h_{\text{STATE}},
+h_{\text{TURN}},
+\operatorname{AttnPool}(H_{\text{LEGAL}}),
+\operatorname{AttnPool}(H_{\text{WINDOW}})
+)
+]
+
+---
+
+# 5. Heads
+
+## 5.1 Value head
+
+The value head returns a scalar from the **current player’s perspective** at the node being evaluated.
+
+```text
+value_logit = MLP_value(G_state)
+value = tanh(value_logit)
+```
+
+Shape:
+
+```text
+value: float[]
+```
+
+Range:
+
+```text
+[-1, 1]
+```
+
+Rust converts the value to the relevant root or node perspective during backup.
+
+No silent zero fallback is allowed. Missing value is an inference error, matching the current V1 implementation’s requirement that `value` is mandatory. 
+
+## 5.2 Cell marginal head
+
+For each legal cell:
+
+[
+M_i = f_M([H_i, G])
+]
+
+Implementation:
+
+```text
+cell_input_i = concat(H_legal[i], G_state, H_legal[i] * W_gated(G_state))
+cell_marginal_logits[i] = linear(MLP_cell(cell_input_i))
+```
+
+Shape:
+
+```text
+cell_marginal_logits: float[N]
+```
+
+Uses:
+
+```text
+candidate source: cell_marginal_cross
+auxiliary training target
+component of pair logit
+diagnostics
+```
+
+This head is not allowed to choose the final move.
+
+## 5.3 Low-rank pair embedding head
+
+The simplest user-proposed version is:
+
+[
+L(i,j) = M_i + M_j + e_i^\top e_j
+]
+
+Recommended default is a slightly more expressive unordered two-tower version:
+
+[
+\operatorname{Dot}(i,j)
+=======================
+
+\frac{1}{2\sqrt{d_r}}
+\left(
+Q_i^\top K_j + Q_j^\top K_i
+\right)
+]
+
+where:
+
+```text
+Q = W_Q H_legal
+K = W_K H_legal
+Q, K: float[N, d_pair_rank]
+```
+
+Default rank:
+
+```text
+d_pair_rank = 64
+```
+
+Recommended ablations:
+
+```text
+32
+64
+128
+```
+
+The symmetrized two-tower version can represent “cell i wants a partner of type k” better than a single shared embedding while preserving unordered pair symmetry.
+
+If the simpler shared-dot variant is used:
+
+[
+\operatorname{Dot}(i,j)
+=======================
+
+\frac{E_i^\top E_j}{\sqrt{d_r}}
+]
+
+then set:
+
+```text
+Q = K = E
+```
+
+## 5.4 Cheap pair feature bias
+
+The dense pair prior may include cheap pair features:
+
+[
+B(i,j) = w_\phi^\top \phi_{\text{cheap}}(i,j)
+]
+
+Required cheap features:
+
+```text
+axial_distance_bucket
+same_axis
+same_line
+same_window_any
+same_window_count_bucket
+both_touch_same_hot_window
+both_touch_opponent_hot_window
+one_is_own_winning_single
+one_is_opponent_cover_cell
+legal_phase_flags
+```
+
+These must be computable either:
+
+```text
+on demand for one pair
+or blockwise for candidate retrieval
+```
+
+Avoid expensive tactical or oracle-derived high-order features in the dense prior unless they are already available in the Rust tactical payload.
+
+## 5.5 Dense low-rank pair logit
+
+Default formula:
+
+[
+L_0(i,j)
+========
+
+\alpha_M(M_i + M_j)
++
+\alpha_D
+\frac{Q_i^\top K_j + Q_j^\top K_i}{2\sqrt{d_r}}
++
+w_\phi^\top \phi_{\text{cheap}}(i,j)
++
+b
+]
+
+Recommended parameterization:
+
+```text
+alpha_M = softplus(raw_alpha_M)
+alpha_D = softplus(raw_alpha_D)
+```
+
+Initialization:
+
+```text
+raw_alpha_M: initialize near 1.0 effective scale
+raw_alpha_D: initialize near 0.1 effective scale
+w_phi: zero or small normal
+b: 0
+Q/K projections: Xavier or small normal
+```
+
+Reason: early training should not let random pair embeddings dominate candidate retrieval.
+
+For unordered pairs:
+
+```text
+L_0(i, j) == L_0(j, i)
+```
+
+Diagonal entries are invalid:
+
+```text
+L_0(i, i) = -inf
+```
+
+## 5.6 Optional admitted-candidate residual
+
+The dense low-rank pair prior should be the main scorer. However, pure dot-product interaction may underfit relational pair tactics. Therefore the model may include a candidate-only residual:
+
+[
+R(i,j)
+======
+
+\operatorname{MLP}*{\text{pair}}
+(
+G,
+H_i + H_j,
+|H_i - H_j|,
+H_i \odot H_j,
+\phi*{\text{full}}(i,j)
+)
+]
+
+Final pair logit for admitted candidates:
+
+[
+L_{\text{final}}(i,j)
+=====================
+
+L_0(i,j)
++
+\lambda_R R(i,j)
+]
+
+Recommended:
+
+```text
+lambda_R = learned scalar
+initialize lambda_R = 0.0 or 0.1
+```
+
+Candidate-only full pair features:
+
+```text
+axial distance
+same-axis
+same-line
+same-window
+terminal exact win flag
+terminal-equivalent win flag
+terminal exact cover flag
+covers-all-opponent-win-requirements flag
+impossible-to-cover state flag
+legal-row phase flags
+```
+
+Do not feed source labels by default:
+
+```text
+source_type
+source_rank
+was_tactical_protected
+was_direct_retrieval
+```
+
+Those are useful for metadata and ablations, but feeding them into the main scorer risks shortcut learning.
+
+## 5.7 Pair completion auxiliary head
+
+Recommended optional head:
+
+[
+C(i,j)
+======
+
+M_j
++
+\frac{A_i^\top B_j}{\sqrt{d_c}}
+]
+
+where (i) is an anchor and (j) is a completion candidate.
+
+Shapes:
+
+```text
+A: float[N, d_completion]
+B: float[N, d_completion]
+pair_completion_logits(i, j): computed on demand or blockwise
+```
+
+This supports an autoregressive-style auxiliary target:
+
+```text
+p(second = j | first = i)
+p(second = i | first = j)
+```
+
+Both orientations must be trained when meaningful. Training only the canonical first cell is forbidden.
+
+## 5.8 Tactical auxiliary head
+
+The model should predict tactical labels as auxiliary supervision:
+
+```text
+terminal_tactical_v1
+```
+
+Recommended outputs:
+
+```text
+own_winning_single_logit[N]
+opponent_cover_cell_logit[N]
+own_hot_completion_pair_logit over admitted/tactical pair rows
+opponent_cover_pair_logit over admitted/tactical pair rows
+impossible_to_cover_logit scalar
+```
+
+Rust tactical payload remains the source of truth. The model’s tactical head does not define legality and does not force moves.
+
+---
+
+# 6. Runtime pair-scoring API
+
+The model/provider must expose these operations.
+
+## 6.1 Score specific pairs
+
+```python
+score_pairs(
+    legal_hidden: Tensor[N, d_model],
+    cell_marginal_logits: Tensor[N],
+    q: Tensor[N, d_pair_rank],
+    k: Tensor[N, d_pair_rank],
+    pair_indices: Tensor[K, 2],
+    cheap_pair_features: Tensor[K, f_cheap],
+    full_pair_features: Optional[Tensor[K, f_full]],
+    use_residual: bool,
+) -> Tensor[K]
+```
+
+Returns:
+
+```text
+pair_logits[K]
+```
+
+Must enforce:
+
+```text
+i != j
+canonical pair key
+finite logits
+same legal row table hash
+```
+
+## 6.2 Compute blockwise top-k pairs
+
+```python
+topk_pairs_blockwise(
+    M: Tensor[N],
+    Q: Tensor[N, d],
+    K: Tensor[N, d],
+    legal_rows,
+    k_total: int,
+    block_size: int,
+    masks,
+    cheap_feature_provider,
+) -> list[PairCandidate]
+```
+
+Algorithm:
+
+```text
+global_heap = empty min-heap of size k_total
+
+for block_a in legal rows:
+  for block_b in legal rows:
+    compute L_block for pairs in block_a x block_b
+    mask diagonal
+    mask lower triangle if same block
+    mask illegal / forbidden
+    local_topk = top k_block from L_block
+    merge local_topk into global_heap
+
+return heap sorted by descending score
+```
+
+Requirements:
+
+```text
+exact for configured candidate pool
+D6-stable
+row-order-stable
+diagonal-masked
+deduplicated by canonical pair key
+chunking-stable
+```
+
+For small (N), the implementation may compute the full matrix:
+
+[
+L = M\mathbf{1}^{T}+\mathbf{1}M^T+\frac{QK^T+KQ^T}{2\sqrt{d}}
+]
+
+then mask and top-k the upper triangle.
+
+## 6.3 Full matrix mode
+
+Full matrix construction is allowed only for:
+
+```text
+small-state exhaustive audit
+debugging
+tiny-state training experiments
+candidate retrieval when N is below threshold
+```
+
+It should not be required by MCTS.
+
+Configuration:
+
+```text
+full_matrix_threshold_N = 256   # tune by hardware
+block_size = 256 or 512
+```
+
+---
+
+# 7. Candidate selector: `candidate_selector_lowrank_v1`
+
+## 7.1 Candidate sources
+
+The selector must combine sources by quota, not by one blended sampler.
+
+| Source                          |    Required | Purpose                                                         |
+| ------------------------------- | ----------: | --------------------------------------------------------------- |
+| `terminal_exact_v1`             |         yes | Own hot completions, opponent covers, terminal-equivalent pairs |
+| `lowrank_direct_topk`           |         yes | Main learned relational pair source                             |
+| `cell_marginal_cross`           |         yes | Dense unary baseline and stability source                       |
+| `anchor_conditioned_completion` | recommended | Autoregressive-style recovery source                            |
+| `structured_diversity`          |         yes | Prevent low-rank/top-k support collapse                         |
+| `blind_canary`                  |   yes, tiny | Diagnostic recall/collapse probe                                |
+| `manual_audit_pairs`            |       debug | Deterministic tests and oracle fixtures                         |
+
+The V1 proposal already requires multiple candidate sources, tactical protection, direct pair retrieval, structured exploration, and diagnostic canaries. This spec makes low-rank direct retrieval the main learned pair source. 
+
+## 7.2 Default quotas
+
+Root defaults:
+
+```text
+root_total_candidate_budget = 1024
+
+terminal_exact_v1: protected, no ordinary eviction
+lowrank_direct_topk: 512
+cell_marginal_cross: 128
+anchor_conditioned_completion: 128
+structured_diversity: 192
+blind_canary: 16
+reserve / overflow: 48
+```
+
+Interior defaults:
+
+```text
+interior_total_candidate_budget = 256
+
+terminal_exact_v1: protected
+lowrank_direct_topk: 128
+cell_marginal_cross: 32
+anchor_conditioned_completion: 32
+structured_diversity: 48
+blind_canary: 4
+reserve / overflow: 14
+```
+
+These are starting values. Tune by:
+
+```text
+candidate recall
+missed-pair regret
+pair target entropy
+wall-clock throughput
+```
+
+## 7.3 Candidate record schema
+
+Every admitted candidate must carry:
+
+```python
+CandidatePairRecord {
+    candidate_id: int64
+    pair_key: uint128 or bytes
+    first_legal_row_id: int32
+    second_legal_row_id: int32
+    canonical_i: int32
+    canonical_j: int32
+
+    legal_row_table_hash: uint64
+    row_table_schema_version: int32
+    pair_row_schema_version: int32
+    root_or_interior: enum["root", "interior"]
+    admission_generation: int64
+
+    model_logit_lowrank: float32
+    model_logit_final: float32
+    marginal_component: float32
+    dot_component: float32
+    cheap_feature_component: float32
+    residual_component: float32
+
+    source_contributions: list[SourceContribution]
+
+    terminal_exact_flag: bool
+    terminal_equivalence_flag: bool
+    opponent_cover_exact_flag: bool
+    covers_all_opponent_win_requirements: bool
+    impossible_to_cover_state_flag: bool
+
+    forced_exploration_flag: bool
+    diagnostic_canary_flag: bool
+    target_support_flags: TargetSupportFlags
+
+    proposal_correction_mode: enum
+    proposal_correction_weight: optional float32
+}
+```
+
+Source contribution schema:
+
+```python
+SourceContribution {
+    source_type: enum[
+        "terminal_exact_v1",
+        "lowrank_direct_topk",
+        "cell_marginal_cross",
+        "anchor_conditioned_completion",
+        "structured_diversity",
+        "blind_canary",
+        "manual_audit"
+    ]
+    source_rank: int32
+    source_weight: float32
+    local_probability_or_score: float32
+    quota_id: string
+    inclusion_kind: enum[
+        "stochastic_sample",
+        "deterministic_top_k",
+        "tactical_protected",
+        "structured_quota",
+        "diagnostic_canary",
+        "unknown"
+    ]
+    exact_inclusion_probability: optional float32
+    heuristic_propensity: optional float32
+    correction_mode: enum[
+        "exact_importance",
+        "clipped_propensity",
+        "uncorrected_logged",
+        "training_forbidden"
+    ]
+}
+```
+
+Missing source metadata is a search-admission error.
+
+## 7.4 Candidate priority and eviction
+
+Protected candidates:
+
+```text
+terminal_exact_v1
+opponent exact cover pairs
+impossible-to-cover diagnostic pairs
+```
+
+must not be evicted by ordinary budget pressure.
+
+Eviction order for non-protected candidates:
+
+```text
+1. duplicates
+2. illegal or stale hash rows
+3. low-score excess from overfilled source quota
+4. low-diversity redundant candidates
+5. lowest final candidate priority
+```
+
+Blind canaries:
+
+```text
+may be searched if configured as real legal candidates
+must be training_forbidden unless explicitly promoted
+must be separately counted
+```
+
+---
+
+# 8. Python expansion provider
+
+## 8.1 One-pass node expansion
+
+This low-rank spec should avoid the current two-full-pass lifecycle. The current V1 implementation does a proposal pass without pair rows, then constructs admitted pair rows and runs a final pair-scoring graph pass. 
+
+New lifecycle:
+
+```text
+1. Rust sends expansion request.
+2. Python builds graph with STATE/TURN/STONE/LEGAL/WINDOW6 rows.
+3. Model runs one encoder pass.
+4. Model emits value, M, Q, K, optional tactical heads.
+5. Python computes low-rank candidate scores from cached per-LEGAL outputs.
+6. Candidate selector builds bounded reservoir.
+7. Optional residual MLP scores admitted candidate pairs only.
+8. Python returns candidate records, final logits, and value to Rust.
+```
+
+There must be no second full graph encoder pass.
+
+Allowed:
+
+```text
+one lightweight candidate-only residual pass
+one blockwise matmul retrieval pass
+one pair-feature construction pass
+```
+
+Forbidden:
+
+```text
+full graph re-encode with admitted pair rows
+per-pair model calls
+per-widening model calls
+per-second-placement model calls
+```
+
+## 8.2 Batched expansion
+
+Python must batch expansion requests.
+
+Recommended provider loop:
+
+```python
+requests = rust_engine.run_search_step(max_expansions=batch_size)
+
+graphs = [build_graph(req) for req in requests]
+batch = collate_graphs(graphs)
+
+model_outputs = model(batch)
+
+for req, out in zip(requests, unbatch(model_outputs)):
+    candidates = candidate_selector_lowrank_v1(req, out)
+    response = build_expansion_response(req, out.value, candidates)
+    rust_engine.complete_expansion(response)
+```
+
+Provider metrics:
+
+```text
+encoder_forward_count
+encoder_forward_latency_p50_p95
+blockwise_topk_latency_p50_p95
+candidate_build_latency_p50_p95
+residual_scoring_latency_p50_p95
+expanded_nodes_per_second
+pair_scores_per_second
+```
+
+---
+
+# 9. Rust search: `sampled_joint_pair_lowrank_v1`
+
+## 9.1 Node reservoir
+
+Each expanded full-turn node stores:
+
+```rust
+V1LowRankReservoir {
+    pair_rows: Vec<PairRowV1>,
+    candidate_records: Vec<CandidateMetadata>,
+    raw_model_logits: Vec<f32>,
+    corrected_prior_logits: Vec<f32>,
+    revealed_count: usize,
+
+    edge_visits: Vec<u32>,
+    edge_total_value_current_player: Vec<f32>,
+    child_node_keys: Vec<Option<NodeKey>>,
+
+    terminal_flags: Vec<TerminalFlags>,
+    target_support_flags: Vec<TargetSupportFlags>,
+
+    telemetry: ReservoirTelemetry,
+}
+```
+
+Rust should store raw logits and corrected logits separately.
+
+## 9.2 Prior construction
+
+Default search prior:
+
+[
+P_R(a)
+======
+
+\operatorname{softmax}*{a \in R}
+\left(
+\frac{L*{\text{final}}(a)}{\tau_{\text{prior}}}
+\right)
+]
+
+where (R) is the currently selectable revealed set, not necessarily the full reservoir.
+
+Recommended:
+
+```text
+prior_temperature = 1.0 initially
+renormalize over revealed candidates at selection time
+```
+
+Do not normalize over unrevealed candidates during progressive widening.
+
+### Proposal correction
+
+Default:
+
+```text
+search_prior_uses_proposal_correction = false
+```
+
+Proposal correction may be enabled only for candidates whose inclusion mode has valid probability semantics:
+
+```text
+exact_importance
+clipped_propensity
+```
+
+Formula if enabled:
+
+[
+L_{\text{corrected}}(a)
+=======================
+
+## L_{\text{final}}(a)
+
+\operatorname{clip}(\log q(a), \ell_{\min}, \ell_{\max})
+]
+
+Rows marked:
+
+```text
+uncorrected_logged
+training_forbidden
+```
+
+must not receive fake importance correction.
+
+## 9.3 Progressive widening
+
+For an expanded node:
+
+[
+K_{\text{revealed}}(n)
+======================
+
+\left\lceil
+c_{\text{pw}}
+\cdot
+\max(1,n)^{\alpha_{\text{pw}}}
+\right\rceil
+]
+
+Defaults:
+
+```text
+alpha_pw = 0.5
+c_pw_root = 32
+c_pw_interior = 16
+min_revealed_root = 16
+min_revealed_interior = 8
+```
+
+Clamp:
+
+```text
+1 <= revealed_count <= reservoir_size
+```
+
+Protected terminal/tactical candidates should be revealed immediately.
+
+## 9.4 PUCT selection
+
+For an edge (a) at node (s):
+
+[
+\operatorname{PUCT}(s,a)
+========================
+
+Q(s,a)
++
+c_{\text{puct}}
+P_R(a)
+\frac{\sqrt{\max(1,N(s))}}{1+N(s,a)}
+]
+
+Use:
+
+```text
+sqrt(max(1, parent_visits))
+```
+
+not:
+
+```text
+sqrt(parent_visits)
+```
+
+so priors matter on first selection.
+
+Recommended defaults:
+
+```text
+c_puct_root = 2.0
+c_puct_interior = 1.5
+```
+
+Tune separately for root/interior.
+
+## 9.5 Root Gumbel sequential halving
+
+Root Gumbel mode must be a real root policy-improvement procedure, not a tiny PUCT tie-break.
+
+Terminology:
+
+```text
+reservoir C        = all candidate rows returned by selector
+considered set S0  = rows admitted into Gumbel root procedure
+searched support S = rows that receive search allocation / completed-Q
+```
+
+Procedure:
+
+```text
+1. Start with protected tactical candidates P.
+2. For every non-protected candidate a in C:
+     sample deterministic-seeded g_a ~ Gumbel(0,1)
+     root_key_score(a) = L_final(a) / tau_gumbel + g_a
+3. Select top m_root_gumbel candidates by root_key_score.
+4. S0 = P union selected_nonprotected.
+5. Allocate simulations by sequential halving over S0.
+6. At each round:
+     give each remaining candidate a fixed allocation slice
+     update Q / completed-Q
+     rank by root_key_score(a) + beta_q * completed_Q(a)
+     keep top ceil(len(remaining) / eta)
+7. Final selected move for evaluation may be highest completed-Q or final survivor.
+8. Replay target is built over searched support S, not over all legal pairs.
+```
+
+Suggested defaults:
+
+```text
+m_root_gumbel = 32 to 128
+eta = 2
+beta_q = 2.0 to 5.0
+tau_gumbel = 1.0
+```
+
+Replay must store:
+
+```text
+gumbel_values
+considered_set
+round_allocations
+visit_counts
+Q_values
+completed_Q_values
+improved_policy_target
+target_support_type
+```
+
+If this procedure is not implemented, the mode must not be called `gumbel_sequential_halving_v1`. It should be named something like:
+
+```text
+sampled_pair_puct_lowrank_v1
+```
+
+## 9.6 Completed-Q target
+
+For target construction, define completed Q for every searched-support candidate:
+
+```text
+if edge visited:
+    completed_Q = mean backed-up Q
+else if candidate was considered but unvisited:
+    completed_Q = node_value_baseline or prior-completion estimate
+else:
+    no target support
+```
+
+Recommended improved target:
+
+[
+\pi^*_S(a)
+==========
+
+\operatorname{softmax}*{a \in S}
+\left(
+\frac{L*{\text{final, stopgrad}}(a) + \beta_Q \widehat Q(a)}
+{\tau_{\text{target}}}
+\right)
+]
+
+Alternative visit target may be stored, but should not be the default if widening/Gumbel admission makes visit counts non-comparable.
+
+## 9.7 Pair application
+
+When Rust applies a pair:
+
+```text
+1. Apply first canonical placement.
+2. Check terminal.
+3. If terminal, mark terminal-equivalence semantics.
+4. Otherwise apply second placement.
+5. Check terminal.
+6. If nonterminal, create/reuse child node.
+```
+
+Because the pair is unordered, terminal one-cell wins require special handling.
+
+If a pair contains a winning single cell:
+
+```text
+{winning_cell, filler_cell}
+```
+
+then replay must mark:
+
+```text
+terminal_equivalence_flag = true
+winning_single_cell = winning_cell
+filler_cell = filler_cell
+```
+
+Training must not learn arbitrary filler preference from that pair.
+
+Recommended handling:
+
+```text
+search value: terminal win
+pair-policy target: collapse equivalent winning pairs or omit filler distinction
+cell/tactical target: train winning_single_cell strongly
+```
+
+## 9.8 Backup
+
+The model value is current-player perspective at the expanded node.
+
+Rust backup must maintain explicit perspective conversions:
+
+```text
+root_edge_total_value_root_perspective
+node_total_value_node_current_player_perspective
+edge_total_value_parent_current_player_perspective
+```
+
+Required tests:
+
+```text
+root immediate pair win => root Q = +1
+opponent immediate pair win after root move => root Q = -1
+terminal after first placement == terminal after second placement value
+multi-depth alternating perspectives
+```
+
+---
+
+# 10. Replay schema
+
+Every root decision must store:
+
+```python
+ReplayRootSearchRecord {
+    model_family: "global_pair_lowrank_0"
+    search_mode: "sampled_joint_pair_lowrank_v1"
+
+    root_state_hash: uint64
+    legal_row_table_hash: uint64
+    legal_row_schema_version: int32
+    pair_row_schema_version: int32
+
+    legal_row_count: int32
+    legal_pair_count: int64
+
+    candidate_pairs: list[CandidatePairRecord]
+    selected_pair_key: bytes
+    selected_pair_i: int32
+    selected_pair_j: int32
+
+    root_gumbel_values: optional float[K]
+    root_admission_order: optional int[K]
+    root_simulation_allocation: int[K]
+
+    visit_counts: int[K]
+    q_values: float[K]
+    completed_q_values: float[K]
+
+    raw_model_logits: float[K]
+    corrected_prior_logits: float[K]
+    prior_probabilities_initial: float[K]
+    prior_probabilities_revealed_final: float[K]
+
+    improved_policy_target: float[K]
+    target_support_type: enum
+
+    terminal_tactical_v1: TacticalPayload
+    terminal_equivalence_flags: bool[K]
+    target_support_flags: TargetSupportFlags[K]
+
+    search_surprise_metrics: dict
+    performance_metrics: dict
+}
+```
+
+Target support types:
+
+```text
+exhaustive_legal_pair_table
+admitted_candidate_set_without_explicit_negatives
+admitted_candidate_set_with_explicit_negatives
+completed_q_candidate_posterior
+gumbel_considered_set
+tiny_state_oracle
+```
+
+---
+
+# 11. Training target builder
+
+## 11.1 Main pair-policy loss
+
+For a replay state with target support (S):
+
+[
+L_{\text{pair}}
+===============
+
+-\sum_{a \in S}
+\pi^**S(a)
+\log
+\frac{
+\exp L*\theta(a)
+}{
+\sum_{b \in S}\exp L_\theta(b)
+}
+]
+
+Important:
+
+```text
+denominator = target support S
+not all legal pairs
+not all model-queryable pairs
+not unadmitted pairs
+```
+
+Only use full legal-pair denominator if:
+
+```text
+support_type = exhaustive_legal_pair_table
+```
+
+## 11.2 Low-rank dense auxiliary loss
+
+Allowed in tiny exhaustive states:
+
+[
+L_{\text{full-pair}}
+====================
+
+-\sum_{a \in \mathcal A(s)}
+\pi^*(a)
+\log
+\operatorname{softmax}*{b \in \mathcal A(s)}
+L*\theta(b)
+]
+
+Allowed in normal self-play only if explicit negative support is valid:
+
+```text
+admitted searched weak candidates
+explicit sampled negatives with valid proposal semantics
+oracle-known dominated pairs
+```
+
+Do not use random unsearched pairs as negatives by default.
+
+## 11.3 Cell marginal projection loss
+
+From pair target:
+
+[
+\pi_{\text{cell}}(i)
+====================
+
+\sum_{j:{i,j}\in S}
+\pi^*_S({i,j})
+]
+
+Train:
+
+[
+L_{\text{cell}}
+===============
+
+\operatorname{CE}
+(
+\operatorname{softmax}(M_i \text{ over legal cells}),
+\pi_{\text{cell}}
+)
+]
+
+Coverage gating:
+
+```text
+only full weight if pair support around cell i is adequate
+downweight if S is narrow or source-biased
+```
+
+Store:
+
+```text
+per_cell_support_count
+per_cell_pair_mass
+coverage_weight
+```
+
+## 11.4 Conditional completion loss
+
+For meaningful anchors:
+
+[
+\pi(j|i)
+========
+
+\frac{\pi^*_S({i,j})}
+{\sum_k \pi^*_S({i,k})}
+]
+
+Train both orientations:
+
+```text
+p(second = j | first = i)
+p(second = i | first = j)
+```
+
+Do not train only canonical first-row order.
+
+## 11.5 Value loss
+
+Use game outcome (z) from current-player perspective at the stored state:
+
+[
+L_{\text{value}} = (v_\theta(s)-z)^2
+]
+
+Optional:
+
+```text
+Huber loss
+value calibration bins by phase
+```
+
+## 11.6 Tactical losses
+
+Use Rust tactical payload labels:
+
+```text
+own_winning_single_cell
+own_hot_completion_pair
+terminal_equivalent_pair
+opponent_required_cover_cell
+cover_all_opponent_win_requirements_pair
+impossible_to_cover_state
+```
+
+Suggested losses:
+
+```text
+binary cross entropy for cells
+candidate-conditional BCE for tactical pair rows
+scalar BCE for impossible_to_cover
+```
+
+The tactical labels come from Rust, not from candidate masks.
+
+## 11.7 Terminal-equivalence rule
+
+If a state has a single winning cell and many equivalent filler choices:
+
+```text
+do not train arbitrary pair filler preference
+```
+
+Allowed target treatments:
+
+```text
+1. Omit pair-policy loss for filler distinctions.
+2. Collapse all pairs containing winning_cell into one equivalence class.
+3. Train cell/tactical heads strongly on winning_cell.
+```
+
+This is essential because Hexo’s 5-window threat is won by one placement and the second placement is irrelevant filler. 
+
+## 11.8 Total loss
+
+Recommended initial loss:
+
+[
+L =
+\lambda_{\text{pair}}L_{\text{pair}}
++
+\lambda_{\text{cell}}L_{\text{cell}}
++
+\lambda_{\text{cond}}L_{\text{cond}}
++
+\lambda_{\text{value}}L_{\text{value}}
++
+\lambda_{\text{tactical}}L_{\text{tactical}}
++
+\lambda_{\text{reg}}L_{\text{reg}}
+]
+
+Initial weights:
+
+```text
+lambda_pair = 1.0
+lambda_cell = 0.25
+lambda_cond = 0.25
+lambda_value = 1.0
+lambda_tactical = 0.5
+lambda_reg = 0.01
+```
+
+Regularizers:
+
+```text
+pair logit L2
+dot_component variance monitor
+entropy floor during bootstrap
+D6 consistency loss
+marginal/dot balance penalty if one component dominates
+```
+
+---
+
+# 12. Numerical implementation details
+
+## 12.1 Dot-product scaling
+
+Use:
+
+[
+\frac{Q_i^\top K_j}{\sqrt{d_r}}
+]
+
+or normalize embeddings:
+
+```text
+Q_norm = Q / max(eps, ||Q||)
+K_norm = K / max(eps, ||K||)
+dot = scale * Q_norm @ K_norm.T
+```
+
+Default recommendation:
+
+```text
+scaled unnormalized dot with LayerNorm before Q/K projections
+```
+
+## 12.2 Logit clipping
+
+Before softmax in search:
+
+```text
+clip logits to [-30, 30]
+```
+
+For training:
+
+```text
+do not hard clip unless necessary
+use stable log_softmax
+```
+
+## 12.3 Precision
+
+Recommended:
+
+```text
+encoder: bf16 or fp16 allowed
+QK matmul: fp32 accumulation preferred
+top-k scores: fp32
+Rust priors/Q: f32
+```
+
+## 12.4 Component telemetry
+
+For every candidate, log:
+
+```text
+marginal_component
+dot_component
+cheap_feature_component
+residual_component
+final_logit
+```
+
+Track:
+
+```text
+std(marginal_component)
+std(dot_component)
+std(residual_component)
+correlation(final_logit, marginal_component)
+correlation(final_logit, dot_component)
+```
+
+This catches collapse into “top marginal + top marginal.”
+
+---
+
+# 13. D6 symmetry
+
+Hex grid augmentation must support 12 D6 transforms. Axis-related features and targets must be reindexed under rotations/reflections because the three hex axes permute. 
+
+Required tests:
+
+```text
+legal row identity maps correctly under D6
+pair key maps correctly under D6
+L(i,j) transformed == L(T(i), T(j)) within tolerance
+value transformed == value within tolerance
+cell marginal target transforms correctly
+pair target transforms correctly
+window axis labels transform correctly
+```
+
+D6 consistency loss:
+
+[
+L_{\text{D6}}
+=============
+
+\operatorname{KL}
+(
+\pi_\theta(T(s)),
+T(\pi_\theta(s))
+)
++
+(v_\theta(T(s))-v_\theta(s))^2
+]
+
+Use candidate support intersection when candidate sets differ.
+
+---
+
+# 14. Start-of-turn legality test
+
+This spec requires a Rust property test:
+
+```text
+For every normal two-placement state s:
+  for every legal first cell i in start_legal(s):
+      second_legal_after_applying_i
+      must equal start_legal(s) - {i}
+```
+
+If this fails under the actual game rules, unordered start-of-turn pair MCTS is not semantically valid.
+
+---
+
+# 15. Search/provider API schemas
+
+## 15.1 Rust to Python: `ExpansionRequest`
+
+```python
+ExpansionRequest {
+    node_key: uint64
+    root_generation: uint64
+
+    move_history_bytes: bytes
+    current_player: int
+    phase: enum
+
+    legal_rows: list[LegalRow]
+    legal_row_table_hash: uint64
+    legal_row_schema_version: int32
+
+    tactical_payload: TerminalTacticalSetV1
+    tactical_payload_hash: uint64
+
+    parent_visits: int32
+    node_visits: int32
+
+    root_player: int
+    state_hash: uint64
+}
+```
+
+## 15.2 Python to Rust: `ExpansionResponse`
+
+```python
+ExpansionResponse {
+    node_key: uint64
+    root_generation: uint64
+
+    echoed_state_hash: uint64
+    echoed_legal_row_table_hash: uint64
+    echoed_tactical_payload_hash: uint64
+
+    value_current_player: float32
+
+    candidate_pairs: list[CandidatePairRecord]
+    pair_keys: list[bytes]
+    pair_row_indices: int32[K, 2]
+
+    raw_model_logits: float32[K]
+    final_pair_logits: float32[K]
+
+    correction_weights: optional float32[K]
+    correction_modes: CorrectionMode[K]
+
+    target_support_flags: TargetSupportFlags[K]
+}
+```
+
+Rust validates:
+
+```text
+node exists
+node pending
+root generation matches
+state hash matches
+legal hash matches
+candidate rows are canonical
+candidate rows are legal
+no duplicates
+finite value/logits
+metadata lengths match
+```
+
+---
+
+# 16. Recommended implementation build order
+
+## Phase 1: Low-rank model head
+
+Implement:
+
+```text
+cell_marginal_logits
+Q/K pair embeddings
+score_pairs()
+full_matrix_small_state()
+topk_pairs_blockwise()
+```
+
+Tests:
+
+```text
+symmetry
+diagonal masking
+blockwise top-k equals full-matrix top-k on small N
+D6 row mapping
+finite logits
+```
+
+## Phase 2: Candidate selector
+
+Implement:
+
+```text
+terminal_exact protected candidates
+lowrank_direct_topk
+cell_marginal_cross
+structured_diversity
+blind_canary
+candidate metadata
+```
+
+Tests:
+
+```text
+tactical protected candidates cannot be evicted
+duplicate pair rows deduped
+source metadata survives
+row-order stability
+chunking stability
+```
+
+## Phase 3: One-pass provider
+
+Replace two full graph passes with:
+
+```text
+one encoder pass
+low-rank pair retrieval
+optional candidate residual
+response to Rust
+```
+
+Telemetry must prove:
+
+```text
+encoder_forward_count_per_expanded_node <= 1
+no per-pair model calls
+no per-widening model calls
+```
+
+## Phase 4: Rust low-rank search mode
+
+Implement:
+
+```text
+sampled_joint_pair_lowrank_v1
+revealed-prior renormalization
+PUCT sqrt(max(1,N))
+terminal-equivalence flags
+completed-Q target records
+```
+
+## Phase 5: Training targets
+
+Implement:
+
+```text
+candidate-conditional pair CE
+cell marginal projection
+unordered conditional target
+tactical auxiliary losses
+terminal-equivalence collapse
+support_type enforcement
+```
+
+## Phase 6: Acceptance ablations
+
+Compare:
+
+```text
+A. current global_pair_biaffine_0
+B. global_pair_lowrank_0 plain shared dot
+C. global_pair_lowrank_0 symmetrized Q/K
+D. lowrank + cheap pair features
+E. lowrank + admitted-candidate residual
+F. autoregressive afterstate-DAG baseline
+```
+
+Primary acceptance metric:
+
+```text
+equal-wall-clock strength on mature checkpoints
+```
+
+not equal simulation count.
+
+---
+
+# 17. Required validation suite
+
+## 17.1 Model correctness
+
+```text
+L(i,j) == L(j,i)
+L(i,i) is invalid
+score_pairs matches full matrix on small N
+blockwise top-k matches full top-k
+D6-transformed logits match transformed original logits
+```
+
+## 17.2 Candidate correctness
+
+```text
+100% inclusion of exact own hot completion pairs
+100% inclusion of exact opponent cover pairs
+protected candidates not evicted
+blind canaries marked training_forbidden
+candidate metadata complete
+no legal-row-order dependence
+```
+
+## 17.3 Search correctness
+
+```text
+root final action is canonical unordered PairAction
+normal two-placement hot-window states are searched, not force-played
+PUCT priors affect first selection
+widening does not call model
+revealed priors renormalize over revealed set
+terminal one-cell win does not train filler preference
+backup sign tests pass
+```
+
+## 17.4 Training correctness
+
+```text
+unsampled legal pairs never become negatives
+support_type controls denominator
+terminal-equivalence collapse works
+conditional targets emit both orientations
+marginal target downweights low-coverage cells
+D6 target transform is correct
+```
+
+## 17.5 Performance
+
+Track:
+
+```text
+node_expansions_per_second
+pair_scores_per_second
+encoder_latency_p50_p95
+topk_latency_p50_p95
+candidate_generation_latency_p95
+gpu_utilization
+neural_calls_per_expanded_full_turn_node
+reservoir_refill_rate
+```
+
+Acceptance should require equal-wall-clock comparison against a fair sequential afterstate-DAG baseline, consistent with the V1 proposal’s evaluation requirement. 
+
+---
+
+# 18. Opinionated default configuration
+
+Recommended first implementation:
+
+```yaml
+model_family: global_pair_lowrank_0
+
+encoder:
+  d_model: 256
+  layers: 6
+  attention_heads: 8
+  ffn_dim: 1024
+  norm: pre_layernorm
+  activation: silu
+
+pair_policy:
+  type: symmetrized_qk_lowrank
+  rank: 64
+  use_cell_marginals: true
+  use_cheap_pair_features: true
+  use_candidate_residual: false_initially
+  residual_init_scale: 0.0
+  dot_scale: sqrt_rank
+  prior_temperature: 1.0
+
+candidate_selector:
+  root_budget: 1024
+  interior_budget: 256
+  lowrank_direct_topk_root: 512
+  lowrank_direct_topk_interior: 128
+  cell_marginal_cross_root: 128
+  cell_marginal_cross_interior: 32
+  structured_diversity_root: 192
+  structured_diversity_interior: 48
+  blind_canary_root: 16
+  blind_canary_interior: 4
+  tactical_protected: true
+
+search:
+  mode: sampled_joint_pair_lowrank_v1
+  c_puct_root: 2.0
+  c_puct_interior: 1.5
+  alpha_pw: 0.5
+  c_pw_root: 32
+  c_pw_interior: 16
+  renormalize_prior_over_revealed: true
+  search_prior_uses_proposal_correction: false
+  terminal_equivalence_collapse: true
+
+root_gumbel:
+  enabled: true
+  considered_nonprotected: 64
+  eta: 2
+  beta_q: 3.0
+  tau_gumbel: 1.0
+  target_uses_completed_q: true
+
+training:
+  pair_loss_support: candidate_conditional
+  full_pair_softmax_only_for_exhaustive_audits: true
+  unsampled_legal_pairs_are_negatives: false
+  cell_projection_loss_weight: 0.25
+  conditional_loss_weight: 0.25
+  pair_loss_weight: 1.0
+  value_loss_weight: 1.0
+  tactical_loss_weight: 0.5
+```
+
+---
+
+# 19. What this architecture improves over the current V1 path
+
+This spec gives the pair-MCTS path a true global pair-prior surface:
+
+```text
+any legal pair can be scored from per-cell outputs
+```
+
+without introducing all-pair graph tokens.
+
+Compared with the current implementation description, the main practical improvement is:
+
+```text
+current: proposal graph pass -> candidate rows -> final pair-row graph pass
+new:     one graph encoder pass -> low-rank pair surface -> candidate reservoir
+```
+
+The current implementation’s two-pass model path is coherent, but it risks becoming wall-clock expensive because each expanded node may require both proposal inference and final admitted-pair scoring. The low-rank spec makes final pair scoring a cheap operation over cached legal-cell outputs. 
+
+The main statistical improvement is that pair supervision generalizes across pairs. A target on pair `{i,j}` updates:
+
+```text
+M_i
+M_j
+Q_i / K_i
+Q_j / K_j
+```
+
+which affects other structurally similar pairs. That is better than treating every admitted pair row as an isolated sparse object.
+
+The main caveat remains:
+
+```text
+dense model logits != dense search target
+```
+
+So this should be implemented as:
+
+```text
+dense low-rank pair prior
++
+bounded candidate-aware MCTS
++
+candidate-conditional targets
+```
+
+not as:
+
+```text
+full legal-pair AlphaZero target over unsearched actions
+```
+
+That distinction is the difference between a trainable architecture and a self-reinforcing candidate-generator imitation loop.
