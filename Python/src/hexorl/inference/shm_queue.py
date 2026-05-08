@@ -13,6 +13,7 @@ Plus two shared-memory doorbell bytes per worker (spawn-safe):
 
 import time as _time
 import contextlib
+import os
 from dataclasses import dataclass
 import numpy as np
 import logging
@@ -107,7 +108,9 @@ def _shm_name(base: str, worker_id: int) -> str:
         "req_ready": "qr",
         "res_ready": "rr",
     }
-    return f"hx_{aliases.get(base, base)}_{worker_id}"
+    namespace = "".join(ch for ch in os.environ.get("HEXORL_SHM_NAMESPACE", "hx") if ch.isalnum())
+    namespace = (namespace or "hx")[:12]
+    return f"{namespace}_{aliases.get(base, base)}_{worker_id}"
 
 
 def _create_shm(name: str, size: int) -> SharedMemory:
