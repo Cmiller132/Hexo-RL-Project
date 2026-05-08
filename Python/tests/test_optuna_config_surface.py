@@ -198,6 +198,9 @@ def test_v1_pair_candidate_materializes_conservative_runtime_without_architectur
     assert cfg.buffer.capacity == 120_000
     assert cfg.selfplay.num_workers == 2
     assert cfg.selfplay.batch_size_per_worker == 4
+    assert cfg.runtime.v1_metadata_compression == "zlib"
+    assert cfg.runtime.min_free_system_memory_gb == pytest.approx(4.0)
+    assert cfg.runtime.v1_selfplay_worker_probe_max == 8
     assert cfg.inference.max_batch_size == 48
     assert cfg.inference.max_wait_us == 500
     assert cfg.inference.fp16 is True
@@ -225,9 +228,12 @@ def test_pair_mcts_modes_materialize_as_explicit_runtime_modes(mode):
 
 def test_config_hash_is_canonical_sorted_json_sha256():
     cfg = Config()
+    payload = cfg.model_dump(mode="json")
+    for key in ("min_free_system_memory_gb", "v1_metadata_compression", "v1_selfplay_worker_probe_max"):
+        payload["runtime"].pop(key, None)
     expected = hashlib.sha256(
         json.dumps(
-            cfg.model_dump(mode="json"),
+            payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")

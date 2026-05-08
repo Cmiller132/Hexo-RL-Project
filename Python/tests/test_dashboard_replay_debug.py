@@ -24,7 +24,6 @@ def test_replay_endpoint_returns_policy_weights_regret_and_candidate_debug(tmp_p
             {
                 "turn_index": 1,
                 "player": 1,
-                "move_history": history,
                 "root_value": 0.25,
                 "policy_target": {},
                 "debug": {

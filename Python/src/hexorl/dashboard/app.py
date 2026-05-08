@@ -28,7 +28,8 @@ from hexorl.buffer.sampler import _transform_history_bytes
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
 from hexorl.dashboard.checkpoints import scan_checkpoints
-from hexorl.dashboard.db import DashboardStore, decode_bytes
+from hexorl.dashboard.db import SCHEMA_VERSION as DASHBOARD_SCHEMA_VERSION
+from hexorl.dashboard.db import DashboardSchemaError, DashboardStore, decode_bytes
 from hexorl.dashboard.fixtures import (
     ClassicalFixtureConfig,
     generate_classical_fixtures,
@@ -169,7 +170,7 @@ def create_app(
     def health() -> dict[str, Any]:
         return {
             "ok": True,
-            "schema_version": 1,
+            "schema_version": DASHBOARD_SCHEMA_VERSION,
             "db_path": str(store.path),
             "suite_enabled": suite_root is not None,
             "suite_run_root": str(suite_root) if suite_root else None,
@@ -809,6 +810,26 @@ def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
         db = trial_dir / "dashboard.sqlite3"
         try:
             run_rows = DashboardStore(db).rows("SELECT * FROM runs ORDER BY updated_at DESC")
+        except DashboardSchemaError as exc:
+            rows.append(
+                {
+                    "run_id": trial_dir.name,
+                    "trial_id": trial_dir.name,
+                    "suite_trial_id": trial_dir.name,
+                    "source_db": str(db),
+                    "name": _trial_display_name(trial_dir.name),
+                    "output_dir": str(trial_dir),
+                    "config_json": {},
+                    "payload_json": {
+                        "dashboard_schema_error": str(exc),
+                        "requires_rebuild": True,
+                        "schema_version": DASHBOARD_SCHEMA_VERSION,
+                    },
+                    "created_at": 0.0,
+                    "updated_at": 0.0,
+                }
+            )
+            continue
         except Exception:
             continue
         for row in run_rows:

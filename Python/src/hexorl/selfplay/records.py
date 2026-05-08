@@ -9,7 +9,9 @@ Each record represents one position from a self-play game:
 """
 
 import json
+import pickle
 import struct
+import zlib
 import numpy as np
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from dataclasses import dataclass, field
@@ -20,11 +22,14 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 10
+COMPACT_VERSION_V2 = 11
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
 V1_PAIR_SEARCH_SCHEMA_VERSION = 1
+V1_PAIR_SEARCH_COMPACT_MAGIC = b"HXVM"
+V1_PAIR_SEARCH_COMPACT_VERSION = 2
+V1_PAIR_SEARCH_COMPRESSION_ZLIB = 1
 V1_PAIR_SUPPORT_TYPES = frozenset(
     {
         "exhaustive_legal_pair_table",
@@ -66,6 +71,15 @@ V1_CORRECTION_MODES = frozenset(
 
 PairCoord = Tuple[int, int]
 PairKey = Tuple[PairCoord, PairCoord]
+_V1_SUPPORT_FLAG_ORDER = (
+    "admitted",
+    "explicit_negative",
+    "forced",
+    "sampled_negative",
+    "terminal_exact",
+    "terminal_equivalent",
+    "unsampled",
+)
 
 
 def _pair_coord(value: Any) -> PairCoord:
@@ -634,20 +648,358 @@ class V1SearchPairMetadata:
         )
 
 
-def v1_search_metadata_to_json_bytes(metadata: Optional[V1SearchPairMetadata]) -> bytes:
+def _v1_flag_mask(flags: Tuple[str, ...]) -> int:
+    mask = 0
+    for bit, name in enumerate(_V1_SUPPORT_FLAG_ORDER):
+        if name in flags:
+            mask |= 1 << bit
+    return mask
+
+
+def _v1_flags_from_mask(mask: int) -> Tuple[str, ...]:
+    return tuple(name for bit, name in enumerate(_V1_SUPPORT_FLAG_ORDER) if int(mask) & (1 << bit))
+
+
+def _v1_pack_array(values: np.ndarray) -> tuple[str, tuple[int, ...], bytes]:
+    arr = np.asarray(values)
+    return (arr.dtype.str, tuple(int(dim) for dim in arr.shape), arr.tobytes(order="C"))
+
+
+def _v1_unpack_array(payload: tuple[str, tuple[int, ...], bytes]) -> np.ndarray:
+    dtype, shape, blob = payload
+    return np.frombuffer(blob, dtype=np.dtype(dtype)).reshape(tuple(shape))
+
+
+def _v1_encode_compact_payload(metadata: V1SearchPairMetadata) -> tuple[Any, ...]:
+    strings: list[str] = [""]
+    string_ids: dict[str, int] = {"": 0}
+
+    def sid(value: Any) -> int:
+        text = "" if value is None else str(value)
+        idx = string_ids.get(text)
+        if idx is None:
+            idx = len(strings)
+            strings.append(text)
+            string_ids[text] = idx
+        return idx
+
+    n = len(metadata.candidate_pairs)
+    pair_qr = np.zeros((n, 4), dtype=np.int16)
+    legal_row_ids = np.zeros((n, 2), dtype=np.int32)
+    row_schema = np.zeros(n, dtype=np.uint16)
+    bool_flags = np.zeros(n, dtype=np.uint8)
+    target_masks = np.zeros(n, dtype=np.uint8)
+    admissions = np.zeros(n, dtype=np.uint16)
+    roots = np.zeros(n, dtype=np.uint8)
+    candidate_ids = np.zeros(n, dtype=np.uint16)
+    selection_reasons = np.zeros(n, dtype=np.uint16)
+    source_payloads: list[tuple[tuple[Any, ...], ...]] = []
+    proposal_payloads: list[tuple[Any, ...]] = []
+    for idx, candidate in enumerate(metadata.candidate_pairs):
+        pair_qr[idx] = (
+            int(candidate.pair_key[0][0]),
+            int(candidate.pair_key[0][1]),
+            int(candidate.pair_key[1][0]),
+            int(candidate.pair_key[1][1]),
+        )
+        legal_row_ids[idx] = (int(candidate.first_legal_row_id), int(candidate.second_legal_row_id))
+        row_schema[idx] = int(candidate.row_table_schema_version)
+        flags = 0
+        if candidate.forced_exploration_flag:
+            flags |= 1
+        if candidate.terminal_exact_flag:
+            flags |= 2
+        if candidate.terminal_equivalence_flag:
+            flags |= 4
+        bool_flags[idx] = flags
+        target_masks[idx] = _v1_flag_mask(candidate.target_support_flags)
+        admissions[idx] = int(candidate.admission_generation)
+        roots[idx] = 1 if candidate.root_or_interior == "root" else 0
+        candidate_ids[idx] = sid(candidate.candidate_id)
+        selection_reasons[idx] = sid(candidate.candidate_selection_reason)
+        source_payloads.append(
+            tuple(
+                (
+                    sid(source.source_type),
+                    -1 if source.source_rank is None else int(source.source_rank),
+                    np.nan if source.source_weight is None else float(source.source_weight),
+                    np.nan
+                    if source.local_probability_or_score is None
+                    else float(source.local_probability_or_score),
+                    sid(source.quota_id),
+                    sid(source.inclusion_kind),
+                    np.nan
+                    if source.exact_inclusion_probability is None
+                    else float(source.exact_inclusion_probability),
+                    np.nan if source.heuristic_propensity is None else float(source.heuristic_propensity),
+                    sid(source.correction_mode),
+                )
+                for source in candidate.source_contributions
+            )
+        )
+        proposal = candidate.proposal_propensity_metadata
+        proposal_payloads.append(
+            (
+                sid(proposal.proposal_policy),
+                sid(proposal.correction_mode),
+                np.nan
+                if proposal.total_proposal_probability is None
+                else float(proposal.total_proposal_probability),
+                np.nan
+                if proposal.log_proposal_probability is None
+                else float(proposal.log_proposal_probability),
+                1 if proposal.sampling_without_replacement else 0,
+                sid(proposal.notes),
+            )
+        )
+
+    selected = None
+    if metadata.selected_pair is not None:
+        selected = (
+            int(metadata.selected_pair[0][0]),
+            int(metadata.selected_pair[0][1]),
+            int(metadata.selected_pair[1][0]),
+            int(metadata.selected_pair[1][1]),
+        )
+    correction = metadata.proposal_correction_parameters
+    scalar_payload = (
+        sid(metadata.candidate_selector_version),
+        sid(metadata.support_type),
+        int(metadata.legal_pair_count),
+        int(metadata.legal_row_schema_version),
+        int(metadata.pair_row_schema_version),
+        int(metadata.schema_version),
+    )
+    correction_payload = (
+        sid(correction.correction_mode),
+        float(correction.min_log),
+        float(correction.max_log),
+        float(correction.prior_temperature),
+    )
+    search_array_payload = (
+        _v1_pack_array(np.asarray(metadata.root_gumbel_values, dtype=np.float32)),
+        _v1_pack_array(np.asarray(metadata.root_admission_order, dtype=np.uint16)),
+        _v1_pack_array(np.asarray(metadata.root_simulation_allocation, dtype=np.uint32)),
+        _v1_pack_array(np.asarray(metadata.visit_counts, dtype=np.uint32)),
+        _v1_pack_array(np.asarray(metadata.q_values, dtype=np.float32)),
+        _v1_pack_array(np.asarray(metadata.completed_q_values, dtype=np.float32)),
+        _v1_pack_array(np.asarray([_v1_flag_mask(flags) for flags in metadata.target_support_flags], dtype=np.uint8)),
+        _v1_pack_array(np.asarray(metadata.terminal_equivalence_flags, dtype=np.bool_)),
+    )
+    surprise_payload = tuple(
+        (sid(key), float(value)) for key, value in sorted(metadata.search_surprise_metrics.items())
+    )
+    neural_payload = (
+        np.nan
+        if metadata.neural_calls_per_expanded_full_turn_node is None
+        else float(metadata.neural_calls_per_expanded_full_turn_node)
+    )
+    refill_payload = tuple(
+        (
+            sid(event.node_id),
+            sid(event.reason),
+            int(event.generation),
+            int(event.requested_count),
+            int(event.added_count),
+        )
+        for event in metadata.reservoir_refill_events
+    )
+    return (
+        V1_PAIR_SEARCH_COMPACT_VERSION,
+        tuple(strings),
+        scalar_payload,
+        (
+            _v1_pack_array(pair_qr),
+            _v1_pack_array(legal_row_ids),
+            _v1_pack_array(row_schema),
+            _v1_pack_array(bool_flags),
+            _v1_pack_array(target_masks),
+            _v1_pack_array(admissions),
+            _v1_pack_array(roots),
+            _v1_pack_array(candidate_ids),
+            _v1_pack_array(selection_reasons),
+        ),
+        tuple(source_payloads),
+        tuple(proposal_payloads),
+        correction_payload,
+        search_array_payload,
+        selected,
+        surprise_payload,
+        neural_payload,
+        refill_payload,
+    )
+
+
+def _v1_decode_compact_payload(payload: tuple[Any, ...]) -> V1SearchPairMetadata:
+    (
+        compact_version,
+        strings,
+        scalars,
+        candidate_arrays,
+        source_payloads,
+        proposal_payloads,
+        correction_payload,
+        search_arrays,
+        selected,
+        surprise_payload,
+        neural_calls,
+        refill_payloads,
+    ) = payload
+    if int(compact_version) != V1_PAIR_SEARCH_COMPACT_VERSION:
+        raise ValueError(f"Unsupported V1 compact metadata version {compact_version}")
+
+    def s(idx: int) -> str:
+        return str(strings[int(idx)])
+
+    (
+        pair_qr,
+        legal_row_ids,
+        row_schema,
+        bool_flags,
+        target_masks,
+        admissions,
+        roots,
+        candidate_ids,
+        selection_reasons,
+    ) = (_v1_unpack_array(item) for item in candidate_arrays)
+    candidates = []
+    for idx in range(int(pair_qr.shape[0])):
+        source_contributions = tuple(
+            V1CandidateSourceContribution(
+                source_type=s(source[0]),
+                source_rank=None if int(source[1]) < 0 else int(source[1]),
+                source_weight=None if np.isnan(float(source[2])) else float(source[2]),
+                local_probability_or_score=None if np.isnan(float(source[3])) else float(source[3]),
+                quota_id=None if int(source[4]) == 0 else s(source[4]),
+                inclusion_kind=s(source[5]),
+                exact_inclusion_probability=None if np.isnan(float(source[6])) else float(source[6]),
+                heuristic_propensity=None if np.isnan(float(source[7])) else float(source[7]),
+                correction_mode=s(source[8]),
+            )
+            for source in source_payloads[idx]
+        )
+        proposal = proposal_payloads[idx]
+        proposal_metadata = V1ProposalPropensityMetadata(
+            proposal_policy=s(proposal[0]),
+            correction_mode=s(proposal[1]),
+            total_proposal_probability=None if np.isnan(float(proposal[2])) else float(proposal[2]),
+            log_proposal_probability=None if np.isnan(float(proposal[3])) else float(proposal[3]),
+            sampling_without_replacement=bool(proposal[4]),
+            notes=s(proposal[5]),
+        )
+        flags = int(bool_flags[idx])
+        candidates.append(
+            V1CandidatePair(
+                candidate_id=s(candidate_ids[idx]),
+                pair_key=(
+                    (int(pair_qr[idx, 0]), int(pair_qr[idx, 1])),
+                    (int(pair_qr[idx, 2]), int(pair_qr[idx, 3])),
+                ),
+                first_legal_row_id=int(legal_row_ids[idx, 0]),
+                second_legal_row_id=int(legal_row_ids[idx, 1]),
+                row_table_schema_version=int(row_schema[idx]),
+                source_contributions=source_contributions,
+                proposal_propensity_metadata=proposal_metadata,
+                forced_exploration_flag=bool(flags & 1),
+                terminal_exact_flag=bool(flags & 2),
+                terminal_equivalence_flag=bool(flags & 4),
+                target_support_flags=_v1_flags_from_mask(int(target_masks[idx])),
+                admission_generation=int(admissions[idx]),
+                root_or_interior="root" if int(roots[idx]) == 1 else "interior",
+                candidate_selection_reason=s(selection_reasons[idx]),
+            )
+        )
+
+    selected_pair = None
+    if selected is not None:
+        selected_pair = ((int(selected[0]), int(selected[1])), (int(selected[2]), int(selected[3])))
+    correction = V1ProposalCorrectionParameters(
+        correction_mode=s(correction_payload[0]),
+        min_log=float(correction_payload[1]),
+        max_log=float(correction_payload[2]),
+        prior_temperature=float(correction_payload[3]),
+    )
+    (
+        root_gumbels,
+        admission_order,
+        simulation_alloc,
+        visit_counts,
+        q_values,
+        completed_q,
+        target_masks_arr,
+        terminal_flags,
+    ) = (_v1_unpack_array(item) for item in search_arrays)
+    selector_id, support_id, legal_pair_count, legal_schema, pair_schema, schema_version = scalars
+    return V1SearchPairMetadata(
+        schema_version=int(schema_version),
+        candidate_selector_version=s(selector_id),
+        support_type=s(support_id),
+        legal_pair_count=int(legal_pair_count),
+        legal_row_schema_version=int(legal_schema),
+        pair_row_schema_version=int(pair_schema),
+        candidate_pairs=tuple(candidates),
+        proposal_correction_parameters=correction,
+        root_gumbel_values=tuple(float(value) for value in root_gumbels.tolist()),
+        root_admission_order=tuple(int(value) for value in admission_order.tolist()),
+        root_simulation_allocation=tuple(int(value) for value in simulation_alloc.tolist()),
+        visit_counts=tuple(int(value) for value in visit_counts.tolist()),
+        q_values=tuple(float(value) for value in q_values.tolist()),
+        completed_q_values=tuple(float(value) for value in completed_q.tolist()),
+        selected_pair=selected_pair,
+        target_support_flags=tuple(_v1_flags_from_mask(int(mask)) for mask in target_masks_arr.tolist()),
+        terminal_equivalence_flags=tuple(bool(value) for value in terminal_flags.tolist()),
+        search_surprise_metrics={s(key): float(value) for key, value in surprise_payload},
+        neural_calls_per_expanded_full_turn_node=None
+        if np.isnan(float(neural_calls))
+        else float(neural_calls),
+        reservoir_refill_events=tuple(
+            V1ReservoirRefillEvent(
+                node_id=s(event[0]),
+                reason=s(event[1]),
+                generation=int(event[2]),
+                requested_count=int(event[3]),
+                added_count=int(event[4]),
+            )
+            for event in refill_payloads
+        ),
+    )
+
+
+def v1_search_metadata_to_compact_bytes(
+    metadata: Optional[V1SearchPairMetadata],
+    *,
+    compression: str | bool = "zlib",
+) -> bytes:
     if metadata is None:
         return b""
-    payload = json.dumps(metadata.to_dict(), separators=(",", ":"), sort_keys=True)
-    return payload.encode("utf-8")
+    payload = pickle.dumps(_v1_encode_compact_payload(metadata), protocol=5)
+    compression_name = "zlib" if compression is True else str(compression or "none").lower()
+    if compression_name in {"1", "true", "enabled"}:
+        compression_name = "zlib"
+    if compression_name == "zlib":
+        payload = zlib.compress(payload, level=6)
+        return V1_PAIR_SEARCH_COMPACT_MAGIC + struct.pack("<BB", V1_PAIR_SEARCH_COMPACT_VERSION, V1_PAIR_SEARCH_COMPRESSION_ZLIB) + payload
+    if compression_name in {"none", "false", "0", "disabled"}:
+        return V1_PAIR_SEARCH_COMPACT_MAGIC + struct.pack("<BB", V1_PAIR_SEARCH_COMPACT_VERSION, 0) + payload
+    raise ValueError(f"Unsupported V1 metadata compression mode {compression!r}")
 
 
-def v1_search_metadata_from_json_bytes(blob: bytes | None) -> Optional[V1SearchPairMetadata]:
+def v1_search_metadata_from_compact_bytes(blob: bytes | None) -> Optional[V1SearchPairMetadata]:
     if not blob:
         return None
-    data = json.loads(blob.decode("utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("V1 pair search metadata payload must be a JSON object")
-    return V1SearchPairMetadata.from_dict(data)
+    if not blob.startswith(V1_PAIR_SEARCH_COMPACT_MAGIC):
+        raise ValueError("Unsupported legacy V1 metadata payload: compact schema v2 is required")
+    if len(blob) < len(V1_PAIR_SEARCH_COMPACT_MAGIC) + 2:
+        raise ValueError("Truncated V1 compact metadata header")
+    version, compression_id = struct.unpack_from("<BB", blob, len(V1_PAIR_SEARCH_COMPACT_MAGIC))
+    if int(version) != V1_PAIR_SEARCH_COMPACT_VERSION:
+        raise ValueError(f"Unsupported V1 compact metadata version {version}")
+    payload = blob[len(V1_PAIR_SEARCH_COMPACT_MAGIC) + 2 :]
+    if int(compression_id) == V1_PAIR_SEARCH_COMPRESSION_ZLIB:
+        payload = zlib.decompress(payload)
+    elif int(compression_id) != 0:
+        raise ValueError(f"Unsupported V1 compact metadata compression id {compression_id}")
+    return _v1_decode_compact_payload(pickle.loads(payload))
 
 
 @dataclass
@@ -946,7 +1298,7 @@ class GameRecord:
             for q, r in discovery_examples:
                 parts.extend(struct.pack("<ii", int(q), int(r)))
 
-            v1_metadata_blob = v1_search_metadata_to_json_bytes(pos.v1_search_metadata)
+            v1_metadata_blob = v1_search_metadata_to_compact_bytes(pos.v1_search_metadata)
             parts.extend(struct.pack("<I", len(v1_metadata_blob)))
             parts.extend(v1_metadata_blob)
 
@@ -1189,7 +1541,7 @@ class GameRecord:
                     if metadata_len:
                         metadata_blob = data[offset:offset + metadata_len]
                         offset += metadata_len
-                        v1_search_metadata = v1_search_metadata_from_json_bytes(metadata_blob)
+                        v1_search_metadata = v1_search_metadata_from_compact_bytes(metadata_blob)
 
             positions.append(PositionRecord(
                 move_history=move_history,

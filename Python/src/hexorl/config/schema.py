@@ -599,6 +599,9 @@ class RuntimeConfig(BaseModel):
     graph_worker_torch_threads: int = 1
     selfplay_workers: int | None = None
     selfplay_cpu_reserve: int = 4
+    v1_metadata_compression: str = "zlib"
+    min_free_system_memory_gb: float = 4.0
+    v1_selfplay_worker_probe_max: int = 8
     channels_last: bool = True
     allow_tf32: bool = True
     cudnn_benchmark: bool = True

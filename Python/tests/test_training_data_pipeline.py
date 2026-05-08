@@ -43,6 +43,8 @@ from hexorl.selfplay.records import (
     pair_policy_v2_from_place_target,
     policy_v2_from_visits,
     sparsify_policy,
+    v1_search_metadata_from_compact_bytes,
+    v1_search_metadata_to_compact_bytes,
 )
 from hexorl.replay.training_batch import prepare_dense_training_batch
 from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
@@ -766,6 +768,47 @@ def test_v1_pair_search_metadata_roundtrips_through_compact_record_and_ring():
     assert buffered.v1_search_metadata.explicit_negative_pairs() == (((0, 2), (2, 0)),)
     assert buffered.pair_policy_target_v2 == []
     assert buffered.pair_policy_complete is False
+
+
+def test_v1_pair_search_metadata_compact_blob_rejects_legacy_json():
+    metadata = _v1_metadata_fixture()
+    blob = v1_search_metadata_to_compact_bytes(metadata)
+
+    loaded = v1_search_metadata_from_compact_bytes(blob)
+
+    assert loaded is not None
+    assert loaded.candidate_selector_version == metadata.candidate_selector_version
+    assert loaded.candidate_pairs[0].pair_key == metadata.candidate_pairs[0].pair_key
+    assert loaded.candidate_pairs[1].proposal_propensity_metadata.proposal_policy == (
+        metadata.candidate_pairs[1].proposal_propensity_metadata.proposal_policy
+    )
+    assert loaded.completed_q_values == pytest.approx(metadata.completed_q_values)
+    with pytest.raises(ValueError, match="legacy V1 metadata"):
+        v1_search_metadata_from_compact_bytes(b'{"schema_version":1,"candidate_pairs":[]}')
+
+
+def test_replay_memory_estimate_accounts_for_compressed_v1_metadata():
+    metadata = _v1_metadata_fixture()
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.25,
+        player=0,
+        outcome=1.0,
+        v1_search_metadata=metadata,
+    )
+    compressed = RingBuffer(capacity=2, max_policy_v2_entries=8, v1_metadata_compression="zlib")
+    raw = RingBuffer(capacity=2, max_policy_v2_entries=8, v1_metadata_compression="none")
+
+    compressed.append(rec)
+    raw.append(rec)
+
+    compressed_estimate = compressed.memory_estimate()
+    raw_estimate = raw.memory_estimate()
+    assert compressed_estimate["v1_metadata_compression"] == "zlib"
+    assert compressed_estimate["v1_metadata_bytes"] > 0
+    assert raw_estimate["v1_metadata_bytes"] >= compressed_estimate["v1_metadata_bytes"]
 
 
 def test_v1_support_type_is_explicit_and_validated():

@@ -73,6 +73,32 @@ def _uses_pair_policy_targets(cfg: Config) -> bool:
     return bool((heads & GRAPH_PAIR_POLICY_HEADS) or "pair_policy" in heads)
 
 
+def _system_memory_metrics(output_dir: Path | None = None) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    try:
+        import psutil
+
+        proc = psutil.Process(os.getpid())
+        mem = proc.memory_info()
+        vm = psutil.virtual_memory()
+        metrics["process_rss_mb"] = round(float(mem.rss) / (1024.0 * 1024.0), 3)
+        metrics["process_private_mb"] = round(
+            float(getattr(mem, "private", getattr(mem, "vms", 0))) / (1024.0 * 1024.0),
+            3,
+        )
+        metrics["free_system_gb"] = round(float(vm.available) / (1024.0 * 1024.0 * 1024.0), 3)
+    except Exception:
+        pass
+    if output_dir is not None:
+        db = Path(output_dir) / "dashboard.sqlite3"
+        if db.exists():
+            try:
+                metrics["dashboard_db_mb"] = round(float(db.stat().st_size) / (1024.0 * 1024.0), 3)
+            except OSError:
+                pass
+    return metrics
+
+
 def _make_training_dataset(
     cfg: Config,
     replay: RingBuffer,
@@ -225,6 +251,7 @@ def run_epoch(
                 architecture=cfg.model.architecture,
                 sparse_policy=cfg.model.sparse_policy,
             ),
+            v1_metadata_compression=cfg.runtime.v1_metadata_compression,
         )
     )
 
@@ -328,10 +355,15 @@ def run_epoch(
 
         checkpoint_path = output_dir / f"epoch_{int(train_stats.get('epoch', 1)):04d}.pt"
         trainer.save_checkpoint(checkpoint_path)
+        memory_metrics = _system_memory_metrics(output_dir)
         recorder.metric(
             {
                 "train": train_stats,
                 "buffer": replay.stats,
+                "replay_memory": replay.memory_estimate(),
+                "runtime_memory": memory_metrics,
+                "selfplay_workers": int(getattr(cfg.selfplay, "num_workers", 0)),
+                "inference_max_batch_size": int(getattr(cfg.inference, "max_batch_size", 0)),
                 "checkpoint_path": str(checkpoint_path),
             },
             phase="train",
@@ -346,6 +378,10 @@ def run_epoch(
         )
 
     buffer_stats = dict(replay.stats)
+    buffer_stats["replay_memory"] = replay.memory_estimate()
+    buffer_stats["runtime_memory"] = _system_memory_metrics(output_dir)
+    buffer_stats["selfplay_workers"] = int(getattr(cfg.selfplay, "num_workers", 0))
+    buffer_stats["inference_max_batch_size"] = int(getattr(cfg.inference, "max_batch_size", 0))
     buffer_stats.update(
         {
             key: value
@@ -438,6 +474,7 @@ def run_tiny_training_smoke(
             architecture=cfg.model.architecture,
             sparse_policy=cfg.model.sparse_policy,
         ),
+        v1_metadata_compression=cfg.runtime.v1_metadata_compression,
     )
     replay.extend(_make_bootstrap_positions(cfg, 16))
 

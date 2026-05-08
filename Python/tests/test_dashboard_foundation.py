@@ -475,7 +475,6 @@ def test_replay_routes_default_to_compact_payloads(tmp_path):
             {
                 "turn_index": 1,
                 "player": 1,
-                "move_history": _move(0, 0, 0),
                 "root_value": 0.0,
                 "policy_target": {},
                 "debug": {},
@@ -495,6 +494,51 @@ def test_replay_routes_default_to_compact_payloads(tmp_path):
     assert compact_position["turn_index"] == 3
     assert "moves" not in compact_position
     assert compact_position["stones"]
+
+    columns = app.state.store.rows("PRAGMA table_info(positions)")
+    assert "move_history_b64" not in {row["name"] for row in columns}
+
+
+def test_compact_position_rows_reconstruct_from_game_history(tmp_path):
+    from hexorl.dashboard.replay import get_replay_position, replay_game
+
+    store = DashboardStore(tmp_path / "dashboard.sqlite3")
+    history = _move(0, 0, 0) + _move(1, 1, 0) + _move(0, 0, 1) + _move(1, 2, 0)
+    game_id = store.insert_game_with_positions(
+        run_id="compact-run",
+        game_id="compact-game",
+        source="unit",
+        final_move_history=history,
+        positions=[
+            {"turn_index": 0, "player": 0, "root_value": 0.0, "policy_target": {}, "debug": {}},
+            {"turn_index": 2, "player": 0, "root_value": 0.1, "policy_target": {}, "debug": {}},
+            {"turn_index": 4, "player": 0, "root_value": 0.2, "policy_target": {}, "debug": {}},
+        ],
+    )
+
+    payload = replay_game(store, game_id, include_positions=True)
+
+    assert [row["turn_index"] for row in payload["positions"]] == [0, 2, 4]
+    for turn in (0, 2, 4):
+        pos = get_replay_position(history, turn_index=turn)
+        assert len(pos.moves) == turn
+        assert len(pos.stones) == turn
+
+
+def test_old_position_history_dashboard_schema_is_rejected(tmp_path):
+    import sqlite3
+
+    from hexorl.dashboard.db import DashboardSchemaError
+
+    db = tmp_path / "old-dashboard.sqlite3"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)")
+        conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, 0.0)")
+        conn.execute(
+            "CREATE TABLE positions (position_id INTEGER PRIMARY KEY, move_history_b64 TEXT NOT NULL DEFAULT '')"
+        )
+    with pytest.raises(DashboardSchemaError, match="schema v2"):
+        DashboardStore(db)
 
 
 def test_suite_game_lookup_accepts_dashboard_run_id_that_differs_from_trial_dir(tmp_path):

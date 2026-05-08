@@ -15,8 +15,8 @@ import numpy as np
 
 from hexorl.selfplay.records import (
     PositionRecord,
-    v1_search_metadata_from_json_bytes,
-    v1_search_metadata_to_json_bytes,
+    v1_search_metadata_from_compact_bytes,
+    v1_search_metadata_to_compact_bytes,
 )
 from hexorl.models.registry import replay_uses_sparse_diagnostics
 
@@ -231,6 +231,7 @@ class RingBuffer:
         store_opp_policy: bool = True,
         store_pair_policy: bool = True,
         store_sparse_diagnostics: bool = True,
+        v1_metadata_compression: str | bool = "zlib",
     ):
         if capacity <= 0:
             raise ValueError("RingBuffer capacity must be positive")
@@ -250,6 +251,7 @@ class RingBuffer:
         self.store_opp_policy = bool(store_opp_policy)
         self.store_pair_policy = bool(store_pair_policy)
         self.store_sparse_diagnostics = bool(store_sparse_diagnostics)
+        self.v1_metadata_compression = v1_metadata_compression
 
         self._game_slots = np.full(self.capacity, -1, dtype=np.int32)
         self._prefix_plies = np.zeros(self.capacity, dtype=np.uint16)
@@ -369,6 +371,7 @@ class RingBuffer:
 
         optional_blob_bytes = 0
         optional_blob_refs = 0
+        v1_metadata_bytes = sum(len(blob) for blob in self._v1_search_metadata_blobs if blob)
         for blobs in (
             self._opp_policy_blobs,
             self._opp_policy_v2_blobs,
@@ -397,6 +400,9 @@ class RingBuffer:
             },
             "allocated_numpy_mib": round(numpy_bytes / (1024.0 * 1024.0), 3),
             "history_mib": round((history_bytes + history_refs) / (1024.0 * 1024.0), 3),
+            "v1_metadata_bytes": int(v1_metadata_bytes),
+            "v1_metadata_mib": round(v1_metadata_bytes / (1024.0 * 1024.0), 3),
+            "v1_metadata_compression": str(self.v1_metadata_compression),
             "optional_target_blob_mib": round((optional_blob_bytes + optional_blob_refs) / (1024.0 * 1024.0), 3),
             "estimated_total_mib": round(total / (1024.0 * 1024.0), 3),
             "active_game_history_slots": int(sum(1 for item in self._game_histories if item is not None)),
@@ -550,7 +556,10 @@ class RingBuffer:
                 self._pair_policy_complete[idx] = False
         else:
             self._pair_policy_complete[idx] = False
-        self._v1_search_metadata_blobs[idx] = v1_search_metadata_to_json_bytes(record.v1_search_metadata)
+        self._v1_search_metadata_blobs[idx] = v1_search_metadata_to_compact_bytes(
+            record.v1_search_metadata,
+            compression=self.v1_metadata_compression,
+        )
 
         dropped_mass = sum(prob for _q, _r, prob in entries[n:])
         self._outside_policy_mass[idx] = float(record.target_policy_mass_outside_window)
@@ -672,7 +681,7 @@ class RingBuffer:
         pair_policy_v2 = _unpack_pair_blob(
             self._pair_policy_v2_blobs[idx] if self._pair_policy_v2_blobs is not None else None
         )
-        v1_search_metadata = v1_search_metadata_from_json_bytes(self._v1_search_metadata_blobs[idx])
+        v1_search_metadata = v1_search_metadata_from_compact_bytes(self._v1_search_metadata_blobs[idx])
 
         stored_value = float(self._values[idx])
         player = int(self._players[idx])

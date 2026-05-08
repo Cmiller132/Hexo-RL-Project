@@ -166,7 +166,6 @@ class RunRecorder:
                     {
                         "turn_index": pos.turn_index,
                         "player": pos.player,
-                        "move_history": pos.move_history,
                         "root_value": pos.root_value,
                         "policy_target": pos.policy_target,
                         "debug": {
