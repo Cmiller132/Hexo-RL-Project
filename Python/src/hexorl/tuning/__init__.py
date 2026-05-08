@@ -20,6 +20,7 @@ from hexorl.tuning.optuna_scout import (
 )
 from hexorl.tuning.fixed_classical_eval import (
     CandidateFixedClassicalEvalResult,
+    DEFAULT_FIXED_CLASSICAL_MAX_MOVES,
     FixedClassicalEvalSettings,
     FixedClassicalEvalSummary,
     evaluate_candidate_fixed_classical,
@@ -49,6 +50,17 @@ from hexorl.tuning.phase3_runner import (
     load_phase3_study_specs,
     phase3_scorecard_paths_for_run,
     rerank_phase3_trials,
+)
+from hexorl.tuning.phase3_supervisor import (
+    DEFAULT_FIXED_CLASSICAL_GAMES,
+    DEFAULT_MAX_TRIALS_PER_STUDY,
+    DEFAULT_PHASE3_TRIAL_EPOCHS,
+    Phase3AutonomousSupervisor,
+    Phase3SupervisorRoundSummary,
+    Phase3SupervisorSummary,
+    Phase3StudyTerminalCounts,
+    next_round_target,
+    phase3_terminal_counts,
 )
 from hexorl.tuning.quarantine import CandidateQuarantineRecord
 from hexorl.tuning.review import (
@@ -84,6 +96,7 @@ __all__ = [
     "ScoutRunSummary",
     "scout_storage_url",
     "CandidateFixedClassicalEvalResult",
+    "DEFAULT_FIXED_CLASSICAL_MAX_MOVES",
     "FixedClassicalEvalSettings",
     "FixedClassicalEvalSummary",
     "evaluate_candidate_fixed_classical",
@@ -109,6 +122,15 @@ __all__ = [
     "load_phase3_study_specs",
     "phase3_scorecard_paths_for_run",
     "rerank_phase3_trials",
+    "DEFAULT_MAX_TRIALS_PER_STUDY",
+    "DEFAULT_FIXED_CLASSICAL_GAMES",
+    "DEFAULT_PHASE3_TRIAL_EPOCHS",
+    "Phase3AutonomousSupervisor",
+    "Phase3SupervisorRoundSummary",
+    "Phase3SupervisorSummary",
+    "Phase3StudyTerminalCounts",
+    "next_round_target",
+    "phase3_terminal_counts",
     "CandidateQuarantineRecord",
     "Phase2CandidateRank",
     "Phase2ExcludedCandidate",

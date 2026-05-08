@@ -22,7 +22,7 @@ from hexorl.eval.scorecard import (
 )
 
 DEFAULT_FIXED_CLASSICAL_GAMES = 20
-DEFAULT_FIXED_CLASSICAL_MAX_MOVES = 200
+DEFAULT_FIXED_CLASSICAL_MAX_MOVES = 500
 
 
 GameRunner = Callable[[int, int], MatchResult]

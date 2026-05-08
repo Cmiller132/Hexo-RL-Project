@@ -7,7 +7,10 @@ import argparse
 import json
 from pathlib import Path
 
-from hexorl.tuning.fixed_classical_eval import FixedClassicalEvalSettings
+from hexorl.tuning.fixed_classical_eval import (
+    DEFAULT_FIXED_CLASSICAL_MAX_MOVES,
+    FixedClassicalEvalSettings,
+)
 from hexorl.tuning.phase3_runner import (
     DryRunPhase3TrialRunner,
     EpochPhase3TrialRunner,
@@ -24,19 +27,19 @@ def main() -> int:
         help="Phase 3 study specs JSON. Defaults to <run-dir>/phase2_review/phase3_study_specs.json.",
     )
     parser.add_argument("--n-trials-per-study", type=int, default=1)
-    parser.add_argument("--trial-epochs", type=int, default=2)
+    parser.add_argument("--trial-epochs", type=int, default=4)
     parser.add_argument("--max-studies", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Use deterministic dry trial runner.")
     parser.add_argument("--bootstrap-games", type=int, default=0)
     parser.add_argument("--no-selfplay", action="store_true")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--fixed-classical-games", type=int, default=20)
+    parser.add_argument("--fixed-classical-games", type=int, default=64)
     parser.add_argument("--fixed-classical-seed", type=int, default=20260507)
     parser.add_argument("--eval-time-ms", type=int, default=100)
     parser.add_argument("--eval-depth", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--max-moves", type=int, default=200)
+    parser.add_argument("--max-moves", type=int, default=DEFAULT_FIXED_CLASSICAL_MAX_MOVES)
     parser.add_argument("--summary", default=None)
     args = parser.parse_args()
 
@@ -79,4 +82,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
