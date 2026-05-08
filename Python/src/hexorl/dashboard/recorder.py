@@ -183,7 +183,7 @@ class RunRecorder:
                             "opp_policy_weight": pos.opp_policy_weight,
                             "policy_target_v2": pos.policy_target_v2,
                             "opp_policy_target_v2": pos.opp_policy_target_v2,
-                            "opp_policy_legal_v2": pos.opp_policy_legal_v2,
+                            "opp_policy_legal_v2_count": len(pos.opp_policy_legal_v2 or []),
                             "pair_policy_target_v2": pos.pair_policy_target_v2,
                             "target_policy_mass_outside_window": pos.target_policy_mass_outside_window,
                             "missing_target_policy_mass": pos.missing_target_policy_mass,

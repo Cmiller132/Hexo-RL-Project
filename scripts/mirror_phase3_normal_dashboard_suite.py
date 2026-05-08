@@ -30,8 +30,6 @@ def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> 
 
     mirrored: list[dict[str, object]] = []
     for source in sorted(path for path in source_root.iterdir() if path.is_dir()):
-        if not (source / "dashboard.sqlite3").exists():
-            continue
         target = trials_dir / source.name
         if not target.exists():
             target.mkdir(parents=True)
@@ -43,14 +41,22 @@ def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> 
                 for checkpoint in child.glob("*"):
                     if checkpoint.is_file():
                         _copy_file_if_changed(checkpoint, target / child.name / checkpoint.name)
+        dashboard = source / "dashboard.sqlite3"
+        source_mtime = max(
+            (child.stat().st_mtime for child in source.iterdir() if child.is_file()),
+            default=source.stat().st_mtime,
+        )
         mirrored.append(
             {
                 "trial_id": source.name,
                 "source": str(source),
-                "dashboard_mtime": datetime.fromtimestamp(
-                    (source / "dashboard.sqlite3").stat().st_mtime,
-                    timezone.utc,
-                ).isoformat(),
+                "dashboard_mtime": (
+                    datetime.fromtimestamp(dashboard.stat().st_mtime, timezone.utc).isoformat()
+                    if dashboard.exists()
+                    else None
+                ),
+                "source_mtime": datetime.fromtimestamp(source_mtime, timezone.utc).isoformat(),
+                "has_dashboard": dashboard.exists(),
             }
         )
 

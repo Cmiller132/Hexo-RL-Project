@@ -66,7 +66,13 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     history = _move(0, 0, 0) + _move(1, 1, 0)
     game = GameRecord(
         positions=[
-            PositionRecord(b"", {action_to_board_index(0, 0): 1.0}, 0.2, player=0),
+            PositionRecord(
+                b"",
+                {action_to_board_index(0, 0): 1.0},
+                0.2,
+                player=0,
+                opp_policy_legal_v2=[(q, 0) for q in range(33)],
+            ),
             PositionRecord(_move(0, 0, 0), {action_to_board_index(1, 0): 1.0}, -0.1, player=1, turn_index=1),
         ],
         outcome=1.0,
@@ -82,6 +88,8 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     positions = store.rows("SELECT * FROM positions WHERE game_id=? ORDER BY turn_index", (game_row_id,))
     assert len(positions) == 2
     assert positions[0]["policy_json"]
+    assert "opp_policy_legal_v2" not in positions[0]["debug_json"]
+    assert positions[0]["debug_json"]["opp_policy_legal_v2_count"] == 33
     assert (tmp_path / "events.jsonl").exists()
 
 
@@ -743,6 +751,58 @@ def test_suite_events_merge_trial_events_and_suppress_game_spam(tmp_path):
     assert status["event_count"] == 3
     assert status["warning_count"] == 1
     assert status["last_event_name"] == "epoch_complete"
+
+
+def test_suite_lists_metadata_only_trials_after_dashboard_rotation(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "global_graph768_champion__none__v1"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "full_config.json").write_text(
+        json.dumps(
+            {
+                "model": {"architecture": "global_graph768_champion", "channels": 192, "blocks": 16},
+                "selfplay": {"mcts_simulations": 512, "max_game_moves": 500},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trial_dir / "optuna_trial.json").write_text(
+        json.dumps({"trial_number": 1, "params": {"candidate_id": trial_dir.name}}),
+        encoding="utf-8",
+    )
+    (trial_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "event_type": "epoch_complete",
+                "phase": "epoch",
+                "epoch": 2,
+                "payload": {"checkpoint_path": "checkpoints/epoch_0002.pt"},
+                "time": 20.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_root / "manifest.json").write_text(json.dumps({"run_id": "unit"}), encoding="utf-8")
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+
+    trials = client.get("/api/suite/trials").json()
+    assert [row["trial_id"] for row in trials] == ["global_graph768_champion__none__v1"]
+    assert trials[0]["games"] == 0
+    assert trials[0]["positions"] == 0
+    assert trials[0]["architecture"] == "global_graph768_champion"
+    assert trials[0]["mcts_simulations"] == 512
+
+    events = client.get("/api/suite/events").json()
+    assert any(row["trial_id"] == "global_graph768_champion__none__v1" for row in events)
+    assert not (trial_dir / "dashboard.sqlite3").exists()
 
 
 def test_suite_dashboard_scores_and_stage_fallback(tmp_path):

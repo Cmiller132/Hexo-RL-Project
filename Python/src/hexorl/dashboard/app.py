@@ -698,13 +698,31 @@ def _suite_trial_dirs(run_root: Path) -> list[Path]:
     trials = run_root / "trials"
     if not trials.exists():
         return []
-    return sorted([path for path in trials.iterdir() if (path / "dashboard.sqlite3").exists()])
+    return sorted(
+        [
+            path
+            for path in trials.iterdir()
+            if path.is_dir()
+            and (
+                (path / "dashboard.sqlite3").exists()
+                or (path / "optuna_trial.json").exists()
+                or (path / "full_config.json").exists()
+                or (path / "events.jsonl").exists()
+                or (path / "scorecards.jsonl").exists()
+                or (path / "checkpoints").exists()
+            )
+        ]
+    )
+
+
+def _suite_dashboard_trial_dirs(run_root: Path) -> list[Path]:
+    return [path for path in _suite_trial_dirs(run_root) if (path / "dashboard.sqlite3").exists()]
 
 
 def _suite_game_trial_dirs(run_root: Path) -> list[Path]:
     """Return dashboard-backed dirs that can contribute replayable games."""
     candidates: list[Path] = []
-    candidates.extend(_suite_trial_dirs(run_root))
+    candidates.extend(_suite_dashboard_trial_dirs(run_root))
     phase3_root = run_root.parent / "phase3_trials"
     if phase3_root.exists():
         candidates.extend(path for path in phase3_root.iterdir() if path.is_dir() and (path / "dashboard.sqlite3").exists())
@@ -806,8 +824,19 @@ def _trial_display_name(trial_id: str) -> str:
 def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     trial_state = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
-    for trial_dir in _suite_game_trial_dirs(run_root):
+    for trial_dir in _suite_trial_dirs(run_root):
         db = trial_dir / "dashboard.sqlite3"
+        if not db.exists():
+            rows.append(
+                {
+                    "run_id": _suite_primary_run_id(trial_dir),
+                    "trial_id": trial_dir.name,
+                    "updated_at": 0,
+                    "metadata_only": True,
+                    **trial_state.get(trial_dir.name, {}),
+                }
+            )
+            continue
         try:
             run_rows = DashboardStore(db).rows("SELECT * FROM runs ORDER BY updated_at DESC")
         except DashboardSchemaError as exc:
@@ -1256,7 +1285,7 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
     score_by_trial = _suite_score_by_trial(run_root)
     phase2_by_trial = {row["trial_id"]: row for row in _suite_phase2_rows(run_root)}
     rows: list[dict[str, Any]] = []
-    for trial_dir in _suite_game_trial_dirs(run_root):
+    for trial_dir in _suite_trial_dirs(run_root):
         trial_id = trial_dir.name
         state = dict(state_trials.get(trial_id) or {})
         trial_json = _read_json(trial_dir / "trial.json")
@@ -1522,7 +1551,7 @@ def _suite_events(run_root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
     for row in _jsonl_tail(run_root / "events.jsonl", limit=limit):
         rows.append(_normalize_suite_event(row, trial_id=str(row.get("trial_id") or row.get("candidate_id") or "")))
     per_trial_limit = max(80, min(300, limit))
-    for trial_dir in _suite_game_trial_dirs(run_root):
+    for trial_dir in _suite_trial_dirs(run_root):
         rows.extend(_suite_events_for_trial(trial_dir, limit=per_trial_limit))
     unique: dict[tuple[str, str, str, float, int], dict[str, Any]] = {}
     for row in rows:
