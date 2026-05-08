@@ -381,15 +381,25 @@ def select_pair_candidates_v1(
         top_cells=cfg.cell_marginal_top_cells,
         limit=max(cfg.quota_for(SOURCE_CELL_MARGINAL_CROSS), cfg.candidate_budget, 1),
     )
-    source_proposals[SOURCE_STRUCTURED_DIVERSITY] = _structured_diversity_proposals(
+    diversity_rows = _deterministic_row_pool(
         sorted_rows,
+        seed=cfg.blind_canary_seed ^ 0x5155_7101,
+        limit=cfg.structured_diversity_pool_rows,
+    )
+    canary_rows = _deterministic_row_pool(
+        sorted_rows,
+        seed=cfg.blind_canary_seed,
+        limit=cfg.structured_diversity_pool_rows,
+    )
+    source_proposals[SOURCE_STRUCTURED_DIVERSITY] = _structured_diversity_proposals(
+        diversity_rows,
         legal_by_id,
         pair_rows_by_id_pair,
         seed=cfg.blind_canary_seed ^ 0x5155_7101,
-        limit=max(cfg.quota_for(SOURCE_STRUCTURED_DIVERSITY), cfg.structured_diversity_pool_rows),
+        limit=max(cfg.quota_for(SOURCE_STRUCTURED_DIVERSITY), 0),
     )
     source_proposals[SOURCE_BLIND_CANARY] = _blind_canary_proposals(
-        sorted_rows,
+        canary_rows,
         legal_by_id,
         pair_rows_by_id_pair,
         seed=cfg.blind_canary_seed,
@@ -439,10 +449,14 @@ def select_pair_candidates_v1(
         (candidate for candidate in preliminary if not candidate.tactical_protected_flag),
         key=_candidate_order_key,
     )
-    remaining = max(0, cfg.candidate_budget - len(protected))
+    selected_protected = protected[: cfg.candidate_budget]
+    remaining = max(0, cfg.candidate_budget - len(selected_protected))
     selected_nonprotected = nonprotected[:remaining]
-    budget_evictions = max(0, len(nonprotected) - len(selected_nonprotected))
-    selected = tuple(protected + selected_nonprotected)
+    budget_evictions = (
+        max(0, len(protected) - len(selected_protected))
+        + max(0, len(nonprotected) - len(selected_nonprotected))
+    )
+    selected = tuple(selected_protected + selected_nonprotected)
     _validate_admitted_candidates(selected)
     telemetry = PairCandidateSelectorTelemetryV1(
         legal_row_count=len(sorted_rows),
@@ -452,7 +466,7 @@ def select_pair_candidates_v1(
         duplicate_proposals=duplicate_proposals,
         quota_evictions=quota_evictions,
         budget_evictions=budget_evictions,
-        protected_count=len(protected),
+        protected_count=len(selected_protected),
         canary_count=sum(1 for candidate in selected if SOURCE_BLIND_CANARY in candidate.source_scores),
         direct_retrieval_scored_pair_count=direct_scored_pair_count,
         direct_retrieval_block_size=direct_block_size,
@@ -750,6 +764,32 @@ def _structured_diversity_proposals(
         )
         for rank, (identity, score) in enumerate(ordered[:limit])
     ]
+
+
+def _deterministic_row_pool(
+    sorted_rows: Sequence[LegalRowIdentityV1],
+    *,
+    seed: int,
+    limit: int,
+) -> tuple[LegalRowIdentityV1, ...]:
+    """Return a row-order-independent bounded pool for non-exhaustive sources.
+
+    Direct pair retrieval remains blockwise-exact over the full legal table.
+    Structured diversity and blind canaries are proposal-support sources; on
+    late 500-move games the full Rust legal table can contain thousands of
+    rows, so enumerating every legal pair in Python makes V1 unable to produce
+    game records.  A deterministic hash pool preserves row identity and avoids
+    legal-order bias while keeping these auxiliary sources bounded.
+    """
+
+    row_limit = int(limit)
+    if row_limit <= 0 or len(sorted_rows) <= row_limit:
+        return tuple(sorted_rows)
+    ranked = sorted(
+        sorted_rows,
+        key=lambda row: (_stable_u64(seed, row.row_id, row.q, row.r), row.row_id, row.cell),
+    )
+    return tuple(sorted(ranked[:row_limit], key=lambda row: (row.row_id, row.cell)))
 
 
 def _blind_canary_proposals(

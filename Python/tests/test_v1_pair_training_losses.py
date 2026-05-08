@@ -210,6 +210,16 @@ def test_v1_loss_plan_trains_all_pair_heads_and_blocks_unsampled_negative_masks(
     total.backward()
     assert predictions["pair_joint_logits"].grad is not None
 
+    entropy_weights = {**weights, "entropy": 0.01}
+    entropy_total, entropy_heads = compute_losses(
+        predictions,
+        targets,
+        loss_weights=entropy_weights,
+        loss_plan=build_loss_plan(tuple(predictions), entropy_weights),
+    )
+    assert torch.isfinite(entropy_total)
+    assert "entropy" in entropy_heads
+
     bad_targets = dict(targets)
     bad_targets["v1_pair_ranking_mask"] = bad_targets["v1_pair_ranking_mask"].copy()
     bad_targets["v1_unsampled_pair_mask"] = bad_targets["v1_unsampled_pair_mask"].copy()

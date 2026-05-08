@@ -362,9 +362,43 @@ def test_sampled_joint_pair_v1_worker_uses_pair_native_runtime(monkeypatch):
     assert np.asarray(graph_batch.pair_first_indices).shape[0] == len(metadata.candidate_pairs)
     assert np.asarray(graph_batch.pair_token_indices).shape[0] == len(metadata.candidate_pairs)
     assert np.all(np.asarray(graph_batch.pair_token_indices) == -1)
+    graph_legal = {tuple(row) for row in np.asarray(graph_batch.legal_qr, dtype=np.int32).tolist()}
     assert np.asarray(graph_batch.legal_qr).shape[0] == int(
+        metadata.search_surprise_metrics["graph_legal_row_count"]
+    )
+    assert np.asarray(graph_batch.legal_qr).shape[0] < int(
         metadata.search_surprise_metrics["selector_legal_row_count"]
     )
+    for candidate in metadata.candidate_pairs:
+        first, second = candidate.pair_key
+        assert tuple(first) in graph_legal
+        assert tuple(second) in graph_legal
+
+
+def test_sampled_joint_pair_v1_real_engine_smoke_outputs_distinct_history():
+    if not worker_module.HAS_ENGINE:
+        import pytest
+
+        pytest.skip("Rust _engine extension is unavailable")
+
+    from scripts.run_v1_selfplay_coherence_smoke import run_smoke
+
+    summary = run_smoke(
+        target_states=8,
+        mcts_simulations=4,
+        max_game_moves=8,
+        pair_budget=32,
+    )
+
+    assert summary["ok"] is True
+    assert summary["positions"] >= 8
+    assert summary["games"] >= 1
+    assert summary["graph_calls"] >= 1
+    assert summary["max_graph_pair_count"] <= 32
+    first = summary["records"][0]
+    assert first["positions"] > 0
+    assert first["game_length"] <= 8
+    assert len(first["first_moves"]) == len(set(tuple(move) for move in first["first_moves"]))
 
 
 def test_sampled_joint_pair_v1_source_path_has_no_legacy_projection_authority():

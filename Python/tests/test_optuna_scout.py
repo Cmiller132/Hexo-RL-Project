@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import optuna
 import pytest
 
-from hexorl.autotune import CandidateRecipe, ModelRecipe, PairStrategySpec
+from hexorl.autotune import CandidateRecipe, ModelRecipe, PairStrategySpec, RuntimeSpec
 from hexorl.config import Config
 from hexorl.tuning.optuna_scout import (
     EpochScoutEpochRunner,
@@ -123,6 +123,71 @@ def test_phase1_scout_uses_one_sqlite_study_nop_pruner_and_enqueues_once(tmp_pat
     assert len(trials) == 2
     assert {trial.user_attrs["candidate_id"] for trial in trials} == {c.candidate_id for c in candidates}
     assert resumed.user_attrs["phase1_pruner"] == "NopPruner"
+
+
+def test_resume_allows_runtime_only_recipe_updates_before_checkpoint_lineage(tmp_path):
+    v1_heads = [
+        "cell_marginal_logits",
+        "pair_completion_logits",
+        "pair_proposal_score",
+        "pair_joint_logits",
+        "value",
+        "terminal_tactical_v1",
+    ]
+    first_candidates = (
+        CandidateRecipe(
+            model=ModelRecipe(architecture_id="global_pair_biaffine_0", output_heads=v1_heads),
+            pair_strategy=PairStrategySpec(mode="sampled_joint_pair_v1", pair_row_budget=256),
+        ),
+    )
+    first = Phase1OptunaScoutController(
+        runs_root=tmp_path / "runs",
+        run_id="runtime_update",
+        candidates=first_candidates,
+        runner=RecordingRunner(),
+        min_epochs=2,
+        quantum_epochs=2,
+    )
+    first_study = first.create_or_resume_study()
+    first_trial = first_study.get_trials(deepcopy=False)[0]
+    old_hash = first_trial.user_attrs["config_hash"]
+
+    updated_candidates = (
+        CandidateRecipe(
+            model=first_candidates[0].model,
+            pair_strategy=first_candidates[0].pair_strategy,
+            runtime=RuntimeSpec(
+                buffer_capacity=120_000,
+                selfplay_workers=2,
+                batch_size_per_worker=4,
+                inference_max_batch_size=48,
+                inference_wait_us=500,
+                graph_microbatch_size=1,
+            ),
+        ),
+    )
+    resumed = Phase1OptunaScoutController(
+        runs_root=tmp_path / "runs",
+        run_id="runtime_update",
+        candidates=updated_candidates,
+        runner=ConfigRecordingRunner(),
+        min_epochs=2,
+        quantum_epochs=2,
+    )
+    resumed_study = resumed.create_or_resume_study()
+    trials = resumed_study.get_trials(deepcopy=False)
+
+    assert len(trials) == 1
+    assert trials[0].number == first_trial.number
+    assert trials[0].user_attrs["candidate_id"] == first_trial.user_attrs["candidate_id"]
+    assert trials[0].user_attrs["config_hash"] != old_hash
+    cfg = trials[0].user_attrs["full_config"]
+    assert cfg["buffer"]["capacity"] == 120_000
+    assert cfg["selfplay"]["num_workers"] == 2
+    assert cfg["selfplay"]["batch_size_per_worker"] == 4
+    assert cfg["inference"]["max_batch_size"] == 48
+    assert cfg["inference"]["max_wait_us"] == 500
+    assert cfg["train"]["graph_microbatch_size"] == 1
 
 
 def test_round_robin_two_epoch_quanta_and_lifecycle_attrs_reach_epoch_floor(tmp_path):

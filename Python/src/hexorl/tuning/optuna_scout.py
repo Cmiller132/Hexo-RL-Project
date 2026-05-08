@@ -431,7 +431,10 @@ class Phase1OptunaScoutController:
         existing_hash = study.user_attrs.get("candidate_plan_hash")
         if existing_hash is not None:
             if existing_hash != plan_hash:
-                raise RuntimeError("resumed Optuna study has a different Phase 1 candidate plan")
+                existing_plan = [str(candidate_id) for candidate_id in (study.user_attrs.get("candidate_plan") or [])]
+                if existing_plan != list(self._candidate_ids):
+                    raise RuntimeError("resumed Optuna study has a different Phase 1 candidate plan")
+                study.set_user_attr("candidate_plan_hash", plan_hash)
             self._validate_one_trial_per_candidate(study)
             return
 
@@ -1094,7 +1097,15 @@ def _completed_epochs(trial: Any) -> int:
 
 
 def _candidate_plan_hash(candidates: tuple[CandidateRecipe, ...]) -> str:
-    payload = [candidate.model_dump(mode="json") for candidate in candidates]
+    payload = [
+        {
+            "candidate_id": candidate.candidate_id,
+            "architecture_id": candidate.model.architecture_id,
+            "pair_strategy": candidate.pair_strategy.mode,
+            "recipe_schema_version": candidate.schema_version,
+        }
+        for candidate in candidates
+    ]
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

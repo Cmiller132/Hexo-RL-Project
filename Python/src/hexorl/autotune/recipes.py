@@ -127,6 +127,7 @@ class ScheduleSpec(BaseModel):
 class RuntimeSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    buffer_capacity: int = 0
     selfplay_workers: int = 0
     batch_size_per_worker: int = 0
     inference_max_batch_size: int = 0
@@ -219,6 +220,8 @@ class CandidateRecipe(BaseModel):
         inference.update(inference_update)
 
         buffer = data.setdefault("buffer", {})
+        if self.runtime.buffer_capacity > 0:
+            buffer["capacity"] = int(self.runtime.buffer_capacity)
         buffer["recency_decay"] = self.schedule.recency_decay
 
         train = data.setdefault("train", {})
@@ -319,13 +322,27 @@ def _pair_strategy_for_mode(pair_mode: str) -> PairStrategySpec:
 
 
 def _runtime_spec_for_architecture(architecture_id: str) -> RuntimeSpec:
-    if normalize_architecture_id(architecture_id) == "global_graph768_champion":
+    normalized = normalize_architecture_id(architecture_id)
+    if normalized == "global_graph768_champion":
         return RuntimeSpec(
             inference_fp16=False,
             graph_microbatch_size=1,
             graph_microbatch_autotune_max_size=4,
             graph_microbatch_memory_headroom=0.60,
             memory_safety_envelope="graph768_conservative_fp32_microbatch1",
+        )
+    if normalized == "global_pair_biaffine_0":
+        return RuntimeSpec(
+            buffer_capacity=120_000,
+            selfplay_workers=2,
+            batch_size_per_worker=4,
+            inference_max_batch_size=48,
+            inference_wait_us=500,
+            inference_fp16=True,
+            graph_microbatch_size=1,
+            graph_microbatch_autotune_max_size=4,
+            graph_microbatch_memory_headroom=0.60,
+            memory_safety_envelope="v1_pair_runtime_conservative_fp16_workers2_batch4",
         )
     return RuntimeSpec()
 

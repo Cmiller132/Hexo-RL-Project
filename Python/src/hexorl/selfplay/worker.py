@@ -483,6 +483,35 @@ def _v1_pair_qr_from_candidates(candidates: Sequence[PairCandidateV1]) -> np.nda
     return np.asarray(rows, dtype=np.int32).reshape(-1, 4)
 
 
+def _v1_required_pair_cells(pair_qr: np.ndarray) -> list[tuple[int, int]]:
+    cells: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for q1, r1, q2, r2 in np.asarray(pair_qr, dtype=np.int32).reshape(-1, 4).tolist():
+        for cell in ((int(q1), int(r1)), (int(q2), int(r2))):
+            if cell not in seen:
+                seen.add(cell)
+                cells.append(cell)
+    return cells
+
+
+def _validate_v1_graph_legal_subset(
+    graph_legal_qr: np.ndarray,
+    *,
+    rust_legal_qr: np.ndarray,
+    required_pair_cells: Sequence[tuple[int, int]],
+) -> None:
+    graph_legal = {(int(q), int(r)) for q, r in np.asarray(graph_legal_qr, dtype=np.int32).reshape(-1, 2).tolist()}
+    rust_legal = {(int(q), int(r)) for q, r in np.asarray(rust_legal_qr, dtype=np.int32).reshape(-1, 2).tolist()}
+    if len(graph_legal) != int(np.asarray(graph_legal_qr, dtype=np.int32).reshape(-1, 2).shape[0]):
+        raise ValueError("sampled_joint_pair_v1 graph LEGAL rows contain duplicate cells")
+    missing = sorted(cell for cell in required_pair_cells if cell not in graph_legal)
+    if missing:
+        raise ValueError(f"sampled_joint_pair_v1 graph LEGAL rows dropped admitted pair cells: {missing[:8]}")
+    extra = sorted(cell for cell in graph_legal if cell not in rust_legal)
+    if extra:
+        raise ValueError(f"sampled_joint_pair_v1 graph LEGAL rows contain non-Rust-legal cells: {extra[:8]}")
+
+
 def _v1_pair_features_from_candidates(candidates: Sequence[PairCandidateV1]) -> np.ndarray:
     out = np.zeros((len(candidates), V1_PAIR_FEATURE_DIM), dtype=np.float32)
     for row, candidate in enumerate(candidates):
@@ -1642,6 +1671,9 @@ class SelfPlayWorker:
             raise ValueError("sampled_joint_pair_v1 selector admitted no pair candidates")
 
         pair_qr = _v1_pair_qr_from_candidates(selector_result.candidates)
+        required_pair_cells = _v1_required_pair_cells(pair_qr)
+        required_pair_count = len(set(required_pair_cells))
+        graph_legal_limit = max(int(self.candidate_budget), required_pair_count)
         graph_batch = build_graph_batch_from_history(
             bytes(move_history),
             legal_moves=[(int(q), int(r)) for q, r in legal_qr.tolist()],
@@ -1650,12 +1682,16 @@ class SelfPlayWorker:
             max_pair_rows=0,
             include_pair_rows=False,
             include_opp_policy_rows=self.opp_policy_enabled,
-            max_legal_rows=None,
+            max_legal_rows=graph_legal_limit,
             max_context_tokens=self.candidate_budget,
+            required_legal_rows=required_pair_cells,
         )
         graph_legal = np.asarray(graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2)
-        if graph_legal.shape != legal_qr.shape or not np.array_equal(graph_legal, legal_qr):
-            raise ValueError("sampled_joint_pair_v1 graph LEGAL rows do not match Rust V1 legal rows")
+        _validate_v1_graph_legal_subset(
+            graph_legal,
+            rust_legal_qr=legal_qr,
+            required_pair_cells=required_pair_cells,
+        )
         graph_batch = graph_batch_with_admitted_pair_rows(
             graph_batch,
             pair_qr,
@@ -1668,7 +1704,7 @@ class SelfPlayWorker:
         metadata = graph_out.get("metadata")
         if isinstance(metadata, Mapping) and "legal_qr" in metadata:
             observed = np.asarray(metadata["legal_qr"], dtype=np.int32).reshape(-1, 2)
-            if observed.shape != legal_qr.shape or not np.array_equal(observed, legal_qr):
+            if observed.shape != graph_legal.shape or not np.array_equal(observed, graph_legal):
                 raise ValueError("sampled_joint_pair_v1 inference metadata changed LEGAL row identity")
         value = _v1_graph_value_from_output(graph_out, self._engine_adapter)
         pair_logits = _v1_pair_logits_from_graph_output(
@@ -1691,6 +1727,8 @@ class SelfPlayWorker:
             "selector_budget_evictions": float(selector_result.telemetry.budget_evictions),
             "selector_protected_count": float(selector_result.telemetry.protected_count),
             "selector_canary_count": float(selector_result.telemetry.canary_count),
+            "graph_legal_row_count": float(graph_legal.shape[0]),
+            "graph_required_pair_cell_count": float(required_pair_count),
         }
         return selector_result, pair_logits, value, metrics
 
@@ -1785,6 +1823,10 @@ class SelfPlayWorker:
             )
             root = v1_engine.init_root_v1()
             phase = str(root.get("phase", "unknown"))
+            placements_needed = 2 if phase == "normal_two_placement" else 1
+            if move_idx + placements_needed > self.max_game_moves:
+                terminal_reason = "max_game_moves"
+                break
             legal_table = root["legal_row_table"]
             legal_schema = int(legal_table.get("schema_version", 1))
             pair_schema = int(root["terminal_tactical"].get("pair_row_schema_version", 1))

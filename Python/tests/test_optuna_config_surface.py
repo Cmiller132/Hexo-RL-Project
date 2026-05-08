@@ -156,6 +156,56 @@ def test_graph768_champion_materializes_conservative_training_runtime():
     assert cfg.train.graph_microbatch_memory_headroom == pytest.approx(0.60)
 
 
+def test_v1_pair_candidate_materializes_conservative_runtime_without_architecture_change():
+    config = Config.model_validate(
+        {
+            "autotune": {
+                "scout": {
+                    "candidate_plan": [
+                        "global_xattn_0:none",
+                        "global_graph768_champion:none",
+                        "global_pair_biaffine_0:sampled_joint_pair_v1",
+                    ],
+                }
+            }
+        }
+    )
+    recipe = next(
+        recipe
+        for recipe in candidate_recipes_from_config(config)
+        if recipe.model.architecture_id == "global_pair_biaffine_0"
+    )
+
+    cfg = recipe.materialize_config(config)
+
+    assert cfg.model.architecture == "global_pair_biaffine_0"
+    assert cfg.model.graph_token_set == "graph512_turn_pair_prior"
+    assert cfg.model.graph_token_budget == 512
+    assert cfg.model.graph_layers == 3
+    assert cfg.model.pair_strategy == "sampled_joint_pair_v1"
+    assert cfg.model.pair_strategy_max_pairs == 256
+    assert cfg.model.heads == [
+        "cell_marginal_logits",
+        "pair_completion_logits",
+        "pair_proposal_score",
+        "pair_joint_logits",
+        "value",
+        "terminal_tactical_v1",
+    ]
+    assert cfg.selfplay.legal_row_mode == "full_rust_legal"
+    assert cfg.selfplay.tactical_mode == "proposal_and_label"
+    assert cfg.selfplay.constrain_threats is False
+    assert cfg.buffer.capacity == 120_000
+    assert cfg.selfplay.num_workers == 2
+    assert cfg.selfplay.batch_size_per_worker == 4
+    assert cfg.inference.max_batch_size == 48
+    assert cfg.inference.max_wait_us == 500
+    assert cfg.inference.fp16 is True
+    assert cfg.train.graph_microbatch_size == 1
+    assert cfg.train.graph_microbatch_autotune_max_size == 4
+    assert cfg.train.graph_microbatch_memory_headroom == pytest.approx(0.60)
+
+
 @pytest.mark.parametrize("mode", ["root_pair_mcts", "full_pair_mcts"])
 def test_pair_mcts_modes_materialize_as_explicit_runtime_modes(mode):
     recipe = CandidateRecipe(

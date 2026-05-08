@@ -69,9 +69,17 @@ class LossPlan:
             per_head[head_name] = float(entry.weight) * loss
 
         if self.entropy_weight is not None:
-            entropy_head = "policy" if "policy" in predictions else "policy_place" if "policy_place" in predictions else None
+            entropy_head = (
+                "policy"
+                if "policy" in predictions
+                else "policy_place"
+                if "policy_place" in predictions
+                else "cell_marginal_logits"
+                if "cell_marginal_logits" in predictions
+                else None
+            )
             if entropy_head is None:
-                raise LossContractError("entropy loss requires policy or policy_place predictions")
+                raise LossContractError("entropy loss requires policy, policy_place, or cell_marginal_logits predictions")
             per_head["entropy"] = float(self.entropy_weight) * primitive.entropy_loss(predictions[entropy_head])
 
         if not per_head:

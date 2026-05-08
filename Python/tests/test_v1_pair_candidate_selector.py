@@ -4,6 +4,7 @@ from hexorl.search.pair_candidate_selector_v1 import (
     SOURCE_ANCHOR_CONDITIONED_COMPLETION,
     SOURCE_BLIND_CANARY,
     SOURCE_DIRECT_PAIR_RETRIEVAL,
+    SOURCE_STRUCTURED_DIVERSITY,
     SOURCE_TERMINAL_EXACT,
     PairCandidateSelectorV1Config,
     PairCandidateV1,
@@ -190,7 +191,7 @@ def test_v1_selector_canonicalizes_and_deduplicates_across_sources():
 
 def test_v1_tactical_protected_candidates_survive_quota_budget_and_rerank():
     cfg = PairCandidateSelectorV1Config(
-        candidate_budget=1,
+        candidate_budget=2,
         source_quotas={SOURCE_DIRECT_PAIR_RETRIEVAL: 1, SOURCE_BLIND_CANARY: 0},
         source_priority=(SOURCE_DIRECT_PAIR_RETRIEVAL, SOURCE_BLIND_CANARY),
     )
@@ -215,6 +216,35 @@ def test_v1_tactical_protected_candidates_survive_quota_budget_and_rerank():
     assert all(SOURCE_TERMINAL_EXACT in candidate.source_scores for candidate in result.candidates)
     assert result.telemetry.protected_count == 2
     assert result.telemetry.budget_evictions == 1
+
+
+def test_v1_tactical_protected_candidates_are_bounded_by_candidate_budget():
+    tactical_payload = {
+        "pair_row_schema_version": 1,
+        "hot_completion_pairs": [
+            _pair_row(2, 4, row_id=0),
+            _pair_row(2, 7, row_id=1),
+            _pair_row(4, 9, row_id=2),
+        ],
+        "hot_cover_pairs": [],
+        "terminal_equivalent_pairs": [],
+    }
+    cfg = PairCandidateSelectorV1Config(
+        candidate_budget=2,
+        source_quotas={SOURCE_DIRECT_PAIR_RETRIEVAL: 0, SOURCE_BLIND_CANARY: 0},
+        source_priority=(SOURCE_DIRECT_PAIR_RETRIEVAL, SOURCE_BLIND_CANARY),
+    )
+
+    result = select_pair_candidates_v1(
+        LEGAL_ROWS,
+        tactical_payload=tactical_payload,
+        config=cfg,
+    )
+
+    assert len(result.candidates) == 2
+    assert result.telemetry.protected_count == 2
+    assert result.telemetry.budget_evictions == 1
+    assert all(candidate.tactical_protected_flag for candidate in result.candidates)
 
 
 def test_v1_blind_canary_is_deterministic_and_marked_training_forbidden():
@@ -265,6 +295,38 @@ def test_v1_direct_pair_retrieval_is_exact_and_chunking_stable():
         for candidate in block_one.candidates
     )
     assert block_one.scored_pair_count == len(LEGAL_ROWS) * (len(LEGAL_ROWS) - 1) // 2
+
+
+def test_v1_auxiliary_sources_use_bounded_deterministic_row_pool_for_large_tables():
+    legal_rows = tuple((idx, idx % 97, idx // 97) for idx in range(600))
+    cfg = PairCandidateSelectorV1Config(
+        candidate_budget=12,
+        source_quotas={
+            SOURCE_DIRECT_PAIR_RETRIEVAL: 0,
+            SOURCE_ANCHOR_CONDITIONED_COMPLETION: 0,
+            SOURCE_STRUCTURED_DIVERSITY: 6,
+            SOURCE_BLIND_CANARY: 2,
+        },
+        source_priority=(SOURCE_STRUCTURED_DIVERSITY, SOURCE_BLIND_CANARY),
+        structured_diversity_pool_rows=32,
+        blind_canary_seed=777,
+    )
+
+    first = select_pair_candidates_v1(legal_rows, config=cfg)
+    second = select_pair_candidates_v1(tuple(reversed(legal_rows)), config=cfg)
+
+    assert first.telemetry.legal_row_count == 600
+    assert first.telemetry.legal_pair_count == 600 * 599 // 2
+    assert first.telemetry.proposed_by_source[SOURCE_STRUCTURED_DIVERSITY] <= 6
+    assert first.telemetry.proposed_by_source[SOURCE_BLIND_CANARY] <= 2
+    assert [candidate.row_id_pair for candidate in first.candidates] == [
+        candidate.row_id_pair for candidate in second.candidates
+    ]
+    assert all(
+        SOURCE_STRUCTURED_DIVERSITY in candidate.source_scores
+        or SOURCE_BLIND_CANARY in candidate.source_scores
+        for candidate in first.candidates
+    )
 
 
 def test_v1_selector_final_admission_is_stable_under_legal_row_order_changes():
