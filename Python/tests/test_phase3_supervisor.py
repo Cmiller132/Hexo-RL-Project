@@ -23,6 +23,20 @@ from hexorl.tuning.phase3_supervisor import (
 )
 
 
+def test_phase3_runner_defaults_use_current_phase3_budget(tmp_path):
+    run_dir, spec_path = _phase3_supervisor_fixture(tmp_path)
+
+    runner = Phase3OptunaTpeRunner(
+        run_dir=run_dir,
+        spec_path=spec_path,
+        trial_runner=DryRunPhase3TrialRunner(),
+    )
+
+    assert runner.trial_epochs == 4
+    assert runner.fixed_eval_settings.games_per_candidate == 64
+    assert runner.fixed_eval_settings.max_moves == 500
+
+
 def test_phase3_supervisor_next_target_uses_min_terminal_count():
     empty = (
         Phase3StudyTerminalCounts("a", "sqlite:///a", "a", 0, 0, 0, 0, 0),

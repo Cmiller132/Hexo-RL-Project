@@ -186,12 +186,15 @@ class FakeV1PairSearchEngine:
         assert int(root_generation) == int(self.selected["root_generation"])
         assert int(legal_row_table_hash) == int(self.selected["legal_row_table_hash"])
         if self.selected["action_kind"] == "single":
+            self.game.place(*self.selected["first"])
             return {
                 "action_kind": "single",
                 "placements_applied": 1,
                 "first": self.selected["first"],
             }
         assert int(pair_key) == int(self.selected["pair_key"])
+        self.game.place(*self.selected["first"])
+        self.game.place(*self.selected["second"])
         return {
             "action_kind": "pair",
             "placements_applied": 2,

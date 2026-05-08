@@ -21,7 +21,7 @@ from hexorl.eval.scorecard import (
     read_scorecards,
 )
 
-DEFAULT_FIXED_CLASSICAL_GAMES = 20
+DEFAULT_FIXED_CLASSICAL_GAMES = 64
 DEFAULT_FIXED_CLASSICAL_MAX_MOVES = 500
 
 
