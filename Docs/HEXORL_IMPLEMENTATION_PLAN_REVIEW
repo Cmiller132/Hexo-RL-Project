@@ -1,0 +1,353 @@
+## Executive verdict
+
+**Approve the direction, but revise before implementation.** The plan is conceptually right: Hexo’s post-opening semantic action really is a two-stone unordered pair, and the proposed separation between **factorized proposal** and **pair-native search/backup/targets** is the right architecture. It is also implementable if the project treats candidate generation, row identity, and target construction as first-class runtime contracts rather than model-head conveniences.
+
+The main risk is not the pair-action idea. The main risk is **support failure**: the best pair is not admitted, beta/proposal metadata is wrong or missing, the model trains on a biased sampled support, and equal-simulation wins disappear at equal wall-clock. I would approve this as a research mainline only with mandatory gates around candidate recall, proposal correction, interior-node behavior, latency, and target correctness.
+
+Hexo’s own rules justify pair semantics: after the opening, every turn places two stones, and both 5-windows and 4-windows are immediate turn-level threats because a player has two placements per turn. The game guide also frames the core win mechanism as creating more independent threats than two opponent placements can cover, which is exactly a pair-level covering/overload problem.  
+
+---
+
+## 1. Overall verdict
+
+The plan is **directionally correct** and better than the current “pair heads exist but runtime semantics can still degrade into single-action or legal-order behavior” setup. The strongest part of the plan is that it insists on one semantic contract: after the opening, the searched edge, backup, target, and runtime move are all the completed unordered pair. That is the right way to avoid ordered-action leakage and pair-to-single projection artifacts. 
+
+I would classify the plan as **approved with revisions**, not simply approved. The architecture is sound, but several pieces are not implementation-ready enough:
+
+* The **interior-node lifecycle** is underdefined: when candidates are generated, when the model is called, whether candidate pools are cached, how widening admits new pairs, and when a node is re-scored.
+* The **beta/inclusion estimate** is required by the plan but mathematically underspecified for deterministic top-k, overlapping source quotas, protected terminal actions, and structured exploration.
+* The **root Gumbel operator** is named, but the exact completed-Q target construction, temperature, tie-breaking, and target-pruning interactions need executable pseudocode.
+* The **acceptance criteria** are good in spirit but need phase-specific thresholds, confidence intervals, hardware-fixed wall-clock definitions, and explicit candidate-budget/latency budgets.
+
+The highest-risk assumptions are:
+
+1. **Candidate recall will be high enough.** Pair-native MCTS is only strong if the candidate selector admits the important pair before search starts. Missing the best pair is worse than using a weaker sequential search that can stumble into it through a first move.
+2. **The proposal correction will be usable.** The plan requires source metadata and combined beta/inclusion estimates, but deterministic top-k retrieval does not naturally provide a clean sampling probability.
+3. **The pair scorer will learn synergy from sampled support.** `pair_joint_logits` can become overconfident on the admitted distribution and blind to unsampled pairs unless replay and losses are very carefully corrected.
+4. **Equal-wall-clock performance will survive.** Pair search has better semantics but worse branching. The plan correctly says final acceptance requires equal-wall-clock strength, not just equal-simulation strength. 
+5. **Terminal semantics are consistent.** If a first stone in the pair wins, the implementation must decide whether the second placement is still applied or terminal-equivalent only. The plan calls this out, but it must be resolved before replay and tactical targets are built. 
+
+---
+
+## 2. Pair-native search
+
+Treating a full two-stone turn as an unordered pair action **makes sense for Hexo**. The game’s strategic object is often not “best first stone” plus “best second stone”; it is “which two cells together complete, block, overload, or coordinate across windows.” A sequential decomposition imposes an arbitrary order on an unordered move and can assign too much search credit to the first selected cell. The plan correctly identifies `(a,b)` and `(b,a)` aliasing as a semantic and statistical problem. 
+
+Pair-native MCTS is **likely better than sequential single-placement MCTS** under the following conditions:
+
+* The candidate pool has high tactical and audit-search recall.
+* Pair edges are applied atomically through the exact simulator.
+* The pair prior is over completed pairs, not reconstructed from independent cell priors.
+* The search target is candidate-aware and does not punish unsampled legal pairs.
+* The baseline comparison is against a fair sequential **DAG/transposition** baseline, not a naïve ordered tree.
+
+This lines up with the literature motivation. Gumbel AlphaZero/MuZero was explicitly designed to improve policy learning when search cannot visit all root actions, and Sampled MuZero formalizes planning and policy improvement over sampled action subsets in complex action spaces. ([OpenReview][1]) ([arXiv][2])
+
+What can go wrong:
+
+* **Quadratic branching returns through the back door.** If pair retrieval, reranking, or logging accidentally scores too many pairs per node, wall-clock collapses.
+* **Candidate myopia.** If retrieval is mostly unary or conditional on high-marginal anchors, the system misses “two mediocre cells together are great” pairs.
+* **Aliasing through targets.** If unordered pairs are canonicalized but conditional heads are trained only from the canonical first cell, row-order artifacts leak back in.
+* **Terminal-equivalent pollution.** If a single winning cell makes all filler second cells equivalent, the model must not learn arbitrary preferences among the fillers.
+* **Search horizon compression.** Pair macro-actions halve the nominal ply depth compared with single placements, which is good semantically, but value calibration must match this turn-level depth.
+
+The better alternative is not to revert to sequential search. The better fallback is a **pair-native edge with stronger factorized candidate generation** and a fair sequential DAG baseline kept only as an ablation.
+
+---
+
+## 3. Model heads
+
+### `cell_marginal_logits`
+
+Useful and necessary, but it must stay auxiliary/proposal-only. It gives dense supervision in a sparse pair-action setting and provides anchor candidates for conditional completion. It is risky only if runtime starts selecting cells independently or projecting pair logits back to single-cell logits. The plan correctly states that cell marginals and completions do not define the searched action. 
+
+My recommendation: keep it, train it from the pruned pair posterior’s marginals, and log its calibration. Do not use it as a final policy.
+
+### `pair_completion_logits`
+
+Useful, but the riskiest proposal head. It is ordered and anchor-conditioned, while the semantic action is unordered. That is fine only if training always emits both orientations for an unordered pair and never trains only the canonical first row. The plan says conditional second-cell targets should include both unordered views, which is exactly right. 
+
+The plan should specify more:
+
+* Which anchors are scored at inference: all legal anchors, top-k marginal anchors, retrieval-suggested anchors, or source-quota anchors?
+* Whether `completion(i,j)` and `completion(j,i)` are combined by `logsumexp`, average, max, or treated as separate source contributions before canonical deduplication.
+* How anchor probabilities contribute to beta. A completion source is not just `P(j|i)`; it is `P(anchor=i) * P(j|i)` plus the reverse orientation if both are sampled.
+* How to avoid “anchor saliency bias,” where a strong pair is missed because neither cell is a high-ranked anchor.
+
+Verdict: keep it, but require explicit orientation-safe inference and target code before use in MCTS.
+
+### `pair_proposal_score`
+
+Very useful. This is the right head for direct pair retrieval because it can retrieve pairs whose relationship is strong even when neither cell is a top unary action. The proposed symmetric low-rank form is appropriate as a cheap retrieval signal, and the plan correctly distinguishes it from the final policy: the cheap score forms a bounded candidate set, while richer `pair_joint_logits` and MCTS decide among admitted pairs. 
+
+The risk is that this head becomes a poorly calibrated “second policy” with no clear target. It needs its own training contract: probably contrastive/ranking loss over admitted strong pairs, sampled explicit negatives, terminal pairs, and audit-search pairs, with proposal correction metadata. It should optimize **candidate recall**, not policy accuracy.
+
+Verdict: essential, but evaluate it on final candidate-pool recall, not only retrieval top-k precision.
+
+### `pair_joint_logits`
+
+This should be the main policy prior for pair MCTS. The proposed decomposition,
+
+`m_i + m_j + symmetric pair relation + symmetric MLP features`,
+
+is conceptually strong because it combines dense single-cell learning with explicit pair interaction. The requirement that the biaffine term be mathematically order-invariant is non-negotiable. 
+
+The biggest concern is candidate-distribution bias. `pair_joint_logits` only sees bounded candidate pairs in normal runtime. That is acceptable, but the loss must not pretend the scored candidate set is the whole legal pair space. Also, source-contribution bitsets are useful features, but they can become shortcuts: the scorer may learn “terminal source good, canary bad” rather than board geometry. I would include source features in an ablation, not necessarily in the default pure policy scorer.
+
+Verdict: keep as main policy prior, but require symmetry tests, source-feature ablation, calibration metrics, and audit-search recall/regret metrics.
+
+### `value`
+
+Essential. The plan is right to keep exact Rust dynamics and a value head rather than MuZero dynamics. What is underspecified is the value target’s perspective and terminal timing. It must be explicit whether value is from side-to-move at a full-turn node, after a completed pair, or after a first-placement diagnostic state.
+
+Verdict: required; add value calibration by phase and tactical density.
+
+### `terminal_tactical_v1`
+
+Useful and correctly scoped. Exact immediate wins, exact blocks, terminal-equivalent pairs, and impossible-to-block flags are the right V1 tactical labels. They protect candidate recall without turning the project into a brittle tactical oracle. The plan is also right that tactical labels are proposals/auxiliaries/target-pruning metadata, not hidden legal filters. 
+
+Verdict: required. Make terminal tactical fixtures exhaustive and cross-language tested.
+
+### `pair_q_or_completed_q`
+
+Potentially valuable, but dangerous if treated casually. Completed-Q is useful for Gumbel-style policy improvement and sparse-visit targets, but it is easy to create inconsistent targets if Q is mixed across different candidate supports, search budgets, or terminal-pruning regimes. The plan says replay should store visits, Q values, completed-Q values, gumbel admission order, proposal parameters, and prune flags; that metadata is necessary. 
+
+Verdict: implement completed-Q logging and target construction first; add a trainable head only after the target is stable.
+
+### `uncertainty_or_regret`
+
+This is the most underspecified head. It could help replay prioritization, source quotas, widening, or hard-state mining. It could also become a noisy auxiliary that destabilizes early training. There is no clear target definition in the plan.
+
+Verdict: defer as a runtime-consuming head. Start with logged uncertainty proxies: value variance across augmentations, policy entropy, search surprise, Q variance, and checkpoint disagreement. Promote to a head only when there is a precise target.
+
+---
+
+## 4. Candidate generation
+
+The source-based selector is the right design. A single blended sampler would hide failure modes. Source quotas make it possible to ask: did terminal exact, direct retrieval, anchor completion, marginal cross, structured diversity, or canary sampling actually contribute to recall?
+
+Direct pair retrieval is a good idea because it is the only model-led source that can find pair synergy without depending on high unary saliency. The plan’s insistence that `direct_pair_retrieval` starts with blockwise-exact top-k before approximate retrieval is also correct. Exact retrieval is easier to test for diagonal masking, unordered deduplication, legal-row-order independence, D6 consistency, and batching stability. The plan explicitly requires those tests before approximate retrieval is allowed. 
+
+The recall metrics are directionally good but need sharpening. “Candidate recall contains the final best-search pair on at least 95% of roots” is a good mature-stage criterion, but “best pair” is not always well-defined because large-budget search itself has noise. The plan also correctly says direct retrieval must improve **final candidate-pool recall**, not just its own top-k ranking. 
+
+Candidate recall should be measured as:
+
+* **Terminal recall:** exact win-pair recall, terminal-equivalent winning-cell recall, mandatory block-pair recall, and impossible-to-block classification. Immediate own wins should be effectively 100% because they are exact tactical facts, not learned proposals.
+* **Audit-search recall:** fraction of roots where the admitted candidate pool contains at least one pair in the audit top-k set, not only the single top pair.
+* **Regret-weighted recall:** `max_Q_audit - max_Q_admitted`, bucketed by game phase, legal-pair count, tactical density, and candidate budget.
+* **Source recall:** recall with each source removed and with each source alone.
+* **Widening recall:** recall of the initial admitted set versus the full node candidate reservoir versus pairs eventually widened into search.
+* **Symmetry/stability recall:** same candidate set under D6 transforms and legal-row reorderings, up to deterministic tie-breaks.
+
+A critical addition: candidate recall must be measured on **fixed positions with multiple budgets**. A selector can look good at large candidate budgets but fail when the budget is squeezed to the real self-play setting.
+
+---
+
+## 5. MCTS design
+
+Gumbel sequential halving at the root makes sense. The root is where policy improvement targets are generated, and the action space is too large to visit exhaustively. Gumbel planning is relevant precisely because AlphaZero-style search can fail to improve when not all root actions are visited, and the Gumbel paper addresses action sampling without replacement under low simulation counts. ([OpenReview][1])
+
+Proposal-aware PUCT below the root also makes sense. If the child set is sampled from a nonuniform process, raw logits over that sampled set are biased unless the system accounts for inclusion. Sampled MuZero’s main relevant lesson for Hexo is not learned dynamics; it is sampled action-set planning and careful policy improvement over sampled subsets. ([arXiv][2])
+
+Progressive widening is the right family of techniques, but the specification is not complete. Progressive widening is a known response to large or continuous action spaces, where considering every action at every node is intractable.  The plan gives the usual shape,
+
+`allowed_children = ceil(c_pw * visits ** alpha_pw)`,
+
+but it must also define:
+
+* the ranked reservoir from which newly widened children are drawn;
+* whether widening draws by corrected prior, uncorrected proposal, source quota, or diversity;
+* how protected terminal actions bypass widening;
+* whether a node can request more candidates after its reservoir is exhausted;
+* how source quotas change between root and interior nodes;
+* whether widening is deterministic under seed and D6 transform;
+* how virtual loss and batching interact with widening in parallel self-play.
+
+Proposal correction and beta metadata should be handled conservatively. Store both uncorrected model logits and corrected priors. Compute a combined inclusion estimate from all source contributions where possible, but mark deterministic/protected sources separately. Use clipped correction, as the plan proposes, but never silently treat missing beta as 1. Missing beta should either block search admission or mark the candidate as “uncorrected diagnostic only.” The plan’s candidate proposal contract is correctly strict that a candidate without source metadata cannot enter search. 
+
+At interior nodes, the model should be called **once per newly expanded full-turn state**, not once per possible second placement or once per candidate pair. The expected flow should be:
+
+1. Apply the selected pair atomically.
+2. If terminal, return exact value.
+3. Otherwise, at the new full-turn node, call the model once to get state value, legal-cell embeddings, and proposal heads.
+4. Build a bounded pair candidate reservoir.
+5. Score the bounded pool with the cheap retrieval/rich reranker as needed.
+6. Admit children progressively from that reservoir as node visits grow.
+7. Cache the reservoir, corrected priors, tactical payload, and model outputs for the node.
+
+The plan implies this, but it should be made explicit. Otherwise an implementation could accidentally call the neural model repeatedly inside candidate expansion.
+
+---
+
+## 6. Training targets
+
+The candidate-aware target design is correct and one of the strongest parts of the plan. The rule “unsampled legal pair != negative pair” is essential. In a sampled pair-action space, omitted actions are unknown, not false. The plan explicitly requires pruned candidate-set posteriors, completed-Q or regularized posteriors, marginal targets, conditional targets, sampled-softmax/ranking losses with proposal correction, tactical auxiliaries, and value/Q heads. 
+
+The marginal and conditional auxiliary targets are helpful if they are derived from the pruned joint posterior and do not become independent policy targets. They are dangerous if:
+
+* marginal targets are trained from raw pair counts that include forced exploration;
+* conditional targets use only canonical ordering;
+* completion targets punish unadmitted second cells as negatives;
+* terminal-equivalent filler cells create arbitrary preferences.
+
+The plan’s terminal-equivalence handling is conceptually right: if one cell wins, then every legal pair containing that cell may be strategically equivalent, so the model should not learn arbitrary second-cell preferences. 
+
+I would add one more target status:
+
+```text
+pair_policy_complete = false
+support_type = admitted_candidate_set_without_explicit_negatives
+```
+
+This should be the default unless the target builder can prove exhaustive support, explicit sampled negatives, or completed-Q posterior semantics. That prevents future code from accidentally treating a sparse candidate list as a full distribution.
+
+---
+
+## 7. Tactical design
+
+Terminal-only tactical V1 is the right scope. Exact wins, exact blocks, terminal-equivalent pairs, and impossible-to-block flags are cheap, testable, and necessary. Overloads, forks, shared pivots, and bounded tactical races are important, but they are also a major source of complexity and oracle bias. Deferring them to V2 is correct as long as V1 is not judged by “superhuman tactical strength” prematurely. 
+
+The plan preserves the right structure for the model to learn tactics without a large tactical oracle: `WINDOW6` objects, legal-cell/window membership, window overlap, shared cover cells, same-axis/same-line relations, and active-window cap telemetry. The plan correctly treats six-cell windows as the minimal tactical object matching the win condition. 
+
+My caveat: terminal-only V1 may not be enough to bootstrap non-terminal forcing play. The answer is not to add a giant oracle immediately. The better V1 addition is **evaluation-only non-terminal tactical suites**: overload fixtures, fork fixtures, shared-pivot fixtures, and bounded hot-window-race positions used to measure whether the model and search are learning them. Do not use these as hard filters or default proposal sources until V1 candidate recall and runtime are proven.
+
+---
+
+## 8. Performance
+
+The plan mostly avoids the worst performance trap: hundreds of neural calls per leaf. If implemented as “one graph encode per expanded full-turn node, then vectorized pair scoring over a bounded candidate pool,” the design is plausible. The plan also explicitly rejects materializing all pair actions as graph tokens, which avoids an `O(A^2)` attention path. 
+
+Likely bottlenecks, in order:
+
+1. **Graph construction and active-window extraction.** `WINDOW6` selection can become CPU-bound if it scans too broadly or overflows often.
+2. **Rust/Python boundary and serialization.** Legal rows, pair rows, tactical payloads, and candidate metadata are large and frequent.
+3. **Blockwise pair retrieval.** Cheap low-rank scoring is vectorizable, but still `O(m^2 * r)` in the number of legal cells `m` and retrieval rank `r`.
+4. **Rich pair reranking.** Candidate pools must stay bounded; otherwise the symmetric MLP/biaffine scorer becomes the hot path.
+5. **MCTS bookkeeping.** Source metadata, beta correction, widening state, and deduplication can dominate if implemented naively.
+6. **Inference batching.** Pair-native search may expand fewer semantic plies but with heavier node initialization. Queue backpressure and batch fill rate matter.
+
+The candidate budgets are plausible only if the project profiles real legal-cell distributions. Before committing, profile:
+
+* legal-cell count and legal-pair count by game phase;
+* active-window count and overflow rate;
+* candidate generation p50/p95 latency;
+* blockwise retrieval pair-scores/sec;
+* rich rerank pairs/sec;
+* model inference p50/p95 latency by token count;
+* MCTS node expansions/sec;
+* number of neural calls per move;
+* GPU utilization and inference-server queue backpressure;
+* equal-wall-clock strength under fixed hardware and fixed batching settings.
+
+The plan’s metric list is strong, but it should add a hard invariant: **no self-play configuration is valid unless neural calls per expanded full-turn node are bounded and logged.**
+
+---
+
+## 9. Differences from current model/search setup
+
+The proposed plan differs from the current state in four important ways.
+
+First, it makes **pair runtime semantics explicit**. Current graph pair heads such as `policy_pair_first`, `policy_pair_joint`, and `policy_pair_second` can exist without guaranteeing that MCTS expands, applies, and backs up unordered pair macro-actions. The proposed plan says existing `root_pair_mcts` or `full_pair_mcts` should not be treated as final pair-action MCTS unless they truly expand, apply, and back up unordered pair actions; otherwise they should be quarantined as prior-blend paths. 
+
+Second, it replaces **head-name-driven behavior** with strategy-owned behavior. The model may expose pair-capable outputs, but `sampled_joint_pair_v1`, not tensor-name presence, decides runtime behavior. This is the right migration pattern.
+
+Third, it replaces **legal-order first-N pair scoring** with source-tagged candidate generation. The plan explicitly rejects walking legal rows in nested-loop order and stopping at `max_pairs`, because that biases candidates toward early legal-row anchors and can miss late-row tactical pairs. 
+
+Fourth, it changes training from sparse pair visits to **candidate-aware pair targets** with source metadata, beta estimates, completed-Q values, target-prune flags, terminal-equivalence flags, and auxiliary projections. That is a real schema migration, not a small model-head rename. 
+
+The migration path is realistic if staged vertically:
+
+1. Full legal rows and pair row identity.
+2. Candidate selector with terminal exact and blockwise retrieval.
+3. Pair MCTS edge semantics.
+4. Replay schema.
+5. Candidate-aware targets.
+6. Biaffine pair model.
+7. Cutover and deletion/quarantine of old paths.
+
+The biggest migration risk is not coding the pair head. It is removing hidden assumptions in self-play, replay, inference adapters, and target builders that still expect a single legal-action policy.
+
+---
+
+## 10. Missing pieces and improvements
+
+### Underspecified
+
+The plan should specify:
+
+* exact terminal timing when the first stone in a pair wins;
+* root Gumbel sequential halving pseudocode, including completed-Q construction;
+* candidate budget numbers by phase and by root/interior node;
+* progressive widening admission policy;
+* model-call lifecycle and caching at interior nodes;
+* beta calculation for deterministic top-k, protected terminal candidates, and multi-source deduplication;
+* loss formulas and weights for every head;
+* target completeness flags and sampled-negative semantics;
+* active `WINDOW6` cap values and overflow priority order;
+* hardware-fixed wall-clock evaluation protocol;
+* confidence intervals and SPRT/arena stopping criteria;
+* replay schema versioning and backward compatibility;
+* whether source-contribution features are allowed in the final policy scorer or only in candidate selection/rerank ablations.
+
+### Acceptance criteria that are too weak
+
+“Statistically meaningful equal-wall-clock Elo win” is too vague. Define the hardware, inference batching, candidate budget, confidence interval, number of games, opponent checkpoint policy, and significance threshold.
+
+“Performance budgets” are mentioned but not numerically defined. Add phase-specific budgets for candidate generation p95, pair scores/sec, neural calls per move, GPU utilization, and MCTS expansions/sec.
+
+### Acceptance criteria that are too strong or need phase qualification
+
+“Candidate recall contains the final best-search pair on at least 95% of roots” is good for mature checkpoints, but too strong for bootstrap and ambiguous unless “best-search pair” is defined with an audit budget and top-k/regret tolerance.
+
+“Exact immediate winning pairs have at least 99.5% recall” is actually too weak if terminal exact logic is the source. For own immediate wins, I would require 100% in deterministic tactical fixtures, with 99.5% only for large randomized integration suites where fixture generation or overflow may introduce edge cases.
+
+### What should be simplified
+
+Defer `uncertainty_or_regret` as a trainable runtime head. Log uncertainty first.
+
+Start `pair_q_or_completed_q` as a target/logging artifact before making it a model head.
+
+Keep V1 tactical labels terminal-only, but add non-terminal tactical **evaluation** fixtures.
+
+Make source bitsets an ablated pair-feature group, not an unquestioned default for `pair_joint_logits`.
+
+### What should be explicitly rejected
+
+The plan should continue to reject:
+
+* pair-to-single projection for final move choice;
+* legal-order first-N pair generation in normal runtime;
+* hard threat-filtered `LEGAL` rows;
+* exhaustive all-pair MCTS as mainline;
+* materialized pair tokens in the main encoder;
+* ANN/MIPS retrieval before blockwise-exact retrieval is validated;
+* hidden behavior triggered by model head names;
+* training unsampled legal pairs as negatives;
+* keeping sequential and pair semantics both alive after cutover.
+
+---
+
+## Prioritized recommended changes
+
+1. **Add executable MCTS pseudocode** for root Gumbel sequential halving, completed-Q target construction, interior-node expansion, candidate caching, and progressive widening.
+
+2. **Define beta/inclusion metadata rigorously.** Separate stochastic source probability, deterministic top-k inclusion, protected terminal inclusion, and empirical/calibrated inclusion estimates. Missing beta must be a hard error for training-consuming candidates.
+
+3. **Make candidate recall regret-weighted.** Track terminal recall, audit top-k recall, source ablation recall, widened-child recall, and `max_Q_audit - max_Q_admitted`, bucketed by phase, legal-pair count, and tactical density.
+
+4. **Resolve terminal pair semantics before implementation.** Decide whether a first-stone win stops the turn or whether the full pair is always applied for replay/search purposes, then enforce the same rule in Rust, MCTS, replay, targets, and fixtures.
+
+5. **Make interior model-call behavior explicit.** One neural evaluation per expanded full-turn node; no per-second-placement or per-pair inference loops.
+
+6. **Add concrete phase budgets.** Candidate count, pre-candidate count, root/interior budget, pair rerank budget, p95 candidate latency, pair scores/sec, neural calls per move, and self-play games/hour.
+
+7. **Defer `uncertainty_or_regret` as a trainable head.** Log entropy, Q variance, search surprise, augmentation disagreement, and checkpoint disagreement first.
+
+8. **Harden target completeness flags.** Every pair policy target should declare whether support is exhaustive, admitted-only, admitted-with-explicit-negatives, or completed-Q posterior.
+
+9. **Add non-terminal tactical evaluation fixtures now, but not V2 oracle sources.** Use overload, fork, shared-pivot, and hot-window-race suites to measure whether V1 model/search learns tactics without depending on a tactical proposer.
+
+10. **Require a fair sequential DAG baseline before final cutover.** Pair-native search should be the mainline hypothesis, but final acceptance must prove equal-wall-clock superiority against the strongest fair sequential baseline, not a strawman.
+
+[1]: https://openreview.net/forum?id=bERaNdoegnO "Policy improvement by planning with Gumbel | OpenReview"
+[2]: https://arxiv.org/abs/2104.06303 "[2104.06303] Learning and Planning in Complex Action Spaces"
