@@ -14,7 +14,7 @@ except ModuleNotFoundError:
 _BasePruner = _OPTUNA.pruners.BasePruner if _OPTUNA is not None else object
 
 
-PAIR_MODES = {"none", "root_pair_mcts", "full_pair_mcts"}
+PAIR_MODES = {"none", "sampled_joint_pair_v1"}
 
 
 @dataclass(frozen=True)

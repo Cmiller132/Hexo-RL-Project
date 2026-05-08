@@ -27,7 +27,8 @@ from hexorl.contracts import ValueDecoderContract
 from hexorl.models.loading import build_runtime_model
 from hexorl.models.registry import resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
-from hexorl.search.pair_strategy import build_pair_strategy
+from hexorl.search.pair_strategy import build_legacy_pair_baseline_strategy, build_pair_strategy
+from hexorl.search.legacy_pair_projection import pair_logits_to_action_logits
 from hexorl.selfplay.worker import _expand_crop_root_with_optional_sparse
 
 
@@ -264,7 +265,10 @@ def test_pair_strategy_is_required_for_pair_behavior():
     with pytest.raises(ValueError, match="pair behavior requires an explicit pair strategy"):
         none.require_enabled(context="unit")
 
-    root = build_pair_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
+    with pytest.raises(ValueError, match="quarantined"):
+        build_pair_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
+
+    root = build_legacy_pair_baseline_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
     assert root.enabled
     assert root.pair_rows_owned
     assert not root.leaf_pair_scoring_enabled
@@ -272,17 +276,17 @@ def test_pair_strategy_is_required_for_pair_behavior():
     with pytest.raises(ValueError, match="known first"):
         root.require_pair_phase(second_placement=True, known_first=False, context="unit")
 
-    full = build_pair_strategy("full_pair_mcts", max_pairs=16, prior_mix=0.25)
+    full = build_legacy_pair_baseline_strategy("full_pair_mcts", max_pairs=16, prior_mix=0.25)
     assert full.leaf_pair_scoring_enabled
 
 
 def test_pair_strategy_rejects_non_finite_pair_logits():
-    strategy = build_pair_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
+    strategy = build_legacy_pair_baseline_strategy("root_pair_mcts", max_pairs=16, prior_mix=0.25)
     pair_qr = np.asarray([[0, 0, 1, 0]], dtype=np.int32)
     legal = np.asarray([[0, 0], [1, 0]], dtype=np.int32)
 
     with pytest.raises(ValueError, match="finite"):
-        strategy.pair_logits_to_action_logits(
+        pair_logits_to_action_logits(
             pair_qr,
             np.asarray([np.nan], dtype=np.float32),
             legal,

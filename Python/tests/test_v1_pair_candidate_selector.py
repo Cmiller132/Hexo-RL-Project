@@ -218,7 +218,7 @@ def test_v1_tactical_protected_candidates_survive_quota_budget_and_rerank():
     assert result.telemetry.budget_evictions == 1
 
 
-def test_v1_tactical_protected_candidates_are_bounded_by_candidate_budget():
+def test_v1_tactical_protected_candidates_expand_beyond_candidate_budget():
     tactical_payload = {
         "pair_row_schema_version": 1,
         "hot_completion_pairs": [
@@ -241,10 +241,39 @@ def test_v1_tactical_protected_candidates_are_bounded_by_candidate_budget():
         config=cfg,
     )
 
-    assert len(result.candidates) == 2
-    assert result.telemetry.protected_count == 2
-    assert result.telemetry.budget_evictions == 1
+    assert len(result.candidates) == 3
+    assert result.telemetry.protected_count == 3
+    assert result.telemetry.budget_evictions == 0
     assert all(candidate.tactical_protected_flag for candidate in result.candidates)
+
+
+def test_v1_impossible_cover_payload_marks_hot_cover_candidate_support():
+    tactical_payload = {
+        "status": "hot_cover_impossible",
+        "pair_row_schema_version": 1,
+        "hot_completion_pairs": [],
+        "hot_cover_pairs": [_pair_row(2, 4, row_id=0)],
+        "terminal_equivalent_pairs": [],
+        "impossible_to_cover": True,
+    }
+    cfg = PairCandidateSelectorV1Config(
+        candidate_budget=1,
+        source_quotas={SOURCE_BLIND_CANARY: 0},
+        source_priority=(SOURCE_BLIND_CANARY,),
+    )
+
+    result = select_pair_candidates_v1(
+        LEGAL_ROWS,
+        tactical_payload=tactical_payload,
+        config=cfg,
+    )
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.tactical_protected_flag is True
+    assert "terminal_cover" in candidate.target_support_flags
+    assert "covers_all_opponent_win_requirements" in candidate.target_support_flags
+    assert "impossible_to_cover" in candidate.target_support_flags
 
 
 def test_v1_blind_canary_is_deterministic_and_marked_training_forbidden():

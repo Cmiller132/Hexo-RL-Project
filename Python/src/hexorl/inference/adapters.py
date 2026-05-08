@@ -19,6 +19,9 @@ from hexorl.inference.protocol import (
     GRAPH_HEAD_PAIR_JOINT,
     GRAPH_HEAD_PAIR_SECOND,
     GRAPH_HEAD_REGRET,
+    GRAPH_HEAD_V1_LEGAL_COMPLETION_KEY,
+    GRAPH_HEAD_V1_LEGAL_COMPLETION_QUERY,
+    GRAPH_HEAD_V1_LEGAL_PROPOSAL_EMBEDDINGS,
     OutputMetadata,
     row_table_metadata,
     validate_row_arrays_match,
@@ -52,6 +55,9 @@ class DecodedGraphOutputs:
     pair_completion_logits: np.ndarray | None = None
     pair_proposal_score: np.ndarray | None = None
     pair_joint_logits: np.ndarray | None = None
+    legal_proposal_embeddings: np.ndarray | None = None
+    legal_completion_query: np.ndarray | None = None
+    legal_completion_key: np.ndarray | None = None
     terminal_tactical_v1: np.ndarray | None = None
     regret_rank: np.ndarray | None = None
     metadata: dict[str, object] | None = None
@@ -363,6 +369,35 @@ def decode_global_graph_outputs(
             raise ValueError("pair_proposal_score batch dimension does not match graph inputs")
         pair_proposal_np = _finite_numpy("pair_proposal_score", proposal_t)
 
+    legal_projection_np = None
+    legal_completion_query_np = None
+    legal_completion_key_np = None
+    legal_projection_outputs: list[tuple[str, torch.Tensor]] = []
+    for projection_key in (
+        "legal_proposal_embeddings",
+        "legal_completion_query",
+        "legal_completion_key",
+    ):
+        if projection_key in outputs:
+            projection_t = torch.nan_to_num(
+                outputs[projection_key].detach().float(),
+                nan=0.0,
+                posinf=80.0,
+                neginf=-80.0,
+            ).clamp_(-80.0, 80.0)
+            if projection_t.ndim != 3 or int(projection_t.shape[0]) != batch:
+                raise ValueError(f"{projection_key} output must have shape (B, L, R)")
+            if int(projection_t.shape[1]) < legal_width:
+                raise ValueError(f"{projection_key} legal row dimension is shorter than graph LEGAL rows")
+            legal_projection_outputs.append((projection_key, projection_t[:, :legal_width]))
+    for projection_key, projection_t in legal_projection_outputs:
+        if projection_key == "legal_proposal_embeddings":
+            legal_projection_np = _finite_numpy(projection_key, projection_t)
+        elif projection_key == "legal_completion_query":
+            legal_completion_query_np = _finite_numpy(projection_key, projection_t)
+        elif projection_key == "legal_completion_key":
+            legal_completion_key_np = _finite_numpy(projection_key, projection_t)
+
     terminal_tactical_np = None
     if "terminal_tactical_v1" in outputs:
         terminal_t = torch.nan_to_num(
@@ -488,6 +523,18 @@ def decode_global_graph_outputs(
             "terminal_tactical_v1",
             "auxiliary",
         ).to_dict()
+    for projection_key, projection_np in (
+        ("legal_proposal_embeddings", legal_projection_np),
+        ("legal_completion_query", legal_completion_query_np),
+        ("legal_completion_key", legal_completion_key_np),
+    ):
+        if projection_np is not None:
+            row_tables[projection_key] = legal_meta.to_dict()
+            output_metadata[projection_key] = OutputMetadata(
+                projection_key,
+                "legal_projection",
+                row_table=legal_meta,
+            ).to_dict()
 
     metadata = {
         "row_tables": row_tables,
@@ -506,6 +553,9 @@ def decode_global_graph_outputs(
         pair_completion_logits=pair_completion_np,
         pair_proposal_score=pair_proposal_np,
         pair_joint_logits=v1_pair_joint_np,
+        legal_proposal_embeddings=legal_projection_np,
+        legal_completion_query=legal_completion_query_np,
+        legal_completion_key=legal_completion_key_np,
         terminal_tactical_v1=terminal_tactical_np,
         regret_rank=regret,
         metadata=metadata,
@@ -650,5 +700,38 @@ def decode_graph_slot_response(
                 getattr(slot, "res_graph_regret_rank")[row : row + 1],
                 copy=True,
             )
+        projection_dim = int(slot.res_graph_meta[8]) if len(slot.res_graph_meta) > 8 else 0
+        projection_dim = max(0, projection_dim)
+        for flag, key, attr in (
+            (
+                GRAPH_HEAD_V1_LEGAL_PROPOSAL_EMBEDDINGS,
+                "legal_proposal_embeddings",
+                "res_graph_legal_proposal_embeddings",
+            ),
+            (
+                GRAPH_HEAD_V1_LEGAL_COMPLETION_QUERY,
+                "legal_completion_query",
+                "res_graph_legal_completion_query",
+            ),
+            (
+                GRAPH_HEAD_V1_LEGAL_COMPLETION_KEY,
+                "legal_completion_key",
+                "res_graph_legal_completion_key",
+            ),
+        ):
+            if head_flags & flag:
+                meta["row_tables"][key] = legal_meta.to_dict()
+                meta["outputs"][key] = OutputMetadata(
+                    key,
+                    "legal_projection",
+                    row_table=legal_meta,
+                ).to_dict()
+                result[key] = np.array(
+                    getattr(slot, attr)[
+                        legal_off : legal_off + legal_count,
+                        :projection_dim,
+                    ],
+                    copy=True,
+                )
         results.append(result)
     return results

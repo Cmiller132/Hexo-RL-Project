@@ -274,6 +274,9 @@ def test_v1_pair_biaffine_outputs_are_finite_masked_and_unordered_symmetric():
     assert out["pair_completion_logits"].shape == (1, 3)
     assert out["pair_proposal_score"].shape == (1, 3)
     assert out["pair_joint_logits"].shape == (1, 3)
+    assert out["legal_proposal_embeddings"].shape[:2] == (1, 3)
+    assert out["legal_completion_query"].shape == out["legal_proposal_embeddings"].shape
+    assert out["legal_completion_key"].shape == out["legal_proposal_embeddings"].shape
     assert out["value"].shape == (1, 65)
     assert out["terminal_tactical_v1"].shape == (1, 8)
     assert out["cell_marginal_logits"][0, 2].item() == pytest.approx(-80.0)

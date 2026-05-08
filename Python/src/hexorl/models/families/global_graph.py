@@ -339,6 +339,21 @@ class GlobalHexGraphNet(nn.Module):
                 ~legal_mask_bool,
                 -80.0,
             )
+        if self.is_v1_pair_biaffine and self._wants("cell_marginal_logits"):
+            proposal_left = self.v1_pair_left(legal_vec)
+            proposal_right = self.v1_pair_right(legal_vec)
+            proposal_rank = max(1, proposal_left.shape[-1]) ** -0.5
+            out["legal_proposal_embeddings"] = (
+                0.5 * (proposal_left + proposal_right) * proposal_rank
+            ).masked_fill(~legal_mask_bool.unsqueeze(-1), 0.0)
+            out["legal_completion_query"] = proposal_left.masked_fill(
+                ~legal_mask_bool.unsqueeze(-1),
+                0.0,
+            )
+            out["legal_completion_key"] = proposal_right.masked_fill(
+                ~legal_mask_bool.unsqueeze(-1),
+                0.0,
+            )
         if self._wants("policy_pair_first", "pair_policy"):
             pair_first_vec = legal_vec
             if self.pair_first_refine is not None:

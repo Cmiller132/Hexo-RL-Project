@@ -253,6 +253,19 @@ pub struct V1InteriorWideningResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct V1ExpansionRequest {
+    pub node_key: u64,
+    pub game: HexGameState,
+    pub legal_table: LegalRowTableV1,
+    pub tactical: TerminalTacticalSetV1,
+    pub parent_visits: u32,
+    pub node_visit_count: u32,
+    pub root_generation: u64,
+    pub legal_row_table_hash: u64,
+    pub phase: TurnPhaseV1,
+}
+
+#[derive(Debug, Clone)]
 struct V1RootIdentity {
     generation: u64,
     legal_table: LegalRowTableV1,
@@ -263,9 +276,40 @@ struct V1RootIdentity {
 struct V1InteriorReservoir {
     telemetry: V1InteriorReservoirTelemetry,
     rows: Vec<PairRowV1>,
+    prior_logits: Vec<f32>,
     priors: Vec<f32>,
     visits: Vec<u32>,
     total_values: Vec<f32>,
+    child_keys: Vec<Option<u64>>,
+}
+
+#[derive(Debug, Clone)]
+struct V1PendingExpansion {
+    path: Vec<V1PathEdge>,
+    node_path: Vec<u64>,
+    root_player: u8,
+    game: HexGameState,
+    legal_table_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct V1SearchNode {
+    game: HexGameState,
+    legal_table: LegalRowTableV1,
+    tactical: TerminalTacticalSetV1,
+    parent_edge: Option<V1PathEdge>,
+    incoming_pair: Option<PairRowV1>,
+    current_player: u8,
+    visit_count: u32,
+    total_value: f32,
+    terminal_value_root: Option<f32>,
+    reservoir: Option<V1InteriorReservoir>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum V1PathEdge {
+    Root(usize),
+    Interior { node_key: u64, edge_idx: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +322,8 @@ pub struct V1PairSearchEngine {
     selected: Option<V1SelectedAction>,
     telemetry: V1PairSearchTelemetry,
     interior_reservoirs: FxHashMap<u64, V1InteriorReservoir>,
+    pending_expansions: FxHashMap<u64, V1PendingExpansion>,
+    search_nodes: FxHashMap<u64, V1SearchNode>,
 }
 
 impl V1PairSearchEngine {
@@ -295,6 +341,8 @@ impl V1PairSearchEngine {
                 ..V1PairSearchTelemetry::default()
             },
             interior_reservoirs: FxHashMap::default(),
+            pending_expansions: FxHashMap::default(),
+            search_nodes: FxHashMap::default(),
         }
     }
 
@@ -313,6 +361,9 @@ impl V1PairSearchEngine {
 
         self.root_generation = self.root_generation.wrapping_add(1);
         self.root_candidates.clear();
+        self.pending_expansions.clear();
+        self.interior_reservoirs.clear();
+        self.search_nodes.clear();
         self.selected = None;
         self.root_identity = Some(V1RootIdentity {
             generation: self.root_generation,
@@ -341,6 +392,9 @@ impl V1PairSearchEngine {
         self.telemetry.scoring_pass_count = 0;
         self.telemetry.neural_calls_per_expanded_full_turn_node = 0;
         self.telemetry.reservoir_refill_events = 0;
+        self.telemetry.interior_expanded_full_turn_nodes = 0;
+        self.telemetry.interior_reservoir_build_count = 0;
+        self.telemetry.interior_scoring_pass_count = 0;
 
         V1RootInit {
             legal_table,
@@ -391,7 +445,7 @@ impl V1PairSearchEngine {
         for (idx, row) in pair_table.rows.into_iter().enumerate() {
             let mode = correction_modes[idx];
             let weight = correction_weights[idx];
-            let log_correction = match mode {
+            match mode {
                 ProposalCorrectionModeV1::ExactImportance
                 | ProposalCorrectionModeV1::ClippedPropensity => {
                     if weight <= 0.0 || !weight.is_finite() {
@@ -399,13 +453,9 @@ impl V1PairSearchEngine {
                             "proposal correction weight at {idx} must be finite and positive"
                         )));
                     }
-                    weight.ln().clamp(
-                        self.config.min_log_correction,
-                        self.config.max_log_correction,
-                    )
                 }
                 ProposalCorrectionModeV1::UncorrectedLogged
-                | ProposalCorrectionModeV1::TrainingForbidden => 0.0,
+                | ProposalCorrectionModeV1::TrainingForbidden => {}
             };
             let terminal_exact_flag = terminal_exact_keys.contains(&row.pair_key);
             let terminal_equivalence_flag = terminal_equiv_keys.contains(&row.pair_key);
@@ -425,7 +475,7 @@ impl V1PairSearchEngine {
                 model_logit: model_logits[idx],
                 proposal_correction_weight: weight,
                 correction_mode: mode,
-                prior_logit: model_logits[idx] - log_correction,
+                prior_logit: model_logits[idx],
                 prior: 0.0,
                 gumbel: gumbel_from_seed(self.config.seed, root_generation, row.pair_key),
                 visit_count: 0,
@@ -451,6 +501,330 @@ impl V1PairSearchEngine {
         self.telemetry.scoring_pass_count = 1;
         self.telemetry.neural_calls_per_expanded_full_turn_node = 1;
         Ok(())
+    }
+
+    pub fn run_search_step(
+        &mut self,
+        max_expansions: usize,
+    ) -> Result<Vec<V1ExpansionRequest>, V1PairSearchError> {
+        let identity = self
+            .root_identity
+            .clone()
+            .ok_or(V1PairSearchError::InvalidRootState(
+                "V1 root must be initialized before search",
+            ))?;
+        if identity.legal_table.phase != TurnPhaseV1::NormalTwoPlacement {
+            return Ok(Vec::new());
+        }
+        if self.root_candidates.is_empty() {
+            return Err(V1PairSearchError::InvalidRootState(
+                "normal V1 pair search requires admitted root candidate pairs",
+            ));
+        }
+        if !self.root_candidates.iter().any(|candidate| candidate.admitted) {
+            self.admit_gumbel_root_set()?;
+        }
+        let limit = max_expansions.max(1);
+        let mut requests = Vec::new();
+        while requests.len() < limit
+            && self.telemetry.simulation_count + self.pending_expansions.len() as u32
+                < self.config.num_simulations.max(1)
+        {
+            match self.start_recursive_simulation(&identity)? {
+                Some(request) => requests.push(request),
+                None => {
+                    if self.pending_expansions.is_empty() {
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(requests)
+    }
+
+    fn start_recursive_simulation(
+        &mut self,
+        identity: &V1RootIdentity,
+    ) -> Result<Option<V1ExpansionRequest>, V1PairSearchError> {
+        let Some(root_idx) = self.select_root_puct_edge()? else {
+            return Ok(None);
+        };
+        let mut path = vec![V1PathEdge::Root(root_idx)];
+        let mut node_path = Vec::<u64>::new();
+        let row = self.root_candidates[root_idx].row;
+        let mut child = self.game.clone();
+        let (first, second) = terminal_preferred_pair_order(&child, row);
+        child.place(first.q, first.r)?;
+        if child.is_over() {
+            let value = outcome_value(&child, identity.legal_table.current_player);
+            self.backup_path(&path, &node_path, value);
+            return Ok(None);
+        }
+        child.place(second.q, second.r)?;
+        if child.is_over() {
+            let value = outcome_value(&child, identity.legal_table.current_player);
+            self.backup_path(&path, &node_path, value);
+            return Ok(None);
+        }
+        let mut node_key = child_node_key(0, row.pair_key);
+        self.ensure_search_node(
+            node_key,
+            child,
+            Some(V1PathEdge::Root(root_idx)),
+            Some(row),
+            identity.legal_table.current_player,
+        )?;
+
+        loop {
+            let node = self
+                .search_nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+            if let Some(value) = node.terminal_value_root {
+                self.backup_path(&path, &node_path, value);
+                return Ok(None);
+            }
+            if node.legal_table.phase != TurnPhaseV1::NormalTwoPlacement {
+                let value = self.evaluate_structural_leaf_root_value(
+                    &node,
+                    identity.legal_table.current_player,
+                )?;
+                self.backup_path(&path, &node_path, value);
+                return Ok(None);
+            }
+            node_path.push(node_key);
+            if node.reservoir.is_none() {
+                if self.pending_expansions.contains_key(&node_key) {
+                    return Ok(None);
+                }
+                self.pending_expansions.insert(
+                    node_key,
+                    V1PendingExpansion {
+                        path,
+                        node_path,
+                        root_player: identity.legal_table.current_player,
+                        game: node.game.clone(),
+                        legal_table_hash: node.legal_table.table_hash,
+                    },
+                );
+                let phase = node.legal_table.phase;
+                let legal_row_table_hash = node.legal_table.table_hash;
+                let parent_visits = node.visit_count.max(1);
+                let node_visit_count = node.visit_count;
+                return Ok(Some(V1ExpansionRequest {
+                    node_key,
+                    game: node.game,
+                    phase,
+                    legal_table: node.legal_table,
+                    tactical: node.tactical,
+                    parent_visits,
+                    node_visit_count,
+                    root_generation: identity.generation,
+                    legal_row_table_hash,
+                }));
+            }
+
+            let edge_idx = self.select_interior_puct_edge(node_key)?;
+            let row = self
+                .search_nodes
+                .get(&node_key)
+                .and_then(|node| node.reservoir.as_ref())
+                .and_then(|reservoir| reservoir.rows.get(edge_idx))
+                .copied()
+                .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+            path.push(V1PathEdge::Interior { node_key, edge_idx });
+
+            let mut child = node.game.clone();
+            let (first, second) = terminal_preferred_pair_order(&child, row);
+            child.place(first.q, first.r)?;
+            if child.is_over() {
+                let value = outcome_value(&child, identity.legal_table.current_player);
+                self.backup_path(&path, &node_path, value);
+                return Ok(None);
+            }
+            child.place(second.q, second.r)?;
+            if child.is_over() {
+                let value = outcome_value(&child, identity.legal_table.current_player);
+                self.backup_path(&path, &node_path, value);
+                return Ok(None);
+            }
+            let child_key = child_node_key(node_key, row.pair_key);
+            if let Some(parent) = self.search_nodes.get_mut(&node_key) {
+                if let Some(reservoir) = parent.reservoir.as_mut() {
+                    reservoir.child_keys[edge_idx] = Some(child_key);
+                }
+            }
+            self.ensure_search_node(
+                child_key,
+                child,
+                Some(V1PathEdge::Interior { node_key, edge_idx }),
+                Some(row),
+                identity.legal_table.current_player,
+            )?;
+            node_key = child_key;
+        }
+    }
+
+    fn select_root_puct_edge(&self) -> Result<Option<usize>, V1PairSearchError> {
+        let parent_visits = self
+            .root_candidates
+            .iter()
+            .map(|candidate| candidate.visit_count)
+            .sum::<u32>()
+            .max(1);
+        let parent_sqrt = (parent_visits as f32).sqrt();
+        let mut best: Option<(usize, f32)> = None;
+        for (idx, candidate) in self.root_candidates.iter().enumerate() {
+            if !candidate.admitted
+                || candidate.correction_mode == ProposalCorrectionModeV1::TrainingForbidden
+            {
+                continue;
+            }
+            let child_key = child_node_key(0, candidate.row.pair_key);
+            if self.pending_expansions.contains_key(&child_key) {
+                continue;
+            }
+            let q = candidate.q_value();
+            let score = q
+                + self.config.c_puct * candidate.prior * parent_sqrt
+                    / (1.0 + candidate.visit_count as f32)
+                + candidate.gumbel * 1.0e-6;
+            if best
+                .map(|(_, best_score)| score > best_score)
+                .unwrap_or(true)
+            {
+                best = Some((idx, score));
+            }
+        }
+        Ok(best.map(|(idx, _)| idx))
+    }
+
+    pub fn complete_expansion(
+        &mut self,
+        node_key: u64,
+        node_value_current_player: f32,
+        pairs: &[(Hex, Hex)],
+        model_logits: &[f32],
+        correction_weights: &[f32],
+        correction_modes: &[ProposalCorrectionModeV1],
+    ) -> Result<V1InteriorReservoirTelemetry, V1PairSearchError> {
+        let pending = self
+            .pending_expansions
+            .get(&node_key)
+            .cloned()
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+        let node = self
+            .search_nodes
+            .get(&node_key)
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+        if node.reservoir.is_some() {
+            return Err(V1PairSearchError::DuplicateInteriorNode { node_key });
+        }
+        if node.legal_table.table_hash != pending.legal_table_hash {
+            return Err(V1PairSearchError::ApplyIdentityMismatch(format!(
+                "V1 expansion legal row table hash changed for node {node_key}: got {}, expected {}",
+                node.legal_table.table_hash, pending.legal_table_hash
+            )));
+        }
+        if !node_value_current_player.is_finite() {
+            return Err(V1PairSearchError::InvalidCandidate(
+                "V1 expansion value must be finite".to_string(),
+            ));
+        }
+        let root_value = if pending.game.current_player() == pending.root_player {
+            node_value_current_player
+        } else {
+            -node_value_current_player
+        };
+        let reservoir = self.build_interior_reservoir_for_game(
+            node_key,
+            &pending.game,
+            pairs,
+            model_logits,
+            correction_weights,
+            correction_modes,
+        )?;
+        let telemetry = reservoir.telemetry.clone();
+        self.search_nodes
+            .get_mut(&node_key)
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?
+            .reservoir = Some(reservoir);
+        self.telemetry.interior_expanded_full_turn_nodes += 1;
+        self.telemetry.interior_reservoir_build_count += 1;
+        self.telemetry.interior_scoring_pass_count += 1;
+        let _ = self.widen_tree_node_reservoir(node_key)?;
+        self.pending_expansions.remove(&node_key);
+        self.backup_path(&pending.path, &pending.node_path, root_value);
+        Ok(self
+            .search_nodes
+            .get(&node_key)
+            .and_then(|node| node.reservoir.as_ref())
+            .map(|reservoir| reservoir.telemetry.clone())
+            .unwrap_or(telemetry))
+    }
+
+    pub fn select_root_action(&mut self) -> Result<Option<V1SelectedAction>, V1PairSearchError> {
+        let identity = self
+            .root_identity
+            .clone()
+            .ok_or(V1PairSearchError::InvalidRootState(
+                "V1 root must be initialized before search",
+            ))?;
+        match identity.legal_table.phase {
+            TurnPhaseV1::OpeningSingle | TurnPhaseV1::OnePlacement | TurnPhaseV1::Terminal => {
+                return self.run_root_search();
+            }
+            TurnPhaseV1::NormalTwoPlacement => {}
+        }
+        if !self.pending_expansions.is_empty() {
+            return Err(V1PairSearchError::InvalidRootState(
+                "V1 cannot select root action while interior expansions are pending",
+            ));
+        }
+        if self.telemetry.simulation_count < self.config.num_simulations.max(1) {
+            return Err(V1PairSearchError::InvalidRootState(
+                "V1 root action selection requires the recursive simulation budget to complete",
+            ));
+        }
+        if !self
+            .root_candidates
+            .iter()
+            .any(|candidate| candidate.admitted && candidate.visit_count > 0)
+        {
+            return Err(V1PairSearchError::InvalidRootState(
+                "V1 root action selection requires at least one backed-up pair evaluation",
+            ));
+        }
+        self.complete_q_values();
+        let selected_idx = self
+            .root_candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.admitted
+                    && candidate.visit_count > 0
+                    && candidate.correction_mode != ProposalCorrectionModeV1::TrainingForbidden
+            })
+            .max_by(|(_, left), (_, right)| compare_candidate_final(left, right))
+            .map(|(idx, _)| idx)
+            .ok_or(V1PairSearchError::InvalidRootState(
+                "no selectable admitted V1 pair candidate remained after search",
+            ))?;
+        let row = self.root_candidates[selected_idx].row;
+        let selected = V1SelectedAction::Pair {
+            row,
+            root_generation: identity.generation,
+            legal_row_table_hash: identity.legal_table.table_hash,
+        };
+        self.telemetry.selected_pair_key = Some(row.pair_key);
+        self.telemetry.selected_single = None;
+        self.telemetry.search_performed = true;
+        self.telemetry.hardcoded_action = false;
+        self.telemetry.hardcoded_reason = None;
+        self.selected = Some(selected.clone());
+        Ok(Some(selected))
     }
 
     pub fn run_root_search(&mut self) -> Result<Option<V1SelectedAction>, V1PairSearchError> {
@@ -509,36 +883,227 @@ impl V1PairSearchEngine {
                 "normal V1 pair search requires admitted root candidate pairs",
             ));
         }
-        self.admit_gumbel_root_set()?;
-        self.run_gumbel_sequential_halving(&identity)?;
-        self.complete_q_values();
+        if !self.root_candidates.iter().any(|candidate| candidate.visit_count > 0) {
+            return Err(V1PairSearchError::InvalidRootState(
+                "normal V1 pair search requires run_search_step/complete_expansion before select_root_action",
+            ));
+        }
+        return self.select_root_action();
+    }
 
-        let selected_idx = self
+    fn backup_root_candidate(&mut self, idx: usize, value: f32) {
+        let candidate = &mut self.root_candidates[idx];
+        candidate.visit_count += 1;
+        candidate.allocation += 1;
+        candidate.total_value += value;
+        self.telemetry.simulation_count = self
             .root_candidates
             .iter()
-            .enumerate()
-            .filter(|(_, candidate)| {
-                candidate.admitted
-                    && candidate.correction_mode != ProposalCorrectionModeV1::TrainingForbidden
-            })
-            .max_by(|(_, left), (_, right)| compare_candidate_final(left, right))
-            .map(|(idx, _)| idx)
-            .ok_or(V1PairSearchError::InvalidRootState(
-                "no selectable admitted V1 pair candidate remained after search",
-            ))?;
-        let row = self.root_candidates[selected_idx].row;
-        let selected = V1SelectedAction::Pair {
-            row,
-            root_generation: identity.generation,
-            legal_row_table_hash: identity.legal_table.table_hash,
+            .map(|candidate| candidate.allocation)
+            .sum();
+    }
+
+    fn backup_path(&mut self, path: &[V1PathEdge], node_path: &[u64], root_value: f32) {
+        let root_player = self
+            .root_identity
+            .as_ref()
+            .map(|identity| identity.legal_table.current_player);
+        for edge in path {
+            match *edge {
+                V1PathEdge::Root(idx) => {
+                    self.backup_root_candidate(idx, root_value);
+                }
+                V1PathEdge::Interior { node_key, edge_idx } => {
+                    let Some(node) = self.search_nodes.get(&node_key) else {
+                        continue;
+                    };
+                    let local_value = if root_player
+                        .map(|player| player == node.current_player)
+                        .unwrap_or(true)
+                    {
+                        root_value
+                    } else {
+                        -root_value
+                    };
+                    if let Some(parent) = self.search_nodes.get_mut(&node_key) {
+                        if let Some(reservoir) = parent.reservoir.as_mut() {
+                            if edge_idx < reservoir.visits.len() {
+                                reservoir.visits[edge_idx] += 1;
+                                reservoir.total_values[edge_idx] += local_value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for &node_key in node_path {
+            if let Some(node) = self.search_nodes.get_mut(&node_key) {
+                let local_value = if root_player
+                    .map(|player| player == node.current_player)
+                    .unwrap_or(true)
+                {
+                    root_value
+                } else {
+                    -root_value
+                };
+                node.visit_count += 1;
+                node.total_value += local_value;
+            }
+        }
+    }
+
+    fn ensure_search_node(
+        &mut self,
+        node_key: u64,
+        game: HexGameState,
+        parent_edge: Option<V1PathEdge>,
+        incoming_pair: Option<PairRowV1>,
+        root_player: u8,
+    ) -> Result<(), V1PairSearchError> {
+        if self.search_nodes.contains_key(&node_key) {
+            return Ok(());
+        }
+        let legal_table = legal_row_table_v1(&game);
+        let tactical = terminal_tactical_set_v1(&game);
+        let terminal_value_root = if game.is_over() {
+            Some(outcome_value(&game, root_player))
+        } else {
+            None
         };
-        self.telemetry.selected_pair_key = Some(row.pair_key);
-        self.telemetry.selected_single = None;
-        self.telemetry.search_performed = true;
-        self.telemetry.hardcoded_action = false;
-        self.telemetry.hardcoded_reason = None;
-        self.selected = Some(selected.clone());
-        Ok(Some(selected))
+        self.search_nodes.insert(
+            node_key,
+            V1SearchNode {
+                current_player: game.current_player(),
+                game,
+                legal_table,
+                tactical,
+                parent_edge,
+                incoming_pair,
+                visit_count: 0,
+                total_value: 0.0,
+                terminal_value_root,
+                reservoir: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn select_interior_puct_edge(&mut self, node_key: u64) -> Result<usize, V1PairSearchError> {
+        self.widen_tree_node_reservoir(node_key)?;
+        let node = self
+            .search_nodes
+            .get(&node_key)
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+        let reservoir = node
+            .reservoir
+            .as_ref()
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+        let revealed = reservoir.telemetry.revealed_count as usize;
+        if revealed == 0 {
+            return Err(V1PairSearchError::InvalidRootState(
+                "V1 expanded node has no revealed pair actions",
+            ));
+        }
+        let parent_sqrt = (node.visit_count.max(1) as f32).sqrt();
+        let revealed_priors = softmax(
+            &reservoir.prior_logits[..revealed.min(reservoir.prior_logits.len())],
+            self.config.prior_temperature.max(MIN_PRIOR_TEMPERATURE),
+        );
+        let mut best: Option<(usize, f32)> = None;
+        for idx in 0..revealed.min(reservoir.rows.len()) {
+            if let Some(child_key) = reservoir.child_keys[idx] {
+                if self.pending_expansions.contains_key(&child_key) {
+                    continue;
+                }
+            }
+            let visits = reservoir.visits[idx];
+            let q = if visits == 0 {
+                0.0
+            } else {
+                reservoir.total_values[idx] / visits as f32
+            };
+            let prior = revealed_priors.get(idx).copied().unwrap_or(0.0);
+            let score = q + self.config.c_puct * prior * parent_sqrt / (1.0 + visits as f32);
+            if best
+                .map(|(_, best_score)| score > best_score)
+                .unwrap_or(true)
+            {
+                best = Some((idx, score));
+            }
+        }
+        best.map(|(idx, _)| idx).ok_or(V1PairSearchError::InvalidRootState(
+            "V1 expanded node has no selectable pair actions",
+        ))
+    }
+
+    fn widen_tree_node_reservoir(
+        &mut self,
+        node_key: u64,
+    ) -> Result<V1InteriorWideningResult, V1PairSearchError> {
+        let node = self
+            .search_nodes
+            .get_mut(&node_key)
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+        let reservoir = node
+            .reservoir
+            .as_mut()
+            .ok_or(V1PairSearchError::InteriorNodeNotFound { node_key })?;
+        let desired = progressive_widen_limit(
+            node.visit_count.max(1),
+            self.config.c_pw,
+            self.config.alpha_pw,
+            reservoir.rows.len(),
+        );
+        let start = reservoir.telemetry.revealed_count as usize;
+        let end = desired.max(start).min(reservoir.rows.len());
+        let revealed_rows = reservoir.rows[start..end].to_vec();
+        reservoir.telemetry.revealed_count = end as u32;
+        reservoir.telemetry.widening_events += 1;
+        let parent_sqrt = (node.visit_count.max(1) as f32).sqrt();
+        let revealed_priors = softmax(
+            &reservoir.prior_logits[..end.min(reservoir.prior_logits.len())],
+            self.config.prior_temperature.max(MIN_PRIOR_TEMPERATURE),
+        );
+        let puct_scores = reservoir
+            .visits
+            .iter()
+            .zip(reservoir.total_values.iter())
+            .zip(revealed_priors.iter())
+            .take(end)
+            .map(|((&visits, &total_value), &prior)| {
+                let q = if visits == 0 {
+                    0.0
+                } else {
+                    total_value / visits as f32
+                };
+                q + self.config.c_puct * prior * parent_sqrt / (1.0 + visits as f32)
+            })
+            .collect::<Vec<_>>();
+        Ok(V1InteriorWideningResult {
+            telemetry: reservoir.telemetry.clone(),
+            revealed_rows,
+            puct_scores,
+        })
+    }
+
+    fn evaluate_structural_leaf_root_value(
+        &self,
+        node: &V1SearchNode,
+        root_player: u8,
+    ) -> Result<f32, V1PairSearchError> {
+        if node.game.is_over() {
+            return Ok(outcome_value(&node.game, root_player));
+        }
+        if node.legal_table.phase == TurnPhaseV1::OnePlacement {
+            if let Some(row) = node.legal_table.rows.first() {
+                let mut game = node.game.clone();
+                game.place(row.cell.q, row.cell.r)?;
+                return Ok(outcome_value(&game, root_player));
+            }
+        }
+        Err(V1PairSearchError::InvalidRootState(
+            "V1 recursive search reached a non-terminal non-full-turn leaf without a structural action",
+        ))
     }
 
     pub fn selected_action(&self) -> Option<&V1SelectedAction> {
@@ -628,28 +1193,29 @@ impl V1PairSearchEngine {
                     )));
                 }
                 let backup = self.game.clone();
-                self.game.place(row.first.q, row.first.r)?;
+                let (first, second) = terminal_preferred_pair_order(&self.game, row);
+                self.game.place(first.q, first.r)?;
                 if self.game.is_over() {
                     return Ok(V1AppliedAction {
                         action_kind: "pair",
                         placements_applied: 1,
-                        first: row.first,
-                        second: Some(row.second),
+                        first,
+                        second: Some(second),
                         root_generation,
                         legal_row_table_hash,
                         pair_key: Some(row.pair_key),
                         terminal_after_first: true,
                     });
                 }
-                if let Err(err) = self.game.place(row.second.q, row.second.r) {
+                if let Err(err) = self.game.place(second.q, second.r) {
                     self.game = backup;
                     return Err(V1PairSearchError::Game(err));
                 }
                 Ok(V1AppliedAction {
                     action_kind: "pair",
                     placements_applied: 2,
-                    first: row.first,
-                    second: Some(row.second),
+                    first,
+                    second: Some(second),
                     root_generation,
                     legal_row_table_hash,
                     pair_key: Some(row.pair_key),
@@ -667,22 +1233,67 @@ impl V1PairSearchEngine {
         correction_weights: &[f32],
         correction_modes: &[ProposalCorrectionModeV1],
     ) -> Result<V1InteriorReservoirTelemetry, V1PairSearchError> {
+        let game = self.game.clone();
+        self.cache_interior_reservoir_for_game(
+            node_key,
+            &game,
+            pairs,
+            model_logits,
+            correction_weights,
+            correction_modes,
+        )
+    }
+
+    fn cache_interior_reservoir_for_game(
+        &mut self,
+        node_key: u64,
+        game: &HexGameState,
+        pairs: &[(Hex, Hex)],
+        model_logits: &[f32],
+        correction_weights: &[f32],
+        correction_modes: &[ProposalCorrectionModeV1],
+    ) -> Result<V1InteriorReservoirTelemetry, V1PairSearchError> {
         if self.interior_reservoirs.contains_key(&node_key) {
             return Err(V1PairSearchError::DuplicateInteriorNode { node_key });
         }
+        let reservoir = self.build_interior_reservoir_for_game(
+            node_key,
+            game,
+            pairs,
+            model_logits,
+            correction_weights,
+            correction_modes,
+        )?;
+        let telemetry = reservoir.telemetry.clone();
+        self.interior_reservoirs.insert(node_key, reservoir);
+        self.telemetry.interior_expanded_full_turn_nodes += 1;
+        self.telemetry.interior_reservoir_build_count += 1;
+        self.telemetry.interior_scoring_pass_count += 1;
+        Ok(telemetry)
+    }
+
+    fn build_interior_reservoir_for_game(
+        &self,
+        node_key: u64,
+        game: &HexGameState,
+        pairs: &[(Hex, Hex)],
+        model_logits: &[f32],
+        correction_weights: &[f32],
+        correction_modes: &[ProposalCorrectionModeV1],
+    ) -> Result<V1InteriorReservoir, V1PairSearchError> {
         validate_candidate_metadata(pairs, model_logits, correction_weights, correction_modes)?;
-        let legal_table = legal_row_table_v1(&self.game);
+        let legal_table = legal_row_table_v1(game);
         if legal_table.phase != TurnPhaseV1::NormalTwoPlacement {
             return Err(V1PairSearchError::InvalidRootState(
                 "V1 interior pair reservoir requires normal_two_placement phase",
             ));
         }
         let pair_table = canonical_pair_rows_ordered_v1(&legal_table, pairs)?;
-        let mut logits = Vec::with_capacity(pair_table.rows.len());
+        let mut prior_logits = Vec::with_capacity(pair_table.rows.len());
         for idx in 0..pair_table.rows.len() {
             let mode = correction_modes[idx];
             let weight = correction_weights[idx];
-            let correction = match mode {
+            match mode {
                 ProposalCorrectionModeV1::ExactImportance
                 | ProposalCorrectionModeV1::ClippedPropensity => {
                     if weight <= 0.0 || !weight.is_finite() {
@@ -690,24 +1301,20 @@ impl V1PairSearchEngine {
                             "proposal correction weight at {idx} must be finite and positive"
                         )));
                     }
-                    weight.ln().clamp(
-                        self.config.min_log_correction,
-                        self.config.max_log_correction,
-                    )
                 }
                 ProposalCorrectionModeV1::UncorrectedLogged
-                | ProposalCorrectionModeV1::TrainingForbidden => 0.0,
+                | ProposalCorrectionModeV1::TrainingForbidden => {}
             };
-            logits.push(model_logits[idx] - correction);
+            prior_logits.push(model_logits[idx]);
         }
         let priors = softmax(
-            &logits,
+            &prior_logits,
             self.config.prior_temperature.max(MIN_PRIOR_TEMPERATURE),
         );
         let mut order = (0..pair_table.rows.len()).collect::<Vec<_>>();
         order.sort_by(|&a, &b| {
-            logits[b]
-                .partial_cmp(&logits[a])
+            prior_logits[b]
+                .partial_cmp(&prior_logits[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     pair_table.rows[a]
@@ -719,6 +1326,7 @@ impl V1PairSearchEngine {
             .iter()
             .map(|&idx| pair_table.rows[idx])
             .collect::<Vec<_>>();
+        let prior_logits = order.iter().map(|&idx| prior_logits[idx]).collect::<Vec<_>>();
         let priors = order.iter().map(|&idx| priors[idx]).collect::<Vec<_>>();
         let telemetry = V1InteriorReservoirTelemetry {
             node_key,
@@ -729,20 +1337,15 @@ impl V1PairSearchEngine {
             widening_events: 0,
             reservoir_refill_events: 0,
         };
-        self.interior_reservoirs.insert(
-            node_key,
-            V1InteriorReservoir {
-                telemetry: telemetry.clone(),
-                rows,
-                priors,
-                visits: vec![0; pair_table.rows.len()],
-                total_values: vec![0.0; pair_table.rows.len()],
-            },
-        );
-        self.telemetry.interior_expanded_full_turn_nodes += 1;
-        self.telemetry.interior_reservoir_build_count += 1;
-        self.telemetry.interior_scoring_pass_count += 1;
-        Ok(telemetry)
+        Ok(V1InteriorReservoir {
+            telemetry,
+            rows,
+            prior_logits,
+            priors,
+            visits: vec![0; pair_table.rows.len()],
+            total_values: vec![0.0; pair_table.rows.len()],
+            child_keys: vec![None; pair_table.rows.len()],
+        })
     }
 
     pub fn widen_interior_reservoir(
@@ -766,13 +1369,17 @@ impl V1PairSearchEngine {
         reservoir.telemetry.revealed_count = end as u32;
         reservoir.telemetry.widening_events += 1;
         let parent_sqrt = (parent_visits.max(1) as f32).sqrt();
+        let revealed_priors = softmax(
+            &reservoir.prior_logits[..end.min(reservoir.prior_logits.len())],
+            self.config.prior_temperature.max(MIN_PRIOR_TEMPERATURE),
+        );
         let puct_scores = reservoir
-            .priors
+            .visits
             .iter()
-            .zip(reservoir.visits.iter())
             .zip(reservoir.total_values.iter())
+            .zip(revealed_priors.iter())
             .take(end)
-            .map(|((&prior, &visits), &total_value)| {
+            .map(|((&visits, &total_value), &prior)| {
                 let q = if visits == 0 {
                     0.0
                 } else {
@@ -914,77 +1521,6 @@ impl V1PairSearchEngine {
         Ok(())
     }
 
-    fn run_gumbel_sequential_halving(
-        &mut self,
-        identity: &V1RootIdentity,
-    ) -> Result<(), V1PairSearchError> {
-        let mut active = self
-            .root_candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| candidate.admitted)
-            .map(|(idx, _)| idx)
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            return Err(V1PairSearchError::InvalidRootState(
-                "V1 Gumbel sequential halving requires admitted candidates",
-            ));
-        }
-        let mut remaining = self.config.num_simulations.max(active.len() as u32);
-        let mut rounds = 0u32;
-        while active.len() > 1 && remaining > 0 {
-            rounds += 1;
-            let rounds_left = ceil_log2(active.len()).max(1) as u32;
-            let per_candidate = (remaining / (active.len() as u32 * rounds_left)).max(1);
-            let allocation = per_candidate.min(remaining.max(1));
-            for &idx in &active {
-                if remaining == 0 {
-                    break;
-                }
-                let sims = allocation.min(remaining);
-                self.simulate_candidate(idx, sims, identity)?;
-                remaining -= sims;
-            }
-            active.sort_by(|&left_idx, &right_idx| {
-                compare_candidate_round(
-                    &self.root_candidates[left_idx],
-                    &self.root_candidates[right_idx],
-                )
-            });
-            let keep = active.len().div_ceil(2).max(1);
-            active.truncate(keep);
-        }
-        if let Some(&idx) = active.first() {
-            if remaining > 0 {
-                self.simulate_candidate(idx, remaining, identity)?;
-            }
-        }
-        self.telemetry.gumbel_rounds = rounds;
-        self.telemetry.simulation_count = self
-            .root_candidates
-            .iter()
-            .map(|candidate| candidate.allocation)
-            .sum();
-        Ok(())
-    }
-
-    fn simulate_candidate(
-        &mut self,
-        idx: usize,
-        count: u32,
-        identity: &V1RootIdentity,
-    ) -> Result<(), V1PairSearchError> {
-        for _ in 0..count {
-            let row = self.root_candidates[idx].row;
-            let value = evaluate_pair(&self.game, identity.legal_table.current_player, row)?;
-            let candidate = &mut self.root_candidates[idx];
-            candidate.visit_count += 1;
-            candidate.allocation += 1;
-            candidate.total_value += value;
-        }
-        Ok(())
-    }
-
     fn complete_q_values(&mut self) {
         let mut visited_sum = 0.0;
         let mut visited_count = 0u32;
@@ -1101,30 +1637,28 @@ fn tactical_pair_keys(tactical: &TerminalTacticalSetV1) -> FxHashSet<u64> {
         .collect()
 }
 
-fn evaluate_pair(
-    root_game: &HexGameState,
-    root_player: u8,
-    row: PairRowV1,
-) -> Result<f32, V1PairSearchError> {
-    let mut game = root_game.clone();
-    game.place(row.first.q, row.first.r)?;
-    if game.is_over() {
-        return Ok(outcome_value(&game, root_player));
-    }
-    game.place(row.second.q, row.second.r)?;
-    if game.is_over() {
-        Ok(outcome_value(&game, root_player))
-    } else {
-        Ok(0.0)
-    }
-}
-
 fn outcome_value(game: &HexGameState, root_player: u8) -> f32 {
     if game.winner() == Some(root_player) {
         1.0
     } else {
         -1.0
     }
+}
+
+fn terminal_preferred_pair_order(game: &HexGameState, row: PairRowV1) -> (Hex, Hex) {
+    let player = game.current_player();
+    let first_wins = immediate_win_if_placed(game, row.first, player);
+    let second_wins = immediate_win_if_placed(game, row.second, player);
+    if second_wins && !first_wins {
+        (row.second, row.first)
+    } else {
+        (row.first, row.second)
+    }
+}
+
+fn immediate_win_if_placed(game: &HexGameState, cell: Hex, player: u8) -> bool {
+    let mut probe = game.clone();
+    probe.place(cell.q, cell.r).is_ok() && probe.is_over() && probe.winner() == Some(player)
 }
 
 fn compare_candidate_admission(
@@ -1149,13 +1683,10 @@ fn compare_candidate_round(left: &V1PairCandidate, right: &V1PairCandidate) -> s
 }
 
 fn compare_candidate_final(left: &V1PairCandidate, right: &V1PairCandidate) -> std::cmp::Ordering {
-    left.visit_count
-        .cmp(&right.visit_count)
-        .then_with(|| {
-            left.completed_q
-                .partial_cmp(&right.completed_q)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+    left.completed_q
+        .partial_cmp(&right.completed_q)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.visit_count.cmp(&right.visit_count))
         .then_with(|| {
             left.prior
                 .partial_cmp(&right.prior)
@@ -1179,12 +1710,16 @@ fn next_uniform(state: &mut u64) -> f32 {
     (x as f64 / u64::MAX as f64) as f32
 }
 
-fn ceil_log2(value: usize) -> usize {
-    if value <= 1 {
-        0
-    } else {
-        usize::BITS as usize - (value - 1).leading_zeros() as usize
-    }
+fn child_node_key(parent_key: u64, pair_key: u64) -> u64 {
+    let mut x = parent_key
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ pair_key.rotate_left(17)
+        ^ 0xD1B5_4A32_D192_ED03;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 fn progressive_widen_limit(
@@ -1219,6 +1754,31 @@ mod tests {
         );
         let init = engine.init_root();
         (engine, init)
+    }
+
+    fn request_reservoir_pairs(request: &V1ExpansionRequest) -> Vec<(Hex, Hex)> {
+        assert_eq!(request.legal_table.phase, TurnPhaseV1::NormalTwoPlacement);
+        let a = request.legal_table.rows[0].cell;
+        let b = request.legal_table.rows[1].cell;
+        vec![(a, b)]
+    }
+
+    fn complete_request_with_value(
+        engine: &mut V1PairSearchEngine,
+        request: &V1ExpansionRequest,
+        value: f32,
+    ) -> V1InteriorReservoirTelemetry {
+        let pairs = request_reservoir_pairs(request);
+        engine
+            .complete_expansion(
+                request.node_key,
+                value,
+                &pairs,
+                &[0.0],
+                &[1.0],
+                &[ProposalCorrectionModeV1::ExactImportance],
+            )
+            .expect("complete expansion")
     }
 
     #[test]
@@ -1272,8 +1832,9 @@ mod tests {
     }
 
     #[test]
-    fn v1_root_gsh_selects_and_atomically_applies_canonical_pair() {
+    fn v1_neural_expansion_value_backup_changes_root_choice_and_applies_pair() {
         let (mut engine, init) = normal_engine();
+        engine.config.num_simulations = 2;
         let a = init.legal_table.rows[0].cell;
         let b = init.legal_table.rows[1].cell;
         let c = init.legal_table.rows[2].cell;
@@ -1281,7 +1842,7 @@ mod tests {
         engine
             .admit_root_pairs(
                 init.root_generation,
-                &[(c, d), (b, a)],
+                &[(a, b), (c, d)],
                 &[0.0, 8.0],
                 &[1.0, 1.0],
                 &[
@@ -1290,8 +1851,25 @@ mod tests {
                 ],
             )
             .expect("admit pairs");
+        let winning_key = engine
+            .root_candidates()
+            .iter()
+            .find(|candidate| candidate.row.first == a && candidate.row.second == b)
+            .expect("canonical winning pair")
+            .row
+            .pair_key;
+        let requests = engine.run_search_step(8).expect("expansion requests");
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let value = if request.node_key == winning_key {
+                1.0
+            } else {
+                -1.0
+            };
+            complete_request_with_value(&mut engine, request, value);
+        }
         let selected = engine
-            .run_root_search()
+            .select_root_action()
             .expect("search")
             .expect("selected pair");
         let V1SelectedAction::Pair {
@@ -1371,6 +1949,7 @@ mod tests {
     #[test]
     fn v1_apply_rejects_stale_token_and_pair_key_mismatch() {
         let (mut engine, init) = normal_engine();
+        engine.config.num_simulations = 1;
         let a = init.legal_table.rows[0].cell;
         let b = init.legal_table.rows[1].cell;
         engine
@@ -1382,7 +1961,10 @@ mod tests {
                 &[ProposalCorrectionModeV1::ExactImportance],
             )
             .unwrap();
-        let selected = engine.run_root_search().unwrap().unwrap();
+        let requests = engine.run_search_step(1).unwrap();
+        assert_eq!(requests.len(), 1);
+        complete_request_with_value(&mut engine, &requests[0], 1.0);
+        let selected = engine.select_root_action().unwrap().unwrap();
         let V1SelectedAction::Pair {
             row,
             root_generation,
@@ -1407,6 +1989,178 @@ mod tests {
             ),
             Err(V1PairSearchError::ApplyIdentityMismatch(_))
         ));
+    }
+
+    #[test]
+    fn v1_normal_root_search_rejects_shallow_nonterminal_fallback() {
+        let (mut engine, init) = normal_engine();
+        engine.config.num_simulations = 1;
+        let a = init.legal_table.rows[0].cell;
+        let b = init.legal_table.rows[1].cell;
+        engine
+            .admit_root_pairs(
+                init.root_generation,
+                &[(a, b)],
+                &[3.0],
+                &[1.0],
+                &[ProposalCorrectionModeV1::ExactImportance],
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.run_root_search(),
+            Err(V1PairSearchError::InvalidRootState(message))
+                if message.contains("run_search_step/complete_expansion")
+        ));
+    }
+
+    #[test]
+    fn v1_expansion_completion_rejects_stale_child_pair_identity() {
+        let (mut engine, init) = normal_engine();
+        engine.config.num_simulations = 1;
+        let a = init.legal_table.rows[0].cell;
+        let b = init.legal_table.rows[1].cell;
+        engine
+            .admit_root_pairs(
+                init.root_generation,
+                &[(a, b)],
+                &[3.0],
+                &[1.0],
+                &[ProposalCorrectionModeV1::ExactImportance],
+            )
+            .unwrap();
+        let requests = engine.run_search_step(1).unwrap();
+        let stale = engine.complete_expansion(
+            requests[0].node_key,
+            0.0,
+            &[(a, b)],
+            &[0.0],
+            &[1.0],
+            &[ProposalCorrectionModeV1::ExactImportance],
+        );
+        assert!(matches!(
+            stale,
+            Err(V1PairSearchError::PairRows(PairRowErrorV1::IllegalCell { .. }))
+        ));
+    }
+
+    #[test]
+    fn v1_search_step_builds_one_reservoir_per_expanded_node_and_widens_from_cache() {
+        let (mut engine, init) = normal_engine();
+        engine.config.num_simulations = 2;
+        let a = init.legal_table.rows[0].cell;
+        let b = init.legal_table.rows[1].cell;
+        let c = init.legal_table.rows[2].cell;
+        let d = init.legal_table.rows[3].cell;
+        engine
+            .admit_root_pairs(
+                init.root_generation,
+                &[(a, b), (c, d)],
+                &[3.0, 2.0],
+                &[1.0, 1.0],
+                &[
+                    ProposalCorrectionModeV1::ExactImportance,
+                    ProposalCorrectionModeV1::ExactImportance,
+                ],
+            )
+            .unwrap();
+        let requests = engine.run_search_step(2).unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let telemetry = complete_request_with_value(&mut engine, request, 0.25);
+            assert_eq!(telemetry.reservoir_build_count, 1);
+            assert_eq!(telemetry.scoring_pass_count, 1);
+            assert_eq!(telemetry.reservoir_refill_events, 0);
+            assert!(telemetry.widening_events >= 1);
+        }
+        assert_eq!(engine.telemetry().interior_expanded_full_turn_nodes, 2);
+        assert_eq!(engine.telemetry().interior_reservoir_build_count, 2);
+        assert_eq!(engine.telemetry().interior_scoring_pass_count, 2);
+    }
+
+    #[test]
+    fn v1_recursive_search_descends_past_depth_one_after_expansion() {
+        let (mut engine, init) = normal_engine();
+        engine.config.num_simulations = 2;
+        let a = init.legal_table.rows[0].cell;
+        let b = init.legal_table.rows[1].cell;
+        engine
+            .admit_root_pairs(
+                init.root_generation,
+                &[(a, b)],
+                &[3.0],
+                &[1.0],
+                &[ProposalCorrectionModeV1::ExactImportance],
+            )
+            .unwrap();
+        let first = engine.run_search_step(1).unwrap();
+        assert_eq!(first.len(), 1);
+        let first_key = first[0].node_key;
+        complete_request_with_value(&mut engine, &first[0], 0.5);
+
+        let second = engine.run_search_step(1).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].node_key, first_key);
+        complete_request_with_value(&mut engine, &second[0], 0.25);
+
+        assert_eq!(engine.telemetry().simulation_count, 2);
+        assert_eq!(engine.telemetry().interior_expanded_full_turn_nodes, 2);
+        assert!(engine.select_root_action().unwrap().is_some());
+    }
+
+    #[test]
+    fn v1_search_priors_ignore_proposal_correction_weights() {
+        let (mut engine, init) = normal_engine();
+        let a = init.legal_table.rows[0].cell;
+        let b = init.legal_table.rows[1].cell;
+        let c = init.legal_table.rows[2].cell;
+        let d = init.legal_table.rows[3].cell;
+        engine
+            .admit_root_pairs(
+                init.root_generation,
+                &[(a, b), (c, d)],
+                &[2.0, 0.0],
+                &[0.001, 1000.0],
+                &[
+                    ProposalCorrectionModeV1::ExactImportance,
+                    ProposalCorrectionModeV1::ExactImportance,
+                ],
+            )
+            .unwrap();
+        let first = engine
+            .root_candidates()
+            .iter()
+            .find(|candidate| candidate.row.first == a && candidate.row.second == b)
+            .unwrap();
+        let second = engine
+            .root_candidates()
+            .iter()
+            .find(|candidate| candidate.row.first == c && candidate.row.second == d)
+            .unwrap();
+        assert!(first.prior > second.prior);
+        assert_eq!(first.prior_logit, 2.0);
+        assert_eq!(second.prior_logit, 0.0);
+    }
+
+    #[test]
+    fn v1_terminal_pair_order_applies_winning_cell_before_filler() {
+        let mut game = HexGameState::new();
+        game.set_position(&[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], 0, 2)
+            .expect("terminal-order fixture");
+        let table = legal_row_table_v1(&game);
+        assert_eq!(table.phase, TurnPhaseV1::NormalTwoPlacement);
+        let winning = Hex::new(4, 0);
+        let filler = table
+            .rows
+            .iter()
+            .map(|row| row.cell)
+            .find(|&cell| cell != winning)
+            .expect("filler legal cell");
+        let row = canonical_pair_rows_ordered_v1(&table, &[(filler, winning)])
+            .unwrap()
+            .rows[0];
+        let (first, second) = terminal_preferred_pair_order(&game, row);
+        assert_eq!(first, winning);
+        assert_eq!(second, filler);
     }
 
     #[test]
@@ -1447,5 +2201,35 @@ mod tests {
             ),
             Err(V1PairSearchError::DuplicateInteriorNode { node_key: 42 })
         ));
+    }
+
+    #[test]
+    fn v1_widened_reservoir_renormalizes_priors_over_revealed_rows() {
+        let (mut engine, init) = normal_engine();
+        engine.config.c_pw = 1.0;
+        let a = init.legal_table.rows[0].cell;
+        let b = init.legal_table.rows[1].cell;
+        let c = init.legal_table.rows[2].cell;
+        let d = init.legal_table.rows[3].cell;
+        let telemetry = engine
+            .cache_interior_reservoir(
+                77,
+                &[(a, b), (c, d)],
+                &[0.0, 0.0],
+                &[1.0, 1.0],
+                &[
+                    ProposalCorrectionModeV1::ExactImportance,
+                    ProposalCorrectionModeV1::ExactImportance,
+                ],
+            )
+            .expect("cache interior reservoir");
+        assert_eq!(telemetry.candidate_count, 2);
+        let widened = engine.widen_interior_reservoir(77, 1).unwrap();
+        assert_eq!(widened.revealed_rows.len(), 1);
+        assert_eq!(widened.puct_scores.len(), 1);
+        assert!(
+            widened.puct_scores[0] > engine.config.c_puct * 0.9,
+            "single revealed row should receive nearly all revealed prior mass"
+        );
     }
 }

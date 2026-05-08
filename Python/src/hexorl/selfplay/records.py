@@ -16,6 +16,8 @@ import numpy as np
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from dataclasses import dataclass, field
 
+from hexorl.v1_pair_contract import V1TerminalTacticalPayload
+
 
 # Constants matching Rust encoder (must stay in sync)
 NUM_CHANNELS = 13
@@ -26,9 +28,9 @@ COMPACT_VERSION_V2 = 11
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
 
-V1_PAIR_SEARCH_SCHEMA_VERSION = 1
+V1_PAIR_SEARCH_SCHEMA_VERSION = 2
 V1_PAIR_SEARCH_COMPACT_MAGIC = b"HXVM"
-V1_PAIR_SEARCH_COMPACT_VERSION = 2
+V1_PAIR_SEARCH_COMPACT_VERSION = 3
 V1_PAIR_SEARCH_COMPRESSION_ZLIB = 1
 V1_PAIR_SUPPORT_TYPES = frozenset(
     {
@@ -46,6 +48,9 @@ V1_PAIR_TARGET_SUPPORT_FLAGS = frozenset(
         "sampled_negative",
         "terminal_exact",
         "terminal_equivalent",
+        "terminal_cover",
+        "covers_all_opponent_win_requirements",
+        "impossible_to_cover",
         "unsampled",
     }
 )
@@ -78,6 +83,9 @@ _V1_SUPPORT_FLAG_ORDER = (
     "sampled_negative",
     "terminal_exact",
     "terminal_equivalent",
+    "terminal_cover",
+    "covers_all_opponent_win_requirements",
+    "impossible_to_cover",
     "unsampled",
 )
 
@@ -458,6 +466,7 @@ class V1SearchPairMetadata:
     selected_pair: Optional[PairKey]
     target_support_flags: Tuple[Tuple[str, ...], ...]
     terminal_equivalence_flags: Tuple[bool, ...]
+    terminal_tactical_payload: V1TerminalTacticalPayload | Mapping[str, Any] | None = None
     search_surprise_metrics: Dict[str, float] = field(default_factory=dict)
     neural_calls_per_expanded_full_turn_node: Optional[float] = None
     reservoir_refill_events: Tuple[V1ReservoirRefillEvent, ...] = ()
@@ -495,6 +504,11 @@ class V1SearchPairMetadata:
         )
         target_flags = tuple(_string_tuple(flags) for flags in self.target_support_flags)
         terminal_flags = tuple(bool(flag) for flag in self.terminal_equivalence_flags)
+        tactical_payload = (
+            self.terminal_tactical_payload
+            if isinstance(self.terminal_tactical_payload, V1TerminalTacticalPayload)
+            else V1TerminalTacticalPayload.from_mapping(self.terminal_tactical_payload)
+        )
         arrays = {
             "root_gumbel_values": tuple(float(v) for v in self.root_gumbel_values),
             "root_admission_order": tuple(int(v) for v in self.root_admission_order),
@@ -560,6 +574,7 @@ class V1SearchPairMetadata:
         object.__setattr__(self, "selected_pair", selected)
         object.__setattr__(self, "target_support_flags", target_flags)
         object.__setattr__(self, "terminal_equivalence_flags", terminal_flags)
+        object.__setattr__(self, "terminal_tactical_payload", tactical_payload)
         object.__setattr__(self, "search_surprise_metrics", surprise)
         object.__setattr__(self, "neural_calls_per_expanded_full_turn_node", calls)
         object.__setattr__(self, "reservoir_refill_events", refills)
@@ -603,6 +618,7 @@ class V1SearchPairMetadata:
             else [list(self.selected_pair[0]), list(self.selected_pair[1])],
             "target_support_flags": [list(flags) for flags in self.target_support_flags],
             "terminal_equivalence_flags": list(self.terminal_equivalence_flags),
+            "terminal_tactical_payload": self.terminal_tactical_payload.to_dict(),
             "search_surprise_metrics": dict(self.search_surprise_metrics),
             "neural_calls_per_expanded_full_turn_node": self.neural_calls_per_expanded_full_turn_node,
             "reservoir_refill_events": [event.to_dict() for event in self.reservoir_refill_events],
@@ -610,6 +626,9 @@ class V1SearchPairMetadata:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "V1SearchPairMetadata":
+        schema_version = int(data.get("schema_version", 0))
+        if schema_version >= V1_PAIR_SEARCH_SCHEMA_VERSION and "terminal_tactical_payload" not in data:
+            raise ValueError("V1 schema 2 metadata requires terminal_tactical_payload")
         selected_raw = data.get("selected_pair")
         selected_pair = None
         if selected_raw is not None:
@@ -617,7 +636,7 @@ class V1SearchPairMetadata:
                 raise ValueError("V1 selected_pair must contain two coordinates")
             selected_pair = (_pair_coord(selected_raw[0]), _pair_coord(selected_raw[1]))
         return cls(
-            schema_version=int(data.get("schema_version", 0)),
+            schema_version=schema_version,
             candidate_selector_version=str(data.get("candidate_selector_version", "")),
             support_type=str(data.get("support_type", "")),
             legal_pair_count=int(data.get("legal_pair_count", -1)),
@@ -639,6 +658,9 @@ class V1SearchPairMetadata:
             selected_pair=selected_pair,
             target_support_flags=tuple(tuple(flags) for flags in data.get("target_support_flags", ())),
             terminal_equivalence_flags=tuple(data.get("terminal_equivalence_flags", ())),
+            terminal_tactical_payload=V1TerminalTacticalPayload.from_mapping(
+                data.get("terminal_tactical_payload", {})
+            ),
             search_surprise_metrics=dict(data.get("search_surprise_metrics", {})),
             neural_calls_per_expanded_full_turn_node=data.get("neural_calls_per_expanded_full_turn_node"),
             reservoir_refill_events=tuple(
@@ -688,7 +710,7 @@ def _v1_encode_compact_payload(metadata: V1SearchPairMetadata) -> tuple[Any, ...
     legal_row_ids = np.zeros((n, 2), dtype=np.int32)
     row_schema = np.zeros(n, dtype=np.uint16)
     bool_flags = np.zeros(n, dtype=np.uint8)
-    target_masks = np.zeros(n, dtype=np.uint8)
+    target_masks = np.zeros(n, dtype=np.uint16)
     admissions = np.zeros(n, dtype=np.uint16)
     roots = np.zeros(n, dtype=np.uint8)
     candidate_ids = np.zeros(n, dtype=np.uint16)
@@ -783,7 +805,7 @@ def _v1_encode_compact_payload(metadata: V1SearchPairMetadata) -> tuple[Any, ...
         _v1_pack_array(np.asarray(metadata.visit_counts, dtype=np.uint32)),
         _v1_pack_array(np.asarray(metadata.q_values, dtype=np.float32)),
         _v1_pack_array(np.asarray(metadata.completed_q_values, dtype=np.float32)),
-        _v1_pack_array(np.asarray([_v1_flag_mask(flags) for flags in metadata.target_support_flags], dtype=np.uint8)),
+        _v1_pack_array(np.asarray([_v1_flag_mask(flags) for flags in metadata.target_support_flags], dtype=np.uint16)),
         _v1_pack_array(np.asarray(metadata.terminal_equivalence_flags, dtype=np.bool_)),
     )
     surprise_payload = tuple(
@@ -804,6 +826,12 @@ def _v1_encode_compact_payload(metadata: V1SearchPairMetadata) -> tuple[Any, ...
         )
         for event in metadata.reservoir_refill_events
     )
+    tactical_payload = json.dumps(
+        metadata.terminal_tactical_payload.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    tactical_payload_id = sid(tactical_payload)
     return (
         V1_PAIR_SEARCH_COMPACT_VERSION,
         tuple(strings),
@@ -827,6 +855,7 @@ def _v1_encode_compact_payload(metadata: V1SearchPairMetadata) -> tuple[Any, ...
         surprise_payload,
         neural_payload,
         refill_payload,
+        tactical_payload_id,
     )
 
 
@@ -844,6 +873,7 @@ def _v1_decode_compact_payload(payload: tuple[Any, ...]) -> V1SearchPairMetadata
         surprise_payload,
         neural_calls,
         refill_payloads,
+        tactical_payload_sid,
     ) = payload
     if int(compact_version) != V1_PAIR_SEARCH_COMPACT_VERSION:
         raise ValueError(f"Unsupported V1 compact metadata version {compact_version}")
@@ -948,6 +978,9 @@ def _v1_decode_compact_payload(payload: tuple[Any, ...]) -> V1SearchPairMetadata
         selected_pair=selected_pair,
         target_support_flags=tuple(_v1_flags_from_mask(int(mask)) for mask in target_masks_arr.tolist()),
         terminal_equivalence_flags=tuple(bool(value) for value in terminal_flags.tolist()),
+        terminal_tactical_payload=V1TerminalTacticalPayload.from_mapping(
+            json.loads(s(tactical_payload_sid))
+        ),
         search_surprise_metrics={s(key): float(value) for key, value in surprise_payload},
         neural_calls_per_expanded_full_turn_node=None
         if np.isnan(float(neural_calls))

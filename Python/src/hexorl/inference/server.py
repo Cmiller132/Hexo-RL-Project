@@ -28,6 +28,9 @@ from hexorl.inference.protocol import (
     GRAPH_HEAD_PAIR_JOINT,
     GRAPH_HEAD_PAIR_SECOND,
     GRAPH_HEAD_REGRET,
+    GRAPH_HEAD_V1_LEGAL_COMPLETION_KEY,
+    GRAPH_HEAD_V1_LEGAL_COMPLETION_QUERY,
+    GRAPH_HEAD_V1_LEGAL_PROPOSAL_EMBEDDINGS,
 )
 from hexorl.models.loading import (
     build_runtime_model,
@@ -41,6 +44,7 @@ from hexorl.inference.shm_queue import (
     GRAPH_SCHEMA_VERSION,
     MAX_GRAPH_ACTIONS,
     MAX_GRAPH_PAIRS,
+    MAX_GRAPH_LEGAL_PROJECTION_DIM,
     MAX_GRAPH_RELATION_EDGES,
     MAX_GRAPH_TOKENS,
     MAX_PAIR_CANDIDATES,
@@ -323,6 +327,9 @@ class InferenceServer:
                         graph_pair_joint,
                         graph_pair_second,
                         graph_regret,
+                        graph_legal_projection,
+                        graph_legal_completion_query,
+                        graph_legal_completion_key,
                     ) = self._forward_graph(graph_inputs)
                     sparse_logits = pair_logits = policies = None
                 else:
@@ -340,6 +347,9 @@ class InferenceServer:
                         graph_pair_joint,
                         graph_pair_second,
                         graph_regret,
+                        graph_legal_projection,
+                        graph_legal_completion_query,
+                        graph_legal_completion_key,
                     )
                 else:
                     self._scatter_results(
@@ -760,6 +770,9 @@ class InferenceServer:
             else decoded.pair_completion_logits
         )
         regret_np = decoded.regret_rank
+        legal_projection_np = decoded.legal_proposal_embeddings
+        legal_completion_query_np = decoded.legal_completion_query
+        legal_completion_key_np = decoded.legal_completion_key
         download_ms = (time.monotonic() - download_t0) * 1000.0
 
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -767,7 +780,18 @@ class InferenceServer:
         self.total_model_ms += model_ms
         self.total_postprocess_ms += post_ms
         self.total_download_ms += download_ms
-        return place_np, values_np, opp_np, pair_first_np, pair_joint_np, pair_second_np, regret_np
+        return (
+            place_np,
+            values_np,
+            opp_np,
+            pair_first_np,
+            pair_joint_np,
+            pair_second_np,
+            regret_np,
+            legal_projection_np,
+            legal_completion_query_np,
+            legal_completion_key_np,
+        )
 
     @staticmethod
     def _sanitize_policy_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -833,6 +857,9 @@ class InferenceServer:
         pair_joint_logits: Optional[np.ndarray],
         pair_second_logits: Optional[np.ndarray],
         regret_rank: Optional[np.ndarray] = None,
+        legal_projection: Optional[np.ndarray] = None,
+        legal_completion_query: Optional[np.ndarray] = None,
+        legal_completion_key: Optional[np.ndarray] = None,
     ):
         """Scatter graph logits using each worker's keyed legal/pair counts."""
         head_flags = 0
@@ -846,6 +873,20 @@ class InferenceServer:
             head_flags |= GRAPH_HEAD_PAIR_SECOND
         if regret_rank is not None:
             head_flags |= GRAPH_HEAD_REGRET
+        projection_dim = 0
+        for projection, flag in (
+            (legal_projection, GRAPH_HEAD_V1_LEGAL_PROPOSAL_EMBEDDINGS),
+            (legal_completion_query, GRAPH_HEAD_V1_LEGAL_COMPLETION_QUERY),
+            (legal_completion_key, GRAPH_HEAD_V1_LEGAL_COMPLETION_KEY),
+        ):
+            if projection is not None:
+                head_flags |= flag
+                projection_dim = max(projection_dim, int(projection.shape[-1]))
+        if projection_dim > MAX_GRAPH_LEGAL_PROJECTION_DIM:
+            raise ValueError(
+                "V1 legal projection dim exceeds graph IPC capacity: "
+                f"{projection_dim} > {MAX_GRAPH_LEGAL_PROJECTION_DIM}"
+            )
 
         worker_totals: dict[int, list[int]] = {}
         for row, (worker_id, local_row) in enumerate(row_sources):
@@ -882,6 +923,8 @@ class InferenceServer:
                 totals[0],
                 MAX_GRAPH_TOKENS,
                 head_flags,
+                projection_dim,
+                0,
             )
             if local_row == 0:
                 slot.res_graph_place_logits.fill(0.0)
@@ -889,6 +932,10 @@ class InferenceServer:
                 slot.res_graph_pair_first_logits.fill(0.0)
                 slot.res_graph_pair_logits.fill(0.0)
                 slot.res_graph_pair_second_logits.fill(0.0)
+                if hasattr(slot, "res_graph_legal_proposal_embeddings"):
+                    slot.res_graph_legal_proposal_embeddings.fill(0.0)
+                    slot.res_graph_legal_completion_query.fill(0.0)
+                    slot.res_graph_legal_completion_key.fill(0.0)
             if getattr(slot, "res_graph_regret_rank", None) is not None:
                 slot.res_graph_regret_rank[local_row] = (
                     float(regret_rank[row])
@@ -904,6 +951,21 @@ class InferenceServer:
                 slot.res_graph_pair_logits[pair_off : pair_off + pair_count] = pair_joint_logits[row, :pair_count]
             if pair_count and pair_second_logits is not None:
                 slot.res_graph_pair_second_logits[pair_off : pair_off + pair_count] = pair_second_logits[row, :pair_count]
+            if legal_count and legal_projection is not None:
+                slot.res_graph_legal_proposal_embeddings[
+                    legal_off : legal_off + legal_count,
+                    :projection_dim,
+                ] = legal_projection[row, :legal_count, :projection_dim]
+            if legal_count and legal_completion_query is not None:
+                slot.res_graph_legal_completion_query[
+                    legal_off : legal_off + legal_count,
+                    :projection_dim,
+                ] = legal_completion_query[row, :legal_count, :projection_dim]
+            if legal_count and legal_completion_key is not None:
+                slot.res_graph_legal_completion_key[
+                    legal_off : legal_off + legal_count,
+                    :projection_dim,
+                ] = legal_completion_key[row, :legal_count, :projection_dim]
             slot.req_mode[0] = 0
 
     # ── Stats ─────────────────────────────────────────────────────────────

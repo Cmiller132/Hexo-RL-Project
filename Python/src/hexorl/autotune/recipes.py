@@ -16,7 +16,7 @@ from hexorl.models.registry import global_graph_architecture_ids, normalize_arch
 
 
 RECIPE_SCHEMA_VERSION = 1
-PairMode = Literal["none", "root_pair_mcts", "full_pair_mcts", "sampled_joint_pair_v1"]
+PairMode = Literal["none", "sampled_joint_pair_v1"]
 _PAIR_HEADS = ("policy_pair_first", "policy_pair_joint", "policy_pair_second")
 _V1_PAIR_HEADS = (
     "cell_marginal_logits",
@@ -88,12 +88,12 @@ class PairStrategySpec(BaseModel):
             self.root_only = False
             return self
         if self.pair_row_budget <= 0:
-            raise ValueError("PairStrategySpec.pair_row_budget must be positive for pair MCTS modes")
+            raise ValueError("PairStrategySpec.pair_row_budget must be positive for sampled_joint_pair_v1")
         if not 0.0 < self.pair_prior_mix <= 1.0:
             raise ValueError("PairStrategySpec.pair_prior_mix must be in (0, 1]")
         if self.max_pair_batch_rows <= 0 or self.chunk_rows <= 0:
             raise ValueError("PairStrategySpec batching rows must be positive")
-        self.root_only = self.mode == "root_pair_mcts"
+        self.root_only = False
         return self
 
 
@@ -299,9 +299,6 @@ def _model_recipe_for_architecture(architecture_id: str, pair_mode: str) -> Mode
     elif architecture_id == "global_pair_biaffine_0":
         output_heads = ["cell_marginal_logits", "value"]
         head_bundle = "v1_cell_value"
-    elif pair_mode != "none":
-        output_heads.extend(_PAIR_HEADS)
-        head_bundle = "pair_mcts"
     kwargs: dict[str, Any] = {}
     if architecture_id == "global_graph768_champion":
         kwargs.update({"graph_token_set": "graph768_champion", "graph_token_budget": 768, "graph_layers": 6})

@@ -738,7 +738,7 @@ def test_v1_pair_search_metadata_roundtrips_through_compact_record_and_ring():
 
     loaded = out.positions[0].v1_search_metadata
     assert loaded is not None
-    assert loaded.schema_version == 1
+    assert loaded.schema_version == 2
     assert loaded.candidate_selector_version == "pair_candidate_selector_v1"
     assert loaded.support_type == "admitted_candidate_set_with_explicit_negatives"
     assert loaded.legal_pair_count == 15
@@ -785,6 +785,14 @@ def test_v1_pair_search_metadata_compact_blob_rejects_legacy_json():
     assert loaded.completed_q_values == pytest.approx(metadata.completed_q_values)
     with pytest.raises(ValueError, match="legacy V1 metadata"):
         v1_search_metadata_from_compact_bytes(b'{"schema_version":1,"candidate_pairs":[]}')
+
+
+def test_v1_pair_search_metadata_schema_two_requires_tactical_payload():
+    data = _v1_metadata_fixture().to_dict()
+    data.pop("terminal_tactical_payload")
+
+    with pytest.raises(ValueError, match="terminal_tactical_payload"):
+        V1SearchPairMetadata.from_dict(data)
 
 
 def test_replay_memory_estimate_accounts_for_compressed_v1_metadata():
@@ -886,7 +894,7 @@ def test_prepare_dense_training_batch_masks_legacy_pair_weight_for_v1_schema_mar
         lookahead_list=[],
         aux_targets={
             "pair_policy_weight": np.ones(2, dtype=np.float32),
-            "v1_pair_schema_version": np.array([1, 0], dtype=np.int16),
+            "v1_pair_schema_version": np.array([2, 0], dtype=np.int16),
         },
         lookahead_keys=[],
         device=torch.device("cpu"),

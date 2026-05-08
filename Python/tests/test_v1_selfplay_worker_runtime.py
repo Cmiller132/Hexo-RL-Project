@@ -49,17 +49,26 @@ def _v1_cfg() -> Config:
 class FakeGraphClient:
     def __init__(self) -> None:
         self.graph_batches = []
+        self.graph_many_batches = []
 
     def submit_graph(self, graph_batch):
         self.graph_batches.append(graph_batch)
         pair_count = int(np.asarray(graph_batch.pair_first_indices).shape[0])
-        assert pair_count > 0
+        legal_count = int(np.asarray(graph_batch.legal_qr).shape[0])
+        rank = 4
+        legal_projection = np.zeros((legal_count, rank), dtype=np.float32)
+        if legal_count:
+            legal_projection[:, 0] = np.linspace(0.0, 1.0, legal_count, dtype=np.float32)
+            legal_projection[:, 1] = np.linspace(1.0, 0.0, legal_count, dtype=np.float32)
         return {
             "value": np.asarray([0.25], dtype=np.float32),
             "cell_marginal_logits": np.zeros(
-                int(np.asarray(graph_batch.legal_qr).shape[0]),
+                legal_count,
                 dtype=np.float32,
             ),
+            "legal_proposal_embeddings": legal_projection,
+            "legal_completion_query": legal_projection,
+            "legal_completion_key": legal_projection,
             "pair_completion_logits": np.zeros(pair_count, dtype=np.float32),
             "pair_proposal_score": np.linspace(0.0, 1.0, pair_count, dtype=np.float32),
             "pair_joint_logits": np.linspace(0.0, 3.0, pair_count, dtype=np.float32),
@@ -73,6 +82,100 @@ class FakeGraphClient:
                 },
             },
         }
+
+    def submit_graph_many(self, graph_batches):
+        batch = list(graph_batches)
+        self.graph_many_batches.append(batch)
+        return [self.submit_graph(graph_batch) for graph_batch in batch]
+
+
+class FakeHexGame:
+    def __init__(self) -> None:
+        self.move_count = 0
+        self.placements_remaining = 1
+        self.current_player = 0
+        self._moves = []
+
+    def legal_moves(self):
+        if self.move_count == 0:
+            return [(0, 0)]
+        return [(0, 1), (1, 0), (1, -1), (0, -1), (-1, 0)]
+
+    def place(self, q, r):
+        self._moves.append((int(self.current_player), int(q), int(r)))
+        self.move_count += 1
+        if self.move_count == 1:
+            self.placements_remaining = 2
+            self.current_player = 1
+        elif self.placements_remaining > 1:
+            self.placements_remaining -= 1
+        else:
+            self.placements_remaining = 2
+            self.current_player = 1 - self.current_player
+
+    def is_over(self):
+        return self.move_count >= 3
+
+    def winner(self):
+        return 0 if self.is_over() else None
+
+
+def fake_graph_batch_from_history(
+    _history,
+    *,
+    legal_moves,
+    **_kwargs,
+):
+    legal = np.asarray(legal_moves, dtype=np.int32).reshape(-1, 2)
+    n = int(legal.shape[0])
+    return worker_module.GraphBatch(
+        token_features=np.zeros((n, 12), dtype=np.float32),
+        token_type=np.full(n, 3, dtype=np.int16),
+        token_qr=legal.copy(),
+        token_mask=np.ones(n, dtype=np.bool_),
+        legal_token_indices=np.arange(n, dtype=np.int64),
+        legal_qr=legal.copy(),
+        legal_mask=np.ones(n, dtype=np.bool_),
+        pair_token_indices=np.zeros(0, dtype=np.int64),
+        pair_first_indices=np.zeros(0, dtype=np.int64),
+        pair_second_indices=np.zeros(0, dtype=np.int64),
+        relation_bias=np.zeros((0,), dtype=np.float32),
+        relation_type=np.zeros((0,), dtype=np.int16),
+        policy_target=np.zeros(n, dtype=np.float32),
+        opp_legal_qr=np.zeros((0, 2), dtype=np.int32),
+        opp_legal_mask=np.zeros(0, dtype=np.bool_),
+        opp_policy_target=np.zeros(0, dtype=np.float32),
+        pair_first_policy_target=np.zeros(n, dtype=np.float32),
+        pair_policy_target=np.zeros(0, dtype=np.float32),
+        pair_second_policy_target=np.zeros(0, dtype=np.float32),
+        tactical_target=np.zeros(8, dtype=np.float32),
+        placements_remaining=2 if n > 1 else 1,
+        current_player=0,
+    )
+
+
+def test_v1_proposal_matrix_reader_accepts_legal_by_legal_outputs():
+    values = np.arange(9, dtype=np.float32).reshape(3, 3)
+
+    direct = worker_module._v1_pair_matrix_from_proposal_output(
+        {"pair_completion_logits": values},
+        "pair_completion_logits",
+        3,
+    )
+    batched = worker_module._v1_pair_matrix_from_proposal_output(
+        {"pair_proposal_score": values.reshape(1, 3, 3)},
+        "pair_proposal_score",
+        3,
+    )
+    row_vector = worker_module._v1_pair_matrix_from_proposal_output(
+        {"pair_proposal_score": np.arange(3, dtype=np.float32)},
+        "pair_proposal_score",
+        3,
+    )
+
+    np.testing.assert_array_equal(direct, values)
+    np.testing.assert_array_equal(batched, values)
+    assert row_vector is None
 
 
 class FakeV1PairSearchEngine:
@@ -102,6 +205,8 @@ class FakeV1PairSearchEngine:
         self.correction_weights = np.zeros(0, dtype=np.float32)
         self.correction_modes = np.zeros(0, dtype=np.uint8)
         self.selected = None
+        self.expansion_requests_issued = 0
+        self.expansion_completed = 0
         FakeV1PairSearchEngine.instances.append(self)
 
     def init_root_v1(self):
@@ -180,6 +285,67 @@ class FakeV1PairSearchEngine:
             "legal_row_table_hash": table_hash,
         }
         return self.selected
+
+    def run_search_step(self, max_expansions):
+        assert self.root is not None
+        if self.root["phase"] == "opening_single":
+            return []
+        if self.expansion_requests_issued >= 2:
+            return []
+        legal = [(int(q), int(r)) for q, r in self.game.legal_moves()]
+        rows = [[idx, q, r] for idx, (q, r) in enumerate(legal)]
+        node_key = 12345 if self.expansion_requests_issued == 0 else 67890
+        table_hash = 200000 + self.expansion_requests_issued
+        self.expansion_requests_issued += 1
+        return [
+            {
+                "node_key": node_key,
+                "move_history_bytes": b"",
+                "phase": "normal_two_placement",
+                "parent_visits": 1,
+                "node_visit_count": 0,
+                "root_generation": int(self.root["root_generation"]),
+                "legal_row_table_hash": table_hash,
+                "legal_row_table": {
+                    "schema_version": 7,
+                    "row_count": len(rows),
+                    "rows": rows,
+                    "hash": table_hash,
+                },
+                "terminal_tactical": {
+                    "pair_row_schema_version": 11,
+                    "hot_completion_pairs": [],
+                    "hot_cover_pairs": [],
+                    "terminal_equivalent_pairs": [],
+                },
+            }
+        ][: int(max_expansions)]
+
+    def complete_expansion(
+        self,
+        node_key,
+        value,
+        pair_qr,
+        pair_logits,
+        correction_weights,
+        correction_modes,
+    ):
+        assert int(node_key) in {12345, 67890}
+        assert np.asarray(pair_qr).reshape(-1, 4).shape[0] == np.asarray(pair_logits).reshape(-1).shape[0]
+        self.expansion_completed += 1
+        return {
+            "node_key": int(node_key),
+            "candidate_count": int(np.asarray(pair_qr).reshape(-1, 4).shape[0]),
+            "revealed_count": 1,
+            "reservoir_build_count": 1,
+            "scoring_pass_count": 1,
+            "widening_events": 1,
+            "reservoir_refill_events": 0,
+        }
+
+    def select_root_action(self):
+        assert self.expansion_completed == 2
+        return self.run_root_search()
 
     def apply_selected_action(self, root_generation, legal_row_table_hash, pair_key=None):
         assert self.selected is not None
@@ -260,6 +426,9 @@ class FakeV1PairSearchEngine:
             "legal_row_count": int(self.root["legal_row_table"]["row_count"]),
             "simulation_count": self.num_simulations,
             "reservoir_refill_events": 0,
+            "interior_expanded_full_turn_nodes": self.expansion_completed,
+            "interior_reservoir_build_count": self.expansion_completed,
+            "interior_scoring_pass_count": self.expansion_completed,
             "candidate_pairs": rows,
             "root_gumbel_values_or_admission_order": [[idx, float(idx) / 100.0] for idx in range(n)],
             "root_simulation_allocation": allocations,
@@ -301,6 +470,8 @@ def test_sampled_joint_pair_v1_worker_uses_pair_native_runtime(monkeypatch):
         FakeV1PairSearchEngine,
         raising=False,
     )
+    monkeypatch.setattr(worker_module._engine, "PyHexGame", FakeHexGame, raising=False)
+    monkeypatch.setattr(worker_module, "build_graph_batch_from_history", fake_graph_batch_from_history)
 
     cfg = _v1_cfg()
     record_queue = mp.Queue()
@@ -326,7 +497,7 @@ def test_sampled_joint_pair_v1_worker_uses_pair_native_runtime(monkeypatch):
     assert record.game_length == 3
     assert len(record.final_move_history) == 3 * 12
     assert len(record.positions) == 2
-    assert len(client.graph_batches) == 1
+    assert len(client.graph_batches) == 6
     assert len(FakeV1PairSearchEngine.instances) == 2
 
     opening = record.positions[0]
@@ -349,30 +520,49 @@ def test_sampled_joint_pair_v1_worker_uses_pair_native_runtime(monkeypatch):
         candidate.source_contributions and candidate.proposal_propensity_metadata
         for candidate in metadata.candidate_pairs
     )
-    assert metadata.neural_calls_per_expanded_full_turn_node == 1.0
+    assert metadata.neural_calls_per_expanded_full_turn_node == 6.0
     assert metadata.reservoir_refill_events == ()
-    assert metadata.search_surprise_metrics["model_eval_count"] == 1.0
+    assert metadata.search_surprise_metrics["model_eval_count"] == 6.0
     assert metadata.search_surprise_metrics["reservoir_build_count"] == 1.0
-    assert metadata.search_surprise_metrics["bounded_scoring_pass_count"] == 1.0
+    assert metadata.search_surprise_metrics["bounded_scoring_pass_count"] == 3.0
+    assert metadata.search_surprise_metrics["proposal_batch_size"] == 2.0
+    assert metadata.search_surprise_metrics["scoring_batch_size"] == 2.0
     assert metadata.search_surprise_metrics["rust_reservoir_build_count"] == 1.0
     assert metadata.search_surprise_metrics["rust_scoring_pass_count"] == 1.0
     assert metadata.search_surprise_metrics["rust_reservoir_refill_events"] == 0.0
+    assert metadata.search_surprise_metrics["rust_interior_expanded_full_turn_nodes"] == 2.0
+    assert metadata.search_surprise_metrics["interior_widening_events"] >= 2.0
+    assert len(client.graph_many_batches) == 4
+    assert all(len(batch) == 1 for batch in client.graph_many_batches)
 
-    graph_batch = client.graph_batches[0]
+    proposal_batch = client.graph_batches[0]
+    assert np.asarray(proposal_batch.pair_first_indices).shape[0] == 0
+    assert np.asarray(proposal_batch.pair_token_indices).shape[0] == 0
+
+    graph_batch = client.graph_batches[1]
     assert np.asarray(graph_batch.pair_first_indices).shape[0] == len(metadata.candidate_pairs)
     assert np.asarray(graph_batch.pair_token_indices).shape[0] == len(metadata.candidate_pairs)
     assert np.all(np.asarray(graph_batch.pair_token_indices) == -1)
     graph_legal = {tuple(row) for row in np.asarray(graph_batch.legal_qr, dtype=np.int32).tolist()}
-    assert np.asarray(graph_batch.legal_qr).shape[0] == int(
+    assert np.asarray(graph_batch.legal_qr).shape[0] <= int(
         metadata.search_surprise_metrics["graph_legal_row_count"]
     )
-    assert np.asarray(graph_batch.legal_qr).shape[0] < int(
+    assert np.asarray(graph_batch.legal_qr).shape[0] <= int(
         metadata.search_surprise_metrics["selector_legal_row_count"]
     )
     for candidate in metadata.candidate_pairs:
         first, second = candidate.pair_key
         assert tuple(first) in graph_legal
         assert tuple(second) in graph_legal
+
+    interior_proposal_batch = client.graph_batches[2]
+    interior_graph_batch = client.graph_batches[3]
+    deeper_proposal_batch = client.graph_batches[4]
+    deeper_graph_batch = client.graph_batches[5]
+    assert np.asarray(interior_proposal_batch.pair_first_indices).shape[0] == 0
+    assert np.asarray(interior_graph_batch.pair_first_indices).shape[0] > 0
+    assert np.asarray(deeper_proposal_batch.pair_first_indices).shape[0] == 0
+    assert np.asarray(deeper_graph_batch.pair_first_indices).shape[0] > 0
 
 
 def test_sampled_joint_pair_v1_real_engine_smoke_outputs_distinct_history():
@@ -420,5 +610,7 @@ def test_sampled_joint_pair_v1_source_path_has_no_legacy_projection_authority():
     assert "select_pair_candidates_v1" in v1_segment
     assert "graph_batch_with_admitted_pair_rows" in v1_segment
     assert ".admit_root_pairs(" in v1_segment
-    assert ".run_root_search(" in v1_segment
+    assert ".run_search_step(" in v1_segment
+    assert ".complete_expansion(" in v1_segment
+    assert ".select_root_action(" in v1_segment
     assert ".apply_selected_action(" in v1_segment

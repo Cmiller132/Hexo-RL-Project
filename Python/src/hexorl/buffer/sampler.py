@@ -47,6 +47,7 @@ from hexorl.train.v1_pair_targets import (
     build_v1_pair_training_targets,
     collate_v1_pair_training_targets,
 )
+from hexorl.v1_pair_contract import v1_pair_features_for_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -849,6 +850,10 @@ class ReplayDataset(_IterableDataset):
                     graph = graph_batch_with_admitted_pair_rows(
                         graph,
                         v1_target.candidate_pair_qr,
+                        pair_features=v1_pair_features_for_candidates(
+                            v1_metadata.candidate_pairs,
+                            v1_metadata.terminal_tactical_payload,
+                        ),
                     )
                     if int(graph.pair_policy_target.shape[0]) != int(v1_target.pair_joint_target.shape[0]):
                         raise ValueError("V1 graph pair rows must match V1 target rows exactly")

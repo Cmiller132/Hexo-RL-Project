@@ -13,7 +13,8 @@ use hexgame_core::tactics::{tactical_status, TacticalStatus};
 use hexgame_core::v1::{self, LegalRowV1, PairRowTableV1, PairRowV1, TerminalTacticalSetV1};
 use hexgame_core::v1_pair_search::{
     ProposalCorrectionModeV1, V1AppliedAction, V1InteriorReservoirTelemetry,
-    V1InteriorWideningResult, V1PairCandidate, V1PairSearchConfig, V1PairSearchEngine,
+    V1ExpansionRequest, V1InteriorWideningResult, V1PairCandidate, V1PairSearchConfig,
+    V1PairSearchEngine,
     V1SelectedAction,
 };
 
@@ -428,6 +429,32 @@ fn interior_widening_v1_to_py<'py>(
     )?;
     dict.set_item("revealed_rows", pair_rows_v1_to_py(&result.revealed_rows))?;
     dict.set_item("puct_scores", result.puct_scores)?;
+    Ok(dict)
+}
+
+fn expansion_request_v1_to_py<'py>(
+    py: Python<'py>,
+    request: &V1ExpansionRequest,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("node_key", request.node_key)?;
+    dict.set_item(
+        "move_history_bytes",
+        PyBytes::new(py, &protocol::encode_compact_history_rows(request.game.move_history())),
+    )?;
+    dict.set_item("phase", request.phase.as_str())?;
+    dict.set_item(
+        "legal_row_table",
+        legal_row_table_v1_to_py(py, &request.legal_table)?,
+    )?;
+    dict.set_item(
+        "terminal_tactical",
+        terminal_tactical_v1_to_py(py, request.tactical.clone())?,
+    )?;
+    dict.set_item("parent_visits", request.parent_visits)?;
+    dict.set_item("node_visit_count", request.node_visit_count)?;
+    dict.set_item("root_generation", request.root_generation)?;
+    dict.set_item("legal_row_table_hash", request.legal_row_table_hash)?;
     Ok(dict)
 }
 
@@ -1301,6 +1328,61 @@ impl PyV1PairSearchEngine {
     fn run_root_search<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         self.inner
             .run_root_search()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?
+            .as_ref()
+            .map(|selected| selected_action_v1_to_py(py, selected))
+            .transpose()
+    }
+
+    fn run_search_step<'py>(
+        &mut self,
+        py: Python<'py>,
+        max_expansions: usize,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.inner
+            .run_search_step(max_expansions)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?
+            .iter()
+            .map(|request| expansion_request_v1_to_py(py, request))
+            .collect()
+    }
+
+    fn complete_expansion<'py>(
+        &mut self,
+        py: Python<'py>,
+        node_key: u64,
+        value: f32,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        correction_weights: PyReadonlyArray1<'py, f32>,
+        correction_modes: PyReadonlyArray1<'py, u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let qr = pair_qr.as_array();
+        let decoded = protocol::decode_pair_rows(qr, "pair_qr")?;
+        let pairs = decoded
+            .into_iter()
+            .map(|(q1, r1, q2, r2)| (Hex::new(q1, r1), Hex::new(q2, r2)))
+            .collect::<Vec<_>>();
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        let weights = correction_weights.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("correction_weights array must be contiguous")
+        })?;
+        let mode_codes = correction_modes.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("correction_modes array must be contiguous")
+        })?;
+        let modes = decode_v1_correction_modes(mode_codes)?;
+        let telemetry = self
+            .inner
+            .complete_expansion(node_key, value, &pairs, logits, weights, &modes)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        interior_telemetry_v1_to_py(py, telemetry)
+    }
+
+    fn select_root_action<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.inner
+            .select_root_action()
             .map_err(|err| PyValueError::new_err(err.to_string()))?
             .as_ref()
             .map(|selected| selected_action_v1_to_py(py, selected))

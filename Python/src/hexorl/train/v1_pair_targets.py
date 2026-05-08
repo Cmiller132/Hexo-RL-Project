@@ -14,9 +14,10 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from hexorl.selfplay.records import PairKey, V1SearchPairMetadata
+from hexorl.v1_pair_contract import terminal_tactical_target_vector
 
 
-V1_PAIR_TARGET_VERSION = 1
+V1_PAIR_TARGET_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,6 @@ class V1PairTrainingTargets:
     pair_softened_target: np.ndarray
     pair_completion_target: np.ndarray
     pair_completion_mask: np.ndarray
-    pair_proposal_score_target: np.ndarray
     pair_ranking_target: np.ndarray
     pair_ranking_mask: np.ndarray
     conditional_pair_indices: np.ndarray
@@ -68,7 +68,6 @@ class V1PairTrainingTargets:
             "v1_pair_softened_target": self.pair_softened_target,
             "v1_pair_completion_target": self.pair_completion_target,
             "v1_pair_completion_mask": self.pair_completion_mask,
-            "v1_pair_proposal_score_target": self.pair_proposal_score_target,
             "v1_pair_ranking_target": self.pair_ranking_target,
             "v1_pair_ranking_mask": self.pair_ranking_mask,
             "v1_conditional_pair_indices": self.conditional_pair_indices,
@@ -131,7 +130,6 @@ def build_v1_pair_training_targets(
     n = len(metadata.candidate_pairs)
     pair_qr = np.zeros((n, 4), dtype=np.int32)
     legal_row_ids = np.zeros((n, 2), dtype=np.int64)
-    source_score = np.zeros(n, dtype=np.float32)
     masks = _support_masks(metadata)
     transformed_pair_keys: list[PairKey] = []
 
@@ -145,7 +143,6 @@ def build_v1_pair_training_targets(
             int(pair_key[1][1]),
         ]
         legal_row_ids[idx] = _legal_row_ids_for_pair(candidate, pair_key, legal_row_index_by_qr)
-        source_score[idx] = _proposal_score(candidate.proposal_propensity_metadata.to_dict())
 
     selected_pair = None
     if metadata.selected_pair is not None:
@@ -223,7 +220,6 @@ def build_v1_pair_training_targets(
         pair_softened_target=softened_target.astype(np.float32, copy=False),
         pair_completion_target=terminal_mask.astype(np.float32, copy=False),
         pair_completion_mask=pair_completion_mask.astype(np.bool_, copy=False),
-        pair_proposal_score_target=source_score.astype(np.float32, copy=False),
         pair_ranking_target=ranking_target.astype(np.float32, copy=False),
         pair_ranking_mask=ranking_mask.astype(np.bool_, copy=False),
         conditional_pair_indices=conditional["pair_indices"].astype(np.int64, copy=False),
@@ -235,7 +231,10 @@ def build_v1_pair_training_targets(
         completed_q_mask=completed_q_mask.astype(np.bool_, copy=False),
         q_value_target=q_values,
         q_value_mask=q_value_mask.astype(np.bool_, copy=False),
-        terminal_tactical_target=_terminal_tactical_target(masks, selected_index),
+        terminal_tactical_target=terminal_tactical_target_vector(
+            metadata.terminal_tactical_payload,
+            selected_pair=metadata.selected_pair,
+        ),
         explicit_negative_mask=explicit_negative.astype(np.bool_, copy=False),
         sampled_negative_mask=sampled_negative.astype(np.bool_, copy=False),
         unsampled_mask=masks["unsampled"].astype(np.bool_, copy=False),
@@ -276,7 +275,6 @@ def collate_v1_pair_training_targets(
         "v1_pair_softened_target": np.zeros((batch_size, pair_width), dtype=np.float32),
         "v1_pair_completion_target": np.zeros((batch_size, pair_width), dtype=np.float32),
         "v1_pair_completion_mask": np.zeros((batch_size, pair_width), dtype=np.bool_),
-        "v1_pair_proposal_score_target": np.zeros((batch_size, pair_width), dtype=np.float32),
         "v1_pair_ranking_target": np.zeros((batch_size, pair_width), dtype=np.float32),
         "v1_pair_ranking_mask": np.zeros((batch_size, pair_width), dtype=np.bool_),
         "v1_conditional_pair_indices": np.full((batch_size, condition_width), -1, dtype=np.int64),
@@ -323,7 +321,6 @@ def collate_v1_pair_training_targets(
             ("v1_pair_softened_target", target.pair_softened_target),
             ("v1_pair_completion_target", target.pair_completion_target),
             ("v1_pair_completion_mask", target.pair_completion_mask),
-            ("v1_pair_proposal_score_target", target.pair_proposal_score_target),
             ("v1_pair_ranking_target", target.pair_ranking_target),
             ("v1_pair_ranking_mask", target.pair_ranking_mask),
             ("v1_completed_q_target", target.completed_q_target),
@@ -360,6 +357,9 @@ def _support_masks(metadata: V1SearchPairMetadata) -> dict[str, np.ndarray]:
         "sampled_negative",
         "terminal_exact",
         "terminal_equivalent",
+        "terminal_cover",
+        "covers_all_opponent_win_requirements",
+        "impossible_to_cover",
         "unsampled",
     )
     masks = {name: np.zeros(len(metadata.candidate_pairs), dtype=np.bool_) for name in names}
@@ -521,20 +521,6 @@ def _conditional_targets(
     }
 
 
-def _terminal_tactical_target(masks: Mapping[str, np.ndarray], selected_index: int) -> np.ndarray:
-    out = np.zeros(8, dtype=np.float32)
-    out[0] = float(bool(masks["terminal_exact"].any()))
-    out[1] = float(bool(masks["terminal_equivalent"].any()))
-    out[2] = float(bool(masks["forced"].any()))
-    out[3] = float(bool(masks["terminal_exact"].any() or masks["terminal_equivalent"].any()))
-    if selected_index >= 0:
-        out[4] = float(bool(masks["terminal_exact"][selected_index]))
-        out[5] = float(bool(masks["terminal_equivalent"][selected_index]))
-    out[6] = float(bool((masks["explicit_negative"] | masks["sampled_negative"]).any()))
-    out[7] = float(bool(masks["unsampled"].any()))
-    return out
-
-
 def _selected_pair_index(selected_pair: PairKey | None, pair_keys: Sequence[PairKey]) -> int:
     if selected_pair is None:
         return -1
@@ -573,20 +559,6 @@ def _legal_row_ids_for_pair(
     if first == second:
         raise ValueError(f"V1 candidate pair legal row ids must be distinct: {pair_key}")
     return (int(first), int(second))
-
-
-def _proposal_score(proposal: Mapping[str, object]) -> float:
-    log_prob = proposal.get("log_proposal_probability")
-    if log_prob is not None:
-        value = float(log_prob)
-        if np.isfinite(value):
-            return value
-    prob = proposal.get("total_proposal_probability")
-    if prob is not None:
-        value = float(prob)
-        if value > 0.0 and np.isfinite(value):
-            return float(np.log(value))
-    return 0.0
 
 
 def _copy(destination: np.ndarray, source: np.ndarray, count: int) -> None:

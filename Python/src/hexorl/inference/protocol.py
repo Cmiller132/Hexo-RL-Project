@@ -30,6 +30,9 @@ GRAPH_HEAD_V1_PAIR_COMPLETION = 1 << 6
 GRAPH_HEAD_V1_PAIR_PROPOSAL = 1 << 7
 GRAPH_HEAD_V1_PAIR_JOINT = 1 << 8
 GRAPH_HEAD_V1_TERMINAL_TACTICAL = 1 << 9
+GRAPH_HEAD_V1_LEGAL_PROPOSAL_EMBEDDINGS = 1 << 10
+GRAPH_HEAD_V1_LEGAL_COMPLETION_QUERY = 1 << 11
+GRAPH_HEAD_V1_LEGAL_COMPLETION_KEY = 1 << 12
 
 
 @dataclass(frozen=True)
@@ -198,5 +201,11 @@ def graph_head_flags(outputs: Mapping[str, object]) -> int:
         flags |= GRAPH_HEAD_V1_PAIR_JOINT
     if "terminal_tactical_v1" in outputs:
         flags |= GRAPH_HEAD_V1_TERMINAL_TACTICAL
+    if "legal_proposal_embeddings" in outputs:
+        flags |= GRAPH_HEAD_V1_LEGAL_PROPOSAL_EMBEDDINGS
+    if "legal_completion_query" in outputs:
+        flags |= GRAPH_HEAD_V1_LEGAL_COMPLETION_QUERY
+    if "legal_completion_key" in outputs:
+        flags |= GRAPH_HEAD_V1_LEGAL_COMPLETION_KEY
     return flags
 

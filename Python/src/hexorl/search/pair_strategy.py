@@ -322,34 +322,6 @@ class PairStrategy:
         keep_idx = np.asarray(keep, dtype=np.int64)
         return pair_rows[keep_idx], logits[keep_idx]
 
-    def pair_logits_to_action_logits(
-        self,
-        pair_qr: np.ndarray,
-        pair_logits: np.ndarray,
-        legal: np.ndarray,
-    ) -> np.ndarray:
-        legal = np.asarray(legal, dtype=np.int32).reshape(-1, 2)
-        out = np.full(legal.shape[0], -80.0, dtype=np.float32)
-        if legal.shape[0] == 0 or pair_qr.size == 0 or pair_logits.size == 0:
-            return out
-        legal_index = {(int(q), int(r)): idx for idx, (q, r) in enumerate(legal.tolist())}
-        logits = _validate_logits(pair_logits, np.asarray(pair_qr).shape[0], context="pair action projection")
-        exp = np.exp(logits - np.max(logits))
-        denom = max(float(exp.sum()), 1e-12)
-        mass = np.zeros(legal.shape[0], dtype=np.float32)
-        for row, prob in zip(np.asarray(pair_qr, dtype=np.int32), exp / denom):
-            first = legal_index.get((int(row[0]), int(row[1])))
-            second = legal_index.get((int(row[2]), int(row[3])))
-            if first is not None:
-                mass[first] += float(prob)
-            if second is not None:
-                mass[second] += float(prob)
-        total = float(mass.sum())
-        if total > 0.0:
-            mass /= total
-            out = np.log(np.maximum(mass, 1e-12)).astype(np.float32)
-        return out
-
     def blend_action_logits(self, base_logits: np.ndarray, aux_logits: np.ndarray) -> np.ndarray:
         """Blend keyed action-logit vectors in probability space."""
         base = np.asarray(base_logits, dtype=np.float32)
@@ -449,6 +421,7 @@ def build_pair_strategy(
     *,
     max_pairs: int,
     prior_mix: float,
+    allow_legacy_baseline: bool = False,
 ) -> PairStrategy:
     normalized = str(name)
     if normalized == PAIR_STRATEGY_NONE:
@@ -456,6 +429,11 @@ def build_pair_strategy(
             raise ValueError("pair_strategy_max_pairs must be 0 when pair_strategy='none'")
         return PairStrategy(PairStrategyConfig(normalized, 0, 0.0))
     if normalized in {PAIR_STRATEGY_ROOT_PAIR_MCTS, PAIR_STRATEGY_FULL_PAIR_MCTS}:
+        if not allow_legacy_baseline:
+            raise ValueError(
+                f"{normalized} is quarantined as a legacy/offline baseline; "
+                "use sampled_joint_pair_v1 for V1 runtime self-play"
+            )
         strategy = PairStrategy(
             PairStrategyConfig(normalized, int(max_pairs), float(prior_mix)),
             required_output_contracts=(
@@ -487,6 +465,22 @@ def build_pair_strategy(
     raise ValueError(
         f"model.pair_strategy must be one of "
         f"{list(PAIR_STRATEGY_MODES)}"
+    )
+
+
+def build_legacy_pair_baseline_strategy(
+    name: str,
+    *,
+    max_pairs: int,
+    prior_mix: float,
+) -> PairStrategy:
+    """Build quarantined pre-V1 pair-prior baselines for explicit offline evaluation."""
+
+    return build_pair_strategy(
+        name,
+        max_pairs=max_pairs,
+        prior_mix=prior_mix,
+        allow_legacy_baseline=True,
     )
 
 

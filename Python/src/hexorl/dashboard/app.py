@@ -816,7 +816,7 @@ def _suite_primary_run_id(trial_dir: Path) -> str:
 
 def _trial_display_name(trial_id: str) -> str:
     label = str(trial_id or "")
-    for suffix in ("__none__v1", "__root_pair_mcts__v1", "__full_pair_mcts__v1"):
+    for suffix in ("__none__v1", "__sampled_joint_pair_v1__v1"):
         label = label.replace(suffix, "")
     return label.replace("global_", "").replace("_", " ")
 

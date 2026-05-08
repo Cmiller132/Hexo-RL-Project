@@ -13,6 +13,15 @@ from hexorl.models.specs import ResolvedArchitectureSpec
 from hexorl.train import losses as primitive
 
 
+RUNTIME_ONLY_OUTPUTS = frozenset(
+    {
+        "legal_proposal_embeddings",
+        "legal_completion_query",
+        "legal_completion_key",
+    }
+)
+
+
 class LossContractError(ValueError):
     """Raised when predictions, targets, masks, weights, or phases violate a loss contract."""
 
@@ -55,7 +64,7 @@ class LossPlan:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         row_tables = row_tables or infer_row_tables(targets)
         per_head: dict[str, torch.Tensor] = {}
-        unexpected = sorted(set(predictions) - self.output_names)
+        unexpected = sorted(set(predictions) - self.output_names - RUNTIME_ONLY_OUTPUTS)
         if unexpected:
             raise LossContractError(f"predictions contain outputs without contracts: {unexpected}")
 

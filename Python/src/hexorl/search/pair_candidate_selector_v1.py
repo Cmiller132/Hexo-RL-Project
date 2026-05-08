@@ -233,12 +233,15 @@ class PairCandidateSelectorTelemetryV1:
     legal_row_count: int
     legal_pair_count: int
     proposed_by_source: Mapping[str, int]
+    pre_budget_admitted_by_source: Mapping[str, int]
     admitted_by_source: Mapping[str, int]
+    evicted_by_source: Mapping[str, int]
     duplicate_proposals: int
     quota_evictions: int
     budget_evictions: int
     protected_count: int
     canary_count: int
+    canary_loss_count: int
     direct_retrieval_scored_pair_count: int
     direct_retrieval_block_size: int
 
@@ -449,25 +452,40 @@ def select_pair_candidates_v1(
         (candidate for candidate in preliminary if not candidate.tactical_protected_flag),
         key=_candidate_order_key,
     )
-    selected_protected = protected[: cfg.candidate_budget]
+    selected_protected = protected
     remaining = max(0, cfg.candidate_budget - len(selected_protected))
     selected_nonprotected = nonprotected[:remaining]
     budget_evictions = (
-        max(0, len(protected) - len(selected_protected))
-        + max(0, len(nonprotected) - len(selected_nonprotected))
+        max(0, len(nonprotected) - len(selected_nonprotected))
     )
     selected = tuple(selected_protected + selected_nonprotected)
     _validate_admitted_candidates(selected)
+    final_by_source: dict[str, int] = {}
+    for candidate in selected:
+        for source in candidate.source_contributions:
+            final_by_source[source.source_type] = final_by_source.get(source.source_type, 0) + 1
+    selected_row_ids = {candidate.row_id_pair for candidate in selected}
+    evicted_by_source: dict[str, int] = {}
+    for candidate in preliminary:
+        if candidate.row_id_pair in selected_row_ids:
+            continue
+        for source in candidate.source_contributions:
+            evicted_by_source[source.source_type] = evicted_by_source.get(source.source_type, 0) + 1
+    final_canaries = sum(1 for candidate in selected if SOURCE_BLIND_CANARY in candidate.source_scores)
+    proposed_canaries = proposed_by_source.get(SOURCE_BLIND_CANARY, 0)
     telemetry = PairCandidateSelectorTelemetryV1(
         legal_row_count=len(sorted_rows),
         legal_pair_count=legal_pair_count,
         proposed_by_source=dict(sorted(proposed_by_source.items())),
-        admitted_by_source=dict(sorted(admitted_by_source.items())),
+        pre_budget_admitted_by_source=dict(sorted(admitted_by_source.items())),
+        admitted_by_source=dict(sorted(final_by_source.items())),
+        evicted_by_source=dict(sorted(evicted_by_source.items())),
         duplicate_proposals=duplicate_proposals,
         quota_evictions=quota_evictions,
         budget_evictions=budget_evictions,
         protected_count=len(selected_protected),
-        canary_count=sum(1 for candidate in selected if SOURCE_BLIND_CANARY in candidate.source_scores),
+        canary_count=final_canaries,
+        canary_loss_count=max(0, proposed_canaries - final_canaries),
         direct_retrieval_scored_pair_count=direct_scored_pair_count,
         direct_retrieval_block_size=direct_block_size,
     )
@@ -487,9 +505,12 @@ def _tactical_proposals(
 ) -> list[_SourceProposal]:
     if not tactical_payload:
         return []
+    impossible_to_cover = bool(tactical_payload.get("impossible_to_cover", False)) or str(
+        tactical_payload.get("status", "")
+    ) == "hot_cover_impossible"
     specs = (
         ("hot_completion_pairs", "own_hot_completion", True, False),
-        ("hot_cover_pairs", "opponent_hot_cover", True, False),
+        ("hot_cover_pairs", "opponent_hot_cover", False, False),
         ("terminal_equivalent_pairs", "terminal_equivalent", False, True),
     )
     proposals: list[_SourceProposal] = []
@@ -514,7 +535,11 @@ def _tactical_proposals(
                     protected=True,
                     terminal_exact=terminal_exact,
                     terminal_equivalence=terminal_equivalent,
-                    reason=reason,
+                    reason=(
+                        f"{reason};impossible_to_cover_flag"
+                        if impossible_to_cover and field_name == "hot_cover_pairs"
+                        else reason
+                    ),
                 )
             )
     return proposals
@@ -632,7 +657,26 @@ def _anchor_completion_proposals(
                     pair_rows_by_id_pair=pair_rows_by_id_pair,
                 )
                 scored.append((identity, score))
-    if anchor_completion_scores is not None:
+    if anchor_completion_scores is not None and not isinstance(anchor_completion_scores, Mapping):
+        score_array = np.asarray(anchor_completion_scores, dtype=np.float64)
+        if score_array.shape == (len(rows_in_input_order), len(rows_in_input_order)):
+            for first_idx in range(len(rows_in_input_order)):
+                for second_idx in range(first_idx + 1, len(rows_in_input_order)):
+                    score = float(score_array[first_idx, second_idx])
+                    if not np.isfinite(score):
+                        continue
+                    identity = pair_identity_from_legal_row_ids(
+                        rows_in_input_order[first_idx].row_id,
+                        rows_in_input_order[second_idx].row_id,
+                        legal_by_id,
+                        pair_rows_by_id_pair=pair_rows_by_id_pair,
+                    )
+                    scored.append((identity, score))
+        else:
+            for pair_like, score in _iter_pair_scores(anchor_completion_scores):
+                identity = _identity_from_pair_like(pair_like, legal_by_id, pair_rows_by_id_pair)
+                scored.append((identity, float(score)))
+    elif anchor_completion_scores is not None:
         for pair_like, score in _iter_pair_scores(anchor_completion_scores):
             identity = _identity_from_pair_like(pair_like, legal_by_id, pair_rows_by_id_pair)
             scored.append((identity, float(score)))
@@ -1004,6 +1048,12 @@ def _candidate_from_state(
         flags.append("terminal_exact")
     if state.terminal_equivalence:
         flags.append("terminal_equivalent")
+    reason_text = ";".join(state.reason_parts)
+    if "opponent_hot_cover" in reason_text:
+        flags.append("terminal_cover")
+        flags.append("covers_all_opponent_win_requirements")
+    if "impossible_to_cover_flag" in reason_text:
+        flags.append("impossible_to_cover")
     proposal = V1ProposalPropensityMetadata(
         proposal_policy=PAIR_CANDIDATE_SELECTOR_VERSION_V1,
         correction_mode=_proposal_correction_mode(contributions),

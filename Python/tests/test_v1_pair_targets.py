@@ -185,8 +185,8 @@ def test_v1_targets_export_contract_dictionary():
 
     payload = build_v1_pair_training_targets(metadata).as_dict()
 
-    assert payload["v1_pair_target_schema_version"] == 1
-    assert payload["v1_pair_schema_version"] == 1
+    assert payload["v1_pair_target_schema_version"] == 2
+    assert payload["v1_pair_schema_version"] == 2
     assert payload["v1_candidate_pair_qr"].shape == (1, 4)
     assert payload["v1_pair_legal_row_ids"].tolist() == [[0, 1]]
 
@@ -218,7 +218,7 @@ def test_v1_target_collation_keeps_support_masks_and_unsampled_out_of_training()
 
     batch = collate_v1_pair_training_targets([target], legal_width=4, pair_width=3)
 
-    assert batch["v1_pair_schema_version"].tolist() == [1]
+    assert batch["v1_pair_schema_version"].tolist() == [2]
     assert batch["v1_support_type_id"].tolist() == [3]
     assert batch["v1_pair_joint_mask"].tolist() == [[True, False, False]]
     assert batch["v1_pair_ranking_mask"].tolist() == [[True, True, False]]

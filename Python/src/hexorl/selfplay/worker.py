@@ -13,6 +13,7 @@ import queue
 import logging
 import multiprocessing as mp
 import signal
+from types import SimpleNamespace
 import numpy as np
 from typing import Optional, List, Tuple, Mapping, Sequence, Any
 
@@ -21,6 +22,7 @@ try:
 
     HAS_ENGINE = True
 except ImportError:
+    _engine = SimpleNamespace()
     HAS_ENGINE = False
 
 from hexorl.config import Config
@@ -31,7 +33,6 @@ from hexorl.action_contract.tactical_oracle import (
 )
 from hexorl.inference.client import InferenceClient
 from hexorl.graph.batch import (
-    V1_PAIR_FEATURE_DIM,
     GraphBatch,
     GraphIPCCapacityError,
     build_graph_batch_from_history,
@@ -47,13 +48,12 @@ from hexorl.search.pair_candidate_selector_v1 import (
     select_pair_candidates_v1,
 )
 from hexorl.search.pair_strategy import (
-    PAIR_STRATEGY_FULL_PAIR_MCTS,
     PAIR_STRATEGY_NONE,
     PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1,
     PairStrategy,
     build_pair_strategy,
 )
-from hexorl.search.pair_scorer_v1 import hex_distance, same_hex_line, same_origin_axis
+from hexorl.search.legacy_pair_projection import pair_logits_to_action_logits
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
@@ -65,6 +65,7 @@ from hexorl.selfplay.records import (
     policy_v2_from_visits,
 )
 from hexorl.buffer.targets import pair_policy_target_complete_from_sparse_rows, process_game_record
+from hexorl.v1_pair_contract import v1_pair_features_for_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -512,53 +513,6 @@ def _validate_v1_graph_legal_subset(
         raise ValueError(f"sampled_joint_pair_v1 graph LEGAL rows contain non-Rust-legal cells: {extra[:8]}")
 
 
-def _v1_pair_features_from_candidates(candidates: Sequence[PairCandidateV1]) -> np.ndarray:
-    out = np.zeros((len(candidates), V1_PAIR_FEATURE_DIM), dtype=np.float32)
-    for row, candidate in enumerate(candidates):
-        first, second = candidate.pair_key
-        dist = float(hex_distance(first, second))
-        source_count = float(len(candidate.source_contributions))
-        out[row, 0] = min(dist, 32.0) / 32.0
-        out[row, 1] = 1.0 if same_hex_line(first, second) else 0.0
-        out[row, 2] = 1.0 if same_origin_axis(first, second) else 0.0
-        out[row, 3] = 1.0 if candidate.tactical_protected_flag else 0.0
-        out[row, 4] = 1.0 if candidate.forced_exploration_flag else 0.0
-        out[row, 5] = 1.0 if candidate.terminal_exact_flag else 0.0
-        out[row, 6] = 1.0 if candidate.terminal_equivalence_flag else 0.0
-        out[row, 7] = min(source_count, 8.0) / 8.0
-        out[row, 8] = float(np.tanh(candidate.selector_score / 16.0))
-        out[row, 9] = (
-            0.0
-            if candidate.rich_rerank_score is None
-            else float(np.tanh(float(candidate.rich_rerank_score) / 16.0))
-        )
-        out[row, 10] = min(float(candidate.admission_generation), 16.0) / 16.0
-        out[row, 11] = 1.0 if candidate.root_or_interior == "root" else 0.0
-    return out
-
-
-def _v1_legal_embedding_features(legal_rows: np.ndarray) -> np.ndarray:
-    rows = np.asarray(legal_rows, dtype=np.int32).reshape(-1, 3)
-    if rows.shape[0] == 0:
-        return np.zeros((0, 8), dtype=np.float32)
-    q = rows[:, 1].astype(np.float32)
-    r = rows[:, 2].astype(np.float32)
-    dist = np.maximum.reduce((np.abs(q), np.abs(r), np.abs(q + r)))
-    return np.stack(
-        [
-            q / 16.0,
-            r / 16.0,
-            (q + r) / 16.0,
-            np.abs(q) / 16.0,
-            np.abs(r) / 16.0,
-            dist / 16.0,
-            ((rows[:, 0].astype(np.int32) & 1).astype(np.float32) * 2.0) - 1.0,
-            np.ones(rows.shape[0], dtype=np.float32),
-        ],
-        axis=1,
-    ).astype(np.float32, copy=False)
-
-
 def _v1_pair_logits_from_graph_output(
     graph_out: Mapping[str, Any],
     expected_width: int,
@@ -582,7 +536,11 @@ def _v1_graph_value_from_output(
     graph_out: Mapping[str, Any],
     adapter: EngineAdapter,
 ) -> float:
-    value_arr = np.asarray(graph_out.get("value", [0.0]), dtype=np.float32).reshape(-1)
+    if "value" not in graph_out:
+        raise ValueError("sampled_joint_pair_v1 requires value from graph inference")
+    value_arr = np.asarray(graph_out["value"], dtype=np.float32).reshape(-1)
+    if value_arr.shape[0] == 0:
+        raise ValueError("sampled_joint_pair_v1 value output is empty")
     value = float(value_arr[0]) if value_arr.shape[0] else 0.0
     adapter.validate_value_perspective(
         graph_out.get("metadata"),
@@ -592,6 +550,56 @@ def _v1_graph_value_from_output(
         value,
         context="sampled_joint_pair_v1 graph root inference",
     )
+
+
+def _v1_pair_matrix_from_proposal_output(
+    graph_out: Mapping[str, Any],
+    key: str,
+    legal_count: int,
+) -> np.ndarray | None:
+    if key not in graph_out:
+        return None
+    values = np.asarray(graph_out[key], dtype=np.float32)
+    if values.size == 0:
+        return None
+    expected = int(legal_count)
+    if values.shape == (expected, expected):
+        return values
+    if values.ndim == 3 and values.shape[0] == 1 and values.shape[1:] == (expected, expected):
+        return values[0]
+    return None
+
+
+def _v1_legal_projection_from_output(
+    graph_out: Mapping[str, Any],
+    key: str,
+    legal_count: int,
+) -> np.ndarray | None:
+    if key not in graph_out:
+        return None
+    values = np.asarray(graph_out[key], dtype=np.float32)
+    expected = int(legal_count)
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values[0]
+    if values.ndim != 2 or values.shape[0] < expected or values.shape[1] == 0:
+        return None
+    return values[:expected]
+
+
+def _v1_completion_matrix_from_legal_projections(
+    query: np.ndarray | None,
+    key: np.ndarray | None,
+) -> np.ndarray | None:
+    if query is None or key is None:
+        return None
+    q = np.asarray(query, dtype=np.float32)
+    k = np.asarray(key, dtype=np.float32)
+    if q.ndim != 2 or k.ndim != 2 or q.shape != k.shape or q.shape[0] == 0:
+        return None
+    scale = float(max(1, q.shape[1])) ** -0.5
+    scores = np.matmul(q, k.T).astype(np.float32, copy=False) * scale
+    np.fill_diagonal(scores, -80.0)
+    return scores
 
 
 def _v1_correction_code(mode: str) -> int:
@@ -648,11 +656,17 @@ def _v1_selected_pair_from_selected_action(
     return (a, b) if a <= b else (b, a)
 
 
+def _game_is_over(game: Any) -> bool:
+    value = getattr(game, "is_over", False)
+    return bool(value() if callable(value) else value)
+
+
 def _v1_metadata_from_search(
     *,
     selector_result: PairCandidateSelectorResultV1 | None,
     telemetry: Mapping[str, Any],
     selected: Mapping[str, Any] | None,
+    terminal_tactical_payload: Mapping[str, Any] | None,
     legal_row_schema_version: int,
     pair_row_schema_version: int,
     legal_pair_count: int,
@@ -718,6 +732,9 @@ def _v1_metadata_from_search(
         "hardcoded_action",
         "reservoir_refill_events",
         "legal_row_count",
+        "interior_expanded_full_turn_nodes",
+        "interior_reservoir_build_count",
+        "interior_scoring_pass_count",
     ):
         if key in telemetry:
             metrics[f"rust_{key}"] = float(telemetry[key])
@@ -743,10 +760,11 @@ def _v1_metadata_from_search(
         selected_pair=selected_pair,
         target_support_flags=target_flags,
         terminal_equivalence_flags=terminal_flags,
+        terminal_tactical_payload=terminal_tactical_payload,
         search_surprise_metrics=metrics,
-        neural_calls_per_expanded_full_turn_node=telemetry.get(
-            "neural_calls_per_expanded_full_turn_node",
-            None,
+        neural_calls_per_expanded_full_turn_node=max(
+            float(telemetry.get("neural_calls_per_expanded_full_turn_node", 0.0) or 0.0),
+            float(extra_metrics.get("model_eval_count", 0.0) or 0.0),
         ),
         reservoir_refill_events=(),
     )
@@ -1406,10 +1424,6 @@ class SelfPlayWorker:
         self.v1_pair_runtime_enabled = (
             self._pair_strategy.name == PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1
         )
-        if self._pair_strategy.name == PAIR_STRATEGY_FULL_PAIR_MCTS:
-            if not self.global_graph_enabled:
-                raise ValueError("full_pair_mcts requires a global graph architecture")
-            self.global_graph_leaf_eval = True
         if self.v1_pair_runtime_enabled:
             if not HAS_ENGINE:
                 raise RuntimeError("sampled_joint_pair_v1 self-play requires the Rust _engine extension")
@@ -1647,6 +1661,8 @@ class SelfPlayWorker:
         *,
         move_history: bytes,
         root: Mapping[str, Any],
+        root_or_interior: str = "root",
+        admission_generation: int = 0,
     ) -> tuple[PairCandidateSelectorResultV1, np.ndarray, float, dict[str, float]]:
         legal_table = root["legal_row_table"]
         tactical_payload = root["terminal_tactical"]
@@ -1655,14 +1671,84 @@ class SelfPlayWorker:
         if bool(self.constrain_threats):
             raise ValueError("sampled_joint_pair_v1 cannot build threat-filtered LEGAL rows")
 
+        t_proposal = time.monotonic()
+        proposal_graph = build_graph_batch_from_history(
+            bytes(move_history),
+            legal_moves=[(int(q), int(r)) for q, r in legal_qr.tolist()],
+            radius=8,
+            constrain_threats=False,
+            max_pair_rows=0,
+            include_pair_rows=False,
+            include_opp_policy_rows=self.opp_policy_enabled,
+            max_legal_rows=max(int(legal_rows.shape[0]), 1),
+            max_context_tokens=max(int(self.candidate_budget), int(legal_rows.shape[0]), 1),
+            required_legal_rows=[(int(q), int(r)) for q, r in legal_qr.tolist()],
+        )
+        proposal_out = client.submit_graph(proposal_graph)
+        proposal_ms = (time.monotonic() - t_proposal) * 1000.0
+        if "cell_marginal_logits" not in proposal_out:
+            raise ValueError("sampled_joint_pair_v1 proposal pass requires cell_marginal_logits")
+        cell_marginal_logits = np.asarray(
+            proposal_out["cell_marginal_logits"],
+            dtype=np.float32,
+        ).reshape(-1)
+        if cell_marginal_logits.shape[0] < legal_rows.shape[0]:
+            raise ValueError(
+                "sampled_joint_pair_v1 proposal cell_marginal_logits shorter than Rust legal rows"
+            )
+        learned_legal_embeddings = _v1_legal_projection_from_output(
+            proposal_out,
+            "legal_proposal_embeddings",
+            int(legal_rows.shape[0]),
+        )
+        legal_cell_embeddings = (
+            learned_legal_embeddings
+            if learned_legal_embeddings is not None
+            else cell_marginal_logits[: legal_rows.shape[0], None]
+        )
+        pair_completion_logits = _v1_pair_matrix_from_proposal_output(
+            proposal_out,
+            "pair_completion_logits",
+            int(legal_rows.shape[0]),
+        )
+        completion_query = _v1_legal_projection_from_output(
+            proposal_out,
+            "legal_completion_query",
+            int(legal_rows.shape[0]),
+        )
+        completion_key = _v1_legal_projection_from_output(
+            proposal_out,
+            "legal_completion_key",
+            int(legal_rows.shape[0]),
+        )
+        learned_completion_matrix = _v1_completion_matrix_from_legal_projections(
+            completion_query,
+            completion_key,
+        )
+        if learned_completion_matrix is not None:
+            pair_completion_logits = learned_completion_matrix
+        proposal_pair_scores = _v1_pair_matrix_from_proposal_output(
+            proposal_out,
+            "pair_proposal_score",
+            int(legal_rows.shape[0]),
+        )
+        if proposal_pair_scores is None and learned_legal_embeddings is not None:
+            proposal_pair_scores = _v1_completion_matrix_from_legal_projections(
+                learned_legal_embeddings,
+                learned_legal_embeddings,
+            )
+
         t_build = time.monotonic()
         selector_result = select_pair_candidates_v1(
             legal_table,
             tactical_payload=tactical_payload,
-            legal_cell_embeddings=_v1_legal_embedding_features(legal_rows),
+            legal_cell_embeddings=legal_cell_embeddings,
+            pair_completion_logits=pair_completion_logits,
+            anchor_completion_scores=proposal_pair_scores,
+            cell_marginal_logits=cell_marginal_logits[: legal_rows.shape[0]],
             config=self._v1_selector_config(),
-            admission_generation=0,
-            root_or_interior="root",
+            admission_generation=int(admission_generation),
+            root_or_interior="interior" if root_or_interior == "interior" else "root",
             legal_row_schema_version=int(legal_table.get("schema_version", 1)),
             pair_row_schema_version=int(tactical_payload.get("pair_row_schema_version", 1)),
         )
@@ -1674,6 +1760,7 @@ class SelfPlayWorker:
         required_pair_cells = _v1_required_pair_cells(pair_qr)
         required_pair_count = len(set(required_pair_cells))
         graph_legal_limit = max(int(self.candidate_budget), required_pair_count)
+        graph_context_limit = max(int(self.candidate_budget), required_pair_count)
         graph_batch = build_graph_batch_from_history(
             bytes(move_history),
             legal_moves=[(int(q), int(r)) for q, r in legal_qr.tolist()],
@@ -1683,7 +1770,7 @@ class SelfPlayWorker:
             include_pair_rows=False,
             include_opp_policy_rows=self.opp_policy_enabled,
             max_legal_rows=graph_legal_limit,
-            max_context_tokens=self.candidate_budget,
+            max_context_tokens=graph_context_limit,
             required_legal_rows=required_pair_cells,
         )
         graph_legal = np.asarray(graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2)
@@ -1695,7 +1782,10 @@ class SelfPlayWorker:
         graph_batch = graph_batch_with_admitted_pair_rows(
             graph_batch,
             pair_qr,
-            pair_features=_v1_pair_features_from_candidates(selector_result.candidates),
+            pair_features=v1_pair_features_for_candidates(
+                selector_result.candidates,
+                tactical_payload,
+            ),
         )
 
         t_forward = time.monotonic()
@@ -1712,9 +1802,10 @@ class SelfPlayWorker:
             len(selector_result.candidates),
         )
         metrics = {
-            "model_eval_count": 1.0,
-            "reservoir_build_count": 1.0,
+            "model_eval_count": 2.0,
+            "reservoir_build_count": 1.0 if root_or_interior == "root" else 0.0,
             "bounded_scoring_pass_count": 1.0,
+            "proposal_forward_ms": float(proposal_ms),
             "candidate_build_ms": float(candidate_build_ms),
             "graph_forward_ms": float(forward_ms),
             "selector_legal_row_count": float(selector_result.telemetry.legal_row_count),
@@ -1722,15 +1813,307 @@ class SelfPlayWorker:
             "selector_direct_retrieval_scored_pair_count": float(
                 selector_result.telemetry.direct_retrieval_scored_pair_count
             ),
+            "selector_learned_legal_projection_used": 1.0 if learned_legal_embeddings is not None else 0.0,
+            "selector_learned_completion_projection_used": 1.0 if learned_completion_matrix is not None else 0.0,
             "selector_duplicate_proposals": float(selector_result.telemetry.duplicate_proposals),
             "selector_quota_evictions": float(selector_result.telemetry.quota_evictions),
             "selector_budget_evictions": float(selector_result.telemetry.budget_evictions),
             "selector_protected_count": float(selector_result.telemetry.protected_count),
             "selector_canary_count": float(selector_result.telemetry.canary_count),
+            "selector_canary_loss_count": float(selector_result.telemetry.canary_loss_count),
             "graph_legal_row_count": float(graph_legal.shape[0]),
             "graph_required_pair_cell_count": float(required_pair_count),
         }
         return selector_result, pair_logits, value, metrics
+
+    def _submit_v1_graph_many(
+        self,
+        client: InferenceClient,
+        graph_batches: Sequence[GraphBatch],
+    ) -> list[dict[str, Any]]:
+        if hasattr(client, "submit_graph_many"):
+            return list(client.submit_graph_many(graph_batches))
+        return [client.submit_graph(graph_batch) for graph_batch in graph_batches]
+
+    def _v1_complete_expansion_requests(
+        self,
+        client: InferenceClient,
+        v1_engine: Any,
+        requests: Sequence[Mapping[str, Any]],
+        *,
+        admission_generation_start: int,
+    ) -> tuple[dict[str, float], int]:
+        if not requests:
+            return {}, int(admission_generation_start)
+
+        proposal_graphs: list[GraphBatch] = []
+        contexts: list[dict[str, Any]] = []
+        t_proposal = time.monotonic()
+        for offset, request in enumerate(requests):
+            legal_table = request["legal_row_table"]
+            tactical_payload = request["terminal_tactical"]
+            legal_rows = _v1_legal_rows_from_table(legal_table)
+            legal_qr = legal_rows[:, 1:3].astype(np.int32, copy=False)
+            if bool(self.constrain_threats):
+                raise ValueError("sampled_joint_pair_v1 cannot build threat-filtered LEGAL rows")
+            move_history = bytes(request["move_history_bytes"])
+            proposal_graph = build_graph_batch_from_history(
+                move_history,
+                legal_moves=[(int(q), int(r)) for q, r in legal_qr.tolist()],
+                radius=8,
+                constrain_threats=False,
+                max_pair_rows=0,
+                include_pair_rows=False,
+                include_opp_policy_rows=self.opp_policy_enabled,
+                max_legal_rows=max(int(legal_rows.shape[0]), 1),
+                max_context_tokens=max(int(self.candidate_budget), int(legal_rows.shape[0]), 1),
+                required_legal_rows=[(int(q), int(r)) for q, r in legal_qr.tolist()],
+            )
+            proposal_graphs.append(proposal_graph)
+            contexts.append(
+                {
+                    "request": request,
+                    "move_history": move_history,
+                    "legal_table": legal_table,
+                    "tactical_payload": tactical_payload,
+                    "legal_rows": legal_rows,
+                    "legal_qr": legal_qr,
+                    "admission_generation": int(admission_generation_start) + offset,
+                }
+            )
+
+        proposal_outputs = self._submit_v1_graph_many(client, proposal_graphs)
+        if len(proposal_outputs) != len(proposal_graphs):
+            raise ValueError("sampled_joint_pair_v1 proposal batch returned wrong result count")
+        proposal_ms_per_node = ((time.monotonic() - t_proposal) * 1000.0) / max(1, len(requests))
+
+        scoring_graphs: list[GraphBatch] = []
+        scoring_contexts: list[dict[str, Any]] = []
+        for context, proposal_out in zip(contexts, proposal_outputs):
+            legal_table = context["legal_table"]
+            tactical_payload = context["tactical_payload"]
+            legal_rows = context["legal_rows"]
+            legal_qr = context["legal_qr"]
+            if "cell_marginal_logits" not in proposal_out:
+                raise ValueError("sampled_joint_pair_v1 proposal pass requires cell_marginal_logits")
+            cell_marginal_logits = np.asarray(
+                proposal_out["cell_marginal_logits"],
+                dtype=np.float32,
+            ).reshape(-1)
+            if cell_marginal_logits.shape[0] < legal_rows.shape[0]:
+                raise ValueError(
+                    "sampled_joint_pair_v1 proposal cell_marginal_logits shorter than Rust legal rows"
+                )
+            learned_legal_embeddings = _v1_legal_projection_from_output(
+                proposal_out,
+                "legal_proposal_embeddings",
+                int(legal_rows.shape[0]),
+            )
+            legal_cell_embeddings = (
+                learned_legal_embeddings
+                if learned_legal_embeddings is not None
+                else cell_marginal_logits[: legal_rows.shape[0], None]
+            )
+            pair_completion_logits = _v1_pair_matrix_from_proposal_output(
+                proposal_out,
+                "pair_completion_logits",
+                int(legal_rows.shape[0]),
+            )
+            completion_query = _v1_legal_projection_from_output(
+                proposal_out,
+                "legal_completion_query",
+                int(legal_rows.shape[0]),
+            )
+            completion_key = _v1_legal_projection_from_output(
+                proposal_out,
+                "legal_completion_key",
+                int(legal_rows.shape[0]),
+            )
+            learned_completion_matrix = _v1_completion_matrix_from_legal_projections(
+                completion_query,
+                completion_key,
+            )
+            if learned_completion_matrix is not None:
+                pair_completion_logits = learned_completion_matrix
+            proposal_pair_scores = _v1_pair_matrix_from_proposal_output(
+                proposal_out,
+                "pair_proposal_score",
+                int(legal_rows.shape[0]),
+            )
+            if proposal_pair_scores is None and learned_legal_embeddings is not None:
+                proposal_pair_scores = _v1_completion_matrix_from_legal_projections(
+                    learned_legal_embeddings,
+                    learned_legal_embeddings,
+                )
+
+            t_build = time.monotonic()
+            selector_result = select_pair_candidates_v1(
+                legal_table,
+                tactical_payload=tactical_payload,
+                legal_cell_embeddings=legal_cell_embeddings,
+                pair_completion_logits=pair_completion_logits,
+                anchor_completion_scores=proposal_pair_scores,
+                cell_marginal_logits=cell_marginal_logits[: legal_rows.shape[0]],
+                config=self._v1_selector_config(),
+                admission_generation=int(context["admission_generation"]),
+                root_or_interior="interior",
+                legal_row_schema_version=int(legal_table.get("schema_version", 1)),
+                pair_row_schema_version=int(tactical_payload.get("pair_row_schema_version", 1)),
+            )
+            candidate_build_ms = (time.monotonic() - t_build) * 1000.0
+            if not selector_result.candidates:
+                raise ValueError("sampled_joint_pair_v1 selector admitted no pair candidates")
+
+            pair_qr = _v1_pair_qr_from_candidates(selector_result.candidates)
+            required_pair_cells = _v1_required_pair_cells(pair_qr)
+            required_pair_count = len(set(required_pair_cells))
+            graph_legal_limit = max(int(self.candidate_budget), required_pair_count)
+            graph_context_limit = max(int(self.candidate_budget), required_pair_count)
+            graph_batch = build_graph_batch_from_history(
+                context["move_history"],
+                legal_moves=[(int(q), int(r)) for q, r in legal_qr.tolist()],
+                radius=8,
+                constrain_threats=False,
+                max_pair_rows=0,
+                include_pair_rows=False,
+                include_opp_policy_rows=self.opp_policy_enabled,
+                max_legal_rows=graph_legal_limit,
+                max_context_tokens=graph_context_limit,
+                required_legal_rows=required_pair_cells,
+            )
+            graph_legal = np.asarray(graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2)
+            _validate_v1_graph_legal_subset(
+                graph_legal,
+                rust_legal_qr=legal_qr,
+                required_pair_cells=required_pair_cells,
+            )
+            graph_batch = graph_batch_with_admitted_pair_rows(
+                graph_batch,
+                pair_qr,
+                pair_features=v1_pair_features_for_candidates(
+                    selector_result.candidates,
+                    tactical_payload,
+                ),
+            )
+            scoring_graphs.append(graph_batch)
+            scoring_contexts.append(
+                {
+                    **context,
+                    "selector_result": selector_result,
+                    "pair_qr": pair_qr,
+                    "graph_legal": graph_legal,
+                    "required_pair_count": required_pair_count,
+                    "candidate_build_ms": candidate_build_ms,
+                    "learned_legal_embeddings": learned_legal_embeddings,
+                    "learned_completion_matrix": learned_completion_matrix,
+                }
+            )
+
+        t_forward = time.monotonic()
+        graph_outputs = self._submit_v1_graph_many(client, scoring_graphs)
+        if len(graph_outputs) != len(scoring_graphs):
+            raise ValueError("sampled_joint_pair_v1 scoring batch returned wrong result count")
+        forward_ms_per_node = ((time.monotonic() - t_forward) * 1000.0) / max(1, len(requests))
+
+        total_metrics: dict[str, float] = {}
+        for context, graph_batch, graph_out in zip(scoring_contexts, scoring_graphs, graph_outputs):
+            selector_result = context["selector_result"]
+            graph_legal = context["graph_legal"]
+            metadata = graph_out.get("metadata")
+            if isinstance(metadata, Mapping) and "legal_qr" in metadata:
+                observed = np.asarray(metadata["legal_qr"], dtype=np.int32).reshape(-1, 2)
+                if observed.shape != graph_legal.shape or not np.array_equal(observed, graph_legal):
+                    raise ValueError("sampled_joint_pair_v1 inference metadata changed LEGAL row identity")
+            node_value = _v1_graph_value_from_output(graph_out, self._engine_adapter)
+            pair_logits = _v1_pair_logits_from_graph_output(
+                graph_out,
+                len(selector_result.candidates),
+            )
+            correction_weights, correction_modes = _v1_candidate_correction_arrays(
+                selector_result.candidates
+            )
+            telemetry = v1_engine.complete_expansion(
+                int(context["request"]["node_key"]),
+                float(node_value),
+                context["pair_qr"],
+                pair_logits,
+                correction_weights,
+                correction_modes,
+            )
+            metrics = {
+                "model_eval_count": 2.0,
+                "reservoir_build_count": 0.0,
+                "bounded_scoring_pass_count": 1.0,
+                "proposal_forward_ms": float(proposal_ms_per_node),
+                "candidate_build_ms": float(context["candidate_build_ms"]),
+                "graph_forward_ms": float(forward_ms_per_node),
+                "proposal_batch_size": float(len(requests)),
+                "scoring_batch_size": float(len(requests)),
+                "selector_legal_row_count": float(selector_result.telemetry.legal_row_count),
+                "selector_legal_pair_count": float(selector_result.telemetry.legal_pair_count),
+                "selector_direct_retrieval_scored_pair_count": float(
+                    selector_result.telemetry.direct_retrieval_scored_pair_count
+                ),
+                "selector_learned_legal_projection_used": 1.0
+                if context["learned_legal_embeddings"] is not None
+                else 0.0,
+                "selector_learned_completion_projection_used": 1.0
+                if context["learned_completion_matrix"] is not None
+                else 0.0,
+                "selector_duplicate_proposals": float(selector_result.telemetry.duplicate_proposals),
+                "selector_quota_evictions": float(selector_result.telemetry.quota_evictions),
+                "selector_budget_evictions": float(selector_result.telemetry.budget_evictions),
+                "selector_protected_count": float(selector_result.telemetry.protected_count),
+                "selector_canary_count": float(selector_result.telemetry.canary_count),
+                "selector_canary_loss_count": float(selector_result.telemetry.canary_loss_count),
+                "graph_legal_row_count": float(graph_legal.shape[0]),
+                "graph_required_pair_cell_count": float(context["required_pair_count"]),
+                "interior_candidate_count": float(len(selector_result.candidates)),
+            }
+            if isinstance(telemetry, Mapping):
+                metrics["interior_revealed_count"] = float(telemetry.get("revealed_count", 0))
+                metrics["interior_widening_events"] = float(telemetry.get("widening_events", 0))
+            for key, value in metrics.items():
+                total_metrics[key] = float(total_metrics.get(key, 0.0)) + float(value)
+
+        return total_metrics, int(admission_generation_start) + len(requests)
+
+    def _v1_complete_expansion_request(
+        self,
+        client: InferenceClient,
+        v1_engine: Any,
+        request: Mapping[str, Any],
+        *,
+        admission_generation: int,
+    ) -> dict[str, float]:
+        node_root = {
+            "legal_row_table": request["legal_row_table"],
+            "terminal_tactical": request["terminal_tactical"],
+        }
+        selector_result, pair_logits, node_value, metrics = self._v1_build_and_score_root(
+            client,
+            move_history=bytes(request["move_history_bytes"]),
+            root=node_root,
+            root_or_interior="interior",
+            admission_generation=admission_generation,
+        )
+        correction_weights, correction_modes = _v1_candidate_correction_arrays(
+            selector_result.candidates
+        )
+        pair_qr = _v1_pair_qr_from_candidates(selector_result.candidates)
+        telemetry = v1_engine.complete_expansion(
+            int(request["node_key"]),
+            float(node_value),
+            pair_qr,
+            pair_logits,
+            correction_weights,
+            correction_modes,
+        )
+        metrics["interior_candidate_count"] = float(len(selector_result.candidates))
+        if isinstance(telemetry, Mapping):
+            metrics["interior_revealed_count"] = float(telemetry.get("revealed_count", 0))
+            metrics["interior_widening_events"] = float(telemetry.get("widening_events", 0))
+        return metrics
 
     def _v1_apply_to_tracking_game(
         self,
@@ -1797,7 +2180,7 @@ class SelfPlayWorker:
             if move_idx >= self.max_game_moves:
                 terminal_reason = "max_game_moves"
                 break
-            if bool(getattr(game, "is_over", False)):
+            if _game_is_over(game):
                 terminal_reason = "win"
                 break
             use_pcr, sims = self._search_mode_for_turn(game_seed, move_idx)
@@ -1857,7 +2240,33 @@ class SelfPlayWorker:
                         correction_modes,
                         int(root["root_generation"]),
                     )
-                selected = v1_engine.run_root_search()
+                if phase == "normal_two_placement":
+                    missing_protocol = [
+                        name
+                        for name in ("run_search_step", "complete_expansion", "select_root_action")
+                        if not hasattr(v1_engine, name)
+                    ]
+                    if missing_protocol:
+                        raise RuntimeError(
+                            "sampled_joint_pair_v1 requires Rust expansion protocol methods: "
+                            + ", ".join(missing_protocol)
+                        )
+                    expansion_generation = 1
+                    while True:
+                        requests = v1_engine.run_search_step(max(1, min(4, int(self.pair_strategy_max_pairs))))
+                        if not requests:
+                            break
+                        node_metrics, expansion_generation = self._v1_complete_expansion_requests(
+                            client,
+                            v1_engine,
+                            requests,
+                            admission_generation_start=expansion_generation,
+                        )
+                        for key, value in node_metrics.items():
+                            extra_metrics[key] = float(extra_metrics.get(key, 0.0)) + float(value)
+                    selected = v1_engine.select_root_action()
+                else:
+                    selected = v1_engine.run_root_search()
                 if selected is None:
                     terminal_reason = "no_root"
                     break
@@ -1874,6 +2283,7 @@ class SelfPlayWorker:
                     selector_result=selector_result,
                     telemetry=telemetry,
                     selected=selected,
+                    terminal_tactical_payload=root.get("terminal_tactical", {}),
                     legal_row_schema_version=legal_schema,
                     pair_row_schema_version=pair_schema,
                     legal_pair_count=legal_pair_count,
@@ -1956,11 +2366,13 @@ class SelfPlayWorker:
                 move_history=move_history,
             )
             move_idx += int(applied_count)
-            if bool(getattr(game, "is_over", False)):
+            if _game_is_over(game):
                 terminal_reason = "win"
                 break
 
         winner = getattr(game, "winner", None)
+        if callable(winner):
+            winner = winner()
         outcome = 0.0 if winner is None else 1.0 if int(winner) == 0 else -1.0
         full_history = bytes(move_history)
         record = GameRecord(
@@ -2554,7 +2966,7 @@ class SelfPlayWorker:
                                             context="graph leaf pair priors",
                                         )
                                         if pair_qr.shape[0] > 0 and pair_logits.shape[0] >= pair_qr.shape[0]:
-                                            pair_action_logits = self._pair_strategy.pair_logits_to_action_logits(pair_qr, pair_logits, graph_legal)
+                                            pair_action_logits = pair_logits_to_action_logits(pair_qr, pair_logits, graph_legal)
                                             logits = self._pair_strategy.blend_action_logits(
                                                 logits[: graph_legal.shape[0]],
                                                 pair_action_logits,

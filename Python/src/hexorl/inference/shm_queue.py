@@ -44,6 +44,7 @@ MAX_GRAPH_ACTIONS = GRAPH_IPC_ACTION_CAPACITY
 MAX_GRAPH_PAIRS = GRAPH_IPC_PAIR_CAPACITY
 MAX_GRAPH_BATCH = GRAPH_IPC_BATCH_CAPACITY
 MAX_GRAPH_RELATION_EDGES = GRAPH_IPC_RELATION_EDGE_CAPACITY
+MAX_GRAPH_LEGAL_PROJECTION_DIM = 64
 TENSOR_ELEMENTS = NUM_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 13 * 33 * 33 = 14157
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,9 @@ def _shm_name(base: str, worker_id: int) -> str:
         "res_graph_pair_logits": "rgpr",
         "res_graph_pair_second_logits": "rgps",
         "res_graph_regret_rank": "rgrr",
+        "res_graph_legal_proposal_embeddings": "rglp",
+        "res_graph_legal_completion_query": "rglq",
+        "res_graph_legal_completion_key": "rglk",
         "req_ready": "qr",
         "res_ready": "rr",
     }
@@ -158,13 +162,31 @@ GRAPH_SLOT_SPECS: tuple[SlotSpec, ...] = (
     SlotSpec("req_graph_relation_dst", "req_graph_relation_dst", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.int32)),
     SlotSpec("req_graph_relation_edge_type", "req_graph_relation_edge_type", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.int16)),
     SlotSpec("req_graph_relation_edge_bias", "req_graph_relation_edge_bias", lambda _max_batch: (MAX_GRAPH_RELATION_EDGES,), np.dtype(np.float32)),
-    SlotSpec("res_graph_meta", "res_graph_meta", lambda _max_batch: (8,), np.dtype(np.uint32)),
+    SlotSpec("res_graph_meta", "res_graph_meta", lambda _max_batch: (10,), np.dtype(np.uint32)),
     SlotSpec("res_graph_place_logits", "res_graph_place_logits", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.float32)),
     SlotSpec("res_graph_opp_logits", "res_graph_opp_logits", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.float32)),
     SlotSpec("res_graph_pair_first_logits", "res_graph_pair_first_logits", lambda _max_batch: (MAX_GRAPH_ACTIONS,), np.dtype(np.float32)),
     SlotSpec("res_graph_pair_logits", "res_graph_pair_logits", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.float32)),
     SlotSpec("res_graph_pair_second_logits", "res_graph_pair_second_logits", lambda _max_batch: (MAX_GRAPH_PAIRS,), np.dtype(np.float32)),
     SlotSpec("res_graph_regret_rank", "res_graph_regret_rank", lambda _max_batch: (MAX_GRAPH_BATCH,), np.dtype(np.float32)),
+    SlotSpec(
+        "res_graph_legal_proposal_embeddings",
+        "res_graph_legal_proposal_embeddings",
+        lambda _max_batch: (MAX_GRAPH_ACTIONS, MAX_GRAPH_LEGAL_PROJECTION_DIM),
+        np.dtype(np.float32),
+    ),
+    SlotSpec(
+        "res_graph_legal_completion_query",
+        "res_graph_legal_completion_query",
+        lambda _max_batch: (MAX_GRAPH_ACTIONS, MAX_GRAPH_LEGAL_PROJECTION_DIM),
+        np.dtype(np.float32),
+    ),
+    SlotSpec(
+        "res_graph_legal_completion_key",
+        "res_graph_legal_completion_key",
+        lambda _max_batch: (MAX_GRAPH_ACTIONS, MAX_GRAPH_LEGAL_PROJECTION_DIM),
+        np.dtype(np.float32),
+    ),
 )
 
 

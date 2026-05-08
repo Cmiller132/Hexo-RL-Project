@@ -17,8 +17,6 @@ from hexorl.search.pair_strategy import build_pair_strategy
 
 AUTOTUNE_PAIR_STRATEGY_MODES = (
     "none",
-    "root_pair_mcts",
-    "full_pair_mcts",
     "sampled_joint_pair_v1",
 )
 DEFAULT_AUTOTUNE_CANDIDATE_PLAN = (
@@ -27,9 +25,7 @@ DEFAULT_AUTOTUNE_CANDIDATE_PLAN = (
     "global_pair_twostage_0:none",
     "global_graph_full_0:none",
     "global_graph768_champion:none",
-    "global_pair_twostage_0:root_pair_mcts",
-    "global_pair_twostage_0:full_pair_mcts",
-    "global_graph_full_0:root_pair_mcts",
+    "global_pair_biaffine_0:sampled_joint_pair_v1",
 )
 
 
@@ -374,7 +370,6 @@ class AutotunePairStrategyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     modes: List[str] = Field(default_factory=lambda: list(AUTOTUNE_PAIR_STRATEGY_MODES))
-    full_pair_mcts_enabled: bool = True
 
     @model_validator(mode="after")
     def validate_pair_modes(self) -> "AutotunePairStrategyConfig":
@@ -442,11 +437,6 @@ class AutotuneConfig(BaseModel):
                 raise ValueError(
                     "autotune.scout.candidate_plan references a pair mode not listed in "
                     f"autotune.pair_strategy.modes: {pair_mode!r}"
-                )
-            if pair_mode == "full_pair_mcts" and not self.pair_strategy.full_pair_mcts_enabled:
-                raise ValueError(
-                    "autotune.scout.candidate_plan includes full_pair_mcts while "
-                    "autotune.pair_strategy.full_pair_mcts_enabled is false"
                 )
         return self
 

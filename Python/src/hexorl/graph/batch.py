@@ -15,6 +15,10 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+from hexorl.v1_pair_contract import (
+    V1_PAIR_FEATURE_DIM,
+    v1_pair_features_from_qr,
+)
 from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
 from hexorl.graph.capacity import (
     GRAPH_CAPACITY_STRATEGY,
@@ -39,7 +43,6 @@ GRAPH_FEATURE_WINDOW_STONE_COUNT = 7
 GRAPH_FEATURE_WINDOW_EMPTY_COUNT = 8
 GRAPH_FEATURE_WINDOW_AXIS = 9
 GRAPH_FEATURE_LEGAL_WINDOW_COUNT = 10
-V1_PAIR_FEATURE_DIM = 12
 RELATION_SCHEMA_VERSION = 2
 HEX_DIRECTIONS: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
 WIN_LENGTH = 6
@@ -1221,6 +1224,16 @@ def graph_batch_with_admitted_pair_rows(
             raise ValueError("V1 admitted pair_features must be rank-2")
         if features_arr.shape[0] != rows.shape[0]:
             raise ValueError("V1 admitted pair_features rows must match admitted pair rows")
+        if int(features_arr.shape[1]) != V1_PAIR_FEATURE_DIM:
+            raise ValueError(
+                f"V1 admitted pair_features width must be {V1_PAIR_FEATURE_DIM}, "
+                f"got {int(features_arr.shape[1])}"
+            )
+    else:
+        features_arr = v1_pair_features_from_qr(
+            rows,
+            placements_remaining=float(graph_batch.placements_remaining),
+        )
 
     selected: list[tuple[int, int]] = []
     selected_feature_rows: list[np.ndarray] = []
@@ -1237,17 +1250,14 @@ def graph_batch_with_admitted_pair_rows(
             continue
         seen.add(pair)
         selected.append(pair)
-        if features_arr is not None:
-            selected_feature_rows.append(features_arr[row_idx])
+        selected_feature_rows.append(features_arr[row_idx])
 
     pair_first = np.asarray([int(legal_tokens[a_idx]) for a_idx, _ in selected], dtype=np.int64)
     pair_second = np.asarray([int(legal_tokens[b_idx]) for _, b_idx in selected], dtype=np.int64)
     if selected_feature_rows:
         pair_feature_arr = np.asarray(selected_feature_rows, dtype=np.float32)
-    elif features_arr is not None:
-        pair_feature_arr = np.zeros((0, int(features_arr.shape[1])), dtype=np.float32)
     else:
-        pair_feature_arr = None
+        pair_feature_arr = np.zeros((0, V1_PAIR_FEATURE_DIM), dtype=np.float32)
     pair_count = int(pair_first.shape[0])
     return replace(
         graph_batch,

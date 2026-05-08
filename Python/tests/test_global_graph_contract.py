@@ -44,7 +44,7 @@ from hexorl.replay.training_batch import graph_batch_training_targets
 from hexorl.selfplay.records import PositionRecord, action_to_board_index
 from hexorl.selfplay.orchestrator import SelfPlayOrchestrator
 from hexorl.search.engine_adapter import EngineAdapter
-from hexorl.search.pair_strategy import build_pair_strategy
+from hexorl.search.pair_strategy import build_legacy_pair_baseline_strategy
 from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.train.trainer import Trainer
@@ -587,7 +587,7 @@ def test_global_graph_pair_chunks_remove_ipc_pair_cap_as_semantic_limit():
                 break
         if len(pair_first) == 4096:
             break
-    strategy = build_pair_strategy("full_pair_mcts", max_pairs=4096, prior_mix=0.35)
+    strategy = build_legacy_pair_baseline_strategy("full_pair_mcts", max_pairs=4096, prior_mix=0.35)
     chunk = strategy.graph_batch_with_pair_rows(
         graph,
         np.asarray(pair_first, dtype=np.int64),
