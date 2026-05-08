@@ -1,4 +1,4 @@
-"""Expose Phase 3 trial directories in the normal dashboard suite layout."""
+"""Expose candidate/trial directories in the normal dashboard suite layout."""
 
 from __future__ import annotations
 
@@ -20,12 +20,16 @@ def _copy_file_if_changed(src: Path, dst: Path) -> None:
 
 
 def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> dict[str, object]:
-    phase3_trials = run_dir / "phase3_trials"
+    source_root = run_dir / "phase3_trials"
+    layout = "phase3_trials_as_dashboard_suite"
+    if not source_root.exists():
+        source_root = run_dir / "candidates"
+        layout = "phase1_candidates_as_dashboard_suite"
     trials_dir = suite_dir / "trials"
     trials_dir.mkdir(parents=True, exist_ok=True)
 
     mirrored: list[dict[str, object]] = []
-    for source in sorted(path for path in phase3_trials.iterdir() if path.is_dir()):
+    for source in sorted(path for path in source_root.iterdir() if path.is_dir()):
         if not (source / "dashboard.sqlite3").exists():
             continue
         target = trials_dir / source.name
@@ -53,7 +57,7 @@ def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> 
     manifest = {
         "run_id": run_dir.name,
         "source_run_dir": str(run_dir),
-        "layout": "phase3_trials_as_dashboard_suite",
+        "layout": layout,
     }
     (suite_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     if (run_dir / "champion_selection_report_phase3.json").exists():

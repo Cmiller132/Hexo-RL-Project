@@ -215,11 +215,19 @@ class EpochScoutEpochRunner:
                         "buffer_size": float(result.buffer_stats.get("size", 0.0) or 0.0),
                         "selfplay_games_per_epoch": float(request.config.selfplay.games_per_epoch),
                         "selfplay_states_per_epoch": float(request.config.selfplay.states_per_epoch),
+                        "selfplay_max_game_moves": float(request.config.selfplay.max_game_moves),
+                        "selfplay_mcts_simulations": float(request.config.selfplay.mcts_simulations),
+                        "selfplay_pcr_low_sims": float(request.config.selfplay.pcr_low_sims),
                         "train_batches_per_epoch": float(request.config.train.batches_per_epoch),
                         "train_loss": _train_stat_float(result.train_stats, "loss_total", "loss"),
                         "loss_total": _train_stat_float(result.train_stats, "loss_total", "loss"),
                         "loss_policy_place": _train_stat_float(result.train_stats, "loss_policy_place"),
                         "loss_value": _train_stat_float(result.train_stats, "loss_value"),
+                        "value_weight_mean": _train_stat_float(result.train_stats, "value_weight_mean"),
+                        "value_weight_zero_frac": _train_stat_float(result.train_stats, "value_weight_zero_frac"),
+                        "value_effective_samples": _value_effective_samples(
+                            request.config, result.train_stats
+                        ),
                         "pair_policy_weight_mean": _train_stat_float(result.train_stats, "pair_policy_weight_mean"),
                         "batches_per_sec": _train_stat_float(result.train_stats, "batches_per_sec"),
                         "graph_peak_cuda_allocated_mb": _train_stat_float(
@@ -256,6 +264,13 @@ class EpochScoutEpochRunner:
                             result.buffer_stats, "avg_candidate_recall_two_placement_cover"
                         ),
                         "critical_overflow_count": _train_stat_float(result.buffer_stats, "critical_overflow_count"),
+                        "selfplay_games_done": _train_stat_float(result.buffer_stats, "games_done"),
+                        "selfplay_positions_done": _train_stat_float(result.buffer_stats, "positions_done"),
+                        "truncated_games": _train_stat_float(result.buffer_stats, "truncated_games"),
+                        "truncation_rate": _train_stat_float(result.buffer_stats, "truncation_rate"),
+                        "terminal_reason_max_game_moves": _train_stat_float(
+                            result.buffer_stats, "terminal_reason_max_game_moves"
+                        ),
                         "pair_prior_hit_frac": _pair_buffer_stat_float(
                             request.config, result.buffer_stats, "pair_prior_hit_frac"
                         ),
@@ -292,6 +307,13 @@ class EpochScoutEpochRunner:
                         "trial_number": request.trial_number,
                     },
                 }
+            )
+            events.extend(
+                _training_signal_warning_events(
+                    request.candidate.candidate_id,
+                    latest_epoch,
+                    scorecards[-1]["component_metrics"],
+                )
             )
             events.append(
                 {
@@ -956,6 +978,46 @@ def _train_stat_float(train_stats: dict[str, Any] | None, *keys: str) -> float:
         if math.isfinite(result):
             return result
     return 0.0
+
+
+def _value_effective_samples(cfg: Config, train_stats: dict[str, Any] | None) -> float:
+    zero_frac = min(max(_train_stat_float(train_stats, "value_weight_zero_frac"), 0.0), 1.0)
+    return float(cfg.train.batch_size) * max(0.0, 1.0 - zero_frac)
+
+
+def _training_signal_warning_events(
+    candidate_id: str,
+    epoch: int,
+    metrics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    truncation_rate = float(metrics.get("truncation_rate", 0.0) or 0.0)
+    value_zero_frac = float(metrics.get("value_weight_zero_frac", 0.0) or 0.0)
+    if truncation_rate > 0.25:
+        events.append(
+            {
+                "event": "training_signal_warning",
+                "candidate_id": candidate_id,
+                "epoch": int(epoch),
+                "metric": "truncation_rate",
+                "value": truncation_rate,
+                "threshold": 0.25,
+                "action": "monitor_not_strength_prune",
+            }
+        )
+    if value_zero_frac > 0.50:
+        events.append(
+            {
+                "event": "training_signal_warning",
+                "candidate_id": candidate_id,
+                "epoch": int(epoch),
+                "metric": "value_weight_zero_frac",
+                "value": value_zero_frac,
+                "threshold": 0.50,
+                "action": "monitor_not_strength_prune",
+            }
+        )
+    return events
 
 
 def _pair_buffer_stat_float(cfg: Config, buffer_stats: dict[str, Any] | None, key: str) -> float:

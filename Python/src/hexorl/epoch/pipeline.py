@@ -245,6 +245,7 @@ def run_epoch(
     elif model is None:
         model = build_model_from_config(cfg, device=device, inference=False)
 
+    selfplay_stats: Dict[str, Any] = {}
     if use_selfplay:
         selfplay_epoch = int(getattr(trainer, "epoch", 0)) + 1 if trainer is not None else 1
         inference_state = _model_state_for_inference(model)
@@ -266,7 +267,8 @@ def run_epoch(
                     game_id_map[pos.game_id] = base_game_id + len(game_id_map)
                 appended_positions.append(replace(pos, game_id=game_id_map[pos.game_id]))
             replay.extend(appended_positions)
-        recorder.metric(orchestrator.stats, phase="selfplay")
+        selfplay_stats = dict(orchestrator.stats)
+        recorder.metric(selfplay_stats, phase="selfplay")
 
     train_stats: Dict[str, float] = {}
     checkpoint_path: Optional[Path] = None
@@ -343,9 +345,18 @@ def run_epoch(
             global_step=int(getattr(trainer, "global_step", 0)),
         )
 
+    buffer_stats = dict(replay.stats)
+    buffer_stats.update(
+        {
+            key: value
+            for key, value in selfplay_stats.items()
+            if key in {"games_done", "positions_done", "truncated_games", "truncation_rate"}
+            or key.startswith("terminal_reason_")
+        }
+    )
     result = EpochResult(
         train_stats=train_stats,
-        buffer_stats=replay.stats,
+        buffer_stats=buffer_stats,
         checkpoint_path=checkpoint_path,
         elapsed_s=time.monotonic() - t0,
         trainer=trainer,

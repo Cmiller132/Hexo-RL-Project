@@ -10,6 +10,7 @@ from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint
+from hexorl.dashboard.app import _suite_games, _suite_runs, _suite_store_for_run
 from hexorl.dashboard.db import DashboardStore
 from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical_fixtures
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
@@ -82,6 +83,72 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     assert len(positions) == 2
     assert positions[0]["policy_json"]
     assert (tmp_path / "events.jsonl").exists()
+
+
+def test_suite_games_include_direct_phase3_trial_dashboards(tmp_path):
+    suite_root = tmp_path / "run" / "phase_normal_dashboard_suite"
+    suite_trial_dir = suite_root / "trials" / "global_xattn_0__none__v1"
+    phase3_trial_dir = tmp_path / "run" / "phase3_trials" / "global_graph768_champion__none__v1__phase3_t0000"
+    suite_trial_dir.mkdir(parents=True)
+    phase3_trial_dir.mkdir(parents=True)
+
+    def record_game(trial_dir, run_id, game_id):
+        store = DashboardStore(trial_dir / "dashboard.sqlite3")
+        recorder = RunRecorder(store, run_id, trial_dir / "events.jsonl")
+        history = _move(0, 0, 0) + _move(1, 1, 0)
+        game = GameRecord(
+            positions=[],
+            outcome=0.0,
+            game_id=game_id,
+            game_length=2,
+            final_move_history=history,
+        )
+        recorder.game(game, source="selfplay", epoch=14, payload={"terminal_reason": "unit"})
+
+    record_game(
+        suite_trial_dir,
+        "optuna_mcts500_graphfix_20260507_01_global_xattn_0__none__v1",
+        1,
+    )
+    record_game(
+        phase3_trial_dir,
+        "phase3_global_graph768_champion__none__v1__phase3_t0000",
+        2,
+    )
+
+    games = _suite_games(suite_root, limit=10)
+    assert [row["trial_id"] for row in games] == [
+        "global_graph768_champion__none__v1__phase3_t0000",
+        "global_xattn_0__none__v1",
+    ]
+    assert _suite_store_for_run(
+        suite_root, "phase3_global_graph768_champion__none__v1__phase3_t0000"
+    ) is not None
+    runs = _suite_runs(suite_root)
+    assert {row["suite_trial_id"] for row in runs} == {
+        "global_graph768_champion__none__v1__phase3_t0000",
+        "global_xattn_0__none__v1",
+    }
+
+
+def test_run_recorder_dashboard_write_failure_does_not_crash_training(tmp_path):
+    class FailingMetricStore:
+        path = tmp_path / "readonly.sqlite3"
+
+        def upsert_run(self, _run_id):
+            return None
+
+        def record_metric(self, *_args, **_kwargs):
+            raise RuntimeError("readonly database")
+
+    store = FailingMetricStore()
+    recorder = RunRecorder(store, "resilient-run", tmp_path / "events.jsonl")
+
+    assert recorder.metric({"loss": 1.0}, phase="train", epoch=1, global_step=12) == -1
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert rows[-1]["event_type"] == "dashboard_write_failed"
+    assert rows[-1]["payload"]["operation"] == "record_metric"
+    assert rows[-1]["payload"]["error"] == "readonly database"
 
 
 def test_dashboard_store_repairs_partial_v1_schema(tmp_path):
@@ -344,6 +411,249 @@ def test_fastapi_dashboard_smoke(tmp_path):
     ).json()
     assert spread["cells"]
     assert spread["debug_terms"]["legal_cells_scored"] > 0
+
+
+def test_replay_routes_default_to_compact_payloads(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    app = create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing")
+    game_id = app.state.store.insert_game_with_positions(
+        run_id="api-run",
+        game_id="long-game",
+        source="unit",
+        final_move_history=_move(0, 0, 0) + _move(1, 1, 0) + _move(0, 0, 1),
+        positions=[
+            {
+                "turn_index": 1,
+                "player": 1,
+                "move_history": _move(0, 0, 0),
+                "root_value": 0.0,
+                "policy_target": {},
+                "debug": {},
+            }
+        ],
+    )
+    client = TestClient(app)
+
+    summary = client.get(f"/api/games/{game_id}/replay").json()
+    assert len(summary["moves"]) == 3
+    assert summary["positions"] == []
+
+    full = client.get(f"/api/games/{game_id}/replay?include_positions=true").json()
+    assert len(full["positions"]) == 1
+
+    compact_position = client.get(f"/api/games/{game_id}/position/3?compact=true").json()
+    assert compact_position["turn_index"] == 3
+    assert "moves" not in compact_position
+    assert compact_position["stones"]
+
+
+def test_suite_game_lookup_accepts_dashboard_run_id_that_differs_from_trial_dir(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "candidate-a"
+    trial_dir.mkdir(parents=True)
+    store = DashboardStore(trial_dir / "dashboard.sqlite3")
+    run_id = "production_run_candidate_a"
+    game_id = store.insert_game(
+        run_id=run_id,
+        game_id="suite-game",
+        source="selfplay",
+        final_move_history=_move(0, 0, 0),
+    )
+    store.upsert_checkpoint(
+        path=trial_dir / "epoch_0001.pt",
+        sha256="abc",
+        run_id=run_id,
+        epoch=1,
+        global_step=12,
+        is_loadable=True,
+    )
+    client = TestClient(
+        create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root)
+    )
+
+    games = client.get(f"/api/games?run_id={run_id}").json()
+    assert games[0]["game_id"] == game_id
+    assert games[0]["run_id"] == run_id
+
+    checkpoints = client.get(f"/api/checkpoints?run_id={run_id}").json()
+    assert checkpoints[0]["run_id"] == run_id
+    assert checkpoints[0]["trial_id"] == "candidate-a"
+
+
+def test_suite_dashboard_derives_phase1_trial_metrics_without_latest_json(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "global_xattn_0__none__v1"
+    trial_dir.mkdir(parents=True)
+    run_id = "production_global_xattn"
+    store = DashboardStore(trial_dir / "dashboard.sqlite3")
+    store.upsert_run(run_id)
+    ckpt = trial_dir / "epoch_0008.pt"
+    ckpt.write_bytes(b"fake")
+    store.upsert_checkpoint(
+        path=ckpt,
+        sha256="abc",
+        run_id=run_id,
+        epoch=8,
+        global_step=96,
+        is_loadable=True,
+    )
+    store.record_metric(
+        run_id,
+        phase="selfplay",
+        metrics={
+            "positions_per_min": 2400.0,
+            "truncation_rate": 0.125,
+            "recorder_failures": 0,
+            "terminal_reason_win": 10,
+        },
+    )
+    store.record_metric(
+        run_id,
+        phase="train",
+        epoch=8,
+        global_step=96,
+        metrics={
+            "checkpoint_path": str(ckpt),
+            "train": {
+                "epoch": 8,
+                "loss_total": 5.5,
+                "loss_value": 0.7,
+                "value_weight_mean": 1.0,
+            },
+            "buffer": {
+                "avg_missing_target_policy_mass": 0.01,
+                "avg_candidate_recall_mcts_top1": 0.9,
+            },
+        },
+    )
+    (trial_dir / "full_config.json").write_text(
+        json.dumps(
+            {
+                "model": {"architecture": "global_xattn_0", "channels": 128, "blocks": 16},
+                "selfplay": {"mcts_simulations": 512, "max_game_moves": 500, "states_per_epoch": 3000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trial_dir / "optuna_trial.json").write_text(
+        json.dumps({"trial_number": 0, "params": {"candidate_id": "global_xattn_0__none__v1"}}),
+        encoding="utf-8",
+    )
+    (run_root / "manifest.json").write_text(json.dumps({"run_id": "unit"}), encoding="utf-8")
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+
+    trials = client.get("/api/suite/trials").json()
+    assert trials[0]["trial_id"] == "global_xattn_0__none__v1"
+    assert trials[0]["run_id"] == run_id
+    assert trials[0]["architecture"] == "global_xattn_0"
+    assert trials[0]["epoch"] == 8
+    assert trials[0]["loss_total"] == pytest.approx(5.5)
+    assert trials[0]["positions_per_sec"] == pytest.approx(40.0)
+    assert trials[0]["truncation_rate"] == pytest.approx(0.125)
+    assert trials[0]["mcts_simulations"] == 512
+
+    status = client.get("/api/suite/status").json()
+    assert status["leading_trial_id"] == "global_xattn_0__none__v1"
+    assert status["current_trial_id"] == "global_xattn_0__none__v1"
+    assert status["current_model"] == "xattn 0"
+    assert status["total_checkpoints"] == 1
+
+    detail = client.get("/api/suite/trials/global_xattn_0__none__v1").json()
+    assert detail["run_id"] == run_id
+    assert detail["config"]["selfplay"]["max_game_moves"] == 500
+
+
+def test_suite_events_merge_trial_events_and_suppress_game_spam(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "global_xattn_0__none__v1"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "dashboard.sqlite3").write_bytes(b"")
+    (trial_dir / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event_type": "game_recorded",
+                        "phase": "selfplay",
+                        "epoch": 4,
+                        "payload": {"game_id": 1},
+                        "time": 10.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_type": "metric",
+                        "phase": "selfplay",
+                        "payload": {
+                            "positions_done": 3000,
+                            "positions_per_min": 1800.0,
+                            "truncation_rate": 0.25,
+                        },
+                        "time": 11.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "training_signal_warning",
+                        "metric": "truncation_rate",
+                        "value": 0.25,
+                        "threshold": 0.2,
+                        "time": 12.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_type": "epoch_complete",
+                        "phase": "epoch",
+                        "epoch": 4,
+                        "payload": {"elapsed_s": 99.0},
+                        "time": 13.0,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+
+    events = client.get("/api/suite/events").json()
+
+    assert [event["event"] for event in events] == ["metric", "training_signal_warning", "epoch_complete"]
+    assert events[0]["trial_label"] == "xattn 0"
+    assert events[0]["positions_per_sec"] == pytest.approx(30.0)
+    assert "3,000 positions" in events[0]["message"]
+    assert events[1]["severity"] == "warning"
+    assert "truncation_rate" in events[1]["message"]
+
+    status = client.get("/api/suite/status").json()
+    assert status["event_count"] == 3
+    assert status["warning_count"] == 1
+    assert status["last_event_name"] == "epoch_complete"
 
 
 def test_suite_dashboard_scores_and_stage_fallback(tmp_path):

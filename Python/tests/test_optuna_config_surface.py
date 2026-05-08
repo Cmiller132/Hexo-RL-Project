@@ -98,6 +98,10 @@ def test_initial_scout_recipes_have_deterministic_candidate_ids():
     champion = next(recipe for recipe in recipes if recipe.model.architecture_id == "global_graph768_champion")
     assert champion.model.graph_token_budget == 768
     assert champion.pair_strategy.mode == "none"
+    assert champion.runtime.inference_fp16 is False
+    assert champion.runtime.graph_microbatch_size == 1
+    assert champion.runtime.graph_microbatch_autotune_max_size == 4
+    assert champion.runtime.graph_microbatch_memory_headroom == pytest.approx(0.60)
 
 
 def test_candidate_recipe_materializes_valid_config_without_mutating_base():
@@ -127,6 +131,24 @@ def test_candidate_recipe_materializes_valid_config_without_mutating_base():
     assert cfg.inference.max_batch_size == base.inference.max_batch_size
     assert cfg.inference.max_wait_us == base.inference.max_wait_us
     assert Config.model_validate(cfg.model_dump(mode="json")).model.architecture == "global_xattn_0"
+
+
+def test_graph768_champion_materializes_conservative_training_runtime():
+    recipe = next(
+        recipe
+        for recipe in candidate_recipes_from_config(Config())
+        if recipe.model.architecture_id == "global_graph768_champion"
+    )
+
+    cfg = recipe.materialize_config(Config())
+
+    assert cfg.model.architecture == "global_graph768_champion"
+    assert cfg.model.graph_token_budget == 768
+    assert cfg.model.graph_layers == 6
+    assert cfg.inference.fp16 is False
+    assert cfg.train.graph_microbatch_size == 1
+    assert cfg.train.graph_microbatch_autotune_max_size == 4
+    assert cfg.train.graph_microbatch_memory_headroom == pytest.approx(0.60)
 
 
 @pytest.mark.parametrize("mode", ["root_pair_mcts", "full_pair_mcts"])

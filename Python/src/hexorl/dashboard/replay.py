@@ -14,7 +14,7 @@ from hexorl.action_contract.candidates import (
     CANDIDATE_FEATURE_VERSION,
     build_candidate_batch,
 )
-from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_history
+from hexorl.action_contract.tactical_oracle import scan_tactical_oracle_from_game, scan_tactical_oracle_from_history
 from hexorl.dashboard.db import DashboardStore
 from hexorl.selfplay.records import BOARD_SIZE
 
@@ -60,13 +60,20 @@ def encode_move_history(moves: Iterable[Move]) -> bytes:
     return bytes(out)
 
 
-def replay_game(store: DashboardStore, game_id: int) -> dict[str, Any]:
+def replay_game(
+    store: DashboardStore,
+    game_id: int,
+    *,
+    include_positions: bool = True,
+) -> dict[str, Any]:
     game_rows = store.rows("SELECT * FROM games WHERE game_id=?", (game_id,))
     if not game_rows:
         raise KeyError(f"Game not found: {game_id}")
     game = game_rows[0]
-    position_rows = store.rows(
-        "SELECT * FROM positions WHERE game_id=? ORDER BY turn_index", (game_id,)
+    position_rows = (
+        store.rows("SELECT * FROM positions WHERE game_id=? ORDER BY turn_index", (game_id,))
+        if include_positions
+        else []
     )
     final_history = game["final_history_b64"]
     moves = decode_move_history(final_history)
@@ -116,20 +123,23 @@ def encode_tensor_for_history(
     return np.array(tensor_3d, dtype=np.float32), int(offset_q), int(offset_r), legal_bytes
 
 
-def position_payload(position: ReplayPosition) -> dict[str, Any]:
-    return {
+def position_payload(position: ReplayPosition, *, include_moves: bool = True) -> dict[str, Any]:
+    payload = {
         "turn_index": position.turn_index,
         "current_player": position.current_player,
         "placements_remaining": position.placements_remaining,
-        "moves": [_move_dict(m) for m in position.moves],
         "stones": position.stones,
         "is_over": position.is_over,
         "winner": position.winner,
         "legal_moves": position.legal_moves,
         "threat_moves": position.threat_moves,
+        "threat_stones": _threat_support_stones(position.stones, position.threat_moves),
         "encoding": position.encoding,
         "overlays": position.overlays,
     }
+    if include_moves:
+        payload["moves"] = [_move_dict(m) for m in position.moves]
+    return payload
 
 
 def _position_from_game(
@@ -149,7 +159,18 @@ def _position_from_game(
         legal_moves, tensor, offsets, legal_mask = _engine_encoding(
             game, near_radius, constrain_threats
         )
-        threat_moves = _engine_threat_moves(game, near_radius)
+        oracle_threat_moves = _oracle_threat_moves(game, near_radius, offsets)
+        threat_moves = (
+            oracle_threat_moves
+            if oracle_threat_moves is not None
+            else _engine_threat_moves(game, near_radius)
+        )
+        if constrain_threats and threat_moves:
+            threat_set = {(int(move["q"]), int(move["r"])) for move in threat_moves}
+            legal_moves = [
+                move for move in legal_moves
+                if (int(move["q"]), int(move["r"])) in threat_set
+            ]
         encoding = _encoding_summary(tensor, offsets, legal_mask)
     else:
         current_player = len(moves) % 2
@@ -246,6 +267,79 @@ def _engine_threat_moves(game: Any, near_radius: int) -> list[dict[str, int]]:
     if moves is None:
         return []
     return [{"q": int(q), "r": int(r)} for q, r in moves]
+
+
+def _oracle_threat_moves(
+    game: Any,
+    near_radius: int,
+    offsets: tuple[int, int],
+) -> list[dict[str, int]] | None:
+    """Return tactical threats after oracle validation removes blocked windows."""
+    try:
+        legal_moves, _, _, _ = _engine_encoding(game, near_radius, False)
+        oracle = scan_tactical_oracle_from_game(
+            game,
+            [(int(move["q"]), int(move["r"])) for move in legal_moves],
+            offset_q=int(offsets[0]),
+            offset_r=int(offsets[1]),
+            near_radius=near_radius,
+        )
+    except Exception:
+        return None
+    player = int(oracle.current_player)
+    opponent = 1 - player
+    rows: list[dict[str, int | str]] = []
+
+    def add_cells(cells: tuple[tuple[int, int], ...], owner: int, threat_type: str) -> None:
+        for q, r in cells:
+            rows.append({"q": int(q), "r": int(r), "player": int(owner), "threat_type": threat_type})
+
+    add_cells(oracle.win_now_cells, player, "win_now")
+    add_cells(oracle.open_five_cells, player, "open_five")
+    add_cells(oracle.open_four_cells, player, "open_four")
+    add_cells(oracle.forced_block_cells, opponent, "forced_block")
+    add_cells(oracle.cover_cells, opponent, "cover")
+
+    deduped: dict[tuple[int, int], dict[str, int | str]] = {}
+    for row in rows:
+        key = (int(row["q"]), int(row["r"]))
+        deduped.setdefault(key, row)
+    return [dict(row) for row in deduped.values()]
+
+
+def _threat_support_stones(
+    stones: list[dict[str, int]],
+    threat_moves: list[dict[str, Any]],
+) -> list[dict[str, int | str]]:
+    """Return already-placed stones that form the tactical windows behind threat cells."""
+    by_cell = {(int(stone["q"]), int(stone["r"])): int(stone["player"]) for stone in stones}
+    support: dict[tuple[int, int], dict[str, int | str]] = {}
+    for threat in threat_moves:
+        try:
+            tq = int(threat["q"])
+            tr = int(threat["r"])
+            player = int(threat.get("player"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        opponent = 1 - player
+        threat_type = str(threat.get("threat_type") or "threat")
+        for dq, dr in ((1, 0), (0, 1), (1, -1)):
+            for offset in range(6):
+                window = tuple((tq + (i - offset) * dq, tr + (i - offset) * dr) for i in range(6))
+                if (tq, tr) not in window:
+                    continue
+                owners = [by_cell.get(cell) for cell in window]
+                if any(owner == opponent for owner in owners):
+                    continue
+                own_cells = [cell for cell, owner in zip(window, owners) if owner == player]
+                if len(own_cells) < 4:
+                    continue
+                for q, r in own_cells:
+                    support.setdefault(
+                        (q, r),
+                        {"q": int(q), "r": int(r), "player": player, "threat_type": threat_type},
+                    )
+    return list(support.values())
 
 
 def _moves_from_bytes(data: bytes) -> list[tuple[int, int]]:

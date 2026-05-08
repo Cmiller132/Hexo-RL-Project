@@ -119,6 +119,10 @@ class RuntimeSpec(BaseModel):
     batch_size_per_worker: int = 0
     inference_max_batch_size: int = 0
     inference_wait_us: int = 0
+    inference_fp16: bool | None = None
+    graph_microbatch_size: int = 0
+    graph_microbatch_autotune_max_size: int = 0
+    graph_microbatch_memory_headroom: float = 0.0
     memory_safety_envelope: str = "runtime_probe_required"
 
 
@@ -190,12 +194,20 @@ class CandidateRecipe(BaseModel):
             inference_update["max_batch_size"] = self.runtime.inference_max_batch_size
         if self.runtime.inference_wait_us > 0:
             inference_update["max_wait_us"] = self.runtime.inference_wait_us
+        if self.runtime.inference_fp16 is not None:
+            inference_update["fp16"] = bool(self.runtime.inference_fp16)
         inference.update(inference_update)
 
         buffer = data.setdefault("buffer", {})
         buffer["recency_decay"] = self.schedule.recency_decay
 
         train = data.setdefault("train", {})
+        if self.runtime.graph_microbatch_size > 0:
+            train["graph_microbatch_size"] = int(self.runtime.graph_microbatch_size)
+        if self.runtime.graph_microbatch_autotune_max_size > 0:
+            train["graph_microbatch_autotune_max_size"] = int(self.runtime.graph_microbatch_autotune_max_size)
+        if self.runtime.graph_microbatch_memory_headroom > 0.0:
+            train["graph_microbatch_memory_headroom"] = float(self.runtime.graph_microbatch_memory_headroom)
         train["peak_lr"] = self.schedule.peak_lr * self.schedule.lr_multiplier
         train["weight_decay"] = self.schedule.weight_decay
         loss_weights = dict(train.get("loss_weights", {}))
@@ -225,6 +237,7 @@ def candidate_recipes_from_config(config: Config) -> tuple[CandidateRecipe, ...]
             CandidateRecipe(
                 model=_model_recipe_for_architecture(architecture_id, pair_mode),
                 pair_strategy=_pair_strategy_for_mode(pair_mode),
+                runtime=_runtime_spec_for_architecture(architecture_id),
                 metadata={"source": "autotune.scout.candidate_plan", "plan_entry": entry},
             )
         )
@@ -256,6 +269,18 @@ def _pair_strategy_for_mode(pair_mode: str) -> PairStrategySpec:
     if pair_mode == "none":
         return PairStrategySpec(mode="none")
     return PairStrategySpec(mode=pair_mode, pair_row_budget=256, pair_prior_mix=0.35)
+
+
+def _runtime_spec_for_architecture(architecture_id: str) -> RuntimeSpec:
+    if normalize_architecture_id(architecture_id) == "global_graph768_champion":
+        return RuntimeSpec(
+            inference_fp16=False,
+            graph_microbatch_size=1,
+            graph_microbatch_autotune_max_size=4,
+            graph_microbatch_memory_headroom=0.60,
+            memory_safety_envelope="graph768_conservative_fp32_microbatch1",
+        )
+    return RuntimeSpec()
 
 
 def _temperature_schedule(family: str) -> list[list[float]]:

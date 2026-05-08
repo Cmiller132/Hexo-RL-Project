@@ -6,6 +6,8 @@ import base64
 import asyncio
 import json
 import re
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,7 @@ from hexorl.dashboard.fixtures import (
 from hexorl.dashboard.model_cache import ModelCache
 from hexorl.dashboard.play import apply_move, create_session, reset_session, session_payload, undo_move
 from hexorl.dashboard.render import MatchSnapshotOptions, render_match_snapshot_png, snapshot_filename
-from hexorl.dashboard.replay import get_replay_position, position_payload, replay_game
+from hexorl.dashboard.replay import decode_move_history, get_replay_position, position_payload, replay_game
 from hexorl.models.registry import architecture_display_summary, trial_model_summary
 from hexorl.graph.batch import (
     GRAPH_FEATURE_DIM,
@@ -190,16 +192,31 @@ def create_app(
             """,
             (run_id, max(1, min(limit, 5000))),
         )
+        if trial_store is not None and not rows:
+            rows = source.rows(
+                """
+                SELECT * FROM (
+                    SELECT * FROM metrics ORDER BY created_at DESC LIMIT ?
+                ) ORDER BY created_at ASC
+                """,
+                (max(1, min(limit, 5000)),),
+            )
         return rows
 
     @app.get("/api/events/{run_id}")
     def events(run_id: str, limit: int = 500) -> list[dict[str, Any]]:
         trial_store = _suite_store_for_run(suite_root, run_id)
         source = trial_store or store
-        return source.rows(
+        rows = source.rows(
             "SELECT * FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT ?",
             (run_id, max(1, min(limit, 5000))),
         )
+        if trial_store is not None and not rows:
+            rows = source.rows(
+                "SELECT * FROM events ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 5000)),),
+            )
+        return rows
 
     @app.get("/api/checkpoints")
     def checkpoints(run_id: str | None = None) -> list[dict[str, Any]]:
@@ -250,21 +267,30 @@ def create_app(
         return [_game_summary(row) for row in rows]
 
     @app.get("/api/games/{game_id}/replay")
-    def game_replay(game_id: int, run_id: str | None = None) -> dict[str, Any]:
+    def game_replay(
+        game_id: int,
+        run_id: str | None = None,
+        include_positions: bool = False,
+    ) -> dict[str, Any]:
         source = _suite_store_for_run(suite_root, run_id) if run_id else store
         try:
-            return replay_game(source or store, game_id)
+            return replay_game(source or store, game_id, include_positions=include_positions)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/games/{game_id}/position/{turn_index}")
-    def game_position(game_id: int, turn_index: int, run_id: str | None = None) -> dict[str, Any]:
+    def game_position(
+        game_id: int,
+        turn_index: int,
+        run_id: str | None = None,
+        compact: bool = False,
+    ) -> dict[str, Any]:
         source = _suite_store_for_run(suite_root, run_id) if run_id else store
         rows = (source or store).rows("SELECT final_history_b64 FROM games WHERE game_id=?", (game_id,))
         if not rows:
             raise HTTPException(404, f"Game not found: {game_id}")
         pos = get_replay_position(rows[0]["final_history_b64"], turn_index=turn_index)
-        return position_payload(pos)
+        return position_payload(pos, include_moves=not compact)
 
     @app.get("/api/games/{game_id}/snapshot.png")
     def game_snapshot(
@@ -330,6 +356,18 @@ def create_app(
             return []
         return _suite_trials(suite_root)
 
+    @app.get("/api/suite/phase2")
+    def suite_phase2() -> dict[str, Any]:
+        if suite_root is None:
+            return {"enabled": False, "rows": []}
+        return _suite_phase2(suite_root)
+
+    @app.get("/api/suite/phase3")
+    def suite_phase3() -> dict[str, Any]:
+        if suite_root is None:
+            return {"enabled": False, "rows": []}
+        return _suite_phase3(suite_root)
+
     @app.get("/api/suite/trials/{trial_id}")
     def suite_trial_detail(trial_id: str) -> dict[str, Any]:
         if suite_root is None:
@@ -349,7 +387,7 @@ def create_app(
     def suite_events(limit: int = 200) -> list[dict[str, Any]]:
         if suite_root is None:
             return []
-        return _jsonl_tail(suite_root / "events.jsonl", limit=max(1, min(limit, 1000)))
+        return _suite_events(suite_root, limit=max(1, min(limit, 1000)))
 
     @app.get("/api/suite/game-examples")
     def suite_game_examples(limit: int = 80) -> list[dict[str, Any]]:
@@ -371,13 +409,17 @@ def create_app(
             "game": public_row,
             "moves": [
                 {"player": int(player), "q": int(q), "r": int(r)}
-                for player, q, r in get_replay_position(history, turn_index=None).moves
+                for player, q, r in decode_move_history(history)
             ],
             "positions": [],
         }
 
     @app.get("/api/suite/game-examples/{example_id}/position/{turn_index}")
-    def suite_game_example_position(example_id: str, turn_index: int) -> dict[str, Any]:
+    def suite_game_example_position(
+        example_id: str,
+        turn_index: int,
+        compact: bool = False,
+    ) -> dict[str, Any]:
         if suite_root is None:
             raise HTTPException(404, "Suite run root is not configured")
         row = _suite_example_by_id(suite_root, example_id)
@@ -387,7 +429,8 @@ def create_app(
             get_replay_position(
                 _decode_history_value(row["final_history_b64"]),
                 turn_index=turn_index,
-            )
+            ),
+            include_moves=not compact,
         )
 
     @app.post("/api/session/create")
@@ -640,6 +683,21 @@ def _suite_trial_dirs(run_root: Path) -> list[Path]:
     return sorted([path for path in trials.iterdir() if (path / "dashboard.sqlite3").exists()])
 
 
+def _suite_game_trial_dirs(run_root: Path) -> list[Path]:
+    """Return dashboard-backed dirs that can contribute replayable games."""
+    candidates: list[Path] = []
+    candidates.extend(_suite_trial_dirs(run_root))
+    phase3_root = run_root.parent / "phase3_trials"
+    if phase3_root.exists():
+        candidates.extend(path for path in phase3_root.iterdir() if path.is_dir() and (path / "dashboard.sqlite3").exists())
+    deduped: dict[str, Path] = {}
+    for path in candidates:
+        # Prefer direct phase3_trials artifacts over stale mirrored suite copies.
+        if path.parent.name == "phase3_trials" or path.name not in deduped:
+            deduped[path.name] = path
+    return sorted(deduped.values(), key=lambda path: path.name)
+
+
 def _game_row_for_request(
     store: DashboardStore,
     run_root: Path | None,
@@ -660,7 +718,7 @@ def _game_row_for_request(
         return rows[0]
     if run_root is None:
         return None
-    for trial_dir in _suite_trial_dirs(run_root):
+    for trial_dir in _suite_game_trial_dirs(run_root):
         db = trial_dir / "dashboard.sqlite3"
         try:
             trial_store = DashboardStore(db)
@@ -680,7 +738,7 @@ def _suite_store_for_run(run_root: Path | None, run_id: str | None) -> Dashboard
     direct = run_root / "trials" / run_id / "dashboard.sqlite3"
     if direct.exists():
         return DashboardStore(direct)
-    for trial_dir in _suite_trial_dirs(run_root):
+    for trial_dir in _suite_game_trial_dirs(run_root):
         db = trial_dir / "dashboard.sqlite3"
         try:
             rows = DashboardStore(db).rows("SELECT run_id FROM runs WHERE run_id=? LIMIT 1", (run_id,))
@@ -691,10 +749,46 @@ def _suite_store_for_run(run_root: Path | None, run_id: str | None) -> Dashboard
     return None
 
 
+def _suite_trial_id_for_run(run_root: Path | None, run_id: str | None) -> str | None:
+    if run_root is None or not run_id:
+        return None
+    direct = run_root / "trials" / run_id / "dashboard.sqlite3"
+    if direct.exists():
+        return run_id
+    for trial_dir in _suite_game_trial_dirs(run_root):
+        db = trial_dir / "dashboard.sqlite3"
+        try:
+            rows = DashboardStore(db).rows("SELECT run_id FROM runs WHERE run_id=? LIMIT 1", (run_id,))
+        except Exception:
+            continue
+        if rows:
+            return trial_dir.name
+    return None
+
+
+def _suite_primary_run_id(trial_dir: Path) -> str:
+    db = trial_dir / "dashboard.sqlite3"
+    if db.exists():
+        try:
+            rows = DashboardStore(db).rows("SELECT run_id FROM runs ORDER BY updated_at DESC LIMIT 1")
+            if rows and rows[0].get("run_id"):
+                return str(rows[0]["run_id"])
+        except Exception:
+            pass
+    return trial_dir.name
+
+
+def _trial_display_name(trial_id: str) -> str:
+    label = str(trial_id or "")
+    for suffix in ("__none__v1", "__root_pair_mcts__v1", "__full_pair_mcts__v1"):
+        label = label.replace(suffix, "")
+    return label.replace("global_", "").replace("_", " ")
+
+
 def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     trial_state = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
-    for trial_dir in _suite_trial_dirs(run_root):
+    for trial_dir in _suite_game_trial_dirs(run_root):
         db = trial_dir / "dashboard.sqlite3"
         try:
             run_rows = DashboardStore(db).rows("SELECT * FROM runs ORDER BY updated_at DESC")
@@ -703,8 +797,9 @@ def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
         for row in run_rows:
             trial_id = str(row.get("run_id") or trial_dir.name)
             row["trial_id"] = trial_id
+            row["suite_trial_id"] = trial_dir.name
             row["source_db"] = str(db)
-            row["name"] = trial_id
+            row["name"] = _trial_display_name(trial_dir.name)
             state = trial_state.get(trial_id, {})
             row["payload_json"] = {
                 **dict(row.get("payload_json") or {}),
@@ -718,7 +813,26 @@ def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
 
 
 def _suite_games(run_root: Path, *, run_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
-    trial_dirs = [run_root / "trials" / run_id] if run_id else _suite_trial_dirs(run_root)
+    if run_id:
+        trial_store = _suite_store_for_run(run_root, run_id)
+        if trial_store is None:
+            return []
+        try:
+            rows = trial_store.rows(
+                "SELECT * FROM games WHERE run_id=? ORDER BY created_at DESC LIMIT ?",
+                (run_id, limit),
+            )
+            if not rows:
+                rows = trial_store.rows(
+                    "SELECT * FROM games ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                )
+            for row in rows:
+                row.setdefault("trial_id", run_id)
+            return rows
+        except Exception:
+            return []
+    trial_dirs = _suite_game_trial_dirs(run_root)
     rows: list[dict[str, Any]] = []
     for trial_dir in trial_dirs:
         db = trial_dir / "dashboard.sqlite3"
@@ -746,11 +860,15 @@ def _suite_games(run_root: Path, *, run_id: str | None = None, limit: int = 200)
 def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, Any]]:
     examples: list[dict[str, Any]] = []
     for row in _suite_games(run_root, limit=max(1, min(limit, 200))):
+        trial_id = row.get("trial_id") or row.get("run_id")
         examples.append(
             {
                 "example_id": f"selfplay|{row.get('run_id')}|{row.get('game_id')}",
                 "kind": "selfplay",
-                "trial_id": row.get("trial_id") or row.get("run_id"),
+                "opponent_type": "selfplay",
+                "opponent_label": "Self-play",
+                "trial_id": trial_id,
+                "model_label": _trial_display_name(str(trial_id or "")),
                 "run_id": row.get("run_id"),
                 "game_id": row.get("game_id"),
                 "source": row.get("source", "selfplay"),
@@ -763,32 +881,44 @@ def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, A
             }
         )
 
-    run_dir = run_root.parent
-    phase3_trials = run_dir / "phase3_trials"
-    if phase3_trials.exists():
-        for trial_dir in sorted(path for path in phase3_trials.iterdir() if path.is_dir()):
-            for evidence_path in sorted(trial_dir.glob("fixed_classical_epoch_*_games.jsonl")):
-                for row in _jsonl_tail(evidence_path, limit=24):
-                    example_id = f"classical|{trial_dir.name}|{row.get('game_index')}"
-                    examples.append(
-                        {
-                            "example_id": example_id,
-                            "kind": "fixed_classical",
-                            "trial_id": trial_dir.name,
-                            "run_id": trial_dir.name,
-                            "game_id": row.get("game_index"),
-                            "source": "fixed_classical",
-                            "epoch": _epoch_from_fixed_classical_path(evidence_path),
-                            "outcome": row.get("outcome"),
-                            "move_count": row.get("moves"),
-                            "terminal_reason": row.get("reason", ""),
-                            "created_at": _mtime(evidence_path),
-                            "replay_available": bool(row.get("final_history_b64")),
-                            "opponent_id": row.get("opponent_id", ""),
-                            "opening_is_black": row.get("opening_is_black"),
-                            "checkpoint_id": row.get("checkpoint_id", ""),
-                        }
-                    )
+    seen_classical: set[tuple[str, int | None, int]] = set()
+    for trial_dir in _fixed_classical_trial_dirs(run_root):
+        trial_id = trial_dir.name
+        for evidence_path in sorted(trial_dir.glob("fixed_classical_epoch_*_games.jsonl")):
+            epoch = _epoch_from_fixed_classical_path(evidence_path)
+            for row in _jsonl_tail(evidence_path, limit=24):
+                try:
+                    game_index = int(row.get("game_index", -1))
+                except (TypeError, ValueError):
+                    continue
+                key = (trial_id, epoch, game_index)
+                if key in seen_classical:
+                    continue
+                seen_classical.add(key)
+                opponent_id = str(row.get("opponent_id") or "fixed_classical")
+                example_id = f"classical|{trial_id}|{epoch if epoch is not None else 0}|{game_index}"
+                examples.append(
+                    {
+                        "example_id": example_id,
+                        "kind": "fixed_classical",
+                        "opponent_type": opponent_id,
+                        "opponent_label": opponent_id.replace("_", " "),
+                        "trial_id": trial_id,
+                        "model_label": _trial_display_name(trial_id),
+                        "run_id": trial_id,
+                        "game_id": game_index,
+                        "source": "fixed_classical",
+                        "epoch": epoch,
+                        "outcome": row.get("outcome"),
+                        "move_count": row.get("moves"),
+                        "terminal_reason": row.get("reason", ""),
+                        "created_at": _mtime(evidence_path),
+                        "replay_available": bool(row.get("final_history_b64")),
+                        "opponent_id": opponent_id,
+                        "opening_is_black": row.get("opening_is_black"),
+                        "checkpoint_id": row.get("checkpoint_id", ""),
+                    }
+                )
 
     examples.sort(
         key=lambda row: (
@@ -829,32 +959,58 @@ def _suite_example_by_id(run_root: Path, example_id: str) -> dict[str, Any] | No
         return None
     trial_id = parts[1]
     try:
-        target_index = int(parts[2])
+        if len(parts) >= 4:
+            target_epoch = int(parts[2])
+            target_index = int(parts[3])
+        else:
+            target_epoch = None
+            target_index = int(parts[2])
     except ValueError:
         return None
-    trial_dir = run_root.parent / "phase3_trials" / trial_id
-    for evidence_path in sorted(trial_dir.glob("fixed_classical_epoch_*_games.jsonl")):
+    trial_dirs = [path for path in _fixed_classical_trial_dirs(run_root) if path.name == trial_id]
+    for evidence_path in sorted(path for trial_dir in trial_dirs for path in trial_dir.glob("fixed_classical_epoch_*_games.jsonl")):
+        epoch = _epoch_from_fixed_classical_path(evidence_path)
+        if target_epoch is not None and target_epoch != 0 and epoch != target_epoch:
+            continue
         for row in _read_jsonl_lenient(evidence_path):
             if int(row.get("game_index", -1)) != target_index:
                 continue
+            opponent_id = str(row.get("opponent_id") or "fixed_classical")
             row = dict(row)
             row.update(
                 {
                     "example_id": example_id,
                     "kind": "fixed_classical",
+                    "opponent_type": opponent_id,
+                    "opponent_label": opponent_id.replace("_", " "),
                     "trial_id": trial_id,
+                    "model_label": _trial_display_name(trial_id),
                     "run_id": trial_id,
                     "game_id": target_index,
                     "source": "fixed_classical",
-                    "epoch": _epoch_from_fixed_classical_path(evidence_path),
+                    "epoch": epoch,
                     "move_count": row.get("moves"),
                     "terminal_reason": row.get("reason", ""),
                     "created_at": _mtime(evidence_path),
                     "replay_available": bool(row.get("final_history_b64")),
+                    "opponent_id": opponent_id,
                 }
             )
             return row
     return None
+
+
+def _fixed_classical_trial_dirs(run_root: Path) -> list[Path]:
+    """Return trial/candidate dirs with persisted fixed-classical game evidence."""
+    candidates: list[Path] = []
+    candidates.extend(path for path in _suite_trial_dirs(run_root) if list(path.glob("fixed_classical_epoch_*_games.jsonl")))
+    for root in (run_root.parent / "phase3_trials", run_root.parent / "candidates"):
+        if root.exists():
+            candidates.extend(path for path in root.iterdir() if path.is_dir() and list(path.glob("fixed_classical_epoch_*_games.jsonl")))
+    deduped: dict[str, Path] = {}
+    for path in candidates:
+        deduped.setdefault(path.name, path)
+    return sorted(deduped.values(), key=lambda path: path.name)
 
 
 def _read_jsonl_lenient(path: Path) -> list[dict[str, Any]]:
@@ -889,7 +1045,29 @@ def _epoch_from_fixed_classical_path(path: Path) -> int | None:
 
 
 def _suite_checkpoints(run_root: Path, *, run_id: str | None = None) -> list[dict[str, Any]]:
-    trial_dirs = [run_root / "trials" / run_id] if run_id else _suite_trial_dirs(run_root)
+    if run_id:
+        trial_store = _suite_store_for_run(run_root, run_id)
+        if trial_store is None:
+            return []
+        try:
+            rows = trial_store.rows(
+                "SELECT * FROM checkpoints WHERE run_id=? ORDER BY indexed_at DESC",
+                (run_id,),
+            )
+            if not rows:
+                rows = trial_store.rows("SELECT * FROM checkpoints ORDER BY indexed_at DESC")
+            score_by_trial = _suite_score_by_trial(run_root)
+            for row in rows:
+                row["run_id"] = row.get("run_id") or run_id
+                row["trial_id"] = _suite_trial_id_for_run(run_root, run_id) or run_id
+                row["suite_trial_id"] = row["trial_id"]
+                row["trial_label"] = _trial_display_name(str(row["trial_id"]))
+                row["score"] = score_by_trial.get(str(row["trial_id"]))
+                row["scheduler_score"] = row["score"]
+            return rows
+        except Exception:
+            return []
+    trial_dirs = _suite_trial_dirs(run_root)
     rows: list[dict[str, Any]] = []
     score_by_trial = _suite_score_by_trial(run_root)
     for trial_dir in trial_dirs:
@@ -908,10 +1086,12 @@ def _suite_checkpoints(run_root: Path, *, run_id: str | None = None) -> list[dic
         except Exception:
             continue
         for row in next_rows:
-            trial_id = str(row.get("run_id") or trial_dir.name)
-            row["trial_id"] = trial_id
+            row["run_id"] = row.get("run_id") or _suite_primary_run_id(trial_dir)
+            row["trial_id"] = trial_dir.name
+            row["suite_trial_id"] = trial_dir.name
+            row["trial_label"] = _trial_display_name(trial_dir.name)
             row["source_db"] = str(db)
-            row["score"] = score_by_trial.get(trial_id)
+            row["score"] = score_by_trial.get(trial_dir.name)
             row["scheduler_score"] = row["score"]
             rows.append(row)
     rows.sort(
@@ -948,37 +1128,112 @@ def _suite_best_checkpoints(run_root: Path, *, limit: int = 50) -> list[dict[str
     )
     for idx, row in enumerate(ranked, start=1):
         row["rank"] = idx
+        row["rank_basis"] = "score" if row.get("score") is not None else "epoch/recency"
     return ranked[:limit]
+
+
+def _suite_latest_metrics(trial_dir: Path) -> dict[str, Any]:
+    db = trial_dir / "dashboard.sqlite3"
+    payload: dict[str, Any] = {"latest": {}, "train": {}, "selfplay": {}, "buffer": {}}
+    if not db.exists():
+        return payload
+    try:
+        store = DashboardStore(db)
+        rows = store.rows("SELECT * FROM metrics ORDER BY created_at ASC")
+    except Exception:
+        return payload
+    for row in rows:
+        metrics = dict(row.get("metrics_json") or {})
+        phase = str(row.get("phase") or "")
+        created_at = row.get("created_at")
+        epoch = row.get("epoch")
+        global_step = row.get("global_step")
+        if phase == "train":
+            train = dict(metrics.get("train") or metrics)
+            buffer = dict(metrics.get("buffer") or {})
+            train.setdefault("epoch", epoch)
+            train.setdefault("global_step", global_step)
+            train["created_at"] = created_at
+            payload["train"] = train
+            if buffer:
+                payload["buffer"] = buffer
+            payload["latest"] = {
+                **payload["latest"],
+                "epoch": epoch,
+                "global_step": global_step,
+                "checkpoint_path": metrics.get("checkpoint_path") or payload["latest"].get("checkpoint_path"),
+                "epoch_elapsed_s": train.get("elapsed_s"),
+                "updated_at": created_at,
+            }
+        elif phase == "selfplay":
+            selfplay = dict(metrics)
+            selfplay["created_at"] = created_at
+            payload["selfplay"] = selfplay
+            payload["latest"] = {
+                **payload["latest"],
+                "selfplay_updated_at": created_at,
+            }
+    return payload
+
+
+def _suite_trial_config(trial_dir: Path, trial_json: dict[str, Any]) -> dict[str, Any]:
+    cfg = _read_json(trial_dir / "full_config.json")
+    if cfg:
+        return cfg
+    user_attrs = trial_json.get("user_attrs") or {}
+    full_config = user_attrs.get("full_config") or {}
+    return full_config if isinstance(full_config, dict) else {}
 
 
 def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
     state_trials = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
     score_by_trial = _suite_score_by_trial(run_root)
+    phase2_by_trial = {row["trial_id"]: row for row in _suite_phase2_rows(run_root)}
     rows: list[dict[str, Any]] = []
-    for trial_dir in _suite_trial_dirs(run_root):
+    for trial_dir in _suite_game_trial_dirs(run_root):
         trial_id = trial_dir.name
         state = dict(state_trials.get(trial_id) or {})
         trial_json = _read_json(trial_dir / "trial.json")
+        if not trial_json:
+            trial_json = _read_json(trial_dir / "optuna_trial.json")
         latest = _read_json(trial_dir / "LATEST.json")
+        latest_metrics = _suite_latest_metrics(trial_dir)
+        cfg = _suite_trial_config(trial_dir, trial_json)
+        if not latest:
+            latest = dict(latest_metrics.get("latest") or {})
         scores = _jsonl_tail(trial_dir / "scores.jsonl", limit=1)
         family = state.get("family") or trial_json.get("family") or {}
+        model_cfg = cfg.get("model") or {}
+        selfplay_cfg = cfg.get("selfplay") or {}
         counts = _suite_trial_counts(trial_dir)
-        latest_selfplay = latest.get("selfplay") or {}
-        latest_train = latest.get("train") or {}
+        latest_event = _suite_latest_event(trial_dir)
+        latest_selfplay = latest.get("selfplay") or latest_metrics.get("selfplay") or {}
+        latest_train = latest.get("train") or latest_metrics.get("train") or {}
+        latest_buffer = latest.get("buffer") or latest_metrics.get("buffer") or {}
+        checkpoint_path = state.get("checkpoint_path") or latest.get("checkpoint_path") or ""
+        if not checkpoint_path:
+            checkpoints = _suite_checkpoints(run_root, run_id=trial_id)
+            checkpoint_path = checkpoints[0].get("path") if checkpoints else ""
         score = score_by_trial.get(trial_id, state.get("last_score"))
         if (score is None or score == "-inf") and scores:
             score = scores[-1].get("scheduler_score")
+        phase2 = dict(phase2_by_trial.get(trial_id) or {})
         row = {
             "trial_id": trial_id,
-            "family": family.get("name") or latest.get("family") or "",
-            "architecture": family.get("architecture") or "",
-            "model_summary": _model_summary_from_trial(family, state.get("static") or trial_json.get("static") or latest.get("static") or {}),
-            "stage": latest.get("stage") or state.get("stage") or trial_json.get("stage") or "",
-            "epoch": state.get("epoch") or latest.get("epoch") or trial_json.get("epoch") or 0,
+            "run_id": _suite_primary_run_id(trial_dir),
+            "trial_label": _trial_display_name(trial_id),
+            "family": family.get("name") or model_cfg.get("architecture") or latest.get("family") or "",
+            "architecture": family.get("architecture") or model_cfg.get("architecture") or "",
+            "model_summary": _model_summary_from_trial(
+                family or {"architecture": model_cfg.get("architecture"), "channels": model_cfg.get("channels"), "blocks": model_cfg.get("blocks")},
+                state.get("static") or trial_json.get("static") or latest.get("static") or model_cfg,
+            ),
+            "stage": latest.get("stage") or state.get("stage") or trial_json.get("stage") or "phase1 scout",
+            "epoch": state.get("epoch") or latest.get("epoch") or latest_train.get("epoch") or trial_json.get("epoch") or 0,
             "score": _finite_or_none(score),
             "pruned": bool(state.get("pruned") or trial_json.get("pruned") or False),
             "prune_reason": state.get("prune_reason") or trial_json.get("prune_reason") or "",
-            "checkpoint_path": state.get("checkpoint_path") or latest.get("checkpoint_path") or "",
+            "checkpoint_path": checkpoint_path,
             "games": counts["games"],
             "positions": counts["positions"],
             "checkpoints": counts["checkpoints"],
@@ -986,11 +1241,23 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
             "selfplay_positions_per_min": latest_selfplay.get("positions_per_min"),
             "positions_per_sec": _per_second(latest_selfplay.get("positions_per_min")),
             "workers": _worker_summary(latest_selfplay),
-            "epoch_elapsed_s": latest.get("epoch_elapsed_s"),
+            "epoch_elapsed_s": latest.get("epoch_elapsed_s") or latest_train.get("elapsed_s"),
             "loss_total": latest_train.get("loss_total"),
+            "loss_value": latest_train.get("loss_value"),
+            "loss_policy_place": latest_train.get("loss_policy_place"),
+            "value_weight_mean": latest_train.get("value_weight_mean"),
+            "value_weight_zero_frac": latest_train.get("value_weight_zero_frac"),
             "policy_top1_acc": latest_train.get("policy_top1_acc"),
             "sparse_policy_top1_acc": latest_train.get("sparse_policy_top1_acc"),
             "pair_policy_top1_acc": latest_train.get("pair_policy_top1_acc"),
+            "truncation_rate": latest_selfplay.get("truncation_rate"),
+            "terminal_reason_win": latest_selfplay.get("terminal_reason_win"),
+            "max_game_moves": selfplay_cfg.get("max_game_moves"),
+            "mcts_simulations": selfplay_cfg.get("mcts_simulations"),
+            "states_per_epoch": selfplay_cfg.get("states_per_epoch"),
+            "recorder_failures": latest_selfplay.get("recorder_failures"),
+            "missing_target_policy_mass": latest_buffer.get("avg_missing_target_policy_mass"),
+            "candidate_recall_top1": latest_buffer.get("avg_candidate_recall_mcts_top1"),
             "graph_microbatch_size": latest_train.get("graph_microbatch_size"),
             "graph_microbatch_count": latest_train.get("graph_microbatch_count"),
             "graph_collate_s": latest_train.get("graph_collate_s"),
@@ -1001,7 +1268,31 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
             "graph_optimizer_s": latest_train.get("graph_optimizer_s"),
             "graph_peak_cuda_allocated_mb": latest_train.get("graph_peak_cuda_allocated_mb"),
             "runtime_sweep": state.get("runtime_sweep") or trial_json.get("runtime_sweep") or {},
-            "updated_at": max(_mtime(trial_dir / "LATEST.json"), _mtime(trial_dir / "dashboard.sqlite3")),
+            "last_event": latest_event.get("event") or latest_event.get("event_type") or "",
+            "last_event_phase": latest_event.get("phase") or "",
+            "last_event_time": latest_event.get("time") or latest_event.get("created_at"),
+            "last_event_message": _suite_event_message(latest_event),
+            "phase2_status": phase2.get("phase2_status"),
+            "phase2_rank": phase2.get("phase2_rank"),
+            "phase2_promoted": phase2.get("phase2_promoted"),
+            "phase2_excluded": phase2.get("phase2_excluded"),
+            "phase2_exclusion_reason": phase2.get("phase2_exclusion_reason"),
+            "classical_survival_lcb": phase2.get("classical_survival_lcb"),
+            "classical_survival_mean": phase2.get("classical_survival_mean"),
+            "classical_survival_games": phase2.get("classical_survival_games"),
+            "classical_win_rate": phase2.get("classical_win_rate"),
+            "classical_draw_rate": phase2.get("classical_draw_rate"),
+            "classical_avg_moves": phase2.get("classical_avg_moves"),
+            "fixed_classical_evidence_path": phase2.get("fixed_classical_evidence_path"),
+            "hard_pass": phase2.get("hard_pass"),
+            "updated_at": max(
+                float(latest.get("updated_at") or 0.0),
+                float(latest_selfplay.get("created_at") or 0.0),
+                float(latest_train.get("created_at") or 0.0),
+                float(latest_event.get("time") or latest_event.get("created_at") or 0.0),
+                _mtime(trial_dir / "LATEST.json"),
+                _mtime(trial_dir / "dashboard.sqlite3"),
+            ),
         }
         rows.append(row)
     rows.sort(
@@ -1018,12 +1309,20 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
 def _suite_status(run_root: Path) -> dict[str, Any]:
     manifest = _read_json(run_root / "manifest.json")
     state = _suite_state(run_root)
-    events = _jsonl_tail(run_root / "events.jsonl", limit=100)
+    events = _suite_events(run_root, limit=200)
     trials = _suite_trials(run_root)
+    phase2 = _suite_phase2(run_root)
     latest_stage = _latest_suite_stage(state, events, trials)
     total_games = sum(int(trial.get("games") or 0) for trial in trials)
     total_positions = sum(int(trial.get("positions") or 0) for trial in trials)
+    total_checkpoints = sum(int(trial.get("checkpoints") or 0) for trial in trials)
+    warning_count = sum(1 for event in events if event.get("severity") == "warning")
     best = next((trial for trial in trials if not trial.get("pruned") and trial.get("score") is not None), None)
+    leading = max(
+        (trial for trial in trials if not trial.get("pruned")),
+        key=lambda row: (int(row.get("epoch") or 0), float(row.get("updated_at") or 0.0)),
+        default=None,
+    )
     activity = _supervisor_activity(run_root, trials, events, manifest)
     return {
         "enabled": True,
@@ -1033,8 +1332,15 @@ def _suite_status(run_root: Path) -> dict[str, Any]:
         "live_trial_count": sum(1 for trial in trials if not trial.get("pruned")),
         "total_games": total_games,
         "total_positions": total_positions,
+        "total_checkpoints": total_checkpoints,
+        "event_count": len(events),
+        "warning_count": warning_count,
         "best_trial_id": best.get("trial_id") if best else None,
         "best_score": best.get("score") if best else None,
+        "leading_trial_id": leading.get("trial_id") if leading else None,
+        "leading_trial_label": leading.get("trial_label") if leading else None,
+        "leading_epoch": leading.get("epoch") if leading else None,
+        "leading_loss_total": leading.get("loss_total") if leading else None,
         "manifest": manifest,
         "state_elapsed_s": state.get("elapsed_s"),
         "host": manifest.get("host", {}),
@@ -1047,6 +1353,7 @@ def _suite_status(run_root: Path) -> dict[str, Any]:
         "current_stage": activity.get("stage") or latest_stage,
         "last_event_name": (events[-1] if events else {}).get("event"),
         "last_event_time": (events[-1] if events else {}).get("time"),
+        "phase2": phase2,
     }
 
 
@@ -1056,10 +1363,18 @@ def _suite_trial_detail(run_root: Path, trial_id: str) -> dict[str, Any]:
         return {}
     state = next((trial for trial in _suite_state(run_root).get("trials", []) if trial.get("trial_id") == trial_id), {})
     trial_json = _read_json(trial_dir / "trial.json")
+    if not trial_json:
+        trial_json = _read_json(trial_dir / "optuna_trial.json")
     latest = _read_json(trial_dir / "LATEST.json")
+    latest_metrics = _suite_latest_metrics(trial_dir)
+    if not latest:
+        latest = dict(latest_metrics.get("latest") or {})
+        latest["train"] = latest_metrics.get("train") or {}
+        latest["selfplay"] = latest_metrics.get("selfplay") or {}
+        latest["buffer"] = latest_metrics.get("buffer") or {}
     scores = _jsonl_tail(trial_dir / "scores.jsonl", limit=12)
     summaries = _jsonl_tail(trial_dir / "summary.jsonl", limit=12)
-    events = _jsonl_tail(trial_dir / "events.jsonl", limit=80)
+    events = _suite_events_for_trial(trial_dir, limit=80)
     checkpoints = _suite_checkpoints(run_root, run_id=trial_id)
     checkpoint_path = (
         state.get("checkpoint_path")
@@ -1067,7 +1382,7 @@ def _suite_trial_detail(run_root: Path, trial_id: str) -> dict[str, Any]:
         or (checkpoints[0].get("path") if checkpoints else "")
     )
     checkpoint = _checkpoint_metadata(Path(checkpoint_path)) if checkpoint_path else {}
-    cfg = checkpoint.get("cfg") or {}
+    cfg = checkpoint.get("cfg") or _suite_trial_config(trial_dir, trial_json)
     model_metadata = checkpoint.get("model_metadata") or cfg.get("model") or {}
     family = state.get("family") or trial_json.get("family") or {}
     static = state.get("static") or trial_json.get("static") or latest.get("static") or {}
@@ -1084,6 +1399,8 @@ def _suite_trial_detail(run_root: Path, trial_id: str) -> dict[str, Any]:
     }
     return {
         "trial_id": trial_id,
+        "run_id": _suite_primary_run_id(trial_dir),
+        "trial_label": _trial_display_name(trial_id),
         "trial_dir": str(trial_dir),
         "trial": trial_json,
         "state": state,
@@ -1098,6 +1415,7 @@ def _suite_trial_detail(run_root: Path, trial_id: str) -> dict[str, Any]:
         "architecture": architecture,
         "architecture_summary": _architecture_summary(architecture, family),
         "current_activity": _trial_activity(events, latest),
+        "phase2": next((row for row in _suite_phase2_rows(run_root) if row.get("trial_id") == trial_id), {}),
     }
 
 
@@ -1121,8 +1439,162 @@ def _suite_trial_counts(trial_dir: Path) -> dict[str, int]:
             rows = store.rows(f"SELECT COUNT(*) AS n FROM {table}")
             counts[key] = int(rows[0]["n"] if rows else 0)
     except Exception:
-        pass
+            pass
     return counts
+
+
+def _suite_latest_event(trial_dir: Path) -> dict[str, Any]:
+    for row in reversed(_jsonl_tail(trial_dir / "events.jsonl", limit=80)):
+        if _suite_event_is_useful(row):
+            normalized = _normalize_suite_event(row, trial_id=trial_dir.name)
+            return normalized
+    return {}
+
+
+def _suite_events(run_root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _jsonl_tail(run_root / "events.jsonl", limit=limit):
+        rows.append(_normalize_suite_event(row, trial_id=str(row.get("trial_id") or row.get("candidate_id") or "")))
+    per_trial_limit = max(80, min(300, limit))
+    for trial_dir in _suite_game_trial_dirs(run_root):
+        rows.extend(_suite_events_for_trial(trial_dir, limit=per_trial_limit))
+    unique: dict[tuple[str, str, str, float, int], dict[str, Any]] = {}
+    for row in rows:
+        if not row or not _suite_event_is_useful(row):
+            continue
+        key = (
+            str(row.get("trial_id") or ""),
+            str(row.get("event") or row.get("event_type") or ""),
+            str(row.get("phase") or ""),
+            float(row.get("time") or row.get("created_at") or 0.0),
+            int(row.get("epoch") or -1),
+        )
+        unique[key] = row
+    ordered = sorted(
+        unique.values(),
+        key=lambda row: (
+            float(row.get("time") or row.get("created_at") or 0.0),
+            str(row.get("trial_id") or ""),
+            str(row.get("event") or ""),
+        ),
+    )
+    return ordered[-limit:]
+
+
+def _suite_events_for_trial(trial_dir: Path, *, limit: int = 200) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _jsonl_tail(trial_dir / "events.jsonl", limit=limit):
+        if not _suite_event_is_useful(row):
+            continue
+        rows.append(_normalize_suite_event(row, trial_id=trial_dir.name))
+    return rows
+
+
+def _suite_event_is_useful(row: dict[str, Any]) -> bool:
+    event = str(row.get("event") or row.get("event_type") or "")
+    if not event:
+        return False
+    return event != "game_recorded"
+
+
+def _normalize_suite_event(row: dict[str, Any], *, trial_id: str) -> dict[str, Any]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    train = payload.get("train") or payload.get("train_stats") or row.get("train") or {}
+    train = train if isinstance(train, dict) else {}
+    buffer_stats = payload.get("buffer") or payload.get("buffer_stats") or row.get("buffer") or {}
+    buffer_stats = buffer_stats if isinstance(buffer_stats, dict) else {}
+    event = str(row.get("event") or row.get("event_type") or "")
+    resolved_trial_id = trial_id or str(row.get("trial_id") or row.get("candidate_id") or "")
+    normalized = {
+        "event": event,
+        "event_type": row.get("event_type") or row.get("event") or event,
+        "severity": _suite_event_severity(row),
+        "stage": row.get("stage") or payload.get("stage") or "",
+        "trial_id": resolved_trial_id,
+        "trial_label": _trial_display_name(resolved_trial_id),
+        "phase": row.get("phase") or payload.get("phase") or "",
+        "epoch": row.get("epoch") if row.get("epoch") is not None else payload.get("epoch") or train.get("epoch"),
+        "global_step": row.get("global_step") if row.get("global_step") is not None else train.get("global_step"),
+        "reason": row.get("reason") or row.get("prune_reason") or payload.get("reason") or "",
+        "action": row.get("action") or payload.get("action") or "",
+        "start_epoch": row.get("start_epoch") or payload.get("start_epoch"),
+        "end_epoch": row.get("end_epoch") or payload.get("end_epoch"),
+        "completed_epochs": row.get("completed_epochs") or payload.get("completed_epochs"),
+        "expected_epoch": row.get("expected_epoch") or payload.get("expected_epoch"),
+        "metric": row.get("metric") or payload.get("metric"),
+        "value": row.get("value") if row.get("value") is not None else payload.get("value"),
+        "score": _finite_or_none(row.get("score") or row.get("scheduler_score") or payload.get("score")),
+        "loss_total": _finite_or_none(train.get("loss_total")),
+        "loss_value": _finite_or_none(train.get("loss_value")),
+        "value_weight_mean": _finite_or_none(train.get("value_weight_mean")),
+        "value_weight_zero_frac": _finite_or_none(train.get("value_weight_zero_frac")),
+        "positions_per_min": _finite_or_none(payload.get("positions_per_min") or row.get("positions_per_min")),
+        "positions_done": payload.get("positions_done") or buffer_stats.get("positions_done"),
+        "games_done": payload.get("games_done") or buffer_stats.get("games_done"),
+        "truncation_rate": _finite_or_none(payload.get("truncation_rate") or buffer_stats.get("truncation_rate")),
+        "truncated_games": payload.get("truncated_games") or buffer_stats.get("truncated_games"),
+        "terminal_reason_win": payload.get("terminal_reason_win") or buffer_stats.get("terminal_reason_win"),
+        "terminal_reason_max_game_moves": payload.get("terminal_reason_max_game_moves")
+        or buffer_stats.get("terminal_reason_max_game_moves"),
+        "recorder_failures": payload.get("recorder_failures") or buffer_stats.get("recorder_failures"),
+        "checkpoint_path": row.get("checkpoint_path") or payload.get("checkpoint_path") or payload.get("path"),
+        "elapsed_s": row.get("elapsed_s") or payload.get("elapsed_s"),
+        "hexo_status": row.get("hexo_status") or payload.get("hexo_status") or "",
+        "time": row.get("time") or row.get("created_at") or payload.get("time"),
+        "source": "trial" if resolved_trial_id else "suite",
+    }
+    normalized["positions_per_sec"] = _event_positions_per_second(normalized)
+    normalized["message"] = _suite_event_message(normalized)
+    return normalized
+
+
+def _suite_event_severity(row: dict[str, Any]) -> str:
+    event = str(row.get("event") or row.get("event_type") or "")
+    if event in {"training_signal_warning", "runtime_warning", "warning"}:
+        return "warning"
+    if event in {"trial_pruned", "candidate_quarantined", "runtime_quarantine", "hard_failure"}:
+        return "error"
+    return "info"
+
+
+def _suite_event_message(event: dict[str, Any]) -> str:
+    event_name = str(event.get("event") or event.get("event_type") or "")
+    label = event.get("trial_label") or _trial_display_name(str(event.get("trial_id") or event.get("candidate_id") or ""))
+    epoch = event.get("epoch")
+    phase = str(event.get("phase") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if event_name == "metric" and phase == "selfplay":
+        positions = event.get("positions_done") or payload.get("positions_done")
+        trunc = event.get("truncation_rate") if event.get("truncation_rate") is not None else payload.get("truncation_rate")
+        return f"{label} self-play: {format_count_py(positions)} positions, trunc {format_float_py(trunc)}"
+    if event_name == "metric" and phase == "train":
+        loss = event.get("loss_total")
+        if loss is None:
+            train = payload.get("train") or {}
+            loss = train.get("loss_total")
+        return f"{label} train epoch {epoch or '-'}: loss {format_float_py(loss)}"
+    if event_name == "checkpoint":
+        return f"{label} checkpoint saved for epoch {epoch or '-'}"
+    if event_name == "epoch_complete":
+        return f"{label} completed epoch {epoch or '-'}"
+    if event_name == "epoch_start":
+        return f"{label} started an epoch"
+    if event_name == "quantum_started":
+        start = event.get("start_epoch") or payload.get("start_epoch")
+        end = event.get("end_epoch") or payload.get("end_epoch")
+        return f"{label} quantum started for epochs {start or '?'}-{end or '?'}"
+    if event_name == "quantum_completed":
+        completed = event.get("completed_epochs") or payload.get("completed_epochs")
+        return f"{label} quantum completed through epoch {completed or epoch or '-'}"
+    if event_name == "epoch_runner_completed":
+        return f"{label} runner wrote epoch {epoch or event.get('expected_epoch') or '-'}"
+    if event_name == "training_signal_warning":
+        metric = event.get("metric") or payload.get("metric") or "signal"
+        value = event.get("value") if event.get("value") is not None else payload.get("value")
+        return f"{label} warning: {metric} {format_float_py(value)}"
+    if event_name:
+        return f"{label} {_event_blurb(event_name)}"
+    return ""
 
 
 def _suite_score_by_trial(run_root: Path) -> dict[str, float | None]:
@@ -1144,6 +1616,374 @@ def _suite_score_by_trial(run_root: Path) -> dict[str, float | None]:
                 scores[trial_id] = score
                 break
     return scores
+
+
+def _suite_phase2(run_root: Path) -> dict[str, Any]:
+    rows = _suite_phase2_rows(run_root)
+    ranked = [row for row in rows if row.get("phase2_status") == "ready"]
+    pending = [row for row in rows if row.get("phase2_status") == "pending"]
+    excluded = [row for row in rows if row.get("phase2_excluded")]
+    best = ranked[0] if ranked else None
+    latest_summary = _latest_fixed_classical_summary(run_root)
+    return {
+        "enabled": True,
+        "stage": "phase2 fixed-classical review" if ranked else "phase2 pending evidence",
+        "rows": rows,
+        "ranked_count": len(ranked),
+        "pending_count": len(pending),
+        "excluded_count": len(excluded),
+        "best_trial_id": best.get("trial_id") if best else None,
+        "best_label": best.get("trial_label") if best else None,
+        "best_lcb": best.get("classical_survival_lcb") if best else None,
+        "best_mean": best.get("classical_survival_mean") if best else None,
+        "total_classical_games": sum(int(row.get("classical_survival_games") or 0) for row in ranked),
+        "latest_summary_path": str(latest_summary) if latest_summary else "",
+        "updated_at": max([float(row.get("phase2_updated_at") or 0.0) for row in rows] + [_mtime(latest_summary) if latest_summary else 0.0]),
+    }
+
+
+def _suite_phase2_rows(run_root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for trial_dir in _suite_trial_dirs(run_root):
+        trial_id = trial_dir.name
+        trial_json = _read_json(trial_dir / "trial.json") or _read_json(trial_dir / "optuna_trial.json")
+        user_attrs = trial_json.get("user_attrs") if isinstance(trial_json.get("user_attrs"), dict) else {}
+        latest = _read_json(trial_dir / "LATEST.json")
+        latest_metrics = _suite_latest_metrics(trial_dir)
+        cfg = _suite_trial_config(trial_dir, trial_json)
+        model_cfg = cfg.get("model") or {}
+        latest_train = latest.get("train") or latest_metrics.get("train") or {}
+        latest_selfplay = latest.get("selfplay") or latest_metrics.get("selfplay") or {}
+        completed_epochs = user_attrs.get("completed_epochs") or latest.get("epoch") or latest_train.get("epoch") or 0
+        quarantine_reason = user_attrs.get("quarantine_reason")
+        hexo_status = user_attrs.get("hexo_status") or ""
+        scorecard = _latest_classical_scorecard(trial_dir)
+        metrics = scorecard.get("component_metrics") if isinstance(scorecard.get("component_metrics"), dict) else {}
+        metadata = scorecard.get("metadata") if isinstance(scorecard.get("metadata"), dict) else {}
+        fixed_eval = metadata.get("fixed_classical_eval") if isinstance(metadata.get("fixed_classical_eval"), dict) else {}
+        hard_gates = scorecard.get("hard_gates") if isinstance(scorecard.get("hard_gates"), dict) else {}
+        checkpoint_lineage = scorecard.get("checkpoint_lineage") if isinstance(scorecard.get("checkpoint_lineage"), dict) else {}
+        games = _finite_or_none(metrics.get("classical_survival_games"))
+        lcb = _finite_or_none(metrics.get("classical_survival_lcb") or scorecard.get("classical_survival_lcb"))
+        excluded = bool(quarantine_reason or hexo_status in {"quarantined", "failed"})
+        if excluded:
+            phase2_status = "excluded"
+            exclusion_reason = str(quarantine_reason or hexo_status)
+        elif lcb is not None and games and games > 0:
+            phase2_status = "ready"
+            exclusion_reason = ""
+        elif int(completed_epochs or 0) >= 12:
+            phase2_status = "pending"
+            exclusion_reason = "awaiting_fixed_classical_evidence"
+        else:
+            phase2_status = "training"
+            exclusion_reason = "below_epoch_floor"
+        evidence_path = fixed_eval.get("evidence_path") or _latest_fixed_classical_evidence_path(trial_dir)
+        rows.append(
+            {
+                "trial_id": trial_id,
+                "run_id": _suite_primary_run_id(trial_dir),
+                "trial_label": _trial_display_name(trial_id),
+                "architecture": model_cfg.get("architecture") or user_attrs.get("architecture_id") or "",
+                "phase2_status": phase2_status,
+                "phase2_excluded": excluded,
+                "phase2_exclusion_reason": exclusion_reason,
+                "phase2_promoted": phase2_status == "ready",
+                "phase2_rank": None,
+                "epoch": scorecard.get("epoch") or completed_epochs,
+                "classical_survival_lcb": lcb,
+                "classical_survival_mean": _finite_or_none(metrics.get("classical_survival_mean")),
+                "classical_survival_games": games,
+                "classical_win_rate": _finite_or_none(metrics.get("classical_win_rate")),
+                "classical_draw_rate": _finite_or_none(metrics.get("classical_draw_rate")),
+                "classical_avg_moves": _finite_or_none(metrics.get("classical_avg_moves")),
+                "illegal_or_crash_rate": _finite_or_none(metrics.get("illegal_or_crash_rate")),
+                "hard_pass": hard_gates.get("hard_pass") if hard_gates else None,
+                "fixed_classical_evidence_path": str(evidence_path) if evidence_path else "",
+                "scorecard_path": str(trial_dir / "scorecards.jsonl"),
+                "checkpoint_path": scorecard.get("checkpoint_path") or checkpoint_lineage.get("checkpoint_path") or user_attrs.get("latest_checkpoint_path") or "",
+                "phase2_updated_at": _scorecard_time(scorecard) or _mtime(trial_dir / "scorecards.jsonl"),
+                "phase1_truncation_rate": latest_selfplay.get("truncation_rate"),
+                "phase1_value_weight_mean": latest_train.get("value_weight_mean"),
+                "phase1_value_effective_samples": latest_train.get("value_effective_samples"),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            row.get("phase2_status") == "ready",
+            float(row.get("classical_survival_lcb") if row.get("classical_survival_lcb") is not None else float("-inf")),
+            not bool(row.get("phase2_excluded")),
+            float(row.get("phase2_updated_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    best_lcb = next((row.get("classical_survival_lcb") for row in rows if row.get("phase2_status") == "ready"), None)
+    rank = 1
+    for row in rows:
+        if row.get("phase2_status") == "ready":
+            row["phase2_rank"] = rank
+            rank += 1
+            if best_lcb is not None and row.get("classical_survival_lcb") is not None:
+                row["phase2_gap_to_best"] = float(best_lcb) - float(row["classical_survival_lcb"])
+    return rows
+
+
+def _suite_phase3(run_root: Path) -> dict[str, Any]:
+    run_dir = run_root.parent
+    specs = _read_json_list(run_dir / "phase2_review" / "phase3_study_specs.json")
+    rows: list[dict[str, Any]] = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        rows.extend(_suite_phase3_rows_for_spec(run_dir, spec))
+    rows.sort(
+        key=lambda row: (
+            row.get("state") == "COMPLETE",
+            float(row.get("value") if row.get("value") is not None else float("-inf")),
+            float(row.get("updated_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    for rank, row in enumerate([row for row in rows if row.get("state") == "COMPLETE"], start=1):
+        row["phase3_rank"] = rank
+    specs_by_candidate = {
+        str(spec.get("metadata", {}).get("promoted_candidate_id") or ""): spec
+        for spec in specs
+        if isinstance(spec, dict)
+    }
+    running = [row for row in rows if row.get("state") == "RUNNING"]
+    complete = [row for row in rows if row.get("state") == "COMPLETE"]
+    failed = [row for row in rows if row.get("state") in {"FAIL", "FAILED"}]
+    pruned = [row for row in rows if row.get("state") == "PRUNED"]
+    best = complete[0] if complete else None
+    summary = _latest_phase3_summary(run_dir)
+    return {
+        "enabled": True,
+        "stage": "phase3 tuning running" if running else ("phase3 evidence complete" if complete else "phase3 studies ready"),
+        "spec_count": len(specs),
+        "study_count": len(specs_by_candidate),
+        "trial_count": len(rows),
+        "running_count": len(running),
+        "complete_count": len(complete),
+        "pruned_count": len(pruned),
+        "failed_count": len(failed),
+        "best_trial_id": best.get("phase3_candidate_id") if best else None,
+        "best_promoted_candidate_id": best.get("promoted_candidate_id") if best else None,
+        "best_value": best.get("value") if best else None,
+        "latest_summary_path": str(summary) if summary else "",
+        "updated_at": max([float(row.get("updated_at") or 0.0) for row in rows] + [_mtime(summary) if summary else 0.0]),
+        "rows": rows,
+        "specs": [
+            {
+                "promoted_candidate_id": str(spec.get("metadata", {}).get("promoted_candidate_id") or ""),
+                "study_name": spec.get("study_name"),
+                "storage": spec.get("storage"),
+                "search_knobs": (spec.get("search_scope") or {}).get("knobs", []),
+                "sampler": (spec.get("sampler") or {}).get("type", ""),
+                "pruner": (spec.get("pruner") or {}).get("type", ""),
+                "phase2_lcb": (spec.get("metadata") or {}).get("phase2_classical_survival_lcb"),
+            }
+            for spec in specs
+            if isinstance(spec, dict)
+        ],
+    }
+
+
+def _suite_phase3_rows_for_spec(run_dir: Path, spec: dict[str, Any]) -> list[dict[str, Any]]:
+    storage = str(spec.get("storage") or "")
+    study_name = str(spec.get("study_name") or "")
+    metadata = spec.get("metadata") if isinstance(spec.get("metadata"), dict) else {}
+    promoted_candidate_id = str(metadata.get("promoted_candidate_id") or "")
+    db_path = _sqlite_path_from_storage(storage)
+    if db_path is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return rows
+    try:
+        trials = con.execute(
+            "SELECT trial_id, number, state, datetime_start, datetime_complete FROM trials ORDER BY number"
+        ).fetchall()
+        for trial in trials:
+            trial_id = int(trial["trial_id"])
+            params = _optuna_trial_params(con, trial_id)
+            user_attrs = _optuna_trial_attrs(con, trial_id, "trial_user_attributes")
+            phase3_candidate_id = str(user_attrs.get("hexo_phase3_candidate_id") or f"{promoted_candidate_id}__phase3_t{int(trial['number']):04d}")
+            trial_dir = Path(str(user_attrs.get("hexo_trial_dir") or run_dir / "phase3_trials" / phase3_candidate_id))
+            if not trial_dir.is_absolute():
+                trial_dir = Path.cwd() / trial_dir if str(trial_dir).startswith("runs") else run_dir / trial_dir
+            value = _optuna_trial_value(con, trial_id)
+            scorecard = _latest_classical_scorecard(trial_dir)
+            metrics = scorecard.get("component_metrics") if isinstance(scorecard.get("component_metrics"), dict) else {}
+            latest_train = _latest_phase3_train_scorecard(trial_dir)
+            train_metrics = latest_train.get("component_metrics") if isinstance(latest_train.get("component_metrics"), dict) else {}
+            manifest = _read_json(trial_dir / "trial_manifest.json")
+            latest_checkpoint = user_attrs.get("hexo_latest_checkpoint_path") or scorecard.get("checkpoint_path") or latest_train.get("checkpoint_path")
+            events = _jsonl_tail(trial_dir / "events.jsonl", limit=16)
+            rows.append(
+                {
+                    "phase3_candidate_id": phase3_candidate_id,
+                    "promoted_candidate_id": promoted_candidate_id,
+                    "promoted_label": _trial_display_name(promoted_candidate_id),
+                    "study_name": study_name,
+                    "storage": storage,
+                    "trial_number": int(trial["number"]),
+                    "state": trial["state"],
+                    "value": value,
+                    "phase3_rank": None,
+                    "target_epoch": user_attrs.get("hexo_target_epoch") or manifest.get("target_epoch"),
+                    "completed_epochs": user_attrs.get("hexo_completed_epochs") or latest_train.get("epoch"),
+                    "classical_survival_lcb": _finite_or_none(metrics.get("classical_survival_lcb") or scorecard.get("classical_survival_lcb") or value),
+                    "classical_survival_mean": _finite_or_none(metrics.get("classical_survival_mean")),
+                    "classical_survival_games": _finite_or_none(metrics.get("classical_survival_games")),
+                    "classical_win_rate": _finite_or_none(metrics.get("classical_win_rate")),
+                    "classical_draw_rate": _finite_or_none(metrics.get("classical_draw_rate")),
+                    "classical_avg_moves": _finite_or_none(metrics.get("classical_avg_moves")),
+                    "loss_total": _finite_or_none(train_metrics.get("loss_total")),
+                    "loss_value": _finite_or_none(train_metrics.get("loss_value")),
+                    "value_weight_mean": _finite_or_none(train_metrics.get("value_weight_mean")),
+                    "mcts_simulations": params.get("mcts_simulations"),
+                    "pcr_low_sims_ratio": params.get("pcr_low_sims_ratio"),
+                    "c_puct": params.get("c_puct"),
+                    "lr_multiplier": params.get("lr_multiplier"),
+                    "value_loss_weight": params.get("value_loss_weight"),
+                    "params": params,
+                    "trial_dir": str(trial_dir),
+                    "checkpoint_path": str(latest_checkpoint or ""),
+                    "scorecard_path": str(trial_dir / "scorecards.jsonl") if (trial_dir / "scorecards.jsonl").exists() else "",
+                    "events_path": str(trial_dir / "events.jsonl") if (trial_dir / "events.jsonl").exists() else "",
+                    "last_event": (events[-1].get("event") or events[-1].get("event_type") or "") if events else "",
+                    "last_event_message": _suite_event_message(_normalize_suite_event(events[-1], trial_id=phase3_candidate_id)) if events else "",
+                    "started_at": trial["datetime_start"],
+                    "completed_at": trial["datetime_complete"],
+                    "updated_at": max(_mtime(trial_dir), _mtime(trial_dir / "events.jsonl"), _mtime(trial_dir / "scorecards.jsonl"), _timestamp_from_sqlite(trial["datetime_complete"]), _timestamp_from_sqlite(trial["datetime_start"])),
+                }
+            )
+    finally:
+        con.close()
+    return rows
+
+
+def _sqlite_path_from_storage(storage: str) -> Path | None:
+    prefix = "sqlite:///"
+    if not storage.startswith(prefix):
+        return None
+    return Path(storage[len(prefix):])
+
+
+def _optuna_trial_value(con: sqlite3.Connection, trial_id: int) -> float | None:
+    try:
+        row = con.execute("SELECT value FROM trial_values WHERE trial_id=? ORDER BY objective LIMIT 1", (trial_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return _finite_or_none(row["value"]) if row else None
+
+
+def _optuna_trial_params(con: sqlite3.Connection, trial_id: int) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    try:
+        rows = con.execute("SELECT param_name, param_value, distribution_json FROM trial_params WHERE trial_id=?", (trial_id,)).fetchall()
+    except sqlite3.Error:
+        return params
+    for row in rows:
+        params[str(row["param_name"])] = _decode_optuna_param(row["param_value"], row["distribution_json"])
+    return params
+
+
+def _decode_optuna_param(value: Any, distribution_json: str | None) -> Any:
+    try:
+        dist = json.loads(distribution_json or "{}")
+    except json.JSONDecodeError:
+        return _finite_or_none(value)
+    attrs = dist.get("attributes") if isinstance(dist.get("attributes"), dict) else {}
+    choices = attrs.get("choices")
+    if isinstance(choices, list):
+        try:
+            idx = int(float(value))
+            return choices[idx]
+        except (TypeError, ValueError, IndexError):
+            return value
+    return _finite_or_none(value)
+
+
+def _optuna_trial_attrs(con: sqlite3.Connection, trial_id: int, table: str) -> dict[str, Any]:
+    attrs: dict[str, Any] = {}
+    try:
+        rows = con.execute(f"SELECT key, value_json FROM {table} WHERE trial_id=?", (trial_id,)).fetchall()
+    except sqlite3.Error:
+        return attrs
+    for row in rows:
+        try:
+            attrs[str(row["key"])] = json.loads(row["value_json"])
+        except json.JSONDecodeError:
+            attrs[str(row["key"])] = row["value_json"]
+    return attrs
+
+
+def _latest_phase3_train_scorecard(trial_dir: Path) -> dict[str, Any]:
+    for row in reversed(_jsonl_tail(trial_dir / "scorecards.jsonl", limit=64)):
+        metrics = row.get("component_metrics") if isinstance(row.get("component_metrics"), dict) else {}
+        if metrics.get("loss_total") is not None:
+            return row
+    return {}
+
+
+def _latest_phase3_summary(run_dir: Path) -> Path | None:
+    paths = sorted(run_dir.glob("phase3_runner_summary*.json"), key=_mtime)
+    return paths[-1] if paths else None
+
+
+def _timestamp_from_sqlite(value: Any) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace(" ", "T").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _latest_classical_scorecard(trial_dir: Path) -> dict[str, Any]:
+    for row in reversed(_jsonl_tail(trial_dir / "scorecards.jsonl", limit=64)):
+        metrics = row.get("component_metrics") if isinstance(row.get("component_metrics"), dict) else {}
+        games = _finite_or_none(metrics.get("classical_survival_games"))
+        if games is not None and games > 0:
+            return row
+    return {}
+
+
+def _latest_fixed_classical_evidence_path(trial_dir: Path) -> Path | None:
+    paths = sorted(trial_dir.glob("fixed_classical_epoch_*_games.jsonl"), key=_mtime)
+    return paths[-1] if paths else None
+
+
+def _latest_fixed_classical_summary(run_root: Path) -> Path | None:
+    suite_manifest = _read_json(run_root / "manifest.json")
+    source = suite_manifest.get("source_run_dir")
+    candidates = []
+    if source:
+        candidates.append(Path(str(source)))
+    candidates.append(run_root.parent)
+    for root in candidates:
+        if not root.exists():
+            continue
+        summaries = sorted(root.glob("*fixed_classical*_summary*.json"), key=_mtime)
+        summaries.extend(sorted(root.glob("*fixed_classical*_games.json"), key=_mtime))
+        if summaries:
+            return summaries[-1]
+    return None
+
+
+def _scorecard_time(scorecard: dict[str, Any]) -> float:
+    created_at = scorecard.get("created_at")
+    if isinstance(created_at, str) and created_at:
+        try:
+            return datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _latest_suite_stage(
@@ -1192,6 +2032,9 @@ def _supervisor_activity(
             latest_trial_id = str(event.get("trial_id"))
             break
     trial = trial_by_id.get(latest_trial_id, {})
+    if not trial and trials:
+        trial = max(trials, key=lambda row: float(row.get("updated_at") or 0.0))
+        latest_trial_id = str(trial.get("trial_id") or "")
     log_lines = _tail_lines(run_root / "supervisor.log", limit=120)
     progress = _last_progress(log_lines)
     latest_event = events[-1] if events else {}
@@ -1207,13 +2050,17 @@ def _supervisor_activity(
     if progress:
         action = f"Self-play running, {progress['progress_pct']:.1f}% of current epoch"
     elif latest_event.get("event"):
-        action = _event_blurb(str(latest_event.get("event")))
+        action = latest_event.get("message") or _event_blurb(str(latest_event.get("event")))
+    elif trial:
+        action = f"{trial.get('trial_label') or latest_trial_id} last wrote epoch {trial.get('epoch') or '-'}"
     stage = latest_event.get("stage") or trial.get("stage") or ""
     return {
         "trial_id": latest_trial_id or None,
-        "model": trial.get("family") or latest_event.get("family") or None,
+        "model": trial.get("trial_label") or trial.get("family") or latest_event.get("family") or None,
         "architecture": trial.get("architecture") or None,
         "stage": stage,
+        "epoch": trial.get("epoch"),
+        "loss_total": trial.get("loss_total"),
         "action": action,
         "positions_per_sec": positions_per_sec,
         "progress": progress,
@@ -1326,6 +2173,14 @@ def _event_positions_per_second(event: dict[str, Any]) -> float | None:
 
 def _event_blurb(event: str) -> str:
     return {
+        "metric": "metric was recorded",
+        "checkpoint": "checkpoint was indexed",
+        "epoch_complete": "epoch completed",
+        "epoch_start": "epoch started",
+        "quantum_started": "round-robin quantum started",
+        "quantum_completed": "round-robin quantum completed",
+        "epoch_runner_completed": "epoch runner completed",
+        "training_signal_warning": "training signal warning",
         "runtime_sweep_start": "Runtime sweep is testing worker/batch settings",
         "runtime_sweep_result": "Runtime sweep recorded a probe result",
         "runtime_sweep_selected": "Runtime sweep selected the fastest stable setting",
@@ -1337,6 +2192,20 @@ def _event_blurb(event: str) -> str:
     }.get(event, event.replace("_", " "))
 
 
+def format_count_py(value: Any) -> str:
+    try:
+        return f"{int(float(value)):,}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def format_float_py(value: Any) -> str:
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -1345,6 +2214,16 @@ def _read_json(path: Path) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _read_json_list(path: Path) -> list[Any]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 def _mtime(path: Path) -> float:

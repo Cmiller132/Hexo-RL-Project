@@ -8,6 +8,7 @@ scorecard evidence before allowing Optuna pruning or ranking to matter.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import shutil
@@ -27,6 +28,7 @@ from hexorl.tuning.fixed_classical_eval import (
 )
 from hexorl.tuning.optuna_tuning import (
     Phase3StudySpec,
+    create_phase3_sampler,
     create_phase3_study,
     mark_trial_hexo_artifacts,
 )
@@ -219,18 +221,25 @@ class EpochPhase3TrialRunner:
             latest_checkpoint = result.checkpoint_path or latest_checkpoint
             if latest_checkpoint is None:
                 raise Phase3HardFailure("phase3_trial_missing_checkpoint")
+            train_scorecard = _train_scorecard(
+                request,
+                epoch=latest_epoch,
+                checkpoint_path=latest_checkpoint,
+                parent_checkpoint=parent_checkpoint,
+                elapsed_s=float(result.elapsed_s),
+                train_stats=result.train_stats,
+                buffer_stats=result.buffer_stats,
+            )
             append_scorecard(
                 request.trial_dir / "scorecards.jsonl",
-                _train_scorecard(
-                    request,
-                    epoch=latest_epoch,
-                    checkpoint_path=latest_checkpoint,
-                    parent_checkpoint=parent_checkpoint,
-                    elapsed_s=float(result.elapsed_s),
-                    train_stats=result.train_stats,
-                    buffer_stats=result.buffer_stats,
-                ),
+                train_scorecard,
             )
+            for warning in _training_signal_warning_events(
+                request.phase3_candidate_id,
+                latest_epoch,
+                train_scorecard.component_metrics,
+            ):
+                _append_jsonl(request.trial_dir / "events.jsonl", warning)
             _append_jsonl(
                 request.trial_dir / "events.jsonl",
                 {
@@ -307,17 +316,27 @@ class Phase3OptunaTpeRunner:
 
     def _run_study(self, spec: Phase3StudySpec) -> Phase3StudyRunSummary:
         optuna = _import_optuna()
+        seed = _effective_seed_from_spec(spec, existing_trials=0)
+        n_startup_trials = _n_startup_trials_from_spec(spec)
         study = create_phase3_study(
             architecture_id=spec.architecture_id,
             pair_mode=spec.pair_mode,
             storage=spec.storage,
-            seed=_seed_from_spec(spec),
+            seed=seed,
+            signal_floor_epoch=_signal_floor_epoch_from_spec(spec),
+            reduction_factor=_reduction_factor_from_spec(spec),
+            n_startup_trials=n_startup_trials,
             load_if_exists=True,
         )
         existing_trials = len(study.get_trials(deepcopy=False))
         remaining = max(0, self.n_trials_per_study - existing_trials)
         started = 0
         if remaining:
+            if _seed_from_spec(spec) is not None:
+                study.sampler = create_phase3_sampler(
+                    seed=_effective_seed_from_spec(spec, existing_trials=existing_trials),
+                    n_startup_trials=n_startup_trials,
+                )
             study.optimize(
                 lambda trial: self._objective(spec, study, trial),
                 n_trials=remaining,
@@ -477,6 +496,12 @@ def suggest_phase3_params(trial: Any, spec: Phase3StudySpec) -> dict[str, float]
         params["c_puct"] = float(trial.suggest_float("c_puct", 1.0, 2.25))
     if "c_puct_init" in knobs:
         params["c_puct_init"] = float(trial.suggest_float("c_puct_init", 8_000.0, 30_000.0, log=True))
+    if "mcts_simulations" in knobs:
+        params["mcts_simulations"] = float(
+            trial.suggest_categorical("mcts_simulations", [384, 448, 512, 576, 640, 704, 768, 800])
+        )
+    if "pcr_low_sims_ratio" in knobs:
+        params["pcr_low_sims_ratio"] = float(trial.suggest_float("pcr_low_sims_ratio", 0.20, 0.40))
     if "dirichlet_fraction" in knobs:
         params["dirichlet_fraction"] = float(trial.suggest_float("dirichlet_fraction", 0.10, 0.35))
     if "scaled_alpha_total" in knobs:
@@ -511,6 +536,14 @@ def apply_phase3_params(config: Config, params: Mapping[str, float], *, pair_mod
         selfplay["c_puct"] = float(params["c_puct"])
     if "c_puct_init" in params:
         selfplay["c_puct_init"] = float(params["c_puct_init"])
+    if "mcts_simulations" in params:
+        selfplay["mcts_simulations"] = int(params["mcts_simulations"])
+    if "pcr_low_sims_ratio" in params:
+        full_sims = int(selfplay.get("mcts_simulations", config.selfplay.mcts_simulations))
+        selfplay["pcr_low_sims"] = _pcr_low_sims_from_ratio(full_sims, float(params["pcr_low_sims_ratio"]))
+    elif "mcts_simulations" in params:
+        full_sims = int(selfplay["mcts_simulations"])
+        selfplay["pcr_low_sims"] = min(int(selfplay.get("pcr_low_sims", full_sims)), max(1, full_sims - 32))
     if "dirichlet_fraction" in params:
         selfplay["dirichlet_fraction"] = float(params["dirichlet_fraction"])
     if "scaled_alpha_total" in params:
@@ -567,16 +600,27 @@ def _train_scorecard(
         "buffer_size": _finite_float(buffer_stats.get("size", 0.0)),
         "selfplay_games_per_epoch": float(request.config.selfplay.games_per_epoch),
         "selfplay_states_per_epoch": float(request.config.selfplay.states_per_epoch),
+        "selfplay_max_game_moves": float(request.config.selfplay.max_game_moves),
+        "selfplay_mcts_simulations": float(request.config.selfplay.mcts_simulations),
+        "selfplay_pcr_low_sims": float(request.config.selfplay.pcr_low_sims),
         "train_batches_per_epoch": float(request.config.train.batches_per_epoch),
         "train_loss": _train_stat_float(train_stats, "loss_total", "loss", "total"),
         "loss_total": _train_stat_float(train_stats, "loss_total", "loss", "total"),
         "loss_policy_place": _train_stat_float(train_stats, "loss_policy_place", "policy_place", "policy"),
         "loss_value": _train_stat_float(train_stats, "loss_value", "value"),
+        "value_weight_mean": _train_stat_float(train_stats, "value_weight_mean"),
+        "value_weight_zero_frac": _train_stat_float(train_stats, "value_weight_zero_frac"),
+        "value_effective_samples": _value_effective_samples(request.config, train_stats),
         "pair_policy_weight_mean": _train_stat_float(train_stats, "pair_policy_weight_mean"),
         "batches_per_sec": _train_stat_float(train_stats, "batches_per_sec"),
         "graph_peak_cuda_allocated_mb": _train_stat_float(train_stats, "graph_peak_cuda_allocated_mb"),
         "graph_microbatch_oom_retries": _train_stat_float(train_stats, "graph_microbatch_oom_retries"),
         "graph_microbatch_nonfinite_retries": _train_stat_float(train_stats, "graph_microbatch_nonfinite_retries"),
+        "selfplay_games_done": _train_stat_float(buffer_stats, "games_done"),
+        "selfplay_positions_done": _train_stat_float(buffer_stats, "positions_done"),
+        "truncated_games": _train_stat_float(buffer_stats, "truncated_games"),
+        "truncation_rate": _train_stat_float(buffer_stats, "truncation_rate"),
+        "terminal_reason_max_game_moves": _train_stat_float(buffer_stats, "terminal_reason_max_game_moves"),
     }
     return ScorecardRecord(
         candidate_id=request.phase3_candidate_id,
@@ -709,6 +753,79 @@ def _validate_child_identity(base: Config, child: Config, spec: Phase3StudySpec)
 def _seed_from_spec(spec: Phase3StudySpec) -> int | None:
     seed = spec.sampler.get("seed")
     return int(seed) if seed is not None else None
+
+
+def _effective_seed_from_spec(spec: Phase3StudySpec, *, existing_trials: int) -> int | None:
+    seed = _seed_from_spec(spec)
+    if seed is None:
+        return None
+    promoted = str(spec.metadata.get("promoted_candidate_id") or "")
+    identity = f"{spec.study_name}|{spec.architecture_id}|{spec.pair_mode}|{promoted}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    study_offset = int(digest[:8], 16)
+    return int(seed) + study_offset + int(existing_trials)
+
+
+def _n_startup_trials_from_spec(spec: Phase3StudySpec) -> int:
+    return max(1, int(spec.sampler.get("n_startup_trials", 8) or 8))
+
+
+def _signal_floor_epoch_from_spec(spec: Phase3StudySpec) -> int:
+    return max(1, int(spec.pruner.get("signal_floor_epoch", 12) or 12))
+
+
+def _reduction_factor_from_spec(spec: Phase3StudySpec) -> int:
+    delegate = spec.pruner.get("delegate") if isinstance(spec.pruner, Mapping) else None
+    if isinstance(delegate, Mapping):
+        return max(2, int(delegate.get("reduction_factor", 2) or 2))
+    return 2
+
+
+def _pcr_low_sims_from_ratio(full_sims: int, ratio: float) -> int:
+    full_sims = max(1, int(full_sims))
+    raw = int(round(float(full_sims) * float(ratio) / 32.0) * 32)
+    low = max(32, raw)
+    return max(1, min(low, max(1, full_sims - 32)))
+
+
+def _value_effective_samples(config: Config, train_stats: Mapping[str, Any] | None) -> float:
+    zero_frac = min(max(_train_stat_float(train_stats, "value_weight_zero_frac"), 0.0), 1.0)
+    return float(config.train.batch_size) * max(0.0, 1.0 - zero_frac)
+
+
+def _training_signal_warning_events(
+    candidate_id: str,
+    epoch: int,
+    metrics: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    events: list[dict[str, Any]] = []
+    truncation_rate = float(metrics.get("truncation_rate", 0.0) or 0.0)
+    value_zero_frac = float(metrics.get("value_weight_zero_frac", 0.0) or 0.0)
+    if truncation_rate > 0.25:
+        events.append(
+            {
+                "event": "training_signal_warning",
+                "candidate_id": candidate_id,
+                "epoch": int(epoch),
+                "metric": "truncation_rate",
+                "value": truncation_rate,
+                "threshold": 0.25,
+                "action": "monitor_not_strength_prune",
+            }
+        )
+    if value_zero_frac > 0.50:
+        events.append(
+            {
+                "event": "training_signal_warning",
+                "candidate_id": candidate_id,
+                "epoch": int(epoch),
+                "metric": "value_weight_zero_frac",
+                "value": value_zero_frac,
+                "threshold": 0.50,
+                "action": "monitor_not_strength_prune",
+            }
+        )
+    return tuple(events)
 
 
 def _train_stat_float(values: Mapping[str, Any] | None, *keys: str) -> float:

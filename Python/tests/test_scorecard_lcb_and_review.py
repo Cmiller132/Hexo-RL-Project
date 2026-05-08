@@ -395,6 +395,8 @@ def test_phase3_study_spec_names_per_family_pair_mode_and_tpe_floor_pruner():
     assert spec.pruner["signal_floor_epoch"] == 12
     assert spec.pruner["requires_scorecard_written"] is True
     assert spec.pruner["delegate"]["type"] == "SuccessiveHalvingPruner"
+    assert "mcts_simulations" in spec.search_scope["knobs"]
+    assert "pcr_low_sims_ratio" in spec.search_scope["knobs"]
     assert "pair_prior_mix" in spec.search_scope["knobs"]
     assert spec.metadata["hexo_hard_gates_before_optuna"] is True
 

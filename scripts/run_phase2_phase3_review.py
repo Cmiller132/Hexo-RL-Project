@@ -26,6 +26,7 @@ def main() -> int:
     parser.add_argument("--phase3-storage-template", default="")
     parser.add_argument("--phase3-max-promoted", type=int, default=None)
     parser.add_argument("--phase3-seed", type=int, default=None)
+    parser.add_argument("--phase3-tpe-startup-trials", type=int, default=8)
     parser.add_argument("--create-phase3-studies", action="store_true")
     args = parser.parse_args()
 
@@ -46,6 +47,7 @@ def main() -> int:
             report,
             storage_template=args.phase3_storage_template,
             seed=args.phase3_seed,
+            n_startup_trials=args.phase3_tpe_startup_trials,
             max_promoted=args.phase3_max_promoted,
         )
         specs_payload = [asdict(spec) for spec in specs]
@@ -61,6 +63,7 @@ def main() -> int:
                     pair_mode=spec.pair_mode,
                     storage=spec.storage,
                     seed=args.phase3_seed,
+                    n_startup_trials=args.phase3_tpe_startup_trials,
                     load_if_exists=True,
                 )
 

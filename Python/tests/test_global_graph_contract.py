@@ -57,6 +57,11 @@ def _hist(*moves):
     return bytes(data)
 
 
+def test_graph_training_retries_cublas_internal_errors_as_memory_like_failures():
+    assert Trainer._is_cuda_oom(RuntimeError("CUDA error: CUBLAS_STATUS_INTERNAL_ERROR"))
+    assert Trainer._is_cuda_oom(RuntimeError("cublasStatusExecutionFailed in backward"))
+
+
 def _must_block_history():
     return _hist(
         (0, 0, 0),

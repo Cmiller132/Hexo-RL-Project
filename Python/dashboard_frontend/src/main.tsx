@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -43,6 +43,52 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+function replayQuery(
+  runId: string,
+  options: { includePositions?: boolean; compact?: boolean } = {}
+) {
+  const params = new URLSearchParams();
+  if (runId) params.set("run_id", runId);
+  if (options.includePositions !== undefined) {
+    params.set("include_positions", options.includePositions ? "true" : "false");
+  }
+  if (options.compact !== undefined) params.set("compact", options.compact ? "true" : "false");
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function moveWindow(moves: AnyRow[], turn: number, radius = 24) {
+  const center = clamp(Math.round(turn), 0, moves.length);
+  const start = clamp(center - radius, 0, moves.length);
+  const end = clamp(center + radius, 0, moves.length);
+  return {
+    start,
+    end,
+    moves: moves.slice(start, end).map((move, offset) => ({ move, index: start + offset }))
+  };
+}
+
+function shortTrialName(value: string | undefined | null) {
+  return String(value || "-")
+    .replace(/^optuna_[^_]+_[^_]+_\d+_/, "")
+    .replace(/__none__v1$/, "")
+    .replace(/__root_pair_mcts__v1$/, " root-pair")
+    .replace(/__full_pair_mcts__v1$/, " full-pair")
+    .replace(/^global_/, "")
+    .replace(/_/g, " ");
+}
+
+function modelOptionLabel(run: AnyRow, trial?: AnyRow) {
+  const label = trial?.trial_label || run.payload_json?.trial_label || run.name || shortTrialName(run.suite_trial_id || run.trial_id || run.run_id);
+  const epoch = trial?.epoch ?? run.payload_json?.epoch;
+  const loss = trial?.loss_total;
+  const bits = [label];
+  if (epoch !== undefined && epoch !== null && epoch !== "") bits.push(`e${epoch}`);
+  if (loss !== undefined && loss !== null) bits.push(`loss ${fmt(loss)}`);
+  if (trial?.architecture) bits.push(String(trial.architecture));
+  return bits.join(" · ");
+}
+
 function App() {
   const [active, setActive] = useState("suite");
   const [health, setHealth] = useState<AnyRow | null>(null);
@@ -60,6 +106,8 @@ function App() {
   const [axisResults, setAxisResults] = useState<AnyRow[]>([]);
   const [suiteStatus, setSuiteStatus] = useState<AnyRow | null>(null);
   const [suiteTrials, setSuiteTrials] = useState<AnyRow[]>([]);
+  const [phase2, setPhase2] = useState<AnyRow | null>(null);
+  const [phase3, setPhase3] = useState<AnyRow | null>(null);
   const [bestCheckpoints, setBestCheckpoints] = useState<AnyRow[]>([]);
   const [suiteEvents, setSuiteEvents] = useState<AnyRow[]>([]);
   const [suiteGames, setSuiteGames] = useState<AnyRow[]>([]);
@@ -68,19 +116,22 @@ function App() {
   const [refreshNonce, setRefreshNonce] = useState(0);
   const loadInFlight = useRef(false);
   const runDetailInFlight = useRef(false);
+  const replayLoadSeq = useRef(0);
 
   const load = async () => {
     if (loadInFlight.current) return;
     loadInFlight.current = true;
     try {
       setError("");
-      const [h, r, a, p, s, t, b, e, sg, gx] = await Promise.all([
+      const [h, r, a, p, s, t, p2, p3, b, e, sg, gx] = await Promise.all([
         api<AnyRow>("/api/health"),
         api<AnyRow[]>("/api/runs"),
         api<AnyRow[]>("/api/arena/history"),
         api<AnyRow[]>("/api/axis/prototypes"),
         api<AnyRow>("/api/suite/status"),
         api<AnyRow[]>("/api/suite/trials"),
+        api<AnyRow>("/api/suite/phase2"),
+        api<AnyRow>("/api/suite/phase3"),
         api<AnyRow[]>("/api/suite/best-checkpoints"),
         api<AnyRow[]>("/api/suite/events?limit=64"),
         api<AnyRow[]>("/api/games?limit=32"),
@@ -92,6 +143,8 @@ function App() {
       setAxis(p);
       setSuiteStatus(s);
       setSuiteTrials(t);
+      setPhase2(p2);
+      setPhase3(p3);
       setBestCheckpoints(b);
       setSuiteEvents(e);
       setSuiteGames(sg);
@@ -147,28 +200,49 @@ function App() {
   }, [selectedRun, refreshNonce]);
 
   useEffect(() => {
-    if (!selectedGame) return;
-    const gameRun = games.find((game) => game.game_id === selectedGame)?.run_id || selectedRun;
-    const query = gameRun ? `?run_id=${encodeURIComponent(gameRun)}` : "";
+    if (!selectedGame) {
+      setReplay(null);
+      setPosition(null);
+      return;
+    }
+    const requestId = replayLoadSeq.current + 1;
+    replayLoadSeq.current = requestId;
+    const query = replayQuery(selectedRun, { includePositions: false });
+    setReplay(null);
+    setPosition(null);
     api<AnyRow>(`/api/games/${selectedGame}/replay${query}`)
       .then((data) => {
+        if (replayLoadSeq.current !== requestId) return null;
         setReplay(data);
-        return api<AnyRow>(`/api/games/${selectedGame}/position/0${query}`);
+        return api<AnyRow>(`/api/games/${selectedGame}/position/0${replayQuery(selectedRun, { compact: true })}`);
       })
-      .then(setPosition)
-      .catch((e) => setError(e.message));
-  }, [selectedGame, selectedRun, games]);
+      .then((data) => {
+        if (data && replayLoadSeq.current === requestId) setPosition(data);
+      })
+      .catch((e) => {
+        if (replayLoadSeq.current === requestId) setError(e.message);
+      });
+  }, [selectedGame, selectedRun]);
 
   const latestMetric = metrics[metrics.length - 1]?.metrics_json || {};
-  const selectedGameRun = games.find((game) => game.game_id === selectedGame)?.run_id || selectedRun;
+  const selectedGameRun = selectedRun;
+  const trialByRun = useMemo(() => {
+    const byId = new Map<string, AnyRow>();
+    for (const trial of suiteTrials) {
+      if (trial.run_id) byId.set(String(trial.run_id), trial);
+      if (trial.trial_id) byId.set(String(trial.trial_id), trial);
+    }
+    return byId;
+  }, [suiteTrials]);
+  const selectedTrialSummary = trialByRun.get(String(selectedRun));
   const kpis = [
     ["Runs", runs.length],
-    ["Games", games.length],
-    ["Checkpoints", checkpoints.length],
+    ["Suite Games", suiteStatus?.total_games ?? games.length],
+    ["Suite Ckpts", suiteStatus?.total_checkpoints ?? checkpoints.length],
     ["Pos/sec", formatRate(suiteStatus?.current_positions_per_sec)],
     ["Current", suiteStatus?.current_model ?? selectedRun ?? "-"],
-    ["Epoch", latestMetric.train?.epoch ?? latestMetric.epoch ?? "-"],
-    ["Loss", fmt(latestMetric.train?.loss_total ?? latestMetric.loss_total)]
+    ["Epoch", selectedTrialSummary?.epoch ?? latestMetric.train?.epoch ?? latestMetric.epoch ?? "-"],
+    ["Loss", fmt(selectedTrialSummary?.loss_total ?? latestMetric.train?.loss_total ?? latestMetric.loss_total)]
   ];
 
   return (
@@ -182,7 +256,7 @@ function App() {
           <select value={selectedRun} onChange={(e) => setSelectedRun(e.target.value)}>
             <option value="">No run</option>
             {runs.map((run) => (
-              <option key={run.run_id} value={run.run_id}>{run.name || run.run_id}</option>
+              <option key={run.run_id} value={run.run_id}>{modelOptionLabel(run, trialByRun.get(String(run.run_id)))}</option>
             ))}
           </select>
           <button title="Refresh" onClick={reload}><RefreshCw size={16} /></button>
@@ -220,15 +294,19 @@ function App() {
         <SuitePanel
           status={suiteStatus}
           trials={suiteTrials}
+          phase2={phase2}
+          phase3={phase3}
           bestCheckpoints={bestCheckpoints}
           events={suiteEvents}
           games={suiteGames}
           openTrial={(id) => {
-            setSelectedRun(id);
+            const trial = suiteTrials.find((row) => row.trial_id === id || row.run_id === id);
+            setSelectedRun(trial?.run_id || id);
             setActive("charts");
           }}
           openCheckpointTrial={(id) => {
-            setSelectedRun(id);
+            const trial = suiteTrials.find((row) => row.trial_id === id || row.run_id === id);
+            setSelectedRun(trial?.run_id || id);
             setActive("checkpoints");
           }}
           openGame={(row) => {
@@ -295,6 +373,8 @@ function Charts({ metrics }: { metrics: AnyRow[] }) {
 function SuitePanel({
   status,
   trials,
+  phase2,
+  phase3,
   bestCheckpoints,
   events,
   games,
@@ -304,6 +384,8 @@ function SuitePanel({
 }: {
   status: AnyRow | null;
   trials: AnyRow[];
+  phase2: AnyRow | null;
+  phase3: AnyRow | null;
   bestCheckpoints: AnyRow[];
   events: AnyRow[];
   games: AnyRow[];
@@ -313,17 +395,48 @@ function SuitePanel({
 }) {
   const lastEvent = status?.last_event || {};
   const activity = status?.current_activity || {};
-  const activeTrials = trials.filter((trial) => !trial.pruned);
-  const recentEvents = events.slice(-64).reverse();
+  const activeTrials = trials.filter((trial) => !trial.pruned && !trial.phase2_excluded);
   const lastEventLabel = status?.last_event_name || lastEvent.event || "-";
   const progress = activity.progress || {};
+  const leadingTrial = trials.find((trial) => trial.trial_id === status?.leading_trial_id) || trials[0];
+  const phase2Rows = phase2?.rows || status?.phase2?.rows || [];
+  const phase2Best = phase2Rows.find((row: AnyRow) => row.phase2_rank === 1) || phase2Rows[0];
+  const phase2Ready = phase2Rows.filter((row: AnyRow) => row.phase2_status === "ready");
+  const phase2Pending = phase2Rows.filter((row: AnyRow) => row.phase2_status === "pending" || row.phase2_status === "training");
+  const phase2Excluded = phase2Rows.filter((row: AnyRow) => row.phase2_excluded);
+  const phase3Rows = phase3?.rows || [];
+  const phase3Running = phase3Rows.filter((row: AnyRow) => row.state === "RUNNING");
+  const phase3Complete = phase3Rows.filter((row: AnyRow) => row.state === "COMPLETE");
+  const phase3Best = phase3Rows.find((row: AnyRow) => row.phase3_rank === 1) || phase3Complete[0] || phase3Rows[0];
+  const activePhase3 = phase3Running[0] || null;
+  const currentStage = activePhase3 ? phase3?.stage : (status?.current_stage || status?.latest_stage || lastEvent.stage || "phase1 scout");
+  const currentTrialLabel = activePhase3
+    ? activePhase3.phase3_candidate_id
+    : shortTrialName(status?.current_trial_id || activity.trial_id || leadingTrial?.trial_id);
+  const currentModelLabel = activePhase3
+    ? activePhase3.promoted_label
+    : (status?.current_model || shortTrialName(leadingTrial?.trial_id));
+  const currentEpoch = activePhase3?.completed_epochs ?? activity.epoch ?? status?.leading_epoch ?? leadingTrial?.epoch ?? "-";
+  const currentTruncation = activePhase3?.last_event_message?.match(/trunc ([0-9.]+)/)?.[1] ?? fmt(leadingTrial?.truncation_rate);
+  const currentAction = activePhase3?.last_event_message || activity.action || "Waiting for trainer activity";
   const [selectedTrialId, setSelectedTrialId] = useState<string>("");
   const [trialDetail, setTrialDetail] = useState<AnyRow | null>(null);
+  const [eventFilter, setEventFilter] = useState("all");
+  const filteredEvents = events.filter((event) => {
+    if (eventFilter === "all") return true;
+    if (eventFilter === "warnings") return event.severity === "warning" || event.event === "training_signal_warning";
+    return event.trial_id === eventFilter;
+  });
+  const recentEvents = filteredEvents.slice(-64).reverse();
+  const warningEvents = events.filter((event) => event.severity === "warning" || event.event === "training_signal_warning");
+  const latestCheckpointEvent = [...events].reverse().find((event) => event.event === "checkpoint");
+  const latestSelfplayEvent = [...events].reverse().find((event) => event.event === "metric" && event.phase === "selfplay");
+  const latestEpochEvent = [...events].reverse().find((event) => event.event === "epoch_complete");
   useEffect(() => {
     if (selectedTrialId) return;
-    const next = status?.current_trial_id || bestCheckpoints[0]?.trial_id || trials[0]?.trial_id || "";
+    const next = activePhase3?.phase3_candidate_id || status?.current_trial_id || bestCheckpoints[0]?.trial_id || trials[0]?.trial_id || "";
     if (next) setSelectedTrialId(String(next));
-  }, [selectedTrialId, status?.current_trial_id, bestCheckpoints, trials]);
+  }, [selectedTrialId, activePhase3?.phase3_candidate_id, status?.current_trial_id, bestCheckpoints, trials]);
   useEffect(() => {
     if (!selectedTrialId) {
       setTrialDetail(null);
@@ -342,23 +455,23 @@ function SuitePanel({
         <div className="suiteHero">
           <div>
             <span>Stage</span>
-            <strong>{status?.current_stage || status?.latest_stage || lastEvent.stage || "-"}</strong>
+            <strong>{currentStage}</strong>
           </div>
           <div>
             <span>Current Trial</span>
-            <strong>{status?.current_trial_id || activity.trial_id || "-"}</strong>
+            <strong>{shortTrialName(currentTrialLabel)}</strong>
           </div>
           <div>
-            <span>Best Trial</span>
-            <strong>{status?.best_trial_id || "-"}</strong>
+            <span>{status?.best_trial_id ? "Best Trial" : "Most Advanced"}</span>
+            <strong>{shortTrialName(status?.best_trial_id || status?.leading_trial_id || leadingTrial?.trial_id)}</strong>
           </div>
           <div>
-            <span>Best Score</span>
-            <strong>{fmt(status?.best_score)}</strong>
+            <span>{status?.best_score !== null && status?.best_score !== undefined ? "Best Score" : "Latest Loss"}</span>
+            <strong>{status?.best_score !== null && status?.best_score !== undefined ? fmt(status?.best_score) : fmt(status?.leading_loss_total ?? leadingTrial?.loss_total)}</strong>
           </div>
           <div>
             <span>Current Model</span>
-            <strong>{status?.current_model || "-"}</strong>
+            <strong>{currentModelLabel}</strong>
           </div>
           <div>
             <span>Positions/sec</span>
@@ -373,8 +486,12 @@ function SuitePanel({
             <strong>{formatCount(status?.total_games)}</strong>
           </div>
           <div>
-            <span>Workers</span>
-            <strong>{progress.workers_total !== undefined ? `${progress.workers_alive}/${progress.workers_total}` : "-"}</strong>
+            <span>Epoch</span>
+            <strong>{currentEpoch}</strong>
+          </div>
+          <div>
+            <span>Truncation</span>
+            <strong>{currentTruncation}</strong>
           </div>
           <div>
             <span>Last Event</span>
@@ -388,11 +505,24 @@ function SuitePanel({
             <span>Live Trials</span>
             <strong>{activeTrials.length}/{status?.trial_count ?? trials.length}</strong>
           </div>
+          <div>
+            <span>Warnings</span>
+            <strong>{status?.warning_count ?? warningEvents.length}</strong>
+          </div>
+          <div>
+            <span>Events</span>
+            <strong>{status?.event_count ?? events.length}</strong>
+          </div>
         </div>
         <div className="activityStrip">
           <Gauge size={15} />
-          <span>{activity.action || "Waiting for trainer activity"}</span>
-          {activity.trial_id && <button onClick={() => setSelectedTrialId(activity.trial_id)}>Inspect {activity.trial_id}</button>}
+          <span>{currentAction}</span>
+          {activePhase3?.phase3_candidate_id && (
+            <button onClick={() => setSelectedTrialId(activePhase3.phase3_candidate_id)}>
+              Inspect {shortTrialName(activePhase3.phase3_candidate_id)}
+            </button>
+          )}
+          {!activePhase3?.phase3_candidate_id && activity.trial_id && <button onClick={() => setSelectedTrialId(activity.trial_id)}>Inspect {activity.trial_id}</button>}
           {activity.progress && (
             <span className="activityMeta">
               {activity.progress.workers_alive}/{activity.progress.workers_total} workers,
@@ -404,12 +534,139 @@ function SuitePanel({
       </Panel>
 
       <Panel
-        title="Best Models"
-        hint="Ranked checkpoints from the suite. Click a row to inspect architecture, config, runtime, losses, and checkpoint metadata."
+        title="Phase 2 Evidence"
+        hint="Fixed-classical scorecard review for promotion into Phase 3. Rankings use recomputable classical_survival_lcb evidence, not train loss."
+      >
+        <div className="eventSummary">
+          <MetricCard icon={<Trophy size={15} />} label="Leader" value={phase2Best?.trial_label || "-"} />
+          <MetricCard icon={<Target size={15} />} label="Leader LCB" value={fmt(phase2Best?.classical_survival_lcb)} />
+          <MetricCard icon={<Swords size={15} />} label="Classical Games" value={formatCount(phase2?.total_classical_games ?? status?.phase2?.total_classical_games)} />
+          <MetricCard icon={<Activity size={15} />} label="Ready / Pending" value={`${phase2Ready.length}/${phase2Pending.length}`} />
+          <MetricCard icon={<Gauge size={15} />} label="Excluded" value={phase2Excluded.length} />
+        </div>
+        <Table
+          rows={phase2Rows}
+          columns={[
+            "phase2_rank",
+            "trial_label",
+            "phase2_status",
+            "classical_survival_lcb",
+            "classical_survival_mean",
+            "phase2_gap_to_best",
+            "classical_survival_games",
+            "classical_win_rate",
+            "classical_draw_rate",
+            "classical_avg_moves",
+            "hard_pass",
+            "phase2_exclusion_reason"
+          ]}
+          onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
+          selected={(row) => row.trial_id === selectedTrialId}
+          className="suiteTable"
+        />
+        <div className="activityStrip phase2Evidence">
+          <Database size={15} />
+          <span>{phase2?.latest_summary_path || status?.phase2?.latest_summary_path || "No fixed-classical summary artifact yet"}</span>
+        </div>
+      </Panel>
+
+      <Panel
+        title="Phase 3 Tuning"
+        hint="Live Optuna TPE child trials from Phase 2 promoted checkpoints. Optuna values are secondary to scorecard-backed Hexo evidence."
+      >
+        {activePhase3 && (
+          <div className="phase3Now">
+            <Activity size={16} />
+            <div>
+              <strong>{shortTrialName(activePhase3.phase3_candidate_id)} is running</strong>
+              <span>
+                {activePhase3.last_event_message || "Waiting for the next Phase 3 event"} · epoch {activePhase3.completed_epochs ?? "-"}
+                /{activePhase3.target_epoch ?? "-"} · sims {activePhase3.mcts_simulations ?? "-"} · loss {fmt(activePhase3.loss_total)}
+              </span>
+            </div>
+          </div>
+        )}
+        <div className="eventSummary">
+          <MetricCard icon={<Activity size={15} />} label="Stage" value={phase3?.stage || "-"} />
+          <MetricCard icon={<Gauge size={15} />} label="Running" value={phase3Running.length} />
+          <MetricCard icon={<Trophy size={15} />} label="Best Child" value={phase3Best?.phase3_candidate_id || "-"} />
+          <MetricCard icon={<Target size={15} />} label="Best LCB" value={fmt(phase3Best?.classical_survival_lcb ?? phase3?.best_value)} />
+          <MetricCard icon={<Swords size={15} />} label="Complete" value={`${phase3Complete.length}/${phase3?.trial_count ?? phase3Rows.length}`} />
+        </div>
+        <Table
+          rows={phase3Rows}
+          columns={[
+            "phase3_rank",
+            "phase3_candidate_id",
+            "promoted_label",
+            "trial_number",
+            "state",
+            "target_epoch",
+            "completed_epochs",
+            "classical_survival_lcb",
+            "classical_survival_games",
+            "classical_win_rate",
+            "classical_draw_rate",
+            "loss_total",
+            "mcts_simulations",
+            "pcr_low_sims_ratio",
+            "c_puct",
+            "lr_multiplier",
+            "last_event",
+            "started_at",
+            "completed_at"
+          ]}
+          onRow={(row) => row.phase3_candidate_id && setSelectedTrialId(row.phase3_candidate_id)}
+          selected={(row) => row.phase3_candidate_id === selectedTrialId}
+          className="suiteTable"
+        />
+        <div className="activityStrip phase2Evidence">
+          <Database size={15} />
+          <span>{phase3?.latest_summary_path || "Phase 3 summary will appear after the current runner finishes."}</span>
+        </div>
+      </Panel>
+
+      <Panel
+        title="Model Selector"
+        hint="Pick a model once, then jump directly to metrics, checkpoints, games, or replay from the same selection."
+      >
+        <div className="modelPicker">
+          {trials.map((trial) => (
+            <button
+              key={trial.trial_id}
+              className={trial.trial_id === selectedTrialId ? "active" : ""}
+              onClick={() => setSelectedTrialId(String(trial.trial_id))}
+            >
+              <strong>{trial.trial_label || shortTrialName(trial.trial_id)}</strong>
+              <span>{trial.last_event_message || "Waiting for trainer event"}</span>
+              <span>{trial.architecture || "-"} · epoch {trial.epoch ?? "-"} · loss {fmt(trial.loss_total)}</span>
+              <span>{formatRate(trial.positions_per_sec)} · {formatCount(trial.games)} games · trunc {fmt(trial.truncation_rate)}</span>
+              <span>Phase 2 {trial.phase2_status || "-"} · LCB {fmt(trial.classical_survival_lcb)} · classical games {formatCount(trial.classical_survival_games)}</span>
+            </button>
+          ))}
+        </div>
+        <div className="toolbar compact selectorActions">
+          <button disabled={!selectedTrialId} onClick={() => selectedTrialId && openTrial(selectedTrialId)}><BarChart3 size={15} /> Metrics</button>
+          <button disabled={!selectedTrialId} onClick={() => selectedTrialId && openCheckpointTrial(selectedTrialId)}><Database size={15} /> Checkpoints</button>
+          <button
+            disabled={!selectedTrialId}
+            onClick={() => {
+              const game = games.find((row) => row.trial_id === selectedTrialId);
+              if (game) openGame(game);
+            }}
+          >
+            <Eye size={15} /> Latest Replay
+          </button>
+        </div>
+      </Panel>
+
+      <Panel
+        title="Checkpoint Ranking"
+        hint="Before scorecards exist this ranks checkpoints by epoch and recency. After evaluation, score-backed checkpoints sort first."
       >
         <Table
           rows={bestCheckpoints}
-          columns={["rank", "trial_id", "score", "scheduler_score", "epoch", "global_step", "is_loadable", "path"]}
+          columns={["rank", "trial_label", "rank_basis", "score", "scheduler_score", "epoch", "global_step", "is_loadable", "path"]}
           onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
           className="mediumTable"
         />
@@ -429,24 +686,26 @@ function SuitePanel({
         <Table
           rows={trials}
           columns={[
-            "trial_id",
-            "family",
+            "trial_label",
             "architecture",
             "stage",
+            "phase2_status",
+            "phase2_rank",
+            "classical_survival_lcb",
+            "classical_survival_games",
             "epoch",
-            "score",
-            "pruned",
-            "prune_reason",
+            "loss_total",
+            "loss_value",
+            "value_weight_mean",
+            "truncation_rate",
+            "positions_per_sec",
             "games",
             "positions",
             "checkpoints",
-            "positions_per_sec",
-            "workers",
-            "epoch_elapsed_s",
-            "loss_total",
-            "policy_top1_acc",
-            "sparse_policy_top1_acc",
-            "pair_policy_top1_acc"
+            "mcts_simulations",
+            "max_game_moves",
+            "recorder_failures",
+            "score"
           ]}
           onRow={(row) => row.trial_id && setSelectedTrialId(row.trial_id)}
           selected={(row) => row.trial_id === selectedTrialId}
@@ -463,10 +722,41 @@ function SuitePanel({
         />
       </Panel>
 
-      <Panel title="Recent Suite Events" hint="Supervisor decisions such as sweeps, pruning, epoch completions, and stage changes.">
+      <Panel title="Recent Suite Events" hint="Meaningful suite and trial events. Per-game spam is suppressed; use Games for individual records.">
+        <div className="eventSummary">
+          <MetricCard icon={<Activity size={15} />} label="Latest epoch" value={latestEpochEvent?.message || "-"} />
+          <MetricCard icon={<Gauge size={15} />} label="Latest self-play" value={latestSelfplayEvent?.message || "-"} />
+          <MetricCard icon={<Database size={15} />} label="Latest checkpoint" value={latestCheckpointEvent?.message || "-"} />
+          <MetricCard icon={<Target size={15} />} label="Warnings" value={warningEvents.length} />
+        </div>
+        <div className="eventFilters">
+          <button className={eventFilter === "all" ? "active" : ""} onClick={() => setEventFilter("all")}>All</button>
+          <button className={eventFilter === "warnings" ? "active" : ""} onClick={() => setEventFilter("warnings")}>Warnings</button>
+          {trials.map((trial) => (
+            <button
+              key={trial.trial_id}
+              className={eventFilter === trial.trial_id ? "active" : ""}
+              onClick={() => setEventFilter(String(trial.trial_id))}
+            >
+              {trial.trial_label || shortTrialName(trial.trial_id)}
+            </button>
+          ))}
+        </div>
         <Table
           rows={recentEvents}
-          columns={["event", "stage", "trial_id", "reason", "score", "selected_positions_per_min", "elapsed_s", "time"]}
+          columns={[
+            "severity",
+            "event",
+            "trial_label",
+            "phase",
+            "epoch",
+            "message",
+            "loss_total",
+            "positions_per_sec",
+            "truncation_rate",
+            "elapsed_s",
+            "time"
+          ]}
           className="recentTable"
         />
       </Panel>
@@ -510,6 +800,7 @@ function TrialDetail({
   const checkpoint = detail.checkpoint_metadata || {};
   const selected = detail.trial || {};
   const runtimeSweep = detail.state?.runtime_sweep || selected.runtime_sweep || {};
+  const phase2 = detail.phase2 || {};
   return (
     <Panel
       title="Selected Model"
@@ -530,6 +821,7 @@ function TrialDetail({
         <MetricCard icon={<Cpu size={15} />} label="Workers" value={selfplayCfg.num_workers ?? runtimeSweep.selected?.workers ?? "-"} />
         <MetricCard icon={<Gauge size={15} />} label="Positions/sec" value={formatRate((selfplay.positions_per_min || 0) / 60)} />
         <MetricCard icon={<Activity size={15} />} label="Loss" value={fmt(train.loss_total)} />
+        <MetricCard icon={<Trophy size={15} />} label="Phase 2 LCB" value={fmt(phase2.classical_survival_lcb)} />
       </div>
       <div className="detailGrid">
         <KeyValue
@@ -591,6 +883,21 @@ function TrialDetail({
             checkpoint_path: checkpoint.path
           }}
         />
+        <KeyValue
+          title="Phase 2 Evidence"
+          rows={{
+            phase2_status: phase2.phase2_status,
+            phase2_rank: phase2.phase2_rank,
+            classical_survival_lcb: fmt(phase2.classical_survival_lcb),
+            classical_survival_mean: fmt(phase2.classical_survival_mean),
+            classical_survival_games: phase2.classical_survival_games,
+            classical_win_rate: fmt(phase2.classical_win_rate),
+            classical_draw_rate: fmt(phase2.classical_draw_rate),
+            classical_avg_moves: fmt(phase2.classical_avg_moves),
+            hard_pass: String(phase2.hard_pass ?? "-"),
+            evidence_path: phase2.fixed_classical_evidence_path || "-"
+          }}
+        />
       </div>
       <details className="configDetails">
         <summary>Full checkpoint config</summary>
@@ -644,41 +951,125 @@ function Games({ games, selectedGame, openReplay }: {
 }
 
 function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
-  const replayable = examples.filter((row) => row.replay_available);
   const [selectedId, setSelectedId] = useState<string>("");
   const [replay, setReplay] = useState<AnyRow | null>(null);
   const [position, setPosition] = useState<AnyRow | null>(null);
   const [turn, setTurn] = useState(0);
   const [autoplay, setAutoplay] = useState(false);
+  const [modelFilter, setModelFilter] = useState("all");
+  const [opponentFilter, setOpponentFilter] = useState("all");
+  const [sortKey, setSortKey] = useState("newest");
+  const [loadingTurn, setLoadingTurn] = useState(false);
+  const [positionError, setPositionError] = useState("");
+  const replayLoadSeq = useRef(0);
+  const positionSeq = useRef(0);
+  const opponentValue = (row: AnyRow) => String(row.opponent_type || row.opponent_id || row.kind || "unknown");
+  const modelOptions = useMemo(
+    () => Array.from(new Set(examples.map((row) => String(row.trial_id || "")).filter(Boolean))).sort(),
+    [examples]
+  );
+  const opponentOptions = useMemo(
+    () => Array.from(new Set(examples.map(opponentValue).filter(Boolean))).sort(),
+    [examples]
+  );
+  const filteredExamples = useMemo(() => {
+    const rows = examples.filter((row) => {
+      const modelOk = modelFilter === "all" || String(row.trial_id || "") === modelFilter;
+      const opponentOk = opponentFilter === "all" || opponentValue(row) === opponentFilter;
+      return modelOk && opponentOk;
+    });
+    const sorted = [...rows];
+    sorted.sort((a, b) => {
+      if (sortKey === "moves_desc") return Number(b.move_count || 0) - Number(a.move_count || 0);
+      if (sortKey === "moves_asc") return Number(a.move_count || 0) - Number(b.move_count || 0);
+      if (sortKey === "model") {
+        const byModel = String(a.model_label || a.trial_id || "").localeCompare(String(b.model_label || b.trial_id || ""));
+        return byModel || Number(b.created_at || 0) - Number(a.created_at || 0);
+      }
+      if (sortKey === "opponent") {
+        const byOpponent = opponentValue(a).localeCompare(opponentValue(b));
+        return byOpponent || Number(b.created_at || 0) - Number(a.created_at || 0);
+      }
+      if (sortKey === "outcome") {
+        const byOutcome = String(a.outcome || "").localeCompare(String(b.outcome || ""));
+        return byOutcome || Number(b.created_at || 0) - Number(a.created_at || 0);
+      }
+      return Number(b.created_at || 0) - Number(a.created_at || 0);
+    });
+    return sorted;
+  }, [examples, modelFilter, opponentFilter, sortKey]);
+  const replayable = useMemo(() => filteredExamples.filter((row) => row.replay_available), [filteredExamples]);
   const selected = replayable.find((row) => row.example_id === selectedId) || replayable[0];
   const moves = replay?.moves || [];
+  const visibleMoves = useMemo(() => moveWindow(moves, turn), [moves, turn]);
+  const boardMoves = useMemo(() => moves.slice(0, clamp(turn, 0, moves.length)), [moves, turn]);
 
   useEffect(() => {
-    if (!selectedId && replayable.length) setSelectedId(String(replayable[0].example_id));
+    if (!replayable.length) {
+      if (selectedId) setSelectedId("");
+      return;
+    }
+    if (!replayable.some((row) => row.example_id === selectedId)) {
+      setSelectedId(String(replayable[0].example_id));
+    }
   }, [selectedId, replayable]);
 
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedId) {
+      setReplay(null);
+      setPosition(null);
+      return;
+    }
+    const requestId = replayLoadSeq.current + 1;
+    replayLoadSeq.current = requestId;
+    positionSeq.current = requestId;
     setAutoplay(false);
     setTurn(0);
+    setLoadingTurn(true);
+    setPositionError("");
+    setReplay(null);
+    setPosition(null);
     api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/replay`)
       .then((data) => {
+        if (replayLoadSeq.current !== requestId) return null;
         setReplay(data);
-        return api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/0`);
+        return api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/0?compact=true`);
       })
-      .then(setPosition)
-      .catch(() => {
+      .then((data) => {
+        if (data && replayLoadSeq.current === requestId) setPosition(data);
+      })
+      .catch((e) => {
+        if (replayLoadSeq.current !== requestId) return;
+        setPositionError(e.message || "Failed to load example replay");
         setReplay(null);
         setPosition(null);
+      })
+      .finally(() => {
+        if (replayLoadSeq.current === requestId) setLoadingTurn(false);
       });
   }, [selectedId]);
 
-  const loadTurn = (next: number) => {
+  const loadTurn = useCallback((next: number) => {
     if (!selectedId) return;
     const nextTurn = clamp(Math.round(next), 0, moves.length);
+    const requestId = positionSeq.current + 1;
+    positionSeq.current = requestId;
     setTurn(nextTurn);
-    api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/${nextTurn}`).then(setPosition);
-  };
+    setLoadingTurn(true);
+    setPositionError("");
+    api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/${nextTurn}?compact=true`)
+      .then((data) => {
+        if (positionSeq.current === requestId) setPosition(data);
+      })
+      .catch((e) => {
+        if (positionSeq.current !== requestId) return;
+        setPositionError(e.message || "Failed to load example position");
+        setAutoplay(false);
+      })
+      .finally(() => {
+        if (positionSeq.current === requestId) setLoadingTurn(false);
+      });
+  }, [moves.length, selectedId]);
 
   useEffect(() => {
     if (!autoplay || !selectedId) return;
@@ -689,27 +1080,66 @@ function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
           setAutoplay(false);
           return current;
         }
-        api<AnyRow>(`/api/suite/game-examples/${encodeURIComponent(selectedId)}/position/${next}`)
-          .then(setPosition)
-          .catch(() => setAutoplay(false));
+        loadTurn(next);
         return next;
       });
     }, 650);
     return () => window.clearInterval(handle);
-  }, [autoplay, selectedId, moves.length]);
+  }, [autoplay, selectedId, moves.length, loadTurn]);
 
   return (
     <section className="examplesGrid">
-      <Panel title="Game Examples" hint="Replayable self-play and fixed-classical examples from the current Phase 3 run.">
+      <Panel title="Game Examples" hint="Replayable self-play and fixed-classical examples from the current suite.">
         <div className="exampleSummary">
-          <MetricCard icon={<Bot size={15} />} label="Replayable" value={replayable.length} />
-          <MetricCard icon={<Gamepad2 size={15} />} label="Self-play" value={examples.filter((row) => row.kind === "selfplay").length} />
-          <MetricCard icon={<Swords size={15} />} label="Classical" value={examples.filter((row) => row.kind === "fixed_classical").length} />
-          <MetricCard icon={<Trophy size={15} />} label="Selected" value={selected?.trial_id || "-"} />
+          <MetricCard icon={<Bot size={15} />} label="Shown" value={`${filteredExamples.length}/${examples.length}`} />
+          <MetricCard icon={<Gamepad2 size={15} />} label="Self-play" value={filteredExamples.filter((row) => row.kind === "selfplay").length} />
+          <MetricCard icon={<Swords size={15} />} label="Classical" value={filteredExamples.filter((row) => row.kind === "fixed_classical").length} />
+          <MetricCard icon={<Trophy size={15} />} label="Selected" value={selected?.model_label || selected?.trial_id || "-"} />
+        </div>
+        <div className="exampleControls">
+          <label>
+            <span>Model</span>
+            <select value={modelFilter} onChange={(e) => setModelFilter(e.target.value)}>
+              <option value="all">All models</option>
+              {modelOptions.map((model) => (
+                <option key={model} value={model}>{examples.find((row) => row.trial_id === model)?.model_label || model}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Opponent</span>
+            <select value={opponentFilter} onChange={(e) => setOpponentFilter(e.target.value)}>
+              <option value="all">All opponents</option>
+              {opponentOptions.map((opponent) => (
+                <option key={opponent} value={opponent}>{opponent === "selfplay" ? "Self-play" : opponent.replace(/_/g, " ")}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Sort</span>
+            <select value={sortKey} onChange={(e) => setSortKey(e.target.value)}>
+              <option value="newest">Newest first</option>
+              <option value="moves_desc">Longest games</option>
+              <option value="moves_asc">Shortest games</option>
+              <option value="model">Model</option>
+              <option value="opponent">Opponent</option>
+              <option value="outcome">Outcome</option>
+            </select>
+          </label>
+          <div className="eventFilters exampleQuickFilters">
+            <button className={opponentFilter === "all" ? "active" : ""} onClick={() => setOpponentFilter("all")}>All</button>
+            <button className={opponentFilter === "selfplay" ? "active" : ""} onClick={() => setOpponentFilter("selfplay")}>Self-play</button>
+            <button
+              className={opponentFilter !== "all" && opponentFilter !== "selfplay" ? "active" : ""}
+              onClick={() => setOpponentFilter(opponentOptions.find((value) => value !== "selfplay") || "all")}
+            >
+              Classical
+            </button>
+          </div>
         </div>
         <Table
-          rows={examples}
-          columns={["kind", "trial_id", "game_id", "source", "epoch", "outcome", "move_count", "terminal_reason", "opponent_id", "replay_available"]}
+          rows={filteredExamples}
+          columns={["kind", "model_label", "opponent_label", "trial_id", "game_id", "epoch", "outcome", "move_count", "terminal_reason", "replay_available"]}
           onRow={(row) => row.replay_available && setSelectedId(String(row.example_id))}
           selected={(row) => row.example_id === selectedId}
           className="exampleTable"
@@ -723,18 +1153,32 @@ function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
           </button>
           <button onClick={() => loadTurn(Math.max(0, turn - 1))} disabled={!selectedId || turn <= 0}>Prev</button>
           <button onClick={() => loadTurn(Math.min(moves.length, turn + 1))} disabled={!selectedId || turn >= moves.length}>Next</button>
-          <span className="timelineStatus">Turn {turn}/{moves.length}</span>
+          <button onClick={() => loadTurn(moves.length)} disabled={!selectedId || !moves.length}>End</button>
+          <span className="timelineStatus">Turn {turn}/{moves.length}{loadingTurn ? " loading" : ""}</span>
         </div>
-        <Board position={position} viewKey={selectedId} />
+        {positionError && <div className="inlineError">{positionError}</div>}
+        <Board position={position} viewKey={selectedId} labelMoves={boardMoves} />
       </Panel>
       <Panel title="Moves">
-        <div className="moveList">
+        <div className="timelineSlider">
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, moves.length)}
+            value={clamp(turn, 0, moves.length)}
+            onChange={(e) => loadTurn(Number(e.target.value))}
+            disabled={!selectedId || !moves.length}
+          />
+        </div>
+        <div className="moveList compactMoves">
           <button className={turn === 0 ? "active" : ""} onClick={() => loadTurn(0)}>Start</button>
-          {moves.map((m: AnyRow, i: number) => (
-            <button key={i} className={turn === i + 1 ? "active" : ""} onClick={() => loadTurn(i + 1)}>
-              {i + 1}. P{m.player} ({m.q},{m.r})
+          {visibleMoves.start > 0 && <span className="moveGap">...</span>}
+          {visibleMoves.moves.map(({ move, index }: { move: AnyRow; index: number }) => (
+            <button key={index} className={turn === index + 1 ? "active" : ""} onClick={() => loadTurn(index + 1)}>
+              {index + 1}. P{move.player} ({move.q},{move.r})
             </button>
           ))}
+          {visibleMoves.end < moves.length && <span className="moveGap">...</span>}
         </div>
       </Panel>
     </section>
@@ -744,24 +1188,46 @@ function ExamplesPanel({ examples }: { examples: AnyRow[] }) {
 function Replay({ replay, position, setPosition, selectedGame, runId }: {
   replay: AnyRow | null;
   position: AnyRow | null;
-  setPosition: (p: AnyRow) => void;
+  setPosition: (p: AnyRow | null) => void;
   selectedGame: number | null;
   runId: string;
 }) {
   const moves = replay?.moves || [];
   const [turn, setTurn] = useState(0);
   const [autoplay, setAutoplay] = useState(false);
-  const loadTurn = (turn: number) => {
+  const [loadingTurn, setLoadingTurn] = useState(false);
+  const [positionError, setPositionError] = useState("");
+  const positionSeq = useRef(0);
+  const visibleMoves = useMemo(() => moveWindow(moves, turn), [moves, turn]);
+  const boardMoves = useMemo(() => moves.slice(0, clamp(turn, 0, moves.length)), [moves, turn]);
+  const loadTurn = useCallback((next: number) => {
     if (!selectedGame) return;
-    const nextTurn = clamp(Math.round(turn), 0, moves.length);
+    const nextTurn = clamp(Math.round(next), 0, moves.length);
+    const requestId = positionSeq.current + 1;
+    positionSeq.current = requestId;
     setTurn(nextTurn);
-    const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
-    api<AnyRow>(`/api/games/${selectedGame}/position/${nextTurn}${query}`).then(setPosition);
-  };
+    setLoadingTurn(true);
+    setPositionError("");
+    api<AnyRow>(`/api/games/${selectedGame}/position/${nextTurn}${replayQuery(runId, { compact: true })}`)
+      .then((data) => {
+        if (positionSeq.current !== requestId) return;
+        setPosition(data);
+      })
+      .catch((e) => {
+        if (positionSeq.current !== requestId) return;
+        setPositionError(e.message || "Failed to load replay position");
+        setAutoplay(false);
+      })
+      .finally(() => {
+        if (positionSeq.current === requestId) setLoadingTurn(false);
+      });
+  }, [moves.length, runId, selectedGame, setPosition]);
   useEffect(() => {
     setAutoplay(false);
     setTurn(0);
-  }, [selectedGame]);
+    setPositionError("");
+    positionSeq.current += 1;
+  }, [selectedGame, runId]);
   useEffect(() => {
     const nextTurn = Number(position?.turn_index ?? 0);
     if (Number.isFinite(nextTurn)) setTurn(nextTurn);
@@ -775,19 +1241,16 @@ function Replay({ replay, position, setPosition, selectedGame, runId }: {
           setAutoplay(false);
           return current;
         }
-        const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
-        api<AnyRow>(`/api/games/${selectedGame}/position/${next}${query}`)
-          .then(setPosition)
-          .catch(() => setAutoplay(false));
+        loadTurn(next);
         return next;
       });
     }, 650);
     return () => window.clearInterval(handle);
-  }, [autoplay, selectedGame, moves.length, setPosition, runId]);
+  }, [autoplay, selectedGame, moves.length, loadTurn]);
   return (
     <section className="grid replay">
       <Panel title="Board">
-        <Board position={position} />
+        <Board position={position} labelMoves={boardMoves} />
       </Panel>
       <Panel title="Timeline">
         <div className="toolbar compact">
@@ -797,15 +1260,29 @@ function Replay({ replay, position, setPosition, selectedGame, runId }: {
           </button>
           <button onClick={() => loadTurn(Math.max(0, turn - 1))} disabled={!selectedGame || turn <= 0}>Prev</button>
           <button onClick={() => loadTurn(Math.min(moves.length, turn + 1))} disabled={!selectedGame || turn >= moves.length}>Next</button>
-          <span className="timelineStatus">Turn {turn}/{moves.length}</span>
+          <button onClick={() => loadTurn(moves.length)} disabled={!selectedGame || !moves.length}>End</button>
+          <span className="timelineStatus">Turn {turn}/{moves.length}{loadingTurn ? " loading" : ""}</span>
         </div>
-        <div className="moveList">
+        {positionError && <div className="inlineError">{positionError}</div>}
+        <div className="timelineSlider">
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, moves.length)}
+            value={clamp(turn, 0, moves.length)}
+            onChange={(e) => loadTurn(Number(e.target.value))}
+            disabled={!selectedGame || !moves.length}
+          />
+        </div>
+        <div className="moveList compactMoves">
           <button className={turn === 0 ? "active" : ""} onClick={() => loadTurn(0)}>Start</button>
-          {moves.map((m: AnyRow, i: number) => (
-            <button key={i} className={turn === i + 1 ? "active" : ""} onClick={() => loadTurn(i + 1)}>
-              {i + 1}. P{m.player} ({m.q},{m.r})
+          {visibleMoves.start > 0 && <span className="moveGap">...</span>}
+          {visibleMoves.moves.map(({ move, index }: { move: AnyRow; index: number }) => (
+            <button key={index} className={turn === index + 1 ? "active" : ""} onClick={() => loadTurn(index + 1)}>
+              {index + 1}. P{move.player} ({move.q},{move.r})
             </button>
           ))}
+          {visibleMoves.end < moves.length && <span className="moveGap">...</span>}
         </div>
       </Panel>
       <Panel title="Encoding">
@@ -1104,12 +1581,14 @@ function Board({
   interactive = false,
   onCellClick,
   overlayMoves = [],
+  labelMoves,
   viewKey
 }: {
   position: AnyRow | null | undefined;
   interactive?: boolean;
   onCellClick?: (q: number, r: number) => void;
   overlayMoves?: AnyRow[];
+  labelMoves?: AnyRow[];
   viewKey?: string | number | null;
 }) {
   const [hover, setHover] = useState<AnyRow | null>(null);
@@ -1128,13 +1607,16 @@ function Board({
   const stones = position?.stones || [];
   const legal = position?.legal_moves || [];
   const threat = position?.threat_moves || [];
-  const moves = position?.moves || [];
-  const geometry = useMemo(() => buildBoardGeometry(position, overlayMoves), [position, overlayMoves]);
+  const threatStones = position?.threat_stones || [];
+  const moves = labelMoves || position?.moves || [];
+  const geometry = useMemo(() => buildBoardGeometry(position, overlayMoves, moves), [position, overlayMoves, moves]);
   const legalSet = new Set(legal.map((m: AnyRow) => `${m.q},${m.r}`));
-  const threatSet = new Set(threat.map((m: AnyRow) => `${m.q},${m.r}`));
+  const threatMap = new Map<string, AnyRow>(threat.map((m: AnyRow) => [`${m.q},${m.r}`, m]));
+  const threatStoneMap = new Map<string, AnyRow>(threatStones.map((m: AnyRow) => [`${m.q},${m.r}`, m]));
   const overlayMap = new Map<string, AnyRow>(overlayMoves.map((m: AnyRow) => [`${m.q},${m.r}`, m]));
   const moveNum = new Map<string, number>(moves.map((m: AnyRow, i: number) => [`${m.q},${m.r}`, i + 1]));
   const stoneMap = new Map<string, AnyRow>(stones.map((s: AnyRow) => [`${s.q},${s.r}`, s]));
+  const winningCells = useMemo(() => winningLineCells(stones, position?.winner, position?.is_over), [stones, position?.winner, position?.is_over]);
   const currentPlayer = position?.current_player ?? 0;
   const last = position?.overlays?.last_move;
   const resetView = () => setView(fitPlayedView(geometry));
@@ -1221,7 +1703,10 @@ function Board({
             const key = `${cell.q},${cell.r}`;
             const stone = stoneMap.get(key);
             const isLegal = legalSet.has(key);
-            const isThreat = threatSet.has(key);
+            const threatInfo = threatMap.get(key) || threatStoneMap.get(key);
+            const isThreat = Boolean(threatInfo);
+            const isWinning = winningCells.has(key);
+            const threatPlayer = Number.isFinite(Number(threatInfo?.player)) ? Number(threatInfo?.player) : currentPlayer;
             const overlay = overlayMap.get(key);
             const isBothOverlay = overlay?.kind === "both";
             const overlayOwner = overlayOwnerFor(overlay, currentPlayer);
@@ -1233,6 +1718,8 @@ function Board({
               stone ? `stone p${stone.player}` : "empty",
               isLegal ? "legal" : "",
               isThreat ? "threat" : "",
+              isThreat ? `p${threatPlayer}` : "",
+              isWinning ? "winning" : "",
               overlay ? "overlay" : "",
               isBothOverlay ? "bothOverlay" : "",
               interactive && isLegal ? "clickable" : "",
@@ -1254,7 +1741,7 @@ function Board({
                   onPointerUp={() => {
                     if (!drag.current?.moved) clickCell(cell.q, cell.r);
                   }}
-                  onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, overlay })}
+                  onMouseEnter={() => setHover({ q: cell.q, r: cell.r, legal: isLegal, threat: isThreat, threat_type: threatInfo?.threat_type, threat_player: threatInfo?.player, overlay })}
                 />
                 {overlay && !stone && isBothOverlay && (
                   <>
@@ -1294,6 +1781,9 @@ function Board({
                 {stone && (
                   <text className="moveNumber" x={cell.x} y={cell.y + 4}>{moveNum.get(key) || ""}</text>
                 )}
+                {isWinning && (
+                  <path className="winningOutline" d={hexPath(cell.x, cell.y, 25)} />
+                )}
               </g>
             );
           })}
@@ -1320,35 +1810,63 @@ function Board({
 const HEX_SIZE = 24;
 const NEIGHBORS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, -1], [-1, 1]];
 
-function buildBoardGeometry(position: AnyRow | null | undefined, overlayMoves: AnyRow[]) {
+function buildBoardGeometry(
+  position: AnyRow | null | undefined,
+  overlayMoves: AnyRow[],
+  labelMoves?: AnyRow[]
+) {
   const coords = new Set<string>();
+  const frameCoords = new Set<string>();
   const stones = position?.stones || [];
   const legal = position?.legal_moves || [];
-  const moves = position?.moves || [];
-  const add = (q: number, r: number, withNeighbors = true) => {
-    coords.add(`${q},${r}`);
+  const moves = labelMoves || position?.moves || [];
+  const addTo = (target: Set<string>, q: number, r: number, withNeighbors = true) => {
+    if (!Number.isFinite(q) || !Number.isFinite(r)) return;
+    target.add(`${q},${r}`);
     if (withNeighbors) {
-      NEIGHBORS.forEach(([dq, dr]) => coords.add(`${q + dq},${r + dr}`));
+      NEIGHBORS.forEach(([dq, dr]) => target.add(`${q + dq},${r + dr}`));
     }
   };
-  stones.forEach((s: AnyRow) => add(Number(s.q), Number(s.r)));
-  legal.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
-  moves.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
+  const add = (q: number, r: number, withNeighbors = true) => addTo(coords, q, r, withNeighbors);
+  const addFrame = (q: number, r: number, withNeighbors = true) => addTo(frameCoords, q, r, withNeighbors);
+  stones.forEach((s: AnyRow) => {
+    add(Number(s.q), Number(s.r));
+    addFrame(Number(s.q), Number(s.r));
+  });
+  moves.forEach((m: AnyRow) => {
+    add(Number(m.q), Number(m.r));
+    addFrame(Number(m.q), Number(m.r));
+  });
   overlayMoves.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
-  if (coords.size === 0) {
+  legal.forEach((m: AnyRow) => add(Number(m.q), Number(m.r)));
+  if (frameCoords.size === 0 && overlayMoves.length) {
+    overlayMoves.forEach((m: AnyRow) => addFrame(Number(m.q), Number(m.r)));
+  }
+  if (frameCoords.size === 0 && legal.length) {
+    legal.forEach((m: AnyRow) => addFrame(Number(m.q), Number(m.r)));
+  }
+  if (coords.size === 0 || frameCoords.size === 0) {
     for (let q = -3; q <= 3; q++) {
-      for (let r = -3; r <= 3; r++) add(q, r, false);
+      for (let r = -3; r <= 3; r++) {
+        add(q, r, false);
+        addFrame(q, r, false);
+      }
     }
   }
+  const frameParsed = [...frameCoords].map((key) => {
+    const [q, r] = key.split(",").map(Number);
+    const c = hexCenter(q, r);
+    return { q, r, rawX: c.x, rawY: c.y };
+  });
   const parsed = [...coords].map((key) => {
     const [q, r] = key.split(",").map(Number);
     const c = hexCenter(q, r);
     return { q, r, rawX: c.x, rawY: c.y };
   });
-  const minX = Math.min(...parsed.map((c) => c.rawX - HEX_SIZE));
-  const maxX = Math.max(...parsed.map((c) => c.rawX + HEX_SIZE));
-  const minY = Math.min(...parsed.map((c) => c.rawY - HEX_SIZE));
-  const maxY = Math.max(...parsed.map((c) => c.rawY + HEX_SIZE));
+  const minX = Math.min(...frameParsed.map((c) => c.rawX - HEX_SIZE));
+  const maxX = Math.max(...frameParsed.map((c) => c.rawX + HEX_SIZE));
+  const minY = Math.min(...frameParsed.map((c) => c.rawY - HEX_SIZE));
+  const maxY = Math.max(...frameParsed.map((c) => c.rawY + HEX_SIZE));
   const width = Math.max(360, maxX - minX + 44);
   const height = Math.max(360, maxY - minY + 44);
   return {
@@ -1360,6 +1878,40 @@ function buildBoardGeometry(position: AnyRow | null | undefined, overlayMoves: A
       .map((c) => ({ q: c.q, r: c.r, x: c.rawX - minX + 22, y: c.rawY - minY + 22 }))
       .sort((a, b) => a.r - b.r || a.q - b.q)
   };
+}
+
+function winningLineCells(stones: AnyRow[], winner: any, isOver: any) {
+  if (!isOver || !Number.isFinite(Number(winner))) return new Set<string>();
+  const byKey = new Map<string, AnyRow>();
+  stones.forEach((stone: AnyRow) => byKey.set(`${stone.q},${stone.r}`, stone));
+  const winnerPlayer = Number(winner);
+  const players = [winnerPlayer];
+  const directions = [[1, 0], [0, 1], [1, -1]];
+  let best: AnyRow[] = [];
+  for (const player of players) {
+    for (const stone of stones) {
+      if (Number(stone.player) !== player) continue;
+      const q = Number(stone.q);
+      const r = Number(stone.r);
+      for (const [dq, dr] of directions) {
+        const prev = byKey.get(`${q - dq},${r - dr}`);
+        if (prev && Number(prev.player) === player) continue;
+        const line: AnyRow[] = [];
+        let cq = q;
+        let cr = r;
+        while (true) {
+          const next = byKey.get(`${cq},${cr}`);
+          if (!next || Number(next.player) !== player) break;
+          line.push(next);
+          cq += dq;
+          cr += dr;
+        }
+        if (line.length > best.length) best = line;
+      }
+    }
+  }
+  if (best.length < 6) return new Set<string>();
+  return new Set(best.map((stone: AnyRow) => `${stone.q},${stone.r}`));
 }
 
 function fitPlayedView(geometry: AnyRow) {
@@ -1430,7 +1982,7 @@ function bothClipId(q: number, r: number) {
 
 function hoverText(hover: AnyRow) {
   const parts = [`(${hover.q}, ${hover.r})`, hover.legal ? "legal" : "not legal"];
-  if (hover.threat) parts.push("threat");
+  if (hover.threat) parts.push(`${hover.threat_type || "threat"} P${hover.threat_player ?? "-"}`);
   if (hover.overlay) {
     const axes = Array.isArray(hover.overlay.axes)
       ? hover.overlay.axes.map((v: number) => Number(v).toFixed(2)).join(",")
@@ -1613,7 +2165,7 @@ function Table({ rows, columns, onRow, selected, className = "" }: {
               onClick={() => onRow?.(row)}
               className={selected?.(row) ? "selected" : onRow ? "clickable" : ""}
             >
-              {columns.map((c) => <td key={c}>{cell(row[c], c)}</td>)}
+              {columns.map((c) => <td key={c}>{cell(row[c], c, row)}</td>)}
             </tr>
           ))}
         </tbody>
@@ -1746,8 +2298,9 @@ function Sparkline({ points }: { points: { x: number; y: number }[] }) {
   return <svg className="chart" viewBox={`0 0 ${width} ${height}`}><path d={d} /></svg>;
 }
 
-function cell(value: any, key = "") {
+function cell(value: any, key = "", row?: AnyRow) {
   if (value === null || value === undefined) return "-";
+  if (key === "outcome") return outcomeCell(value, row);
   if (isTimestampKey(key)) return formatTimestamp(value);
   if (key.endsWith("_s") || key === "elapsed_s" || key === "epoch_elapsed_s") return formatDuration(value);
   if (key.includes("positions_per_sec")) return formatRate(value);
@@ -1755,6 +2308,28 @@ function cell(value: any, key = "") {
   if (typeof value === "boolean") return value ? "yes" : "no";
   if (typeof value === "object") return JSON.stringify(value).slice(0, 140);
   return String(value);
+}
+
+function outcomeCell(value: any, row?: AnyRow) {
+  const label = String(value || "-");
+  const player = outcomePlayer(label, row);
+  const normalized = label.replace(/_/g, " ");
+  if (player === null) return <span className="outcomeText neutral">{normalized}</span>;
+  return <span className={`outcomeText p${player}`}>{normalized}</span>;
+}
+
+function outcomePlayer(outcome: string, row?: AnyRow): number | null {
+  const value = outcome.toLowerCase();
+  if (value.includes("player_0") || value.includes("p0")) return 0;
+  if (value.includes("player_1") || value.includes("p1")) return 1;
+  if (row?.kind === "fixed_classical" || row?.source === "fixed_classical") {
+    const modelPlayer = row.opening_is_black === false ? 1 : 0;
+    const classicalPlayer = 1 - modelPlayer;
+    if (value.includes("classical_win")) return classicalPlayer;
+    if (value.includes("model_win") || value.includes("survived")) return modelPlayer;
+  }
+  if (value === "win" && Number.isFinite(Number(row?.winner))) return Number(row?.winner);
+  return null;
 }
 
 function fmt(value: any) {

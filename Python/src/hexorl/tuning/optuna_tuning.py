@@ -76,6 +76,8 @@ def phase3_study_spec(
         "weight_decay",
         "c_puct",
         "c_puct_init",
+        "mcts_simulations",
+        "pcr_low_sims_ratio",
         "dirichlet_fraction",
         "scaled_alpha_total",
         "pcr_low_sim_prob",

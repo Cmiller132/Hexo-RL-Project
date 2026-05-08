@@ -839,7 +839,16 @@ class Trainer:
     @staticmethod
     def _is_cuda_oom(exc: RuntimeError) -> bool:
         text = str(exc).lower()
-        return "cuda" in text and ("out of memory" in text or "cublas_status_alloc_failed" in text)
+        retryable_markers = (
+            "out of memory",
+            "cublas_status_alloc_failed",
+            "cublas_status_internal_error",
+            "cublas_status_execution_failed",
+            "cublas_status_not_supported",
+            "cublasstatusinternalerror",
+            "cublasstatusexecutionfailed",
+        )
+        return ("cuda" in text or "cublas" in text) and any(marker in text for marker in retryable_markers)
 
     def _slice_targets_for_batch(
         self,

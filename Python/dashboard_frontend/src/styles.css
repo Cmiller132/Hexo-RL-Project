@@ -203,6 +203,37 @@ h1 {
   margin-bottom: 10px;
 }
 
+.exampleControls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr)) minmax(180px, auto);
+  gap: 8px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.exampleControls label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.exampleControls label span {
+  color: #8b949e;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.exampleControls select {
+  width: 100%;
+}
+
+.exampleQuickFilters {
+  margin-bottom: 0;
+  justify-content: flex-end;
+}
+
 .suiteHero {
   display: grid;
   grid-template-columns: repeat(6, minmax(128px, 1fr));
@@ -233,6 +264,42 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.modelPicker {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.modelPicker button {
+  align-items: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 86px;
+  text-align: left;
+}
+
+.modelPicker button.active {
+  border-color: #58a6ff;
+  background: rgba(88, 166, 255, 0.16);
+}
+
+.modelPicker strong {
+  color: #f0f6fc;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.modelPicker span {
+  color: #8b949e;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.selectorActions {
+  margin-top: 10px;
 }
 
 .suitePath {
@@ -293,6 +360,64 @@ h1 {
   color: #8b949e;
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 11px;
+}
+
+.phase3Now {
+  align-items: center;
+  border: 1px solid #58a6ff;
+  background: rgba(88, 166, 255, 0.13);
+  border-radius: 6px;
+  color: #c9d1d9;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+}
+
+.phase3Now strong,
+.phase3Now span {
+  display: block;
+}
+
+.phase3Now strong {
+  color: #f0f6fc;
+  margin-bottom: 3px;
+}
+
+.phase3Now span {
+  color: #8b949e;
+  font-size: 12px;
+}
+
+.eventSummary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.eventFilters {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.eventFilters button {
+  min-height: 28px;
+  border: 1px solid #30363d;
+  background: #0d1117;
+  color: #c9d1d9;
+  border-radius: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.eventFilters button.active,
+.eventFilters button:hover {
+  border-color: #58a6ff;
+  color: #f0f6fc;
+  background: rgba(88, 166, 255, 0.13);
 }
 
 .emptyState {
@@ -429,6 +554,13 @@ h1 {
   min-width: 980px;
 }
 
+.tableWrap.recentTable td:nth-child(6) {
+  min-width: 260px;
+  max-width: 520px;
+  white-space: normal;
+  line-height: 1.35;
+}
+
 .tableWrap.suiteTable table {
   min-width: 1320px;
 }
@@ -445,6 +577,22 @@ table {
   border-collapse: collapse;
   width: 100%;
   font-size: 12px;
+}
+
+.outcomeText {
+  font-weight: 700;
+}
+
+.outcomeText.p0 {
+  color: #79a7ff;
+}
+
+.outcomeText.p1 {
+  color: #ff8f86;
+}
+
+.outcomeText.neutral {
+  color: #c9d1d9;
 }
 
 th,
@@ -513,9 +661,26 @@ tr.selected {
   stroke-width: 1.2;
 }
 
-.hexCell.empty.threat {
-  stroke: #39d0d6;
-  stroke-width: 2.2;
+.hexCell.empty.threat.p0 {
+  fill: rgba(30, 76, 154, 0.34);
+  stroke: rgba(80, 132, 214, 0.42);
+  stroke-width: 1.1;
+}
+
+.hexCell.empty.threat.p1 {
+  fill: rgba(126, 34, 34, 0.36);
+  stroke: rgba(194, 83, 75, 0.42);
+  stroke-width: 1.1;
+}
+
+.hexCell.stone.threat.p0 {
+  fill: #1f4e9a;
+  stroke: #5084d6;
+}
+
+.hexCell.stone.threat.p1 {
+  fill: #7e2222;
+  stroke: #c2534b;
 }
 
 .hexCell.empty.clickable {
@@ -594,6 +759,19 @@ tr.selected {
 .hexCell.last {
   stroke: #ffffff;
   stroke-width: 2.5;
+}
+
+.hexCell.winning {
+  stroke: #ffffff;
+  stroke-width: 2.3;
+}
+
+.winningOutline {
+  fill: none;
+  stroke: #ffffff;
+  stroke-width: 3.2;
+  stroke-linejoin: round;
+  pointer-events: none;
 }
 
 .moveNumber,
@@ -726,10 +904,45 @@ tr.selected {
   overflow: auto;
 }
 
+.moveList.compactMoves {
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  max-height: 360px;
+}
+
 .moveList button.active {
   border-color: #58a6ff;
   background: rgba(88, 166, 255, 0.18);
   color: #dbeafe;
+}
+
+.moveGap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  color: #8b949e;
+  border: 1px dashed #30363d;
+  border-radius: 6px;
+  background: rgba(13, 17, 23, 0.52);
+}
+
+.timelineSlider {
+  margin: 8px 0 10px;
+}
+
+.timelineSlider input[type="range"] {
+  width: 100%;
+  accent-color: #58a6ff;
+}
+
+.inlineError {
+  margin: 8px 0;
+  border: 1px solid rgba(248, 81, 73, 0.7);
+  background: rgba(248, 81, 73, 0.12);
+  color: #ffdcd7;
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 12px;
 }
 
 .timelineStatus {
@@ -854,7 +1067,10 @@ pre {
 @media (max-width: 1100px) {
   .kpis,
   .suiteHero,
+  .modelPicker,
+  .eventSummary,
   .exampleSummary,
+  .exampleControls,
   .detailCards,
   .detailGrid,
   .grid.two,
