@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 1
-REQUIRED_V1_TABLES = {
+SCHEMA_VERSION = 2
+REQUIRED_TABLES = {
     "arena_matches",
     "artifacts",
     "axis_presets",
@@ -31,6 +31,10 @@ REQUIRED_V1_TABLES = {
     "positions",
     "runs",
 }
+
+
+class DashboardSchemaError(RuntimeError):
+    """Raised when a dashboard database uses an unsupported schema."""
 
 
 def _json_dumps(value: Any) -> str:
@@ -105,12 +109,22 @@ class DashboardStore:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            if 1 not in current or not REQUIRED_V1_TABLES.issubset(existing_tables):
-                _apply_v1(conn)
-            if 1 not in current:
+            if "positions" in existing_tables:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(positions)")
+                }
+                if "move_history_b64" in columns:
+                    raise DashboardSchemaError(
+                        f"Unsupported position-history dashboard schema at {self.path}; "
+                        "compact schema v2 stores game history once per game and positions by turn index."
+                    )
+            if SCHEMA_VERSION not in current or not REQUIRED_TABLES.issubset(existing_tables):
+                _apply_v2(conn)
+            if SCHEMA_VERSION not in current:
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (1, time.time()),
+                    (SCHEMA_VERSION, time.time()),
                 )
             conn.commit()
 
@@ -306,7 +320,6 @@ class DashboardStore:
         *,
         turn_index: int,
         player: int,
-        move_history: bytes,
         root_value: float = 0.0,
         policy_target: Mapping[int, float] | None = None,
         debug: Mapping[str, Any] | None = None,
@@ -315,16 +328,15 @@ class DashboardStore:
             cur = conn.execute(
                 """
                 INSERT INTO positions(
-                    game_id, turn_index, player, move_history_b64,
+                    game_id, turn_index, player,
                     root_value, policy_json, debug_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     game_row_id,
                     turn_index,
                     player,
-                    encode_bytes(move_history),
                     root_value,
                     _json_dumps({str(k): v for k, v in (policy_target or {}).items()}),
                     _json_dumps(debug),
@@ -374,17 +386,16 @@ class DashboardStore:
             conn.executemany(
                 """
                 INSERT INTO positions(
-                    game_id, turn_index, player, move_history_b64,
+                    game_id, turn_index, player,
                     root_value, policy_json, debug_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         game_row_id,
                         int(pos["turn_index"]),
                         int(pos["player"]),
-                        encode_bytes(pos["move_history"]),
                         float(pos.get("root_value", 0.0)),
                         _json_dumps({str(k): v for k, v in pos.get("policy_target", {}).items()}),
                         _json_dumps(pos.get("debug", {})),
@@ -433,7 +444,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
-def _apply_v1(conn: sqlite3.Connection) -> None:
+def _apply_v2(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -505,7 +516,6 @@ def _apply_v1(conn: sqlite3.Connection) -> None:
             game_id INTEGER NOT NULL REFERENCES games(game_id) ON DELETE CASCADE,
             turn_index INTEGER NOT NULL,
             player INTEGER NOT NULL,
-            move_history_b64 TEXT NOT NULL DEFAULT '',
             root_value REAL NOT NULL DEFAULT 0.0,
             policy_json TEXT NOT NULL DEFAULT '{}',
             debug_json TEXT NOT NULL DEFAULT '{}',

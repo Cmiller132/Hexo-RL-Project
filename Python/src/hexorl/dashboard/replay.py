@@ -80,7 +80,10 @@ def replay_game(
     return {
         "game": _public_game(game),
         "moves": [_move_dict(m) for m in moves],
-        "positions": [_public_position(row) for row in position_rows],
+        "positions": [
+            _public_position({**row, "final_history_b64": final_history})
+            for row in position_rows
+        ],
     }
 
 
@@ -435,6 +438,12 @@ def _move_dict(move: Move) -> dict[str, int]:
     return {"player": int(player), "q": int(q), "r": int(r)}
 
 
+def _history_prefix(history: bytes, turn_index: int) -> bytes:
+    stride = 12
+    max_bytes = max(0, min(int(turn_index), len(history) // stride)) * stride
+    return history[:max_bytes]
+
+
 def _public_game(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "game_id": row["game_id"],
@@ -511,7 +520,7 @@ def _public_position(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _candidate_rows_debug(row: dict[str, Any], debug: dict[str, Any], limit: int = 64) -> dict[str, Any]:
-    history = row.get("move_history_b64") or b""
+    history = _history_prefix(row.get("final_history_b64") or b"", int(row.get("turn_index") or 0))
     policy_v2 = _policy_v2_from_debug(debug.get("policy_target_v2", []))
     try:
         position = get_replay_position(history, constrain_threats=False)

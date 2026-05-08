@@ -23,6 +23,7 @@ from hexorl.eval.scorecard import ScorecardRecord, append_scorecard, read_scorec
 from hexorl.models.assembly import build_model_from_config
 from hexorl.models.loading import restore_model_weights
 from hexorl.tuning.fixed_classical_eval import (
+    DEFAULT_FIXED_CLASSICAL_GAMES,
     FixedClassicalEvalSettings,
     evaluate_candidate_fixed_classical,
 )
@@ -272,7 +273,7 @@ class Phase3OptunaTpeRunner:
         spec_path: Path | str,
         trial_runner: Phase3TrialRunner | None = None,
         n_trials_per_study: int = 1,
-        trial_epochs: int = 2,
+        trial_epochs: int = 4,
         fixed_eval_settings: FixedClassicalEvalSettings | None = None,
         fixed_eval_game_runner: Callable[[int, int], Any] | None = None,
         max_studies: int | None = None,
@@ -287,7 +288,9 @@ class Phase3OptunaTpeRunner:
         self.trial_runner = trial_runner or EpochPhase3TrialRunner()
         self.n_trials_per_study = int(n_trials_per_study)
         self.trial_epochs = int(trial_epochs)
-        self.fixed_eval_settings = fixed_eval_settings or FixedClassicalEvalSettings(games_per_candidate=20)
+        self.fixed_eval_settings = fixed_eval_settings or FixedClassicalEvalSettings(
+            games_per_candidate=DEFAULT_FIXED_CLASSICAL_GAMES
+        )
         self.fixed_eval_game_runner = fixed_eval_game_runner
         self.max_studies = max_studies
         self.summary_path = Path(summary_path) if summary_path is not None else None

@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from hexorl.autotune import candidate_recipes_from_config
+from hexorl.autotune import candidate_recipes_from_config, candidate_recipes_from_plan_entries
 from hexorl.config import Config
 from hexorl.tuning.optuna_scout import (
     DryRunScoutEpochRunner,
@@ -87,8 +87,6 @@ def main() -> int:
 
 def _base_config_from_args(args: argparse.Namespace) -> Config:
     data = Config().model_dump(mode="json")
-    if args.candidate_plan:
-        data["autotune"]["scout"]["candidate_plan"] = [str(entry).lower() for entry in args.candidate_plan]
     if args.max_game_moves is not None:
         if int(args.max_game_moves) <= 0:
             raise SystemExit("--max-game-moves must be positive")
@@ -101,7 +99,14 @@ def _base_config_from_args(args: argparse.Namespace) -> Config:
 
 
 def _candidates_from_args(base_config: Config, args: argparse.Namespace):
-    candidates = candidate_recipes_from_config(base_config)
+    candidates = (
+        candidate_recipes_from_plan_entries(
+            args.candidate_plan,
+            metadata_source="cli.candidate_plan",
+        )
+        if args.candidate_plan
+        else candidate_recipes_from_config(base_config)
+    )
     if args.phase1_mcts_simulations is None:
         return candidates
     full_sims = int(args.phase1_mcts_simulations)

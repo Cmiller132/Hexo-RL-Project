@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -230,15 +231,36 @@ class CandidateRecipe(BaseModel):
 def candidate_recipes_from_config(config: Config) -> tuple[CandidateRecipe, ...]:
     """Build the validated initial scout recipe plan from ``config.autotune``."""
 
+    return candidate_recipes_from_plan_entries(
+        config.autotune.scout.candidate_plan,
+        metadata_source="autotune.scout.candidate_plan",
+    )
+
+
+def candidate_recipes_from_plan_entries(
+    plan_entries: Sequence[str],
+    *,
+    metadata_source: str = "explicit_candidate_plan",
+) -> tuple[CandidateRecipe, ...]:
+    """Build validated scout recipes from explicit ``architecture:pair_mode`` entries."""
+
+    normalized_entries = [str(entry).strip().lower() for entry in plan_entries]
+    if not normalized_entries:
+        raise ValueError("candidate plan must not be empty")
+    if len(set(normalized_entries)) != len(normalized_entries):
+        raise ValueError("candidate plan entries must be unique")
+
     recipes = []
-    for entry in config.autotune.scout.candidate_plan:
+    for entry in normalized_entries:
+        if ":" not in entry:
+            raise ValueError("candidate plan entries must have '<architecture_id>:<pair_strategy>' format")
         architecture_id, pair_mode = entry.split(":", 1)
         recipes.append(
             CandidateRecipe(
                 model=_model_recipe_for_architecture(architecture_id, pair_mode),
                 pair_strategy=_pair_strategy_for_mode(pair_mode),
                 runtime=_runtime_spec_for_architecture(architecture_id),
-                metadata={"source": "autotune.scout.candidate_plan", "plan_entry": entry},
+                metadata={"source": metadata_source, "plan_entry": entry},
             )
         )
     ids = [recipe.candidate_id for recipe in recipes]

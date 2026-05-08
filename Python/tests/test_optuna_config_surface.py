@@ -8,6 +8,7 @@ from hexorl.autotune import (
     ModelRecipe,
     PairStrategySpec,
     candidate_recipes_from_config,
+    candidate_recipes_from_plan_entries,
     config_hash,
     write_candidate_artifacts,
 )
@@ -102,6 +103,45 @@ def test_initial_scout_recipes_have_deterministic_candidate_ids():
     assert champion.runtime.graph_microbatch_size == 1
     assert champion.runtime.graph_microbatch_autotune_max_size == 4
     assert champion.runtime.graph_microbatch_memory_headroom == pytest.approx(0.60)
+
+
+def test_explicit_scout_plan_builds_ordered_subset_without_mutating_config():
+    base = Config()
+
+    recipes = candidate_recipes_from_plan_entries(
+        [
+            "global_xattn_0:none",
+            "global_pair_twostage_0:root_pair_mcts",
+        ],
+        metadata_source="cli.candidate_plan",
+    )
+
+    assert [recipe.candidate_id for recipe in recipes] == [
+        "global_xattn_0__none__v1",
+        "global_pair_twostage_0__root_pair_mcts__v1",
+    ]
+    assert recipes[1].metadata == {
+        "source": "cli.candidate_plan",
+        "plan_entry": "global_pair_twostage_0:root_pair_mcts",
+    }
+    cfg = recipes[1].materialize_config(base)
+    assert base.autotune.scout.candidate_plan == Config().autotune.scout.candidate_plan
+    assert cfg.model.architecture == "global_pair_twostage_0"
+    assert cfg.model.pair_strategy == "root_pair_mcts"
+    assert cfg.selfplay.mcts_simulations == 512
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([], "must not be empty"),
+        (["global_xattn_0:none", "global_xattn_0:none"], "unique"),
+        (["global_xattn_0"], "format"),
+    ],
+)
+def test_explicit_scout_plan_validates_before_materialization(entries, message):
+    with pytest.raises(ValueError, match=message):
+        candidate_recipes_from_plan_entries(entries)
 
 
 def test_candidate_recipe_materializes_valid_config_without_mutating_base():

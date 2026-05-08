@@ -28,7 +28,8 @@ from hexorl.buffer.sampler import _transform_history_bytes
 from hexorl.axis_policy.registry import describe_prototypes, evaluate_all, get_prototype
 from hexorl.dashboard.arena_service import ArenaManager
 from hexorl.dashboard.checkpoints import scan_checkpoints
-from hexorl.dashboard.db import DashboardStore, decode_bytes
+from hexorl.dashboard.db import SCHEMA_VERSION as DASHBOARD_SCHEMA_VERSION
+from hexorl.dashboard.db import DashboardSchemaError, DashboardStore, decode_bytes
 from hexorl.dashboard.fixtures import (
     ClassicalFixtureConfig,
     generate_classical_fixtures,
@@ -121,6 +122,7 @@ class ArenaStartRequest(BaseModel):
 
 def _game_summary(row: dict[str, Any]) -> dict[str, Any]:
     payload = row.get("payload_json", {}) or {}
+    replay_error = _history_replay_error(row.get("final_history_b64"))
     return {
         "game_id": row["game_id"],
         "run_id": row["run_id"],
@@ -134,6 +136,8 @@ def _game_summary(row: dict[str, Any]) -> dict[str, Any]:
         "terminal_reason": payload.get("terminal_reason", ""),
         "truncated": bool(payload.get("truncated", False)),
         "positions": payload.get("positions"),
+        "replay_available": bool(row.get("final_history_b64")) and replay_error is None,
+        "replay_error": replay_error or "",
         "payload": payload,
     }
 
@@ -166,7 +170,7 @@ def create_app(
     def health() -> dict[str, Any]:
         return {
             "ok": True,
-            "schema_version": 1,
+            "schema_version": DASHBOARD_SCHEMA_VERSION,
             "db_path": str(store.path),
             "suite_enabled": suite_root is not None,
             "suite_run_root": str(suite_root) if suite_root else None,
@@ -274,6 +278,11 @@ def create_app(
     ) -> dict[str, Any]:
         source = _suite_store_for_run(suite_root, run_id) if run_id else store
         try:
+            rows = (source or store).rows("SELECT final_history_b64 FROM games WHERE game_id=?", (game_id,))
+            if rows:
+                replay_error = _history_replay_error(rows[0].get("final_history_b64"))
+                if replay_error:
+                    raise HTTPException(422, f"Invalid replay history: {replay_error}")
             return replay_game(source or store, game_id, include_positions=include_positions)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
@@ -289,6 +298,9 @@ def create_app(
         rows = (source or store).rows("SELECT final_history_b64 FROM games WHERE game_id=?", (game_id,))
         if not rows:
             raise HTTPException(404, f"Game not found: {game_id}")
+        replay_error = _history_replay_error(rows[0]["final_history_b64"])
+        if replay_error:
+            raise HTTPException(422, f"Invalid replay history: {replay_error}")
         pos = get_replay_position(rows[0]["final_history_b64"], turn_index=turn_index)
         return position_payload(pos, include_moves=not compact)
 
@@ -402,6 +414,9 @@ def create_app(
         row = _suite_example_by_id(suite_root, example_id)
         if not row or not row.get("final_history_b64"):
             raise HTTPException(404, f"Replay not found: {example_id}")
+        replay_error = _history_replay_error(row["final_history_b64"])
+        if replay_error:
+            raise HTTPException(422, f"Invalid replay history: {replay_error}")
         history = _decode_history_value(row["final_history_b64"])
         public_row = dict(row)
         public_row.pop("final_history_b64", None)
@@ -425,6 +440,9 @@ def create_app(
         row = _suite_example_by_id(suite_root, example_id)
         if not row or not row.get("final_history_b64"):
             raise HTTPException(404, f"Position not found: {example_id}")
+        replay_error = _history_replay_error(row["final_history_b64"])
+        if replay_error:
+            raise HTTPException(422, f"Invalid replay history: {replay_error}")
         return position_payload(
             get_replay_position(
                 _decode_history_value(row["final_history_b64"]),
@@ -680,13 +698,31 @@ def _suite_trial_dirs(run_root: Path) -> list[Path]:
     trials = run_root / "trials"
     if not trials.exists():
         return []
-    return sorted([path for path in trials.iterdir() if (path / "dashboard.sqlite3").exists()])
+    return sorted(
+        [
+            path
+            for path in trials.iterdir()
+            if path.is_dir()
+            and (
+                (path / "dashboard.sqlite3").exists()
+                or (path / "optuna_trial.json").exists()
+                or (path / "full_config.json").exists()
+                or (path / "events.jsonl").exists()
+                or (path / "scorecards.jsonl").exists()
+                or (path / "checkpoints").exists()
+            )
+        ]
+    )
+
+
+def _suite_dashboard_trial_dirs(run_root: Path) -> list[Path]:
+    return [path for path in _suite_trial_dirs(run_root) if (path / "dashboard.sqlite3").exists()]
 
 
 def _suite_game_trial_dirs(run_root: Path) -> list[Path]:
     """Return dashboard-backed dirs that can contribute replayable games."""
     candidates: list[Path] = []
-    candidates.extend(_suite_trial_dirs(run_root))
+    candidates.extend(_suite_dashboard_trial_dirs(run_root))
     phase3_root = run_root.parent / "phase3_trials"
     if phase3_root.exists():
         candidates.extend(path for path in phase3_root.iterdir() if path.is_dir() and (path / "dashboard.sqlite3").exists())
@@ -788,10 +824,48 @@ def _trial_display_name(trial_id: str) -> str:
 def _suite_runs(run_root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     trial_state = {trial["trial_id"]: trial for trial in _suite_state(run_root).get("trials", [])}
+    trial_dirs = list(_suite_trial_dirs(run_root))
+    seen_dirs = {path.resolve() for path in trial_dirs}
     for trial_dir in _suite_game_trial_dirs(run_root):
+        resolved = trial_dir.resolve()
+        if resolved not in seen_dirs:
+            trial_dirs.append(trial_dir)
+            seen_dirs.add(resolved)
+    for trial_dir in trial_dirs:
         db = trial_dir / "dashboard.sqlite3"
+        if not db.exists():
+            rows.append(
+                {
+                    "run_id": _suite_primary_run_id(trial_dir),
+                    "trial_id": trial_dir.name,
+                    "updated_at": 0,
+                    "metadata_only": True,
+                    **trial_state.get(trial_dir.name, {}),
+                }
+            )
+            continue
         try:
             run_rows = DashboardStore(db).rows("SELECT * FROM runs ORDER BY updated_at DESC")
+        except DashboardSchemaError as exc:
+            rows.append(
+                {
+                    "run_id": trial_dir.name,
+                    "trial_id": trial_dir.name,
+                    "suite_trial_id": trial_dir.name,
+                    "source_db": str(db),
+                    "name": _trial_display_name(trial_dir.name),
+                    "output_dir": str(trial_dir),
+                    "config_json": {},
+                    "payload_json": {
+                        "dashboard_schema_error": str(exc),
+                        "requires_rebuild": True,
+                        "schema_version": DASHBOARD_SCHEMA_VERSION,
+                    },
+                    "created_at": 0.0,
+                    "updated_at": 0.0,
+                }
+            )
+            continue
         except Exception:
             continue
         for row in run_rows:
@@ -859,8 +933,13 @@ def _suite_games(run_root: Path, *, run_id: str | None = None, limit: int = 200)
 
 def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, Any]]:
     examples: list[dict[str, Any]] = []
-    for row in _suite_games(run_root, limit=max(1, min(limit, 200))):
+    # Validate a wider raw window before applying the final limit. A burst of
+    # invalid or non-replayable rows from one trial should not crowd out
+    # viewable examples from other models.
+    selfplay_limit = 500
+    for row in _suite_games(run_root, limit=selfplay_limit):
         trial_id = row.get("trial_id") or row.get("run_id")
+        replay_error = _history_replay_error(row.get("final_history_b64"))
         examples.append(
             {
                 "example_id": f"selfplay|{row.get('run_id')}|{row.get('game_id')}",
@@ -877,7 +956,8 @@ def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, A
                 "move_count": row.get("move_count"),
                 "terminal_reason": (row.get("payload_json") or {}).get("terminal_reason", ""),
                 "created_at": row.get("created_at"),
-                "replay_available": bool(row.get("final_history_b64")),
+                "replay_available": bool(row.get("final_history_b64")) and replay_error is None,
+                "replay_error": replay_error or "",
             }
         )
 
@@ -897,6 +977,7 @@ def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, A
                 seen_classical.add(key)
                 opponent_id = str(row.get("opponent_id") or "fixed_classical")
                 example_id = f"classical|{trial_id}|{epoch if epoch is not None else 0}|{game_index}"
+                replay_error = _history_replay_error(row.get("final_history_b64"))
                 examples.append(
                     {
                         "example_id": example_id,
@@ -913,7 +994,8 @@ def _suite_game_examples(run_root: Path, *, limit: int = 80) -> list[dict[str, A
                         "move_count": row.get("moves"),
                         "terminal_reason": row.get("reason", ""),
                         "created_at": _mtime(evidence_path),
-                        "replay_available": bool(row.get("final_history_b64")),
+                        "replay_available": bool(row.get("final_history_b64")) and replay_error is None,
+                        "replay_error": replay_error or "",
                         "opponent_id": opponent_id,
                         "opening_is_black": row.get("opening_is_black"),
                         "checkpoint_id": row.get("checkpoint_id", ""),
@@ -952,7 +1034,6 @@ def _suite_example_by_id(run_root: Path, example_id: str) -> dict[str, Any] | No
         row = _game_summary(row)
         row["example_id"] = example_id
         row["kind"] = "selfplay"
-        row["replay_available"] = True
         row["final_history_b64"] = history
         return row
     if kind != "classical":
@@ -976,6 +1057,7 @@ def _suite_example_by_id(run_root: Path, example_id: str) -> dict[str, Any] | No
             if int(row.get("game_index", -1)) != target_index:
                 continue
             opponent_id = str(row.get("opponent_id") or "fixed_classical")
+            replay_error = _history_replay_error(row.get("final_history_b64"))
             row = dict(row)
             row.update(
                 {
@@ -992,7 +1074,8 @@ def _suite_example_by_id(run_root: Path, example_id: str) -> dict[str, Any] | No
                     "move_count": row.get("moves"),
                     "terminal_reason": row.get("reason", ""),
                     "created_at": _mtime(evidence_path),
-                    "replay_available": bool(row.get("final_history_b64")),
+                    "replay_available": bool(row.get("final_history_b64")) and replay_error is None,
+                    "replay_error": replay_error or "",
                     "opponent_id": opponent_id,
                 }
             )
@@ -1037,6 +1120,25 @@ def _decode_history_value(value: Any) -> bytes:
     if isinstance(value, bytes):
         return value
     return decode_bytes(str(value or ""))
+
+
+def _history_replay_error(value: Any) -> str | None:
+    """Return a concise reason a persisted history cannot be replayed safely."""
+    if not value:
+        return "missing history"
+    try:
+        history = _decode_history_value(value)
+    except Exception as exc:
+        return f"history decode failed: {exc}"
+    if len(history) % 12 != 0:
+        return f"history byte length {len(history)} is not divisible by 12"
+    seen: set[tuple[int, int]] = set()
+    for index, (_player, q, r) in enumerate(decode_move_history(history)):
+        key = (int(q), int(r))
+        if key in seen:
+            return f"duplicate placement at move {index}: ({int(q)}, {int(r)})"
+        seen.add(key)
+    return None
 
 
 def _epoch_from_fixed_classical_path(path: Path) -> int | None:
@@ -1190,7 +1292,7 @@ def _suite_trials(run_root: Path) -> list[dict[str, Any]]:
     score_by_trial = _suite_score_by_trial(run_root)
     phase2_by_trial = {row["trial_id"]: row for row in _suite_phase2_rows(run_root)}
     rows: list[dict[str, Any]] = []
-    for trial_dir in _suite_game_trial_dirs(run_root):
+    for trial_dir in _suite_trial_dirs(run_root):
         trial_id = trial_dir.name
         state = dict(state_trials.get(trial_id) or {})
         trial_json = _read_json(trial_dir / "trial.json")
@@ -1456,7 +1558,7 @@ def _suite_events(run_root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
     for row in _jsonl_tail(run_root / "events.jsonl", limit=limit):
         rows.append(_normalize_suite_event(row, trial_id=str(row.get("trial_id") or row.get("candidate_id") or "")))
     per_trial_limit = max(80, min(300, limit))
-    for trial_dir in _suite_game_trial_dirs(run_root):
+    for trial_dir in _suite_trial_dirs(run_root):
         rows.extend(_suite_events_for_trial(trial_dir, limit=per_trial_limit))
     unique: dict[tuple[str, str, str, float, int], dict[str, Any]] = {}
     for row in rows:

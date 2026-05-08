@@ -10,6 +10,7 @@ from .recipes import (
     ScheduleSpec,
     SearchRecipe,
     candidate_recipes_from_config,
+    candidate_recipes_from_plan_entries,
 )
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "ScheduleSpec",
     "SearchRecipe",
     "candidate_recipes_from_config",
+    "candidate_recipes_from_plan_entries",
     "config_hash",
     "write_candidate_artifacts",
 ]

@@ -10,7 +10,7 @@ from hexorl.action_contract.candidates import CANDIDATE_FEATURE_NAMES, CANDIDATE
 from hexorl.axis_policy.core import AxisPolicyInput
 from hexorl.axis_policy.registry import evaluate_all, get_prototype
 from hexorl.dashboard.checkpoints import index_checkpoint
-from hexorl.dashboard.app import _suite_games, _suite_runs, _suite_store_for_run
+from hexorl.dashboard.app import _suite_game_examples, _suite_games, _suite_runs, _suite_store_for_run
 from hexorl.dashboard.db import DashboardStore
 from hexorl.dashboard.fixtures import ClassicalFixtureConfig, generate_classical_fixtures
 from hexorl.dashboard.play import apply_move, create_session, session_payload, undo_move
@@ -66,7 +66,13 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     history = _move(0, 0, 0) + _move(1, 1, 0)
     game = GameRecord(
         positions=[
-            PositionRecord(b"", {action_to_board_index(0, 0): 1.0}, 0.2, player=0),
+            PositionRecord(
+                b"",
+                {action_to_board_index(0, 0): 1.0},
+                0.2,
+                player=0,
+                opp_policy_legal_v2=[(q, 0) for q in range(33)],
+            ),
             PositionRecord(_move(0, 0, 0), {action_to_board_index(1, 0): 1.0}, -0.1, player=1, turn_index=1),
         ],
         outcome=1.0,
@@ -82,6 +88,8 @@ def test_dashboard_store_records_game_and_json_payloads(tmp_path):
     positions = store.rows("SELECT * FROM positions WHERE game_id=? ORDER BY turn_index", (game_row_id,))
     assert len(positions) == 2
     assert positions[0]["policy_json"]
+    assert "opp_policy_legal_v2" not in positions[0]["debug_json"]
+    assert positions[0]["debug_json"]["opp_policy_legal_v2_count"] == 33
     assert (tmp_path / "events.jsonl").exists()
 
 
@@ -129,6 +137,51 @@ def test_suite_games_include_direct_phase3_trial_dashboards(tmp_path):
         "global_graph768_champion__none__v1__phase3_t0000",
         "global_xattn_0__none__v1",
     }
+
+
+def test_suite_game_examples_disable_invalid_duplicate_replay_histories(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "global_xattn_0__none__v1"
+    trial_dir.mkdir(parents=True)
+    store = DashboardStore(trial_dir / "dashboard.sqlite3")
+    run_id = "production_global_xattn"
+    valid_history = _move(0, 0, 0) + _move(1, 1, 0)
+    valid_game_id = store.insert_game(
+        run_id=run_id,
+        game_id="good-history",
+        source="selfplay",
+        final_move_history=valid_history,
+        payload={"terminal_reason": "terminal"},
+    )
+    duplicate_history = _move(0, 0, 0) + _move(0, 0, 0)
+    invalid_game_id = 0
+    for index in range(20):
+        invalid_game_id = store.insert_game(
+            run_id=run_id,
+            game_id=f"bad-history-{index}",
+            source="selfplay",
+            final_move_history=duplicate_history,
+            payload={"terminal_reason": "max_game_moves"},
+        )
+
+    examples = _suite_game_examples(run_root, limit=10)
+    assert examples[0]["game_id"] == valid_game_id
+    assert examples[0]["replay_available"] is True
+    invalid_examples = [row for row in examples if row["game_id"] == invalid_game_id]
+    assert invalid_examples
+    assert invalid_examples[0]["replay_available"] is False
+    assert "duplicate placement" in invalid_examples[0]["replay_error"]
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+    replay = client.get(f"/api/games/{invalid_game_id}/replay?run_id={run_id}")
+    assert replay.status_code == 422
+    assert "duplicate placement" in replay.json()["detail"]
 
 
 def test_run_recorder_dashboard_write_failure_does_not_crash_training(tmp_path):
@@ -430,7 +483,6 @@ def test_replay_routes_default_to_compact_payloads(tmp_path):
             {
                 "turn_index": 1,
                 "player": 1,
-                "move_history": _move(0, 0, 0),
                 "root_value": 0.0,
                 "policy_target": {},
                 "debug": {},
@@ -450,6 +502,51 @@ def test_replay_routes_default_to_compact_payloads(tmp_path):
     assert compact_position["turn_index"] == 3
     assert "moves" not in compact_position
     assert compact_position["stones"]
+
+    columns = app.state.store.rows("PRAGMA table_info(positions)")
+    assert "move_history_b64" not in {row["name"] for row in columns}
+
+
+def test_compact_position_rows_reconstruct_from_game_history(tmp_path):
+    from hexorl.dashboard.replay import get_replay_position, replay_game
+
+    store = DashboardStore(tmp_path / "dashboard.sqlite3")
+    history = _move(0, 0, 0) + _move(1, 1, 0) + _move(0, 0, 1) + _move(1, 2, 0)
+    game_id = store.insert_game_with_positions(
+        run_id="compact-run",
+        game_id="compact-game",
+        source="unit",
+        final_move_history=history,
+        positions=[
+            {"turn_index": 0, "player": 0, "root_value": 0.0, "policy_target": {}, "debug": {}},
+            {"turn_index": 2, "player": 0, "root_value": 0.1, "policy_target": {}, "debug": {}},
+            {"turn_index": 4, "player": 0, "root_value": 0.2, "policy_target": {}, "debug": {}},
+        ],
+    )
+
+    payload = replay_game(store, game_id, include_positions=True)
+
+    assert [row["turn_index"] for row in payload["positions"]] == [0, 2, 4]
+    for turn in (0, 2, 4):
+        pos = get_replay_position(history, turn_index=turn)
+        assert len(pos.moves) == turn
+        assert len(pos.stones) == turn
+
+
+def test_old_position_history_dashboard_schema_is_rejected(tmp_path):
+    import sqlite3
+
+    from hexorl.dashboard.db import DashboardSchemaError
+
+    db = tmp_path / "old-dashboard.sqlite3"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)")
+        conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, 0.0)")
+        conn.execute(
+            "CREATE TABLE positions (position_id INTEGER PRIMARY KEY, move_history_b64 TEXT NOT NULL DEFAULT '')"
+        )
+    with pytest.raises(DashboardSchemaError, match="schema v2"):
+        DashboardStore(db)
 
 
 def test_suite_game_lookup_accepts_dashboard_run_id_that_differs_from_trial_dir(tmp_path):
@@ -654,6 +751,58 @@ def test_suite_events_merge_trial_events_and_suppress_game_spam(tmp_path):
     assert status["event_count"] == 3
     assert status["warning_count"] == 1
     assert status["last_event_name"] == "epoch_complete"
+
+
+def test_suite_lists_metadata_only_trials_after_dashboard_rotation(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from hexorl.dashboard.app import create_app
+
+    run_root = tmp_path / "suite"
+    trial_dir = run_root / "trials" / "global_graph768_champion__none__v1"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "full_config.json").write_text(
+        json.dumps(
+            {
+                "model": {"architecture": "global_graph768_champion", "channels": 192, "blocks": 16},
+                "selfplay": {"mcts_simulations": 512, "max_game_moves": 500},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trial_dir / "optuna_trial.json").write_text(
+        json.dumps({"trial_number": 1, "params": {"candidate_id": trial_dir.name}}),
+        encoding="utf-8",
+    )
+    (trial_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "event_type": "epoch_complete",
+                "phase": "epoch",
+                "epoch": 2,
+                "payload": {"checkpoint_path": "checkpoints/epoch_0002.pt"},
+                "time": 20.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_root / "manifest.json").write_text(json.dumps({"run_id": "unit"}), encoding="utf-8")
+
+    client = TestClient(create_app(tmp_path / "dashboard.sqlite3", frontend_dist=tmp_path / "missing", run_root=run_root))
+
+    trials = client.get("/api/suite/trials").json()
+    assert [row["trial_id"] for row in trials] == ["global_graph768_champion__none__v1"]
+    assert trials[0]["games"] == 0
+    assert trials[0]["positions"] == 0
+    assert trials[0]["architecture"] == "global_graph768_champion"
+    assert trials[0]["mcts_simulations"] == 512
+
+    events = client.get("/api/suite/events").json()
+    assert any(row["trial_id"] == "global_graph768_champion__none__v1" for row in events)
+    assert not (trial_dir / "dashboard.sqlite3").exists()
 
 
 def test_suite_dashboard_scores_and_stage_fallback(tmp_path):
