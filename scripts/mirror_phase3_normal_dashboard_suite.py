@@ -5,18 +5,60 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def _copy_file_if_changed(src: Path, dst: Path) -> None:
-    if not src.exists():
-        return
-    if dst.exists() and dst.read_bytes() == src.read_bytes():
-        return
+def _copy_sqlite_snapshot(src: Path, dst: Path) -> str:
+    tmp = dst.with_name(f".{dst.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    source_uri = f"{src.resolve().as_uri()}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True, timeout=2.0)
+    target = sqlite3.connect(tmp)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    shutil.copystat(src, tmp, follow_symlinks=True)
+    tmp.replace(dst)
+    return "snapshot"
+
+
+def _same_file_stat(src: Path, dst: Path) -> bool:
+    if not dst.exists():
+        return False
+    src_stat = src.stat()
+    dst_stat = dst.stat()
+    return src_stat.st_size == dst_stat.st_size and src_stat.st_mtime_ns == dst_stat.st_mtime_ns
+
+
+def _is_sqlite_sidecar(path: Path) -> bool:
+    return path.name.endswith((".sqlite3-shm", ".sqlite3-wal", ".sqlite3-journal"))
+
+
+def _copy_file_if_changed(src: Path, dst: Path) -> str:
+    if not src.exists():
+        return "missing"
+    if _same_file_stat(src, dst):
+        return "unchanged"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(src, dst)
+        return "copied"
+    except OSError as exc:
+        if src.suffix == ".sqlite3":
+            try:
+                return _copy_sqlite_snapshot(src, dst)
+            except OSError as snapshot_exc:
+                return f"skipped_locked:{type(snapshot_exc).__name__}:{snapshot_exc}"
+            except sqlite3.Error as snapshot_exc:
+                return f"skipped_sqlite:{type(snapshot_exc).__name__}:{snapshot_exc}"
+        return f"skipped_locked:{type(exc).__name__}:{exc}"
 
 
 def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> dict[str, object]:
@@ -33,14 +75,21 @@ def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> 
         target = trials_dir / source.name
         if not target.exists():
             target.mkdir(parents=True)
+        copy_issues: list[dict[str, str]] = []
         for child in source.iterdir():
             if child.is_file():
-                _copy_file_if_changed(child, target / child.name)
+                if _is_sqlite_sidecar(child):
+                    continue
+                status = _copy_file_if_changed(child, target / child.name)
+                if status.startswith("skipped"):
+                    copy_issues.append({"path": str(child), "status": status})
             elif child.name == "checkpoints" and child.is_dir():
                 (target / child.name).mkdir(exist_ok=True)
                 for checkpoint in child.glob("*"):
                     if checkpoint.is_file():
-                        _copy_file_if_changed(checkpoint, target / child.name / checkpoint.name)
+                        status = _copy_file_if_changed(checkpoint, target / child.name / checkpoint.name)
+                        if status.startswith("skipped"):
+                            copy_issues.append({"path": str(checkpoint), "status": status})
         dashboard = source / "dashboard.sqlite3"
         source_mtime = max(
             (child.stat().st_mtime for child in source.iterdir() if child.is_file()),
@@ -57,6 +106,7 @@ def mirror_once(run_dir: Path, suite_dir: Path, summary: Path | None = None) -> 
                 ),
                 "source_mtime": datetime.fromtimestamp(source_mtime, timezone.utc).isoformat(),
                 "has_dashboard": dashboard.exists(),
+                "copy_issues": copy_issues,
             }
         )
 

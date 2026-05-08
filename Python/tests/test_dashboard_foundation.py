@@ -1,5 +1,6 @@
 import base64
 import json
+import sqlite3
 import struct
 
 import numpy as np
@@ -803,6 +804,37 @@ def test_suite_lists_metadata_only_trials_after_dashboard_rotation(tmp_path):
     events = client.get("/api/suite/events").json()
     assert any(row["trial_id"] == "global_graph768_champion__none__v1" for row in events)
     assert not (trial_dir / "dashboard.sqlite3").exists()
+
+
+def test_suite_mirror_snapshots_dashboard_when_copy_is_locked(tmp_path, monkeypatch):
+    from scripts import mirror_phase3_normal_dashboard_suite as mirror
+
+    run_dir = tmp_path / "run"
+    source = run_dir / "candidates" / "trial-a"
+    source.mkdir(parents=True)
+    source_db = source / "dashboard.sqlite3"
+    with sqlite3.connect(source_db) as con:
+        con.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT)")
+        con.execute("INSERT INTO sample (value) VALUES ('ok')")
+    (source / "events.jsonl").write_text(json.dumps({"event_type": "epoch_start", "time": 1.0}) + "\n")
+
+    original_copy2 = mirror.shutil.copy2
+
+    def copy2_with_locked_dashboard(src, dst, *args, **kwargs):
+        if str(src).endswith("dashboard.sqlite3"):
+            raise OSError(1224, "mapped section open")
+        return original_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(mirror.shutil, "copy2", copy2_with_locked_dashboard)
+
+    suite_dir = tmp_path / "suite"
+    result = mirror.mirror_once(run_dir, suite_dir, tmp_path / "summary.json")
+
+    target_db = suite_dir / "trials" / "trial-a" / "dashboard.sqlite3"
+    with sqlite3.connect(target_db) as con:
+        assert con.execute("SELECT value FROM sample").fetchone()[0] == "ok"
+    assert result["trial_count"] == 1
+    assert result["trials"][0]["copy_issues"] == []
 
 
 def test_suite_dashboard_scores_and_stage_fallback(tmp_path):
