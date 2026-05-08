@@ -39,6 +39,18 @@ def main() -> int:
         default=None,
         help="Override selfplay.mcts_simulations for Phase 1 candidate materialization.",
     )
+    parser.add_argument(
+        "--phase1-states-per-epoch",
+        type=int,
+        default=None,
+        help="Override autotune.scout.min_generated_selfplay_positions_per_epoch for Phase 1.",
+    )
+    parser.add_argument(
+        "--phase1-train-batches-per-epoch",
+        type=int,
+        default=None,
+        help="Override train.batches_per_epoch for Phase 1 scout epochs.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Use deterministic smoke runner.")
     parser.add_argument("--production", action="store_true", help="Run real self-play/training epoch quanta.")
     parser.add_argument(
@@ -95,6 +107,14 @@ def _base_config_from_args(args: argparse.Namespace) -> Config:
         if int(args.phase1_mcts_simulations) <= 0:
             raise SystemExit("--phase1-mcts-simulations must be positive")
         data["selfplay"]["mcts_simulations"] = int(args.phase1_mcts_simulations)
+    if args.phase1_states_per_epoch is not None:
+        if int(args.phase1_states_per_epoch) <= 0:
+            raise SystemExit("--phase1-states-per-epoch must be positive")
+        data["autotune"]["scout"]["min_generated_selfplay_positions_per_epoch"] = int(args.phase1_states_per_epoch)
+    if args.phase1_train_batches_per_epoch is not None:
+        if int(args.phase1_train_batches_per_epoch) <= 0:
+            raise SystemExit("--phase1-train-batches-per-epoch must be positive")
+        data["train"]["batches_per_epoch"] = int(args.phase1_train_batches_per_epoch)
     return Config.model_validate(data)
 
 

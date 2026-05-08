@@ -443,6 +443,36 @@ def test_runtime_probe_selection_applies_knobs_before_training(tmp_path):
     assert full_config["train"]["batches_per_epoch"] == 12
 
 
+def test_scout_epoch_budget_respects_explicit_train_batch_override(tmp_path):
+    cfg = Config()
+    cfg.autotune.scout.min_generated_selfplay_positions_per_epoch = 5000
+    cfg.train.batches_per_epoch = 32
+    candidate = _candidate("global_xattn_0")
+    runner = ConfigRecordingRunner()
+
+    Phase1OptunaScoutController(
+        runs_root=tmp_path / "runs",
+        run_id="budget",
+        base_config=cfg,
+        candidates=(candidate,),
+        runner=runner,
+        min_epochs=2,
+        quantum_epochs=2,
+    ).run(max_quanta=1)
+
+    assert runner.runtime_rows == [
+        (
+            cfg.selfplay.num_workers,
+            cfg.selfplay.batch_size_per_worker,
+            cfg.inference.max_batch_size,
+            cfg.inference.max_wait_us,
+            0,
+            5000,
+            32,
+        )
+    ]
+
+
 def test_runtime_probe_speed_quarantine_stops_candidate_but_not_scout(tmp_path):
     candidates = (_candidate("global_xattn_0"), _candidate("global_line_window_0"))
     runner = RecordingRunner()

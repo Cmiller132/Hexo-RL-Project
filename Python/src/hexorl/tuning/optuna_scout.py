@@ -947,10 +947,13 @@ def _scout_epoch_budget_config(cfg: Config) -> Config:
 
     min_positions = max(1, int(cfg.autotune.scout.min_generated_selfplay_positions_per_epoch))
     batch_size = max(1, int(cfg.train.batch_size))
+    min_train_batches = max(1, math.ceil(min_positions / batch_size))
     tuned = cfg.model_copy(deep=True)
     tuned.selfplay.games_per_epoch = 0
     tuned.selfplay.states_per_epoch = min_positions
-    tuned.train.batches_per_epoch = max(1, math.ceil(min_positions / batch_size))
+    tuned.train.batches_per_epoch = min_train_batches
+    if int(cfg.train.batches_per_epoch) != int(Config().train.batches_per_epoch):
+        tuned.train.batches_per_epoch = max(min_train_batches, int(cfg.train.batches_per_epoch))
     return Config.model_validate(tuned.model_dump(mode="json"))
 
 
