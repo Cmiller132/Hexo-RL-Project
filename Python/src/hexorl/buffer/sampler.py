@@ -6,6 +6,7 @@ On-the-fly decode + D6 symmetry augmentation. Runs in DataLoader workers.
 """
 
 from collections import OrderedDict
+from dataclasses import replace
 import logging
 import time
 import numpy as np
@@ -38,8 +39,13 @@ from hexorl.graph.batch import (
     GraphBatch,
     build_graph_batch_from_history,
     collate_graph_batches,
+    graph_batch_with_admitted_pair_rows,
     graph_batch_with_policy_targets,
     graph_batch_with_reference_pair_rows,
+)
+from hexorl.train.v1_pair_targets import (
+    build_v1_pair_training_targets,
+    collate_v1_pair_training_targets,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +155,18 @@ def _transform_pair_policy_v2(
         q2, r2 = _hex_transform(int(second[0]), int(second[1]), sym_idx % 12)
         transformed.append(((int(q1), int(r1)), (int(q2), int(r2)), float(prob)))
     return transformed
+
+
+def _transform_pair_key_for_sym(
+    first: Tuple[int, int],
+    second: Tuple[int, int],
+    sym_idx: int,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    q1, r1 = _hex_transform(int(first[0]), int(first[1]), sym_idx % 12)
+    q2, r2 = _hex_transform(int(second[0]), int(second[1]), sym_idx % 12)
+    a = (int(q1), int(r1))
+    b = (int(q2), int(r2))
+    return (a, b) if a <= b else (b, a)
 
 
 def _transform_history_bytes(history_bytes: bytes, sym_idx: int) -> bytes:
@@ -446,6 +464,8 @@ class ReplayDataset(_IterableDataset):
             "opp_policy_weight": np.zeros(self.batch_size, dtype=np.float32),
         }
         graph_batches: list[GraphBatch] = []
+        v1_pair_targets = [None for _ in range(self.batch_size)]
+        v1_pair_weights = np.zeros(self.batch_size, dtype=np.float32)
         if self.include_sparse_policy:
             budget = candidate_width
             aux_targets["candidate_qr"] = np.zeros((self.batch_size, budget, 2), dtype=np.int32)
@@ -499,6 +519,7 @@ class ReplayDataset(_IterableDataset):
             policy_v2 = list(rec.policy_target_v2)
             opp_policy_v2 = list(rec.opp_policy_target_v2)
             pair_policy_v2 = list(rec.pair_policy_target_v2)
+            v1_metadata = getattr(rec, "v1_search_metadata", None)
             if self.use_symmetry:
                 sym_idx = self._rng.randint(0, 12)
                 sample_history = _transform_history_bytes(rec.move_history, sym_idx)
@@ -757,6 +778,15 @@ class ReplayDataset(_IterableDataset):
                         continue
                     required_graph_legal_rows.append((int(first[0]), int(first[1])))
                     required_graph_legal_rows.append((int(second[0]), int(second[1])))
+                if v1_metadata is not None:
+                    for candidate in v1_metadata.candidate_pairs:
+                        first, second = _transform_pair_key_for_sym(
+                            candidate.pair_key[0],
+                            candidate.pair_key[1],
+                            sym_idx,
+                        )
+                        required_graph_legal_rows.append(first)
+                        required_graph_legal_rows.append(second)
                 graph_base_started = time.perf_counter()
                 graph_base = self._graph_base_for_history(
                     sample_history,
@@ -799,7 +829,48 @@ class ReplayDataset(_IterableDataset):
                             float(aux_targets["pair_candidate_missing_mass"][i]),
                             1.0,
                         )
-                if pair_policy_v2:
+                if v1_metadata is not None:
+                    v1_rows_started = time.perf_counter()
+                    legal_index = {
+                        (int(q), int(r)): row
+                        for row, (q, r) in enumerate(np.asarray(graph.legal_qr, dtype=np.int32).tolist())
+                    }
+
+                    def transform_qr(qr: tuple[int, int]) -> tuple[int, int]:
+                        q, r = _hex_transform(int(qr[0]), int(qr[1]), sym_idx)
+                        return (int(q), int(r))
+
+                    v1_target = build_v1_pair_training_targets(
+                        v1_metadata,
+                        legal_row_count=int(graph.legal_qr.shape[0]),
+                        legal_row_index_by_qr=legal_index,
+                        pair_key_transform=transform_qr,
+                    )
+                    graph = graph_batch_with_admitted_pair_rows(
+                        graph,
+                        v1_target.candidate_pair_qr,
+                    )
+                    if int(graph.pair_policy_target.shape[0]) != int(v1_target.pair_joint_target.shape[0]):
+                        raise ValueError("V1 graph pair rows must match V1 target rows exactly")
+                    graph = replace(
+                        graph,
+                        pair_policy_target=v1_target.pair_joint_target.copy(),
+                        pair_second_policy_target=v1_target.pair_completion_target.copy(),
+                    )
+                    v1_pair_targets[i] = v1_target
+                    v1_pair_weights[i] = (
+                        policy_search_weight
+                        if float(v1_target.pair_joint_target.sum()) > 0.0
+                        else 0.0
+                    )
+                    aux_targets["pair_policy_weight"][i] = 0.0
+                    pair_policy_v2 = []
+                    loader_timings["graph_loader_v1_pair_rows_s"] = (
+                        loader_timings.get("graph_loader_v1_pair_rows_s", 0.0)
+                        + time.perf_counter()
+                        - v1_rows_started
+                    )
+                elif pair_policy_v2:
                     pair_rows_started = time.perf_counter()
                     graph = graph_batch_with_reference_pair_rows(
                         graph,
@@ -865,6 +936,8 @@ class ReplayDataset(_IterableDataset):
                 "tactical_target": graph_batch.tactical_target,
                 "placements_remaining": graph_batch.placements_remaining_by_sample,
             })
+            if graph_batch.pair_features is not None:
+                aux_targets["pair_features"] = graph_batch.pair_features
             first = aux_targets["pair_first_indices"]
             second = aux_targets["pair_second_indices"]
             pair_row_mask = (first >= 0) & (second >= 0) & (first != second)
@@ -874,6 +947,14 @@ class ReplayDataset(_IterableDataset):
             aux_targets["pair_first_unordered"] = unordered_first
             aux_targets["pair_second_known_first"] = known_first
             aux_targets["pair_second_row_mask"] = pair_row_mask & known_first[:, None]
+            if any(target is not None for target in v1_pair_targets):
+                v1_arrays = collate_v1_pair_training_targets(
+                    v1_pair_targets,
+                    legal_width=int(graph_batch.legal_qr.shape[1]),
+                    pair_width=int(graph_batch.pair_first_indices.shape[1]),
+                )
+                v1_arrays["v1_pair_weight"] = v1_arrays["v1_pair_weight"] * v1_pair_weights
+                aux_targets.update(v1_arrays)
             loader_timings["graph_loader_sample_s"] = time.perf_counter() - sample_started
             aux_targets["_loader_timings"] = loader_timings
         return tensors, policies, values, lookahead_arrays, aux_targets

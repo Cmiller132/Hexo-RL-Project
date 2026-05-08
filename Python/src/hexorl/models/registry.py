@@ -9,6 +9,7 @@ from hexorl.models.specs import (
     ArchitectureSpec,
     ResolvedArchitectureSpec,
     dense_spec,
+    global_pair_biaffine_spec,
     global_graph_spec,
     resolve_spec,
 )
@@ -85,6 +86,12 @@ _SPECS: dict[str, ArchitectureSpec] = {
         recipe_id="global_graph",
         description="Scaled global graph champion recipe.",
         relation_required=True,
+    ),
+    "global_pair_biaffine_0": global_pair_biaffine_spec(
+        "global_pair_biaffine_0",
+        family_id="global_pair_biaffine",
+        recipe_id="global_graph",
+        description="V1 bounded symmetric low-rank biaffine pair-action model.",
     ),
 }
 

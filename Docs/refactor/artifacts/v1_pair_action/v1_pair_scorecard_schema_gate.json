@@ -1,0 +1,45 @@
+{
+  "candidate_id": "global_pair_biaffine_0:sampled_joint_pair_v1",
+  "equal_wall_clock": {
+    "arena_stopping_protocol": "required_before_strength_claim",
+    "baseline_comparisons": {},
+    "batching_protocol": "required_before_strength_claim",
+    "candidate_budget": 0,
+    "confidence_interval": "required_before_strength_claim",
+    "evidence_artifact_paths": [],
+    "games_per_pairing": 0,
+    "hardware_profile": "required_before_strength_claim",
+    "opponent_checkpoints": [],
+    "schema_only_blocker": "Worker H added deterministic metric and scorecard gates only. Equal-wall-clock strength cannot be claimed until the current runtime exposes a command-backed fair sequential DAG neural baseline arena with fixed hardware, batching, candidate budget, opponent checkpoints, confidence interval, and stopping protocol.",
+    "strength_claimed": false,
+    "wall_clock_seconds_per_game": 0.0
+  },
+  "metrics": {
+    "candidate_generation_latency_p50_ms": 0.0,
+    "candidate_generation_latency_p95_ms": 0.0,
+    "candidate_recall_audit_topk_mass": 0.0,
+    "candidate_recall_best_search_pair": 0.0,
+    "candidate_recall_equivalence_class": 0.0,
+    "gpu_utilization": 0.0,
+    "inference_latency_p50_ms": 0.0,
+    "inference_latency_p95_ms": 0.0,
+    "neural_calls_per_expanded_full_turn_node": 0.0,
+    "normalized_pair_target_entropy": 0.0,
+    "pair_scores_per_second": 0.0,
+    "queue_backpressure_ratio": 0.0,
+    "regret_weighted_candidate_recall": 0.0,
+    "tactical_candidate_support_recall": 0.0,
+    "tactical_suite_accuracy": 0.0
+  },
+  "schema_version": 1,
+  "side_by_side_baselines": [
+    "global_xattn_0:none",
+    "global_graph768_champion:none",
+    "fair_sequential_dag_neural_baseline"
+  ],
+  "validation": {
+    "hard_pass": true,
+    "schema_only": true,
+    "strength_claimed": false
+  }
+}

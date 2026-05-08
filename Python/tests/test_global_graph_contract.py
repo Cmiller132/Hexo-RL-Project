@@ -62,6 +62,19 @@ def test_graph_training_retries_cublas_internal_errors_as_memory_like_failures()
     assert Trainer._is_cuda_oom(RuntimeError("cublasStatusExecutionFailed in backward"))
 
 
+def test_global_graph_non_v1_architectures_do_not_register_v1_pair_parameters():
+    cfg = Config()
+    cfg.model.architecture = "global_xattn_0"
+    cfg.model.heads = ["policy_place", "value"]
+    model = build_model_from_config(cfg)
+
+    state_keys = set(model.state_dict())
+
+    assert "cell_marginal.weight" not in state_keys
+    assert not any(key.startswith("v1_pair_") for key in state_keys)
+    assert "terminal_tactical_v1.0.weight" not in state_keys
+
+
 def _must_block_history():
     return _hist(
         (0, 0, 0),
@@ -1117,9 +1130,14 @@ def test_global_graph_alternatives_share_targets_and_masks(architecture):
     out = model(**tensors)
 
     assert "policy" not in out
-    assert out["policy_place"].shape == (1, graph.legal_mask.shape[0])
-    assert "policy_pair_first" not in out
-    assert torch.isfinite(out["policy_place"][0, graph.legal_mask]).all()
+    if architecture == "global_pair_biaffine_0":
+        assert out["cell_marginal_logits"].shape == (1, graph.legal_mask.shape[0])
+        assert out["pair_joint_logits"].shape == (1, graph.pair_first_indices.shape[0])
+        assert torch.isfinite(out["cell_marginal_logits"][0, graph.legal_mask]).all()
+    else:
+        assert out["policy_place"].shape == (1, graph.legal_mask.shape[0])
+        assert "policy_pair_first" not in out
+        assert torch.isfinite(out["policy_place"][0, graph.legal_mask]).all()
 
 
 def test_global_graph_output_heads_gate_optional_work():

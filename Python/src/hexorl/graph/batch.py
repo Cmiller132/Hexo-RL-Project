@@ -39,6 +39,7 @@ GRAPH_FEATURE_WINDOW_STONE_COUNT = 7
 GRAPH_FEATURE_WINDOW_EMPTY_COUNT = 8
 GRAPH_FEATURE_WINDOW_AXIS = 9
 GRAPH_FEATURE_LEGAL_WINDOW_COUNT = 10
+V1_PAIR_FEATURE_DIM = 12
 RELATION_SCHEMA_VERSION = 2
 HEX_DIRECTIONS: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
 WIN_LENGTH = 6
@@ -111,6 +112,7 @@ class GraphBatch:
     schema_version: int = GRAPH_SCHEMA_VERSION
     relation_schema_version: int = RELATION_SCHEMA_VERSION
     placements_remaining_by_sample: np.ndarray | None = None
+    pair_features: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1193,70 @@ def graph_batch_with_reference_pair_rows(
         current_player=graph_batch.current_player,
         schema_version=graph_batch.schema_version,
         relation_schema_version=graph_batch.relation_schema_version,
+        pair_features=None,
+    )
+
+
+def graph_batch_with_admitted_pair_rows(
+    graph_batch: GraphBatch,
+    admitted_pair_rows: Sequence[tuple[tuple[int, int], tuple[int, int]]] | np.ndarray,
+    *,
+    pair_features: Sequence[Sequence[float]] | np.ndarray | None = None,
+) -> GraphBatch:
+    """Attach externally admitted V1 unordered pair rows by legal-token reference.
+
+    Candidate selection owns V1 admission and quotas. The graph/model boundary
+    validates that supplied rows reference the existing LEGAL table and scores
+    those bounded rows without adding pair tokens to the attention sequence.
+    """
+
+    legal = [(int(q), int(r)) for q, r in np.asarray(graph_batch.legal_qr, dtype=np.int32).tolist()]
+    legal_index = {qr: idx for idx, qr in enumerate(legal)}
+    legal_tokens = np.asarray(graph_batch.legal_token_indices, dtype=np.int64)
+    rows = np.asarray(admitted_pair_rows, dtype=np.int32).reshape(-1, 4)
+    features_arr = None
+    if pair_features is not None:
+        features_arr = np.asarray(pair_features, dtype=np.float32)
+        if features_arr.ndim != 2:
+            raise ValueError("V1 admitted pair_features must be rank-2")
+        if features_arr.shape[0] != rows.shape[0]:
+            raise ValueError("V1 admitted pair_features rows must match admitted pair rows")
+
+    selected: list[tuple[int, int]] = []
+    selected_feature_rows: list[np.ndarray] = []
+    seen: set[tuple[int, int]] = set()
+    for row_idx, row in enumerate(rows.tolist()):
+        a = (int(row[0]), int(row[1]))
+        b = (int(row[2]), int(row[3]))
+        if a == b:
+            raise ValueError(f"V1 admitted pair row duplicates one legal cell: {a}")
+        if a not in legal_index or b not in legal_index:
+            raise ValueError(f"V1 admitted pair row references non-LEGAL cells: {(a, b)}")
+        pair = tuple(sorted((legal_index[a], legal_index[b])))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        selected.append(pair)
+        if features_arr is not None:
+            selected_feature_rows.append(features_arr[row_idx])
+
+    pair_first = np.asarray([int(legal_tokens[a_idx]) for a_idx, _ in selected], dtype=np.int64)
+    pair_second = np.asarray([int(legal_tokens[b_idx]) for _, b_idx in selected], dtype=np.int64)
+    if selected_feature_rows:
+        pair_feature_arr = np.asarray(selected_feature_rows, dtype=np.float32)
+    elif features_arr is not None:
+        pair_feature_arr = np.zeros((0, int(features_arr.shape[1])), dtype=np.float32)
+    else:
+        pair_feature_arr = None
+    pair_count = int(pair_first.shape[0])
+    return replace(
+        graph_batch,
+        pair_token_indices=np.full(pair_count, -1, dtype=np.int64),
+        pair_first_indices=pair_first,
+        pair_second_indices=pair_second,
+        pair_policy_target=np.zeros(pair_count, dtype=np.float32),
+        pair_second_policy_target=np.zeros(pair_count, dtype=np.float32),
+        pair_features=pair_feature_arr,
     )
 
 
@@ -1507,6 +1573,18 @@ def collate_graph_batches(
     pair_second_indices = pad((bsz, max_p), np.int64, -1)
     pair_policy_target = pad((bsz, max_p), np.float32)
     pair_second_policy_target = pad((bsz, max_p), np.float32)
+    pair_feature_dim = 0
+    for batch in batches:
+        if batch.pair_features is not None:
+            features = np.asarray(batch.pair_features, dtype=np.float32)
+            if features.ndim != 2:
+                raise ValueError("graph pair_features must be rank-2 before collation")
+            pair_feature_dim = max(pair_feature_dim, int(features.shape[1]))
+    pair_features = (
+        pad((bsz, max_p, pair_feature_dim), np.float32)
+        if pair_feature_dim > 0
+        else None
+    )
     tactical_target = pad((bsz, 4), np.float32)
     placements_remaining_by_sample = np.zeros(bsz, dtype=np.int64)
 
@@ -1534,6 +1612,11 @@ def collate_graph_batches(
         pair_second_indices[row, :p] = batch.pair_second_indices
         pair_policy_target[row, :p] = batch.pair_policy_target
         pair_second_policy_target[row, :p] = batch.pair_second_policy_target
+        if pair_features is not None and batch.pair_features is not None:
+            features = np.asarray(batch.pair_features, dtype=np.float32)
+            if features.shape[0] != p:
+                raise ValueError("graph pair_features rows must match pair rows")
+            pair_features[row, :p, : features.shape[1]] = features
         tactical_target[row] = batch.tactical_target
         placements_remaining_by_sample[row] = int(batch.placements_remaining)
 
@@ -1561,6 +1644,7 @@ def collate_graph_batches(
         placements_remaining=-1,
         current_player=-1,
         placements_remaining_by_sample=placements_remaining_by_sample,
+        pair_features=pair_features,
     )
     if timings is not None:
         timings["graph_collate_s"] = timings.get("graph_collate_s", 0.0) + (

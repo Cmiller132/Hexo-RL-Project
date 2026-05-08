@@ -15,7 +15,12 @@ from hexorl.models.specs import merge_resolved_loss_weights
 from hexorl.search.pair_strategy import build_pair_strategy
 
 
-AUTOTUNE_PAIR_STRATEGY_MODES = ("none", "root_pair_mcts", "full_pair_mcts")
+AUTOTUNE_PAIR_STRATEGY_MODES = (
+    "none",
+    "root_pair_mcts",
+    "full_pair_mcts",
+    "sampled_joint_pair_v1",
+)
 DEFAULT_AUTOTUNE_CANDIDATE_PLAN = (
     "global_xattn_0:none",
     "global_line_window_0:none",
@@ -155,6 +160,8 @@ class SelfPlayConfig(BaseModel):
     pcr_low_sims: int = 192
     policy_target_top_k: int = 64
     train_policy_on_full_search_only: bool = True
+    legal_row_mode: str = "legacy"
+    tactical_mode: str = "legacy"
     near_radius: int = 8
     constrain_threats: bool = True
     subtree_reuse: bool = False
@@ -163,6 +170,25 @@ class SelfPlayConfig(BaseModel):
     rgsc_prb_capacity: int = 100
     rgsc_prb_temperature: float = 0.1
     rgsc_prb_ema_alpha: float = 0.5
+
+    @model_validator(mode="after")
+    def validate_row_modes(self) -> "SelfPlayConfig":
+        valid_legal_modes = {
+            "legacy",
+            "full_rust_legal",
+            "diagnostic_threat_filter_v0",
+        }
+        valid_tactical_modes = {
+            "legacy",
+            "proposal_and_label",
+        }
+        self.legal_row_mode = self.legal_row_mode.lower()
+        self.tactical_mode = self.tactical_mode.lower()
+        if self.legal_row_mode not in valid_legal_modes:
+            raise ValueError(f"selfplay.legal_row_mode must be one of {sorted(valid_legal_modes)}")
+        if self.tactical_mode not in valid_tactical_modes:
+            raise ValueError(f"selfplay.tactical_mode must be one of {sorted(valid_tactical_modes)}")
+        return self
 
 
 class InferenceConfig(BaseModel):
@@ -461,11 +487,40 @@ class Config(BaseModel):
             )
         resolved = resolve_model_spec(self)
         if self.model.pair_strategy != "none":
+            strategy = build_pair_strategy(
+                self.model.pair_strategy,
+                max_pairs=self.model.pair_strategy_max_pairs,
+                prior_mix=self.model.pair_prior_mix,
+            )
             if not resolved.pair_capabilities:
                 raise ValueError(
                     "non-none model.pair_strategy requires an architecture with pair capability"
                 )
-            if not (
+            if self.model.pair_strategy == "sampled_joint_pair_v1":
+                if self.model.architecture != "global_pair_biaffine_0":
+                    raise ValueError(
+                        "sampled_joint_pair_v1 requires model.architecture='global_pair_biaffine_0'"
+                    )
+                missing = sorted(set(strategy.required_output_contracts) - set(resolved.outputs))
+                if missing:
+                    raise ValueError(
+                        "sampled_joint_pair_v1 requires explicit V1 output heads; "
+                        f"missing: {missing}"
+                    )
+                if self.selfplay.legal_row_mode != "full_rust_legal":
+                    raise ValueError(
+                        "sampled_joint_pair_v1 requires selfplay.legal_row_mode='full_rust_legal'"
+                    )
+                if self.selfplay.tactical_mode != "proposal_and_label":
+                    raise ValueError(
+                        "sampled_joint_pair_v1 requires selfplay.tactical_mode='proposal_and_label'"
+                    )
+                if self.selfplay.constrain_threats:
+                    raise ValueError(
+                        "sampled_joint_pair_v1 requires full Rust LEGAL rows; "
+                        "selfplay.constrain_threats must be false"
+                    )
+            elif not (
                 {"pair_policy", "policy_pair_first", "policy_pair_second", "policy_pair_joint"}
                 & set(resolved.outputs)
             ):

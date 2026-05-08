@@ -13,7 +13,11 @@ from typing import Iterable, List, Optional
 
 import numpy as np
 
-from hexorl.selfplay.records import PositionRecord
+from hexorl.selfplay.records import (
+    PositionRecord,
+    v1_search_metadata_from_json_bytes,
+    v1_search_metadata_to_json_bytes,
+)
 from hexorl.models.registry import replay_uses_sparse_diagnostics
 
 
@@ -324,6 +328,7 @@ class RingBuffer:
         self._opp_policy_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_opp_policy else None
         self._opp_legal_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_opp_policy else None
         self._pair_policy_v2_blobs: list[bytes | None] | None = [None] * self.capacity if self.store_pair_policy else None
+        self._v1_search_metadata_blobs: list[bytes | None] = [None] * self.capacity
         self._pair_policy_complete = _optional_array(self.store_pair_policy, (self.capacity,), np.bool_, default=False)
 
         self._game_histories: list[bytes | None] = []
@@ -369,6 +374,7 @@ class RingBuffer:
             self._opp_policy_v2_blobs,
             self._opp_legal_v2_blobs,
             self._pair_policy_v2_blobs,
+            self._v1_search_metadata_blobs,
         ):
             if blobs is None:
                 continue
@@ -474,6 +480,7 @@ class RingBuffer:
             self._opp_legal_v2_blobs[idx] = None
         if self._pair_policy_v2_blobs is not None:
             self._pair_policy_v2_blobs[idx] = None
+        self._v1_search_metadata_blobs[idx] = None
         self._pair_policy_complete[idx] = False
 
     def _find_or_create_game_slot(self, game_id: int, history: bytes) -> int:
@@ -535,10 +542,15 @@ class RingBuffer:
             self._opp_policy_v2_blobs[idx] = _pack_v2_blob(record.opp_policy_target_v2)
             self._opp_legal_v2_blobs[idx] = _pack_legal_blob(record.opp_policy_legal_v2)
         if self._pair_policy_v2_blobs is not None:
-            self._pair_policy_v2_blobs[idx] = _pack_pair_blob(record.pair_policy_target_v2)
-            self._pair_policy_complete[idx] = bool(record.pair_policy_complete)
+            if record.v1_search_metadata is None:
+                self._pair_policy_v2_blobs[idx] = _pack_pair_blob(record.pair_policy_target_v2)
+                self._pair_policy_complete[idx] = bool(record.pair_policy_complete)
+            else:
+                self._pair_policy_v2_blobs[idx] = b""
+                self._pair_policy_complete[idx] = False
         else:
             self._pair_policy_complete[idx] = False
+        self._v1_search_metadata_blobs[idx] = v1_search_metadata_to_json_bytes(record.v1_search_metadata)
 
         dropped_mass = sum(prob for _q, _r, prob in entries[n:])
         self._outside_policy_mass[idx] = float(record.target_policy_mass_outside_window)
@@ -660,6 +672,7 @@ class RingBuffer:
         pair_policy_v2 = _unpack_pair_blob(
             self._pair_policy_v2_blobs[idx] if self._pair_policy_v2_blobs is not None else None
         )
+        v1_search_metadata = v1_search_metadata_from_json_bytes(self._v1_search_metadata_blobs[idx])
 
         stored_value = float(self._values[idx])
         player = int(self._players[idx])
@@ -691,6 +704,7 @@ class RingBuffer:
             opp_policy_legal_v2=opp_legal_v2,
             pair_policy_target_v2=pair_policy_v2,
             pair_policy_complete=bool(self._pair_policy_complete[idx]),
+            v1_search_metadata=v1_search_metadata,
             target_policy_mass_outside_window=float(self._outside_policy_mass[idx]),
             missing_target_policy_mass=float(self._missing_policy_mass[idx]),
             candidate_recall_mcts_top1=float(self._candidate_recall_top1[idx]),
@@ -878,6 +892,7 @@ class RingBuffer:
                 self._opp_legal_v2_blobs = [None] * self.capacity
             if self._pair_policy_v2_blobs is not None:
                 self._pair_policy_v2_blobs = [None] * self.capacity
+            self._v1_search_metadata_blobs = [None] * self.capacity
             self._pair_policy_complete.fill(False)
             self._game_histories.clear()
             self._game_refcounts.clear()

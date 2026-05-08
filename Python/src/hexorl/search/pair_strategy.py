@@ -15,10 +15,12 @@ from hexorl.inference.shm_queue import MAX_CANDIDATES, MAX_GRAPH_PAIRS, MAX_PAIR
 PAIR_STRATEGY_NONE = "none"
 PAIR_STRATEGY_ROOT_PAIR_MCTS = "root_pair_mcts"
 PAIR_STRATEGY_FULL_PAIR_MCTS = "full_pair_mcts"
+PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1 = "sampled_joint_pair_v1"
 PAIR_STRATEGY_MODES = (
     PAIR_STRATEGY_NONE,
     PAIR_STRATEGY_ROOT_PAIR_MCTS,
     PAIR_STRATEGY_FULL_PAIR_MCTS,
+    PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1,
 )
 
 
@@ -87,6 +89,7 @@ class PairStrategy:
             pair_second_indices=np.asarray(pair_second_indices, dtype=np.int64),
             pair_policy_target=np.zeros(pair_count, dtype=np.float32),
             pair_second_policy_target=np.zeros(pair_count, dtype=np.float32),
+            pair_features=None,
         )
 
     def score_graph_pair_chunks(
@@ -428,15 +431,17 @@ class PairStrategy:
 
     @staticmethod
     def graph_pair_joint_logits(outputs: dict[str, object], width: int) -> np.ndarray:
-        if "policy_pair_joint" not in outputs:
-            raise ValueError("graph pair strategy requires policy_pair_joint output")
-        return _validate_logits(outputs["policy_pair_joint"], int(width), context="graph pair-joint logits")
+        key = "policy_pair_joint" if "policy_pair_joint" in outputs else "pair_joint_logits"
+        if key not in outputs:
+            raise ValueError("graph pair strategy requires pair-joint output")
+        return _validate_logits(outputs[key], int(width), context="graph pair-joint logits")
 
     @staticmethod
     def graph_pair_second_logits(outputs: dict[str, object], width: int) -> np.ndarray:
-        if "policy_pair_second" not in outputs:
-            raise ValueError("graph pair strategy requires policy_pair_second output")
-        return _validate_logits(outputs["policy_pair_second"], int(width), context="graph pair-second logits")
+        key = "policy_pair_second" if "policy_pair_second" in outputs else "pair_completion_logits"
+        if key not in outputs:
+            raise ValueError("graph pair strategy requires pair-second output")
+        return _validate_logits(outputs[key], int(width), context="graph pair-second logits")
 
 
 def build_pair_strategy(
@@ -461,6 +466,21 @@ def build_pair_strategy(
             ),
             pair_rows_owned=True,
             leaf_pair_scoring_enabled=normalized == PAIR_STRATEGY_FULL_PAIR_MCTS,
+        )
+        strategy.require_enabled(context=normalized)
+        return strategy
+    if normalized == PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1:
+        strategy = PairStrategy(
+            PairStrategyConfig(normalized, int(max_pairs), float(prior_mix)),
+            required_output_contracts=(
+                "cell_marginal_logits",
+                "pair_completion_logits",
+                "pair_proposal_score",
+                "pair_joint_logits",
+                "terminal_tactical_v1",
+            ),
+            pair_rows_owned=True,
+            leaf_pair_scoring_enabled=True,
         )
         strategy.require_enabled(context=normalized)
         return strategy

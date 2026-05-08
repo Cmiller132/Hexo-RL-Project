@@ -129,6 +129,41 @@ def test_phase3_supervisor_dry_run_advances_two_studies_to_round_three(tmp_path)
     assert (run_dir / "champion_selection_report_phase3.json").exists()
 
 
+def test_phase3_supervisor_stops_when_round_adds_failed_trials(tmp_path):
+    optuna = pytest.importorskip("optuna")
+    run_dir, spec_path = _phase3_supervisor_fixture(tmp_path)
+    specs = _load_specs(spec_path)
+
+    def run_round(*, target_trials, summary_path, stdout_path, stderr_path):
+        stdout_path.write_text(f"target={target_trials}\n", encoding="utf-8")
+        stderr_path.write_text("forced failure\n", encoding="utf-8")
+        for spec in specs:
+            study = optuna.create_study(
+                study_name=spec.study_name,
+                storage=spec.storage,
+                direction=spec.direction,
+                load_if_exists=True,
+            )
+            trial = study.ask()
+            study.tell(trial, state=optuna.trial.TrialState.FAIL)
+        summary_path.write_text(json.dumps({"forced_failure": True}), encoding="utf-8")
+        return 0
+
+    summary = Phase3AutonomousSupervisor(
+        run_dir=run_dir,
+        max_rounds=3,
+        mirror_dashboards=False,
+        process_finder=lambda: [],
+        round_runner=run_round,
+        summary_path=run_dir / "phase3_autosupervisor_summary.json",
+    ).run()
+
+    assert summary.status == "failed"
+    assert summary.rounds[0].status == "failed"
+    assert summary.rounds[0].reason.startswith("phase3_trial_failures:")
+    assert len(summary.rounds) == 1
+
+
 def _phase3_supervisor_fixture(tmp_path):
     run_dir = tmp_path / "run"
     spec_path = run_dir / "phase2_review" / "phase3_study_specs.json"

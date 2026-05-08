@@ -444,6 +444,7 @@ class Trainer:
                     "graph_loader_graph_base_s",
                     "graph_loader_policy_overlay_s",
                     "graph_loader_pair_rows_s",
+                    "graph_loader_v1_pair_rows_s",
                     "graph_loader_collate_s",
                 ):
                     result[key] = float(loader_timings.get(key, 0.0))

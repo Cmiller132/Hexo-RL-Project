@@ -59,6 +59,8 @@ mod eval;
 pub mod mcts;
 mod search;
 mod threats;
+pub mod v1;
+pub mod v1_pair_search;
 
 #[cfg(test)]
 mod tests;

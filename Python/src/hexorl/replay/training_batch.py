@@ -11,6 +11,8 @@ import torch
 from hexorl.graph.batch import GraphBatch
 from hexorl.train.loss_plan import infer_row_tables
 
+V1_PAIR_SCHEMA_TARGET_KEY = "v1_pair_schema_version"
+
 
 @dataclass(frozen=True)
 class PreparedTrainingBatch:
@@ -45,6 +47,7 @@ def prepare_dense_training_batch(
     _ensure_sample_weights(targets, "value_weight", targets["value"], True)
     _ensure_sample_weights(targets, "sparse_policy_weight", targets["value"], True)
     _ensure_sample_weights(targets, "pair_policy_weight", targets["value"], True)
+    _mask_v1_legacy_pair_targets(targets)
     return PreparedTrainingBatch(
         model_inputs={"tensors": input_tensor},
         targets=targets,
@@ -81,6 +84,7 @@ def prepare_global_graph_training_batch(
     _ensure_sample_weights(targets, "value_weight", targets["value"], True)
     _ensure_sample_weights(targets, "pair_policy_weight", targets["value"], True)
     _ensure_sample_weights(targets, "opp_policy_weight", targets["value"], True, default=0.0)
+    _mask_v1_legacy_pair_targets(targets)
     model_inputs = {
         key: targets[key]
         for key in (
@@ -100,6 +104,7 @@ def prepare_global_graph_training_batch(
         "pair_first_indices",
         "pair_second_indices",
         "pair_token_indices",
+        "pair_features",
     )
     for key in optional_inputs:
         if key in targets:
@@ -142,6 +147,8 @@ def graph_batch_training_targets(graph_batch: GraphBatch) -> dict[str, object]:
         "pair_second_policy_target": graph_batch.pair_second_policy_target,
         "tactical_target": graph_batch.tactical_target,
     }
+    if graph_batch.pair_features is not None:
+        values["pair_features"] = graph_batch.pair_features
     placements = getattr(graph_batch, "placements_remaining_by_sample", None)
     if placements is None:
         batch_size = int(graph_batch.legal_mask.shape[0])
@@ -210,6 +217,42 @@ def _ensure_sample_weights(
     batch_size = int(ref.shape[0])
     if key not in targets or not train_on_existing:
         targets[key] = torch.full((batch_size,), float(default), device=ref.device, dtype=torch.float32)
+
+
+def _mask_v1_legacy_pair_targets(targets: dict[str, object]) -> None:
+    """Prevent V1 sampled pair-support metadata from training legacy pair heads."""
+
+    if V1_PAIR_SCHEMA_TARGET_KEY not in targets or "pair_policy_weight" not in targets:
+        return
+    weight = targets["pair_policy_weight"]
+    if not isinstance(weight, torch.Tensor):
+        weight = torch.as_tensor(weight)
+    marker = _to_device(targets[V1_PAIR_SCHEMA_TARGET_KEY], weight.device).reshape(-1)
+    if marker.numel() == 0:
+        return
+    mask = marker.long() > 0
+    if not bool(mask.any()):
+        return
+    weight_tensor = _to_device(weight, weight.device, dtype=torch.float32).clone()
+    if weight_tensor.ndim == 0:
+        weight_tensor = weight_tensor.reshape(1)
+    if weight_tensor.shape[0] != mask.shape[0]:
+        raise ValueError(
+            f"{V1_PAIR_SCHEMA_TARGET_KEY} batch dimension {mask.shape[0]} does not match "
+            f"pair_policy_weight batch dimension {weight_tensor.shape[0]}"
+        )
+    weight_tensor[mask] = 0.0
+    targets["pair_policy_weight"] = weight_tensor
+    if "pair_policy_target" in targets:
+        pair_target = _to_device(targets["pair_policy_target"], weight_tensor.device).clone()
+        if pair_target.shape[0] != mask.shape[0]:
+            raise ValueError(
+                f"{V1_PAIR_SCHEMA_TARGET_KEY} batch dimension {mask.shape[0]} does not match "
+                f"pair_policy_target batch dimension {pair_target.shape[0]}"
+            )
+        pair_target[mask] = 0.0
+        targets["pair_policy_target"] = pair_target
+    targets["v1_pair_legacy_pair_targets_masked"] = mask
 
 
 def _to_device(value, device: torch.device, dtype: torch.dtype | None = None) -> torch.Tensor:

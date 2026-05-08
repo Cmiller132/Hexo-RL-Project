@@ -14,7 +14,7 @@ import logging
 import multiprocessing as mp
 import signal
 import numpy as np
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Mapping, Sequence, Any
 
 try:
     import _engine
@@ -30,19 +30,36 @@ from hexorl.action_contract.tactical_oracle import (
     scan_tactical_oracle_from_history,
 )
 from hexorl.inference.client import InferenceClient
-from hexorl.graph.batch import GraphBatch, GraphIPCCapacityError, build_graph_batch_from_history
+from hexorl.graph.batch import (
+    V1_PAIR_FEATURE_DIM,
+    GraphBatch,
+    GraphIPCCapacityError,
+    build_graph_batch_from_history,
+    graph_batch_with_admitted_pair_rows,
+)
 from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
+from hexorl.search.pair_candidate_selector_v1 import (
+    PAIR_CANDIDATE_SELECTOR_VERSION_V1,
+    PairCandidateSelectorResultV1,
+    PairCandidateSelectorV1Config,
+    PairCandidateV1,
+    select_pair_candidates_v1,
+)
 from hexorl.search.pair_strategy import (
     PAIR_STRATEGY_FULL_PAIR_MCTS,
     PAIR_STRATEGY_NONE,
+    PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1,
     PairStrategy,
     build_pair_strategy,
 )
+from hexorl.search.pair_scorer_v1 import hex_distance, same_hex_line, same_origin_axis
 from hexorl.selfplay.rgsc import RGSCRestartService, encode_move_history
 from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
+    V1ProposalCorrectionParameters,
+    V1SearchPairMetadata,
     action_to_board_index,
     dense_policy_from_v2,
     policy_v2_from_visits,
@@ -55,6 +72,18 @@ PRIOR_SOURCE_SPARSE = 1
 PRIOR_SOURCE_DENSE = 2
 PRIOR_SOURCE_DEFAULT = 3
 PRIOR_SOURCE_PAIR = 4
+V1_CORRECTION_MODE_TO_ATTR = {
+    "exact_importance": "V1_CORRECTION_EXACT_IMPORTANCE",
+    "clipped_propensity": "V1_CORRECTION_CLIPPED_PROPENSITY",
+    "uncorrected_logged": "V1_CORRECTION_UNCORRECTED_LOGGED",
+    "training_forbidden": "V1_CORRECTION_TRAINING_FORBIDDEN",
+}
+V1_CORRECTION_MODE_FALLBACK_CODES = {
+    "exact_importance": 0,
+    "clipped_propensity": 1,
+    "uncorrected_logged": 2,
+    "training_forbidden": 3,
+}
 
 
 def _sample_root_dirichlet_noise(
@@ -430,6 +459,299 @@ def _pair_policy_target_is_complete(
 
 
 # ── Mock MCTS Engine ─────────────────────────────────────────────────────────
+
+def _v1_legal_rows_from_table(legal_table: Mapping[str, Any]) -> np.ndarray:
+    rows = np.asarray(legal_table.get("rows", ()), dtype=np.int32).reshape(-1, 3)
+    if rows.shape[0] != int(legal_table.get("row_count", rows.shape[0])):
+        raise ValueError("V1 legal row table row_count does not match rows")
+    if rows.shape[0] == 0:
+        return rows
+    row_ids = rows[:, 0].astype(np.int64, copy=False)
+    if len(set(int(row_id) for row_id in row_ids.tolist())) != rows.shape[0]:
+        raise ValueError("V1 legal row table contains duplicate row IDs")
+    cells = {(int(row[1]), int(row[2])) for row in rows.tolist()}
+    if len(cells) != rows.shape[0]:
+        raise ValueError("V1 legal row table contains duplicate cells")
+    return rows
+
+
+def _v1_pair_qr_from_candidates(candidates: Sequence[PairCandidateV1]) -> np.ndarray:
+    rows: list[tuple[int, int, int, int]] = []
+    for candidate in candidates:
+        first, second = candidate.pair_key
+        rows.append((int(first[0]), int(first[1]), int(second[0]), int(second[1])))
+    return np.asarray(rows, dtype=np.int32).reshape(-1, 4)
+
+
+def _v1_pair_features_from_candidates(candidates: Sequence[PairCandidateV1]) -> np.ndarray:
+    out = np.zeros((len(candidates), V1_PAIR_FEATURE_DIM), dtype=np.float32)
+    for row, candidate in enumerate(candidates):
+        first, second = candidate.pair_key
+        dist = float(hex_distance(first, second))
+        source_count = float(len(candidate.source_contributions))
+        out[row, 0] = min(dist, 32.0) / 32.0
+        out[row, 1] = 1.0 if same_hex_line(first, second) else 0.0
+        out[row, 2] = 1.0 if same_origin_axis(first, second) else 0.0
+        out[row, 3] = 1.0 if candidate.tactical_protected_flag else 0.0
+        out[row, 4] = 1.0 if candidate.forced_exploration_flag else 0.0
+        out[row, 5] = 1.0 if candidate.terminal_exact_flag else 0.0
+        out[row, 6] = 1.0 if candidate.terminal_equivalence_flag else 0.0
+        out[row, 7] = min(source_count, 8.0) / 8.0
+        out[row, 8] = float(np.tanh(candidate.selector_score / 16.0))
+        out[row, 9] = (
+            0.0
+            if candidate.rich_rerank_score is None
+            else float(np.tanh(float(candidate.rich_rerank_score) / 16.0))
+        )
+        out[row, 10] = min(float(candidate.admission_generation), 16.0) / 16.0
+        out[row, 11] = 1.0 if candidate.root_or_interior == "root" else 0.0
+    return out
+
+
+def _v1_legal_embedding_features(legal_rows: np.ndarray) -> np.ndarray:
+    rows = np.asarray(legal_rows, dtype=np.int32).reshape(-1, 3)
+    if rows.shape[0] == 0:
+        return np.zeros((0, 8), dtype=np.float32)
+    q = rows[:, 1].astype(np.float32)
+    r = rows[:, 2].astype(np.float32)
+    dist = np.maximum.reduce((np.abs(q), np.abs(r), np.abs(q + r)))
+    return np.stack(
+        [
+            q / 16.0,
+            r / 16.0,
+            (q + r) / 16.0,
+            np.abs(q) / 16.0,
+            np.abs(r) / 16.0,
+            dist / 16.0,
+            ((rows[:, 0].astype(np.int32) & 1).astype(np.float32) * 2.0) - 1.0,
+            np.ones(rows.shape[0], dtype=np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
+def _v1_pair_logits_from_graph_output(
+    graph_out: Mapping[str, Any],
+    expected_width: int,
+) -> np.ndarray:
+    if "pair_joint_logits" not in graph_out:
+        raise ValueError("sampled_joint_pair_v1 requires pair_joint_logits from graph inference")
+    logits = np.asarray(graph_out["pair_joint_logits"], dtype=np.float32).reshape(-1)
+    expected = int(expected_width)
+    if logits.shape[0] < expected:
+        raise ValueError(
+            f"sampled_joint_pair_v1 pair_joint_logits width {logits.shape[0]} "
+            f"is smaller than admitted pair rows {expected}"
+        )
+    out = logits[:expected]
+    if not np.all(np.isfinite(out)):
+        raise ValueError("sampled_joint_pair_v1 pair_joint_logits must be finite")
+    return out
+
+
+def _v1_graph_value_from_output(
+    graph_out: Mapping[str, Any],
+    adapter: EngineAdapter,
+) -> float:
+    value_arr = np.asarray(graph_out.get("value", [0.0]), dtype=np.float32).reshape(-1)
+    value = float(value_arr[0]) if value_arr.shape[0] else 0.0
+    adapter.validate_value_perspective(
+        graph_out.get("metadata"),
+        context="sampled_joint_pair_v1 graph root inference",
+    )
+    return adapter.validate_value(
+        value,
+        context="sampled_joint_pair_v1 graph root inference",
+    )
+
+
+def _v1_correction_code(mode: str) -> int:
+    normalized = str(mode)
+    attr = V1_CORRECTION_MODE_TO_ATTR.get(normalized)
+    if HAS_ENGINE and attr is not None and hasattr(_engine, attr):
+        return int(getattr(_engine, attr))
+    if normalized not in V1_CORRECTION_MODE_FALLBACK_CODES:
+        raise ValueError(f"unsupported V1 proposal correction mode: {mode!r}")
+    return int(V1_CORRECTION_MODE_FALLBACK_CODES[normalized])
+
+
+def _v1_candidate_correction_arrays(
+    candidates: Sequence[PairCandidateV1],
+) -> tuple[np.ndarray, np.ndarray]:
+    weights = np.ones(len(candidates), dtype=np.float32)
+    modes = np.zeros(len(candidates), dtype=np.uint8)
+    for idx, candidate in enumerate(candidates):
+        if not candidate.source_contributions:
+            raise ValueError(
+                f"V1 admitted candidate {candidate.candidate_id!r} is missing source metadata"
+            )
+        proposal = candidate.proposal_propensity_metadata
+        if proposal is None:
+            raise ValueError(
+                f"V1 admitted candidate {candidate.candidate_id!r} is missing proposal metadata"
+            )
+        mode = str(proposal.correction_mode)
+        modes[idx] = _v1_correction_code(mode)
+        if mode in {"exact_importance", "clipped_propensity"}:
+            probability = proposal.total_proposal_probability
+            if probability is None or float(probability) <= 0.0:
+                raise ValueError(
+                    f"V1 admitted candidate {candidate.candidate_id!r} has no "
+                    "positive proposal probability for corrected admission"
+                )
+            weights[idx] = float(probability)
+        else:
+            weights[idx] = 1.0
+    return weights, modes
+
+
+def _v1_selected_pair_from_selected_action(
+    selected: Mapping[str, Any] | None,
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    if not selected or selected.get("action_kind") != "pair":
+        return None
+    first = selected.get("first")
+    second = selected.get("second")
+    if second is None:
+        return None
+    a = (int(first[0]), int(first[1]))
+    b = (int(second[0]), int(second[1]))
+    return (a, b) if a <= b else (b, a)
+
+
+def _v1_metadata_from_search(
+    *,
+    selector_result: PairCandidateSelectorResultV1 | None,
+    telemetry: Mapping[str, Any],
+    selected: Mapping[str, Any] | None,
+    legal_row_schema_version: int,
+    pair_row_schema_version: int,
+    legal_pair_count: int,
+    proposal_correction: V1ProposalCorrectionParameters,
+    extra_metrics: Mapping[str, float],
+) -> V1SearchPairMetadata:
+    candidates = (
+        selector_result.replay_candidate_pairs
+        if selector_result is not None
+        else ()
+    )
+    rust_candidates = list(telemetry.get("candidate_pairs", ()))
+    n = len(candidates)
+    if len(rust_candidates) not in {0, n}:
+        raise ValueError(
+            "V1 Rust search telemetry candidate count does not match selector metadata"
+        )
+
+    if rust_candidates:
+        root_gumbel_values = tuple(float(row.get("gumbel", 0.0)) for row in rust_candidates)
+        root_simulation_allocation = tuple(int(row.get("allocation", 0)) for row in rust_candidates)
+        visit_counts = tuple(int(row.get("visit_count", 0)) for row in rust_candidates)
+        q_values = tuple(float(row.get("q_value", 0.0)) for row in rust_candidates)
+        completed_q_values = tuple(float(row.get("completed_q", 0.0)) for row in rust_candidates)
+    else:
+        root_gumbel_values = tuple(0.0 for _ in range(n))
+        root_simulation_allocation = tuple(0 for _ in range(n))
+        visit_counts = tuple(0 for _ in range(n))
+        q_values = tuple(0.0 for _ in range(n))
+        completed_q_values = tuple(0.0 for _ in range(n))
+
+    admitted_ids = [
+        int(row[0])
+        for row in telemetry.get("root_gumbel_values_or_admission_order", ())
+        if len(row) >= 1
+    ]
+    admitted_set = set(admitted_ids)
+    rest = [idx for idx in range(n) if idx not in admitted_set]
+    root_admission_order = tuple((admitted_ids + rest)[:n])
+    if len(root_admission_order) < n:
+        root_admission_order = root_admission_order + tuple(
+            idx for idx in range(n) if idx not in set(root_admission_order)
+        )
+
+    target_flags = (
+        tuple(tuple(str(flag) for flag in candidate.target_support_flags) for candidate in selector_result.candidates)
+        if selector_result is not None
+        else ()
+    )
+    terminal_flags = (
+        tuple(bool(candidate.terminal_equivalence_flag) for candidate in selector_result.candidates)
+        if selector_result is not None
+        else ()
+    )
+    selected_pair = _v1_selected_pair_from_selected_action(selected)
+    metrics = {str(key): float(value) for key, value in extra_metrics.items()}
+    for key in (
+        "reservoir_build_count",
+        "scoring_pass_count",
+        "supplied_candidate_count",
+        "admitted_pair_count",
+        "search_performed",
+        "hardcoded_action",
+        "reservoir_refill_events",
+        "legal_row_count",
+    ):
+        if key in telemetry:
+            metrics[f"rust_{key}"] = float(telemetry[key])
+
+    return V1SearchPairMetadata(
+        candidate_selector_version=(
+            selector_result.candidate_selector_version
+            if selector_result is not None
+            else PAIR_CANDIDATE_SELECTOR_VERSION_V1
+        ),
+        support_type="completed_q_candidate_posterior",
+        legal_pair_count=int(legal_pair_count),
+        legal_row_schema_version=int(legal_row_schema_version),
+        pair_row_schema_version=int(pair_row_schema_version),
+        candidate_pairs=candidates,
+        proposal_correction_parameters=proposal_correction,
+        root_gumbel_values=root_gumbel_values,
+        root_admission_order=root_admission_order,
+        root_simulation_allocation=root_simulation_allocation,
+        visit_counts=visit_counts,
+        q_values=q_values,
+        completed_q_values=completed_q_values,
+        selected_pair=selected_pair,
+        target_support_flags=target_flags,
+        terminal_equivalence_flags=terminal_flags,
+        search_surprise_metrics=metrics,
+        neural_calls_per_expanded_full_turn_node=telemetry.get(
+            "neural_calls_per_expanded_full_turn_node",
+            None,
+        ),
+        reservoir_refill_events=(),
+    )
+
+
+def _v1_visit_weighted_root_value(metadata: V1SearchPairMetadata, fallback: float) -> float:
+    visits = np.asarray(metadata.visit_counts, dtype=np.float32)
+    q_values = np.asarray(metadata.q_values, dtype=np.float32)
+    total = float(visits.sum())
+    if total <= 0.0 or visits.shape != q_values.shape:
+        return float(fallback)
+    return float(np.dot(visits, q_values) / total)
+
+
+def _v1_selected_action_value(metadata: V1SearchPairMetadata) -> float | None:
+    if metadata.selected_pair is None:
+        return None
+    for idx, candidate in enumerate(metadata.candidate_pairs):
+        if candidate.pair_key == metadata.selected_pair:
+            return float(metadata.q_values[idx])
+    return None
+
+
+def _append_move_history_row(
+    move_history: bytearray,
+    *,
+    player: int,
+    q: int,
+    r: int,
+) -> None:
+    move_history.extend(int(player).to_bytes(4, "little", signed=True))
+    move_history.extend(int(q).to_bytes(4, "little", signed=True))
+    move_history.extend(int(r).to_bytes(4, "little", signed=True))
+
 
 class MockMCTSEngine:
     """Plausible mock of the Rust MCTSEngine for pipeline testing.
@@ -1052,10 +1374,27 @@ class SelfPlayWorker:
         self.pair_strategy = self._pair_strategy.name
         self.pair_strategy_max_pairs = self._pair_strategy.max_pairs
         self.pair_policy_enabled = self._pair_strategy.enabled
+        self.v1_pair_runtime_enabled = (
+            self._pair_strategy.name == PAIR_STRATEGY_SAMPLED_JOINT_PAIR_V1
+        )
         if self._pair_strategy.name == PAIR_STRATEGY_FULL_PAIR_MCTS:
             if not self.global_graph_enabled:
                 raise ValueError("full_pair_mcts requires a global graph architecture")
             self.global_graph_leaf_eval = True
+        if self.v1_pair_runtime_enabled:
+            if not HAS_ENGINE:
+                raise RuntimeError("sampled_joint_pair_v1 self-play requires the Rust _engine extension")
+            if not self.global_graph_enabled:
+                raise ValueError("sampled_joint_pair_v1 requires a global graph architecture")
+            if str(getattr(sp, "legal_row_mode", "legacy")) != "full_rust_legal":
+                raise ValueError("sampled_joint_pair_v1 requires selfplay.legal_row_mode='full_rust_legal'")
+            if str(getattr(sp, "tactical_mode", "legacy")) != "proposal_and_label":
+                raise ValueError("sampled_joint_pair_v1 requires selfplay.tactical_mode='proposal_and_label'")
+            if bool(self.constrain_threats):
+                raise ValueError(
+                    "sampled_joint_pair_v1 cannot receive threat-filtered LEGAL rows; "
+                    "selfplay.constrain_threats must be false"
+                )
         self._engine_adapter = EngineAdapter()
         self.candidate_budget = max(
             int(getattr(cfg.model, "candidate_budget", 256)),
@@ -1115,7 +1454,11 @@ class SelfPlayWorker:
         }
 
     def _pair_prior_metrics_applicable(self, move_idx: int) -> bool:
-        return self._pair_strategy.enabled and int(move_idx) > 0
+        return (
+            self._pair_strategy.enabled
+            and not self.v1_pair_runtime_enabled
+            and int(move_idx) > 0
+        )
 
     def _use_pcr_for_turn(self, game_seed: int, move_idx: int) -> bool:
         """Deterministically interleave low-sim and full-sim roots within a game."""
@@ -1233,6 +1576,371 @@ class SelfPlayWorker:
             if client is not None:
                 client.disconnect()
 
+    def _v1_selector_config(self) -> PairCandidateSelectorV1Config:
+        budget = max(1, int(self.pair_strategy_max_pairs))
+        return PairCandidateSelectorV1Config(
+            candidate_budget=budget,
+            direct_retrieval_top_k=budget,
+            direct_retrieval_block_size=min(512, max(1, budget)),
+            cell_marginal_top_cells=min(32, max(2, budget)),
+            structured_diversity_pool_rows=max(budget, 32),
+            blind_canary_seed=int(self.cfg.run.seed + self.worker_id * 10000),
+        )
+
+    def _emit_v1_runtime_diagnostic(
+        self,
+        metadata: V1SearchPairMetadata,
+        *,
+        move_index: int,
+        phase: str,
+    ) -> None:
+        if self.diagnostic_queue is None:
+            return
+        payload = {
+            "event": "v1_pair_search_runtime",
+            "worker_id": int(self.worker_id),
+            "move_index": int(move_index),
+            "phase": str(phase),
+            "candidate_pairs": len(metadata.candidate_pairs),
+            "selected_pair": metadata.selected_pair,
+            "neural_calls_per_expanded_full_turn_node": metadata.neural_calls_per_expanded_full_turn_node,
+            "reservoir_refill_events": len(metadata.reservoir_refill_events),
+            **metadata.search_surprise_metrics,
+        }
+        try:
+            self.diagnostic_queue.put_nowait(payload)
+        except Exception:
+            logger.debug("Worker %s: failed to enqueue V1 pair diagnostic", self.worker_id)
+
+    def _v1_build_and_score_root(
+        self,
+        client: InferenceClient,
+        *,
+        move_history: bytes,
+        root: Mapping[str, Any],
+    ) -> tuple[PairCandidateSelectorResultV1, np.ndarray, float, dict[str, float]]:
+        legal_table = root["legal_row_table"]
+        tactical_payload = root["terminal_tactical"]
+        legal_rows = _v1_legal_rows_from_table(legal_table)
+        legal_qr = legal_rows[:, 1:3].astype(np.int32, copy=False)
+        if bool(self.constrain_threats):
+            raise ValueError("sampled_joint_pair_v1 cannot build threat-filtered LEGAL rows")
+
+        t_build = time.monotonic()
+        selector_result = select_pair_candidates_v1(
+            legal_table,
+            tactical_payload=tactical_payload,
+            legal_cell_embeddings=_v1_legal_embedding_features(legal_rows),
+            config=self._v1_selector_config(),
+            admission_generation=0,
+            root_or_interior="root",
+            legal_row_schema_version=int(legal_table.get("schema_version", 1)),
+            pair_row_schema_version=int(tactical_payload.get("pair_row_schema_version", 1)),
+        )
+        candidate_build_ms = (time.monotonic() - t_build) * 1000.0
+        if not selector_result.candidates:
+            raise ValueError("sampled_joint_pair_v1 selector admitted no pair candidates")
+
+        pair_qr = _v1_pair_qr_from_candidates(selector_result.candidates)
+        graph_batch = build_graph_batch_from_history(
+            bytes(move_history),
+            legal_moves=[(int(q), int(r)) for q, r in legal_qr.tolist()],
+            radius=8,
+            constrain_threats=False,
+            max_pair_rows=0,
+            include_pair_rows=False,
+            include_opp_policy_rows=self.opp_policy_enabled,
+            max_legal_rows=None,
+            max_context_tokens=self.candidate_budget,
+        )
+        graph_legal = np.asarray(graph_batch.legal_qr, dtype=np.int32).reshape(-1, 2)
+        if graph_legal.shape != legal_qr.shape or not np.array_equal(graph_legal, legal_qr):
+            raise ValueError("sampled_joint_pair_v1 graph LEGAL rows do not match Rust V1 legal rows")
+        graph_batch = graph_batch_with_admitted_pair_rows(
+            graph_batch,
+            pair_qr,
+            pair_features=_v1_pair_features_from_candidates(selector_result.candidates),
+        )
+
+        t_forward = time.monotonic()
+        graph_out = client.submit_graph(graph_batch)
+        forward_ms = (time.monotonic() - t_forward) * 1000.0
+        metadata = graph_out.get("metadata")
+        if isinstance(metadata, Mapping) and "legal_qr" in metadata:
+            observed = np.asarray(metadata["legal_qr"], dtype=np.int32).reshape(-1, 2)
+            if observed.shape != legal_qr.shape or not np.array_equal(observed, legal_qr):
+                raise ValueError("sampled_joint_pair_v1 inference metadata changed LEGAL row identity")
+        value = _v1_graph_value_from_output(graph_out, self._engine_adapter)
+        pair_logits = _v1_pair_logits_from_graph_output(
+            graph_out,
+            len(selector_result.candidates),
+        )
+        metrics = {
+            "model_eval_count": 1.0,
+            "reservoir_build_count": 1.0,
+            "bounded_scoring_pass_count": 1.0,
+            "candidate_build_ms": float(candidate_build_ms),
+            "graph_forward_ms": float(forward_ms),
+            "selector_legal_row_count": float(selector_result.telemetry.legal_row_count),
+            "selector_legal_pair_count": float(selector_result.telemetry.legal_pair_count),
+            "selector_direct_retrieval_scored_pair_count": float(
+                selector_result.telemetry.direct_retrieval_scored_pair_count
+            ),
+            "selector_duplicate_proposals": float(selector_result.telemetry.duplicate_proposals),
+            "selector_quota_evictions": float(selector_result.telemetry.quota_evictions),
+            "selector_budget_evictions": float(selector_result.telemetry.budget_evictions),
+            "selector_protected_count": float(selector_result.telemetry.protected_count),
+            "selector_canary_count": float(selector_result.telemetry.canary_count),
+        }
+        return selector_result, pair_logits, value, metrics
+
+    def _v1_apply_to_tracking_game(
+        self,
+        game,
+        applied: Mapping[str, Any],
+        *,
+        player: int,
+        move_history: bytearray,
+    ) -> int:
+        first = applied.get("first")
+        if first is None:
+            raise ValueError("V1 applied action is missing first placement")
+        q, r = int(first[0]), int(first[1])
+        game.place(q, r)
+        _append_move_history_row(move_history, player=player, q=q, r=r)
+        applied_count = 1
+        if int(applied.get("placements_applied", 1)) >= 2:
+            second = applied.get("second")
+            if second is None:
+                raise ValueError("V1 pair applied action is missing second placement")
+            q2, r2 = int(second[0]), int(second[1])
+            game.place(q2, r2)
+            _append_move_history_row(move_history, player=player, q=q2, r=r2)
+            applied_count = 2
+        return applied_count
+
+    def _play_one_game_v1_pair(
+        self,
+        client: Optional[InferenceClient],
+    ) -> Optional[GameRecord]:
+        if client is None:
+            logger.warning(
+                "Worker %s: sampled_joint_pair_v1 requires an inference client",
+                self.worker_id,
+            )
+            return None
+        if not HAS_ENGINE:
+            raise RuntimeError("sampled_joint_pair_v1 requires the Rust _engine extension")
+        game_seed = (
+            self.cfg.run.seed + self.worker_id * 10000 + self._game_counter
+        )
+        game_id = self._game_id()
+        game_cls = getattr(_engine, "HexGame", None) or getattr(_engine, "PyHexGame", None)
+        if game_cls is None:
+            raise RuntimeError("sampled_joint_pair_v1 requires Rust _engine HexGame/PyHexGame")
+        rgsc_restart = self.rgsc.maybe_restart(
+            game_cls,
+            max_game_moves=self.max_game_moves,
+        )
+        game = rgsc_restart.game if rgsc_restart.used else game_cls()
+        move_history = bytearray(rgsc_restart.move_history if rgsc_restart and rgsc_restart.used else b"")
+        move_idx = int(rgsc_restart.move_count) if rgsc_restart and rgsc_restart.used else 0
+        positions: List[PositionRecord] = []
+        terminal_reason = "unknown"
+
+        proposal_correction = V1ProposalCorrectionParameters(
+            correction_mode="uncorrected_logged",
+            min_log=-4.0,
+            max_log=4.0,
+            prior_temperature=1.0,
+        )
+
+        while True:
+            if move_idx >= self.max_game_moves:
+                terminal_reason = "max_game_moves"
+                break
+            if bool(getattr(game, "is_over", False)):
+                terminal_reason = "win"
+                break
+            use_pcr, sims = self._search_mode_for_turn(game_seed, move_idx)
+            root_player = int(getattr(game, "current_player", 0))
+            record_history = bytes(move_history)
+            engine_cls = getattr(_engine, "PyV1PairSearchEngine", None) or getattr(
+                _engine,
+                "V1PairSearchEngine",
+                None,
+            )
+            if engine_cls is None:
+                raise RuntimeError("Rust _engine V1PairSearchEngine is required for sampled_joint_pair_v1")
+            v1_engine = engine_cls(
+                game,
+                int(sims),
+                self.c_puct,
+                int(game_seed + move_idx),
+                int(self.pair_strategy_max_pairs),
+                1,
+                proposal_correction.prior_temperature,
+                proposal_correction.min_log,
+                proposal_correction.max_log,
+            )
+            root = v1_engine.init_root_v1()
+            phase = str(root.get("phase", "unknown"))
+            legal_table = root["legal_row_table"]
+            legal_schema = int(legal_table.get("schema_version", 1))
+            pair_schema = int(root["terminal_tactical"].get("pair_row_schema_version", 1))
+            legal_pair_count = int(root.get("legal_pair_count", 0))
+            selector_result: PairCandidateSelectorResultV1 | None = None
+            graph_value = 0.0
+            extra_metrics: dict[str, float] = {
+                "model_eval_count": 0.0,
+                "reservoir_build_count": 0.0,
+                "bounded_scoring_pass_count": 0.0,
+            }
+
+            try:
+                if phase == "normal_two_placement":
+                    selector_result, pair_logits, graph_value, extra_metrics = self._v1_build_and_score_root(
+                        client,
+                        move_history=record_history,
+                        root=root,
+                    )
+                    correction_weights, correction_modes = _v1_candidate_correction_arrays(
+                        selector_result.candidates
+                    )
+                    pair_qr = _v1_pair_qr_from_candidates(selector_result.candidates)
+                    v1_engine.admit_root_pairs(
+                        pair_qr,
+                        pair_logits,
+                        correction_weights,
+                        correction_modes,
+                        int(root["root_generation"]),
+                    )
+                selected = v1_engine.run_root_search()
+                if selected is None:
+                    terminal_reason = "no_root"
+                    break
+                if phase == "normal_two_placement" and selected.get("action_kind") != "pair":
+                    raise ValueError("normal sampled_joint_pair_v1 root did not select a pair action")
+                pair_key = selected.get("pair_key") if selected.get("action_kind") == "pair" else None
+                applied = v1_engine.apply_selected_action(
+                    int(selected["root_generation"]),
+                    int(selected["legal_row_table_hash"]),
+                    None if pair_key is None else int(pair_key),
+                )
+                telemetry = v1_engine.replay_telemetry()
+                metadata = _v1_metadata_from_search(
+                    selector_result=selector_result,
+                    telemetry=telemetry,
+                    selected=selected,
+                    legal_row_schema_version=legal_schema,
+                    pair_row_schema_version=pair_schema,
+                    legal_pair_count=legal_pair_count,
+                    proposal_correction=proposal_correction,
+                    extra_metrics=extra_metrics,
+                )
+            except Exception as exc:
+                self._emit_graph_ipc_overflow(
+                    exc,
+                    phase="v1_pair_root",
+                    move_index=move_idx,
+                    root=True,
+                )
+                logger.warning(
+                    "Worker %s: sampled_joint_pair_v1 failed at move %s: %s",
+                    self.worker_id,
+                    move_idx,
+                    exc,
+                )
+                return None
+
+            root_value = _v1_visit_weighted_root_value(metadata, graph_value)
+            selected_action_value = _v1_selected_action_value(metadata)
+            if selected_action_value is None and selected.get("action_kind") == "single":
+                selected_action_value = root_value
+            self._emit_v1_runtime_diagnostic(
+                metadata,
+                move_index=move_idx,
+                phase=phase,
+            )
+
+            policy: dict[int, float] = {}
+            policy_v2: list[tuple[int, int, float]] = []
+            if selected.get("action_kind") == "single":
+                first = selected.get("cell", selected.get("first"))
+                if first is not None:
+                    flat = action_to_board_index(int(first[0]), int(first[1]), -16, -16)
+                    if 0 <= flat < 1089:
+                        policy = {int(flat): 1.0}
+                    policy_v2 = [(int(first[0]), int(first[1]), 1.0)]
+
+            positions.append(
+                PositionRecord(
+                    move_history=record_history,
+                    policy_target=policy,
+                    policy_target_v2=policy_v2,
+                    pair_policy_target_v2=[],
+                    pair_policy_complete=False,
+                    v1_search_metadata=metadata,
+                    target_policy_mass_outside_window=0.0,
+                    missing_target_policy_mass=0.0 if policy_v2 else 1.0,
+                    sparse_prior_stage=self.sparse_prior_stage,
+                    sparse_prior_root_candidate_count=int(len(metadata.candidate_pairs)),
+                    sparse_prior_leaf_candidate_count=0.0,
+                    sparse_prior_root_hit_frac=1.0 if metadata.candidate_pairs else 0.0,
+                    sparse_prior_leaf_hit_frac=0.0,
+                    fallback_prior_use=0.0,
+                    sparse_vs_dense_disagreement=0.0,
+                    sparse_prior_forward_ms=float(extra_metrics.get("graph_forward_ms", 0.0)),
+                    sparse_prior_candidate_build_ms=float(extra_metrics.get("candidate_build_ms", 0.0)),
+                    pair_prior_candidate_count=int(len(metadata.candidate_pairs)),
+                    pair_prior_hit_frac=1.0 if metadata.candidate_pairs else 0.0,
+                    pair_fallback_prior_use=0.0,
+                    pair_fallback_prior_use_on_mcts_top1=0.0,
+                    pair_fallback_prior_use_on_mcts_top4=0.0,
+                    pair_fallback_prior_use_on_mcts_top8=0.0,
+                    root_value=root_value,
+                    selected_action_value=selected_action_value,
+                    player=root_player,
+                    game_id=game_id,
+                    is_full_search=not use_pcr,
+                    turn_index=move_idx,
+                )
+            )
+
+            applied_count = self._v1_apply_to_tracking_game(
+                game,
+                applied,
+                player=root_player,
+                move_history=move_history,
+            )
+            move_idx += int(applied_count)
+            if bool(getattr(game, "is_over", False)):
+                terminal_reason = "win"
+                break
+
+        winner = getattr(game, "winner", None)
+        outcome = 0.0 if winner is None else 1.0 if int(winner) == 0 else -1.0
+        full_history = bytes(move_history)
+        record = GameRecord(
+            positions=positions,
+            outcome=outcome,
+            game_id=game_id,
+            game_length=move_idx,
+        )
+        if rgsc_restart is not None:
+            record.rgsc_restart_attempted = rgsc_restart.attempted
+            record.rgsc_restart_used = rgsc_restart.used
+            record.rgsc_restart_reason = rgsc_restart.reason
+            record.rgsc_restart_entry_index = rgsc_restart.entry_index
+            record.rgsc_restart_entry_id = rgsc_restart.entry_id
+            record.rgsc_restart_move_count = rgsc_restart.move_count
+        record.rgsc_tree_node_insertions = int(self.rgsc.tree_node_insertions)
+        record.final_move_history = full_history
+        record.truncated = terminal_reason != "win"
+        record.terminal_reason = terminal_reason
+        record.assign_outcomes()
+        return record
+
     def _play_one_game(
         self, client: Optional[InferenceClient]
     ) -> Optional[GameRecord]:
@@ -1240,6 +1948,9 @@ class SelfPlayWorker:
 
         Returns a GameRecord with all position data, or None on failure.
         """
+        if self.v1_pair_runtime_enabled:
+            return self._play_one_game_v1_pair(client)
+
         game_seed = (
             self.cfg.run.seed + self.worker_id * 10000 + self._game_counter
         )

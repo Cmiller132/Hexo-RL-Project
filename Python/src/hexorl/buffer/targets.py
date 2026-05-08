@@ -247,9 +247,15 @@ def _assign_auxiliary_targets(record: GameRecord) -> None:
             pos.opp_policy_target_v2 = []
             pos.opp_policy_legal_v2 = []
             pos.opp_policy_weight = 0.0
-        if not pos.pair_policy_target_v2:
+        if not pos.pair_policy_target_v2 and getattr(pos, "v1_search_metadata", None) is None:
             pos.pair_policy_target_v2 = _real_pair_policy_target(positions, i)
-        if pos.pair_policy_target_v2 and _is_first_placement_turn_start(positions, i):
+        if getattr(pos, "v1_search_metadata", None) is not None:
+            # V1 pair metadata has explicit sparse-support semantics.  The
+            # legacy pair target path interprets missing legal pairs as zero
+            # mass, so keep V1 rows masked until a V1-aware target consumer is
+            # implemented.
+            pos.pair_policy_complete = False
+        elif pos.pair_policy_target_v2 and _is_first_placement_turn_start(positions, i):
             pos.pair_policy_complete = pair_policy_target_complete_from_sparse_rows(
                 pos.pair_policy_target_v2,
                 _legal_qr_from_history(pos.move_history),

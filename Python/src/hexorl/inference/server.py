@@ -753,8 +753,12 @@ class InferenceServer:
         values_np = decoded.value
         opp_np = decoded.opp_policy
         pair_first_np = decoded.pair_first
-        pair_joint_np = decoded.pair_joint
-        pair_second_np = decoded.pair_second
+        pair_joint_np = decoded.pair_joint if decoded.pair_joint is not None else decoded.pair_joint_logits
+        pair_second_np = (
+            decoded.pair_second
+            if decoded.pair_second is not None
+            else decoded.pair_completion_logits
+        )
         regret_np = decoded.regret_rank
         download_ms = (time.monotonic() - download_t0) * 1000.0
 

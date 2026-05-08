@@ -232,6 +232,7 @@ class Phase3AutonomousSupervisor:
         last_returncode = 1
         reason = ""
         started_at = datetime.now(timezone.utc).isoformat()
+        before_counts = phase3_terminal_counts(specs)
         self._event("round_start", {"target_trials_per_study": target})
         for attempt in range(self.retry_limit + 1):
             attempts = attempt + 1
@@ -245,6 +246,22 @@ class Phase3AutonomousSupervisor:
             )
             counts = phase3_terminal_counts(specs)
             missing = [item for item in counts if item.trials_terminal < target]
+            failed_delta = _failed_trial_delta(before_counts, counts)
+            if failed_delta:
+                reason = "phase3_trial_failures:" + ",".join(
+                    f"{candidate_id}+{delta}" for candidate_id, delta in sorted(failed_delta.items())
+                )
+                self._event(
+                    "round_failed",
+                    {
+                        "target_trials_per_study": target,
+                        "attempt": attempts,
+                        "returncode": last_returncode,
+                        "reason": reason,
+                        "counts": [item.to_dict() for item in counts],
+                    },
+                )
+                break
             if last_returncode == 0 and not missing:
                 artifacts = refresh_phase3_supervisor_artifacts(
                     self.run_dir,
@@ -288,7 +305,7 @@ class Phase3AutonomousSupervisor:
                     "reason": reason,
                     "counts": [item.to_dict() for item in counts],
                 },
-            )
+                )
         return Phase3SupervisorRoundSummary(
             target_trials_per_study=target,
             attempts=attempts,
@@ -440,6 +457,19 @@ def phase3_terminal_counts(specs: tuple[Phase3StudySpec, ...]) -> tuple[Phase3St
     return tuple(rows)
 
 
+def _failed_trial_delta(
+    before: tuple[Phase3StudyTerminalCounts, ...],
+    after: tuple[Phase3StudyTerminalCounts, ...],
+) -> dict[str, int]:
+    previous = {item.promoted_candidate_id: item.trials_failed for item in before}
+    delta: dict[str, int] = {}
+    for item in after:
+        added = item.trials_failed - int(previous.get(item.promoted_candidate_id, 0))
+        if added > 0:
+            delta[item.promoted_candidate_id] = added
+    return delta
+
+
 def refresh_phase3_supervisor_artifacts(
     run_dir: Path | str,
     *,
@@ -489,25 +519,51 @@ def _champion_scorecard_paths(run_dir: Path, specs: tuple[Phase3StudySpec, ...])
 
 def _mirror_dashboard_artifacts(run_dir: Path) -> dict[str, str]:
     artifacts: dict[str, str] = {}
-    try:
-        from scripts.mirror_phase3_normal_dashboard_suite import mirror_once as mirror_normal
-
-        suite_dir = run_dir / "phase_normal_dashboard_suite"
-        summary = run_dir / "phase_normal_dashboard_suite_mirror_summary.json"
-        mirror_normal(run_dir, suite_dir, summary)
+    suite_dir = run_dir / "phase_normal_dashboard_suite"
+    summary = run_dir / "phase_normal_dashboard_suite_mirror_summary.json"
+    result = _run_dashboard_mirror(
+        "scripts/mirror_phase3_normal_dashboard_suite.py",
+        "--run-dir",
+        str(run_dir),
+        "--suite-dir",
+        str(suite_dir),
+        "--summary",
+        str(summary),
+        "--once",
+    )
+    if result == 0:
         artifacts["normal_dashboard_suite_mirror_summary"] = str(summary)
-    except Exception as exc:
-        artifacts["normal_dashboard_suite_mirror_error"] = f"{type(exc).__name__}:{exc}"
-    try:
-        from scripts.mirror_phase3_optuna_dashboard import mirror_once as mirror_optuna
+    else:
+        artifacts["normal_dashboard_suite_mirror_error"] = f"mirror_returncode:{result}"
 
-        output = run_dir / "phase3_studies" / "phase3_dashboard_combined.sqlite3"
-        summary = run_dir / "phase3_optuna_dashboard_mirror_summary.json"
-        mirror_optuna(run_dir, output, summary)
+    output = run_dir / "phase3_studies" / "phase3_dashboard_combined.sqlite3"
+    summary = run_dir / "phase3_optuna_dashboard_mirror_summary.json"
+    result = _run_dashboard_mirror(
+        "scripts/mirror_phase3_optuna_dashboard.py",
+        "--run-dir",
+        str(run_dir),
+        "--output",
+        str(output),
+        "--summary",
+        str(summary),
+        "--once",
+    )
+    if result == 0:
         artifacts["optuna_dashboard_mirror_summary"] = str(summary)
-    except Exception as exc:
-        artifacts["optuna_dashboard_mirror_error"] = f"{type(exc).__name__}:{exc}"
+    else:
+        artifacts["optuna_dashboard_mirror_error"] = f"mirror_returncode:{result}"
     return artifacts
+
+
+def _run_dashboard_mirror(script: str, *args: str) -> int:
+    result = subprocess.run(
+        [sys.executable, script, *args],
+        cwd=Path.cwd(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return int(result.returncode)
 
 
 def find_active_phase3_processes(run_dir: Path | str) -> list[ActiveProcess]:

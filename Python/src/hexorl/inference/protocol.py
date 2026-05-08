@@ -25,6 +25,11 @@ GRAPH_HEAD_PAIR_FIRST = 1 << 1
 GRAPH_HEAD_PAIR_JOINT = 1 << 2
 GRAPH_HEAD_PAIR_SECOND = 1 << 3
 GRAPH_HEAD_REGRET = 1 << 4
+GRAPH_HEAD_V1_CELL_MARGINAL = 1 << 5
+GRAPH_HEAD_V1_PAIR_COMPLETION = 1 << 6
+GRAPH_HEAD_V1_PAIR_PROPOSAL = 1 << 7
+GRAPH_HEAD_V1_PAIR_JOINT = 1 << 8
+GRAPH_HEAD_V1_TERMINAL_TACTICAL = 1 << 9
 
 
 @dataclass(frozen=True)
@@ -183,5 +188,15 @@ def graph_head_flags(outputs: Mapping[str, object]) -> int:
         flags |= GRAPH_HEAD_PAIR_SECOND
     if "regret_rank" in outputs:
         flags |= GRAPH_HEAD_REGRET
+    if "cell_marginal_logits" in outputs:
+        flags |= GRAPH_HEAD_V1_CELL_MARGINAL
+    if "pair_completion_logits" in outputs:
+        flags |= GRAPH_HEAD_V1_PAIR_COMPLETION
+    if "pair_proposal_score" in outputs:
+        flags |= GRAPH_HEAD_V1_PAIR_PROPOSAL
+    if "pair_joint_logits" in outputs:
+        flags |= GRAPH_HEAD_V1_PAIR_JOINT
+    if "terminal_tactical_v1" in outputs:
+        flags |= GRAPH_HEAD_V1_TERMINAL_TACTICAL
     return flags
 

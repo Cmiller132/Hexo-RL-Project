@@ -36,7 +36,12 @@ def test_autotune_config_defaults_match_scout_plan():
     assert cfg.autotune.optuna.storage == "sqlite:///runs/<run_id>/optuna.sqlite3"
     assert cfg.autotune.optuna.phase1_pruner == "nop"
     assert cfg.autotune.runtime_probe.speed_quarantine_positions_per_sec == pytest.approx(2.0)
-    assert cfg.autotune.pair_strategy.modes == ["none", "root_pair_mcts", "full_pair_mcts"]
+    assert cfg.autotune.pair_strategy.modes == [
+        "none",
+        "root_pair_mcts",
+        "full_pair_mcts",
+        "sampled_joint_pair_v1",
+    ]
     assert cfg.autotune.scoring.target_scalar == "classical_survival_lcb"
     assert cfg.autotune.final_eval.classical_arena_games == 400
 

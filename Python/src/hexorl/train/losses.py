@@ -239,6 +239,143 @@ def graph_policy_loss(
     return sparse_policy_loss(pred_logits, target_probs, row_mask, weight)
 
 
+def completed_q_regularization_loss(
+    pred_logits: torch.Tensor,
+    completed_q: torch.Tensor,
+    mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Cross-entropy from a completed-Q soft posterior over sampled pair rows."""
+
+    logits = pred_logits.float()
+    row_mask = mask.to(device=logits.device, dtype=torch.bool)
+    q = completed_q.to(device=logits.device, dtype=logits.dtype)
+    finite = torch.isfinite(q)
+    row_mask = row_mask & finite
+    valid_rows = row_mask.any(dim=-1)
+    if not torch.any(valid_rows):
+        return pred_logits.sum() * 0.0
+    q_logits = (q / max(float(temperature), 1e-6)).masked_fill(~row_mask, -80.0)
+    target = torch.softmax(q_logits, dim=-1) * row_mask.to(dtype=logits.dtype)
+    target_mass = target.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    target = target / target_mass
+    return sparse_policy_loss(logits, target, row_mask, weight)
+
+
+def pair_ranking_loss(
+    pred_logits: torch.Tensor,
+    binary_target: torch.Tensor,
+    mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sampled-negative pair ranking loss over explicit positive/negative rows."""
+
+    logits = pred_logits.float()
+    row_mask = mask.to(device=logits.device, dtype=torch.bool)
+    target = binary_target.to(device=logits.device, dtype=logits.dtype).clamp(0.0, 1.0)
+    valid_rows = row_mask.any(dim=-1)
+    if not torch.any(valid_rows):
+        return pred_logits.sum() * 0.0
+
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    masked_bce = (bce * row_mask.to(dtype=bce.dtype)).sum(dim=-1) / row_mask.sum(dim=-1).clamp(min=1)
+
+    pairwise_losses: list[torch.Tensor] = []
+    for batch_idx in range(logits.shape[0]):
+        active = row_mask[batch_idx]
+        pos = active & (target[batch_idx] > 0.5)
+        neg = active & (target[batch_idx] <= 0.5)
+        if torch.any(pos) and torch.any(neg):
+            margin = logits[batch_idx, pos].unsqueeze(1) - logits[batch_idx, neg].unsqueeze(0)
+            pairwise_losses.append(F.softplus(-margin).mean())
+        else:
+            pairwise_losses.append(logits[batch_idx].sum() * 0.0)
+    pairwise = torch.stack(pairwise_losses)
+    loss = masked_bce + pairwise
+    if weight is not None:
+        w = weight.to(device=loss.device, dtype=loss.dtype) * valid_rows.to(dtype=loss.dtype)
+        if not torch.any(w > 0):
+            return pred_logits.sum() * 0.0
+        return (loss * w).sum() / w.sum().clamp(min=1e-6)
+    return loss[valid_rows].mean()
+
+
+def pair_conditional_loss(
+    pred_logits: torch.Tensor,
+    pair_indices: torch.Tensor,
+    first_row_ids: torch.Tensor,
+    conditional_target: torch.Tensor,
+    conditional_mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Unordered-safe conditional second-cell loss using both pair orientations."""
+
+    logits = pred_logits.float()
+    pair_idx = pair_indices.to(device=logits.device, dtype=torch.long)
+    first_ids = first_row_ids.to(device=logits.device, dtype=torch.long)
+    target = conditional_target.to(device=logits.device, dtype=logits.dtype)
+    mask = conditional_mask.to(device=logits.device, dtype=torch.bool)
+    mask = mask & (pair_idx >= 0) & (pair_idx < logits.shape[1]) & (first_ids >= 0) & (target > 0)
+    batch_losses: list[torch.Tensor] = []
+    valid_batch = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.bool)
+    for batch_idx in range(logits.shape[0]):
+        row_mask = mask[batch_idx]
+        if not torch.any(row_mask):
+            batch_losses.append(logits[batch_idx].sum() * 0.0)
+            continue
+        losses: list[torch.Tensor] = []
+        for first in torch.unique(first_ids[batch_idx, row_mask]):
+            group = row_mask & (first_ids[batch_idx] == first)
+            if not torch.any(group):
+                continue
+            rows = pair_idx[batch_idx, group]
+            group_target = target[batch_idx, group]
+            group_mass = group_target.sum()
+            if group_mass <= 0:
+                continue
+            group_target = group_target / group_mass.clamp(min=1e-6)
+            losses.append(-(group_target * F.log_softmax(logits[batch_idx, rows], dim=-1)).sum())
+        if losses:
+            valid_batch[batch_idx] = True
+            batch_losses.append(torch.stack(losses).mean())
+        else:
+            batch_losses.append(logits[batch_idx].sum() * 0.0)
+    loss = torch.stack(batch_losses)
+    if weight is not None:
+        w = weight.to(device=loss.device, dtype=loss.dtype) * valid_batch.to(dtype=loss.dtype)
+        if not torch.any(w > 0):
+            return pred_logits.sum() * 0.0
+        return (loss * w).sum() / w.sum().clamp(min=1e-6)
+    if not torch.any(valid_batch):
+        return pred_logits.sum() * 0.0
+    return loss[valid_batch].mean()
+
+
+def masked_bce_loss(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Binary cross-entropy over masked row logits."""
+
+    logits = pred_logits.float()
+    row_mask = mask.to(device=logits.device, dtype=torch.bool)
+    labels = target.to(device=logits.device, dtype=logits.dtype)
+    valid_rows = row_mask.any(dim=-1)
+    if not torch.any(valid_rows):
+        return pred_logits.sum() * 0.0
+    loss = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+    loss = (loss * row_mask.to(dtype=loss.dtype)).sum(dim=-1) / row_mask.sum(dim=-1).clamp(min=1)
+    if weight is not None:
+        w = weight.to(device=loss.device, dtype=loss.dtype) * valid_rows.to(dtype=loss.dtype)
+        if not torch.any(w > 0):
+            return pred_logits.sum() * 0.0
+        return (loss * w).sum() / w.sum().clamp(min=1e-6)
+    return loss[valid_rows].mean()
+
+
 def opp_policy_loss(
     pred_logits: torch.Tensor,
     target_probs: torch.Tensor,

@@ -220,6 +220,47 @@ def output_contracts_for(names: Sequence[str]) -> dict[str, OutputContract]:
                 state_row=None if name == "legal_token_quality" else "state",
                 optional=True,
             )
+        elif name == "cell_marginal_logits":
+            contracts[name] = OutputContract(
+                name=name,
+                kind="policy",
+                prediction_key=name,
+                row_family="legal",
+                runtime_consumed=True,
+                required_for_selfplay=True,
+            )
+        elif name == "pair_completion_logits":
+            contracts[name] = OutputContract(
+                name=name,
+                kind="pair_policy",
+                prediction_key=name,
+                row_family="pair_joint",
+                runtime_consumed=True,
+            )
+        elif name == "pair_proposal_score":
+            contracts[name] = OutputContract(
+                name=name,
+                kind="pair_policy",
+                prediction_key=name,
+                row_family="pair_joint",
+                runtime_consumed=True,
+            )
+        elif name == "pair_joint_logits":
+            contracts[name] = OutputContract(
+                name=name,
+                kind="pair_policy",
+                prediction_key=name,
+                row_family="pair_joint",
+                runtime_consumed=True,
+                required_for_selfplay=True,
+            )
+        elif name == "terminal_tactical_v1":
+            contracts[name] = OutputContract(
+                name=name,
+                kind="auxiliary",
+                prediction_key=name,
+                state_row="state",
+            )
     return contracts
 
 
@@ -248,6 +289,15 @@ GLOBAL_OPTIONAL_OUTPUTS = (
     "legal_token_quality",
 )
 
+V1_PAIR_OUTPUTS = (
+    "cell_marginal_logits",
+    "pair_completion_logits",
+    "pair_proposal_score",
+    "pair_joint_logits",
+    "value",
+    "terminal_tactical_v1",
+)
+
 DENSE_LOSS_DEFAULTS = {
     "policy": 1.0,
     "value": 1.5,
@@ -267,6 +317,15 @@ GLOBAL_LOSS_DEFAULTS = {
     "moves_left": 0.05,
     "tactical": 0.05,
     "legal_token_quality": 0.05,
+}
+
+V1_PAIR_LOSS_DEFAULTS = {
+    "cell_marginal_logits": 1.0,
+    "pair_completion_logits": 0.05,
+    "pair_proposal_score": 0.05,
+    "pair_joint_logits": 1.0,
+    "value": 1.0,
+    "terminal_tactical_v1": 0.05,
 }
 
 
@@ -353,6 +412,48 @@ def global_graph_spec(
     )
 
 
+def global_pair_biaffine_spec(
+    architecture_id: str,
+    *,
+    family_id: str,
+    recipe_id: str,
+    description: str,
+) -> ArchitectureSpec:
+    return ArchitectureSpec(
+        architecture_id=architecture_id,
+        family_id=family_id,
+        recipe_id=recipe_id,
+        description=description,
+        default_outputs=V1_PAIR_OUTPUTS,
+        supported_optional_outputs=GLOBAL_OPTIONAL_OUTPUTS,
+        selfplay_required_outputs=("cell_marginal_logits", "pair_joint_logits", "value"),
+        training_adapter_id="global_graph:v1_pair",
+        inference_adapter_id="global_graph:v1_pair",
+        policy_provider_id="sampled_joint_pair:v1",
+        pair_capabilities=(
+            "sampled_joint_pair_v1",
+            "bounded_biaffine_pair_joint",
+        ),
+        input_contract_id="global_graph_tokens:v1_pair",
+        row_families=(
+            "legal",
+            "opponent_legal",
+            "pair_joint",
+            "known_first_pair",
+            "graph_token",
+        ),
+        relation_required=False,
+        graph=True,
+        global_graph=True,
+        graph_pair_capable=True,
+        replay_sparse_diagnostics=True,
+        requires_attention_head_divisibility=True,
+        display_name=family_id,
+        default_loss_weights=V1_PAIR_LOSS_DEFAULTS,
+        output_contracts=output_contracts_for((*V1_PAIR_OUTPUTS, *GLOBAL_OPTIONAL_OUTPUTS)),
+    )
+
+
 def resolve_outputs(
     spec: ArchitectureSpec,
     requested_heads: Sequence[str] | None,
@@ -363,6 +464,9 @@ def resolve_outputs(
 ) -> tuple[tuple[str, ...], Mapping[str, str]]:
     requested = list(requested_heads or spec.default_outputs)
     aliases: dict[str, str] = {}
+    if spec.architecture_id == "global_pair_biaffine_0" and requested == ["policy", "value"]:
+        aliases["policy"] = "cell_marginal_logits"
+        requested = list(spec.default_outputs)
     if spec.global_graph and requested == ["policy", "value"]:
         requested = ["policy_place", "value", LOOKAHEAD_FAMILY]
     if spec.global_graph:

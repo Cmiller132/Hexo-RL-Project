@@ -1,4 +1,5 @@
 use hexgame_core::rules::{Hex, MoveRecord};
+use hexgame_core::v1::{LegalRowV1, PairRowV1};
 use numpy::ndarray::ArrayView2;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -6,12 +7,38 @@ use pyo3::prelude::*;
 const LEGAL_ROW_BYTES: usize = 8;
 const BOARD_PIECE_ROW_BYTES: usize = 12;
 const COMPACT_HISTORY_ROW_BYTES: usize = 12;
+pub(crate) const V1_LEGAL_ROW_BYTES: usize = 12;
+pub(crate) const V1_PAIR_ROW_BYTES: usize = 28;
 
 pub(crate) fn encode_legal_rows(legal: &[Hex]) -> Vec<u8> {
     let mut out = Vec::with_capacity(legal.len() * LEGAL_ROW_BYTES);
     for h in legal {
         push_i32(&mut out, h.q);
         push_i32(&mut out, h.r);
+    }
+    out
+}
+
+pub(crate) fn encode_v1_legal_rows(rows: &[LegalRowV1]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rows.len() * V1_LEGAL_ROW_BYTES);
+    for row in rows {
+        push_i32(&mut out, row.row_id as i32);
+        push_i32(&mut out, row.cell.q);
+        push_i32(&mut out, row.cell.r);
+    }
+    out
+}
+
+pub(crate) fn encode_v1_pair_rows(rows: &[PairRowV1]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rows.len() * V1_PAIR_ROW_BYTES);
+    for row in rows {
+        push_i32(&mut out, row.row_id as i32);
+        push_i32(&mut out, row.first_legal_row_id as i32);
+        push_i32(&mut out, row.second_legal_row_id as i32);
+        push_i32(&mut out, row.first.q);
+        push_i32(&mut out, row.first.r);
+        push_i32(&mut out, row.second.q);
+        push_i32(&mut out, row.second.r);
     }
     out
 }

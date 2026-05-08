@@ -402,6 +402,57 @@ def _tactical(entry: LossPlanEntry, pred: torch.Tensor, targets: Mapping[str, ob
     return primitive.tactical_loss(pred, _tensor(targets[c.target_key], pred.device), _maybe_tensor(targets, c.weight_key, pred.device))
 
 
+def _v1_pair_joint(entry: LossPlanEntry, pred: torch.Tensor, targets: Mapping[str, object], _n_bins: int) -> torch.Tensor:
+    _validate_v1_pair_support(targets, pred.device)
+    c = entry.contract
+    weight = _maybe_tensor(targets, c.weight_key, pred.device)
+    policy = primitive.sparse_policy_loss(
+        pred,
+        _tensor(targets[c.target_key], pred.device),
+        _tensor(targets[c.mask_key], pred.device, dtype=torch.bool),  # type: ignore[arg-type]
+        weight,
+    )
+    completed_q = primitive.completed_q_regularization_loss(
+        pred,
+        _tensor(targets["v1_completed_q_target"], pred.device),
+        _tensor(targets["v1_completed_q_mask"], pred.device, dtype=torch.bool),
+        weight,
+    )
+    return policy + (0.10 * completed_q)
+
+
+def _v1_pair_completion(entry: LossPlanEntry, pred: torch.Tensor, targets: Mapping[str, object], _n_bins: int) -> torch.Tensor:
+    _validate_v1_pair_support(targets, pred.device)
+    c = entry.contract
+    weight = _maybe_tensor(targets, c.weight_key, pred.device)
+    conditional = primitive.pair_conditional_loss(
+        pred,
+        _tensor(targets["v1_conditional_pair_indices"], pred.device, dtype=torch.long),
+        _tensor(targets["v1_conditional_first_legal_row_ids"], pred.device, dtype=torch.long),
+        _tensor(targets["v1_pair_conditional_target"], pred.device),
+        _tensor(targets["v1_pair_conditional_mask"], pred.device, dtype=torch.bool),
+        weight,
+    )
+    terminal = primitive.masked_bce_loss(
+        pred,
+        _tensor(targets[c.target_key], pred.device),
+        _tensor(targets[c.mask_key], pred.device, dtype=torch.bool),  # type: ignore[arg-type]
+        weight,
+    )
+    return conditional + (0.10 * terminal)
+
+
+def _v1_pair_ranking(entry: LossPlanEntry, pred: torch.Tensor, targets: Mapping[str, object], _n_bins: int) -> torch.Tensor:
+    _validate_v1_pair_support(targets, pred.device)
+    c = entry.contract
+    return primitive.pair_ranking_loss(
+        pred,
+        _tensor(targets[c.target_key], pred.device),
+        _tensor(targets[c.mask_key], pred.device, dtype=torch.bool),  # type: ignore[arg-type]
+        _maybe_tensor(targets, c.weight_key, pred.device),
+    )
+
+
 HEAD_TARGETS: Mapping[str, TargetContract] = {
     "policy": TargetContract("policy", "policy", "policy", row_family="dense_board", weight_key="policy_weight", require_weight=True, require_positive_mass=True),
     "sparse_policy": TargetContract("sparse_policy", "sparse_policy_target", "masked_policy", row_family="candidate", mask_key="candidate_mask", weight_key="sparse_policy_weight", require_weight=True, require_positive_mass=True),
@@ -411,6 +462,11 @@ HEAD_TARGETS: Mapping[str, TargetContract] = {
     "policy_pair_first": TargetContract("policy_pair_first", "pair_first_policy_target", "masked_policy", row_family="legal", mask_key="legal_mask", weight_key="pair_policy_weight", phase_key="pair_first_unordered", phase_value=True, require_weight=True, require_positive_mass=True),
     "policy_pair_joint": TargetContract("policy_pair_joint", "pair_policy_target", "masked_policy", row_family="pair_joint", mask_key="pair_row_mask", weight_key="pair_policy_weight", require_weight=True, require_positive_mass=True),
     "policy_pair_second": TargetContract("policy_pair_second", "pair_second_policy_target", "masked_policy", row_family="known_first_pair", mask_key="pair_second_row_mask", weight_key="pair_policy_weight", phase_key="pair_second_known_first", phase_value=True, require_weight=True, require_positive_mass=True),
+    "cell_marginal_logits": TargetContract("cell_marginal_logits", "v1_cell_marginal_target", "masked_policy", row_family="legal", mask_key="legal_mask", weight_key="v1_pair_weight", require_weight=True, require_positive_mass=True),
+    "pair_joint_logits": TargetContract("pair_joint_logits", "v1_pair_joint_target", "v1_pair_joint", row_family="pair_joint", mask_key="v1_pair_joint_mask", weight_key="v1_pair_weight", require_weight=True, require_positive_mass=True),
+    "pair_completion_logits": TargetContract("pair_completion_logits", "v1_pair_completion_target", "v1_pair_completion", row_family="pair_joint", mask_key="v1_pair_completion_mask", weight_key="v1_pair_weight", require_weight=True),
+    "pair_proposal_score": TargetContract("pair_proposal_score", "v1_pair_ranking_target", "v1_pair_ranking", row_family="pair_joint", mask_key="v1_pair_ranking_mask", weight_key="v1_pair_weight", require_weight=True),
+    "terminal_tactical_v1": TargetContract("terminal_tactical_v1", "v1_terminal_tactical_target", "tactical", weight_key="v1_pair_weight", require_weight=True),
     "opp_policy": TargetContract("opp_policy", "opp_policy", "opp_policy", row_family="dense_board", weight_key="opp_policy_weight", require_weight=True, require_positive_mass=True),
     "value": TargetContract("value", "value", "value", weight_key="value_weight", require_weight=True),
     "regret_rank": TargetContract("regret_rank", "regret_rank", "regret_rank", weight_key="regret_weight", require_weight=True),
@@ -432,7 +488,43 @@ LOSS_HANDLERS: Mapping[str, Callable[[LossPlanEntry, torch.Tensor, Mapping[str, 
     "axis_map": _axis_map,
     "moves_left": _moves_left,
     "tactical": _tactical,
+    "v1_pair_joint": _v1_pair_joint,
+    "v1_pair_completion": _v1_pair_completion,
+    "v1_pair_ranking": _v1_pair_ranking,
 }
+
+
+def _validate_v1_pair_support(targets: Mapping[str, object], device: torch.device) -> None:
+    required = (
+        "v1_pair_schema_version",
+        "v1_support_type_id",
+        "v1_unsampled_pair_mask",
+        "v1_explicit_negative_mask",
+        "v1_sampled_negative_mask",
+        "v1_pair_joint_mask",
+        "v1_pair_ranking_mask",
+        "v1_completed_q_mask",
+    )
+    missing = [key for key in required if key not in targets]
+    if missing:
+        raise LossContractError(f"V1 pair losses require explicit support targets: {missing}")
+    schema = _tensor(targets["v1_pair_schema_version"], device, dtype=torch.long).reshape(-1)
+    support = _tensor(targets["v1_support_type_id"], device, dtype=torch.long).reshape(-1)
+    active = schema > 0
+    if not torch.any(active):
+        raise LossContractError("V1 pair losses require at least one V1 target row")
+    if torch.any((support[active] < 1) | (support[active] > 4)):
+        raise LossContractError("V1 support_type_id must identify a known V1 support type")
+    unsampled = _tensor(targets["v1_unsampled_pair_mask"], device, dtype=torch.bool)
+    forbidden_overlap = (
+        _tensor(targets["v1_pair_joint_mask"], device, dtype=torch.bool)
+        | _tensor(targets["v1_pair_ranking_mask"], device, dtype=torch.bool)
+        | _tensor(targets["v1_completed_q_mask"], device, dtype=torch.bool)
+        | _tensor(targets["v1_explicit_negative_mask"], device, dtype=torch.bool)
+        | _tensor(targets["v1_sampled_negative_mask"], device, dtype=torch.bool)
+    )
+    if torch.any(unsampled & forbidden_overlap):
+        raise LossContractError("V1 unsampled legal pairs cannot enter policy, ranking, Q, or negative masks")
 
 
 def _tensor(value: object, device: torch.device, dtype: torch.dtype | None = None) -> torch.Tensor:

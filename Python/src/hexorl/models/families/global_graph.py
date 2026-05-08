@@ -12,6 +12,8 @@ from hexorl.graph.batch import (
     GRAPH_FEATURE_DIM,
     GRAPH_FEATURE_PLACEMENTS_REMAINING,
     GraphTokenType,
+    V1_PAIR_FEATURE_DIM,
+    WIN_LENGTH,
 )
 from hexorl.models.registry import (
     global_graph_architecture_ids,
@@ -164,6 +166,7 @@ class GlobalHexGraphNet(nn.Module):
         self.architecture = architecture
         self.channels = channels
         self.n_bins = n_bins
+        self.is_v1_pair_biaffine = architecture == "global_pair_biaffine_0"
         self._all_heads = output_heads is None
         self.head_names = set(output_heads or [])
         self.lookahead_heads = sorted(name for name in self.head_names if name.startswith("lookahead_"))
@@ -186,6 +189,34 @@ class GlobalHexGraphNet(nn.Module):
         self.policy_place = nn.Linear(channels, 1)
         self.policy_pair_first = nn.Linear(channels, 1)
         self.policy_opp = nn.Linear(channels, 1)
+        self.cell_marginal: Optional[nn.Module] = None
+        self.v1_pair_left: Optional[nn.Module] = None
+        self.v1_pair_right: Optional[nn.Module] = None
+        self.v1_pair_feature_score: Optional[nn.Module] = None
+        self.v1_pair_interaction: Optional[nn.Module] = None
+        self.v1_pair_completion: Optional[nn.Module] = None
+        self.terminal_tactical_v1: Optional[nn.Module] = None
+        if self.is_v1_pair_biaffine:
+            pair_rank = max(4, min(64, channels // 2))
+            self.cell_marginal = nn.Linear(channels, 1)
+            self.v1_pair_left = nn.Linear(channels, pair_rank, bias=False)
+            self.v1_pair_right = nn.Linear(channels, pair_rank, bias=False)
+            self.v1_pair_feature_score = nn.Linear(V1_PAIR_FEATURE_DIM, 1, bias=False)
+            self.v1_pair_interaction = nn.Sequential(
+                nn.Linear(channels * 4 + V1_PAIR_FEATURE_DIM, channels),
+                nn.SiLU(),
+                nn.Linear(channels, 1),
+            )
+            self.v1_pair_completion = nn.Sequential(
+                nn.Linear(channels * 4 + V1_PAIR_FEATURE_DIM, channels),
+                nn.SiLU(),
+                nn.Linear(channels, 1),
+            )
+            self.terminal_tactical_v1 = nn.Sequential(
+                nn.Linear(channels, channels),
+                nn.SiLU(),
+                nn.Linear(channels, 8),
+            )
         self.pair_first_refine: Optional[nn.Module] = None
         self.pair_second_refine: Optional[nn.Module] = None
         if architecture == "global_pair_twostage_0":
@@ -242,6 +273,7 @@ class GlobalHexGraphNet(nn.Module):
         pair_first_indices: Optional[torch.Tensor] = None,
         pair_second_indices: Optional[torch.Tensor] = None,
         pair_token_indices: Optional[torch.Tensor] = None,
+        pair_features: Optional[torch.Tensor] = None,
         relation_type: Optional[torch.Tensor] = None,
         relation_bias: Optional[torch.Tensor] = None,
         crop_tensor: Optional[torch.Tensor] = None,
@@ -302,6 +334,11 @@ class GlobalHexGraphNet(nn.Module):
                 ~legal_mask_bool,
                 -80.0,
             )
+        if self.is_v1_pair_biaffine and self._wants("cell_marginal_logits"):
+            out["cell_marginal_logits"] = self.cell_marginal(legal_vec).squeeze(-1).masked_fill(
+                ~legal_mask_bool,
+                -80.0,
+            )
         if self._wants("policy_pair_first", "pair_policy"):
             pair_first_vec = legal_vec
             if self.pair_first_refine is not None:
@@ -328,6 +365,8 @@ class GlobalHexGraphNet(nn.Module):
             out["moves_left"] = self.moves_left(state)
         if self._wants("tactical"):
             out["tactical"] = self.tactical(state)
+        if self.is_v1_pair_biaffine and self._wants("terminal_tactical_v1"):
+            out["terminal_tactical_v1"] = self.terminal_tactical_v1(state)
         if self._wants("axis"):
             out["axis"] = self.axis(state)
         if self._wants("axis_delta_norm"):
@@ -430,7 +469,146 @@ class GlobalHexGraphNet(nn.Module):
                 )
                 second_logits = self.pair_second(second_features).squeeze(-1)
                 out["policy_pair_second"] = second_logits.masked_fill(~pair_mask, -80.0)
+        wants_v1_pair = self.is_v1_pair_biaffine and self._wants(
+            "pair_completion_logits",
+            "pair_proposal_score",
+            "pair_joint_logits",
+        )
+        if wants_v1_pair and pair_first_indices is not None and pair_second_indices is not None:
+            if pair_first_indices.shape != pair_second_indices.shape:
+                raise ValueError("pair_first_indices and pair_second_indices must have matching shape")
+            first_raw = pair_first_indices.to(device=x.device, dtype=torch.long)
+            second_raw = pair_second_indices.to(device=x.device, dtype=torch.long)
+            pair_mask = (
+                (first_raw >= 0)
+                & (first_raw < x.shape[1])
+                & (second_raw >= 0)
+                & (second_raw < x.shape[1])
+                & (first_raw != second_raw)
+            )
+            first = first_raw.clamp(0, max(x.shape[1] - 1, 0))
+            second = second_raw.clamp(0, max(x.shape[1] - 1, 0))
+            token_type_device = token_type.to(device=x.device)
+            first_type = token_type_device.gather(1, first)
+            second_type = token_type_device.gather(1, second)
+            first_active = mask.gather(1, first)
+            second_active = mask.gather(1, second)
+            legal_type = int(GraphTokenType.LEGAL)
+            pair_mask = pair_mask & first_active & second_active
+            pair_mask = pair_mask & (first_type == legal_type) & (second_type == legal_type)
+            if pair_token_indices is not None:
+                pair_token_raw = pair_token_indices.to(device=x.device, dtype=torch.long)
+                if pair_token_raw.shape != pair_first_indices.shape:
+                    raise ValueError("pair_token_indices must match pair_first_indices shape")
+                pair_mask = pair_mask & (pair_token_raw < 0)
+
+            first_vec = x.gather(1, first.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+            second_vec = x.gather(1, second.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+            state_pair = state.unsqueeze(1).expand_as(first_vec)
+            pair_feature_tensor = self._v1_pair_feature_tensor(
+                token_qr,
+                token_features,
+                first,
+                second,
+                pair_features,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            symmetric_features = torch.cat(
+                [
+                    state_pair,
+                    first_vec + second_vec,
+                    (first_vec - second_vec).abs(),
+                    first_vec * second_vec,
+                    pair_feature_tensor,
+                ],
+                dim=-1,
+            )
+            left_first = self.v1_pair_left(first_vec)
+            right_first = self.v1_pair_right(first_vec)
+            left_second = self.v1_pair_left(second_vec)
+            right_second = self.v1_pair_right(second_vec)
+            rank_scale = max(1, left_first.shape[-1]) ** -0.5
+            biaffine = 0.5 * (
+                (left_first * right_second).sum(dim=-1)
+                + (left_second * right_first).sum(dim=-1)
+            ) * rank_scale
+            proposal = biaffine + self.v1_pair_feature_score(pair_feature_tensor).squeeze(-1)
+            if self._wants("pair_proposal_score"):
+                out["pair_proposal_score"] = proposal.masked_fill(~pair_mask, -80.0)
+            if self._wants("pair_completion_logits"):
+                completion = self.v1_pair_completion(symmetric_features).squeeze(-1)
+                out["pair_completion_logits"] = completion.masked_fill(~pair_mask, -80.0)
+            if self._wants("pair_joint_logits"):
+                first_cell = self.cell_marginal(first_vec).squeeze(-1)
+                second_cell = self.cell_marginal(second_vec).squeeze(-1)
+                interaction = self.v1_pair_interaction(symmetric_features).squeeze(-1)
+                joint = first_cell + second_cell + proposal + interaction
+                out["pair_joint_logits"] = joint.masked_fill(~pair_mask, -80.0)
         return out
+
+    def _v1_pair_feature_tensor(
+        self,
+        token_qr: torch.Tensor,
+        token_features: torch.Tensor,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        pair_features: Optional[torch.Tensor],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if pair_features is not None:
+            supplied = pair_features.to(device=device, dtype=dtype)
+            if supplied.ndim != 3 or supplied.shape[:2] != first.shape:
+                raise ValueError(
+                    "pair_features must have shape (B, P, F) matching pair indices"
+                )
+            if int(supplied.shape[-1]) != V1_PAIR_FEATURE_DIM:
+                raise ValueError(
+                    f"pair_features must have feature width {V1_PAIR_FEATURE_DIM}, "
+                    f"got {int(supplied.shape[-1])}"
+                )
+            return supplied
+
+        qr = token_qr.to(device=device, dtype=dtype)
+        first_qr = qr.gather(1, first.unsqueeze(-1).expand(-1, -1, 2))
+        second_qr = qr.gather(1, second.unsqueeze(-1).expand(-1, -1, 2))
+        dq = first_qr[..., 0] - second_qr[..., 0]
+        dr = first_qr[..., 1] - second_qr[..., 1]
+        dist = torch.maximum(torch.maximum(dq.abs(), dr.abs()), (dq + dr).abs())
+        same_line = (
+            (first_qr[..., 0] == second_qr[..., 0])
+            | (first_qr[..., 1] == second_qr[..., 1])
+            | ((first_qr[..., 0] + first_qr[..., 1]) == (second_qr[..., 0] + second_qr[..., 1]))
+        ).to(dtype=dtype)
+        same_axis = same_line
+        same_window = ((dist <= float(WIN_LENGTH - 1)) & (same_line > 0.0)).to(dtype=dtype)
+        placement_phase = token_features[:, 0, GRAPH_FEATURE_PLACEMENTS_REMAINING].to(
+            device=device,
+            dtype=dtype,
+        )
+        full_turn = (placement_phase >= 0.75).to(dtype=dtype).unsqueeze(-1).expand_as(dist)
+        known_first = ((placement_phase > 0.0) & (placement_phase < 0.75)).to(dtype=dtype).unsqueeze(-1).expand_as(dist)
+        both_legal = torch.ones_like(dist, dtype=dtype)
+        zeros = torch.zeros_like(dist, dtype=dtype)
+        return torch.stack(
+            [
+                (dist / 16.0).clamp(0.0, 1.0),
+                same_axis,
+                same_line,
+                same_window,
+                zeros,
+                zeros,
+                zeros,
+                zeros,
+                zeros,
+                full_turn,
+                known_first,
+                both_legal,
+            ],
+            dim=-1,
+        )
 
     @staticmethod
     def graph_policy_loss(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

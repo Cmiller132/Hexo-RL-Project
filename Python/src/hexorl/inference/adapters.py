@@ -48,6 +48,11 @@ class DecodedGraphOutputs:
     pair_first: np.ndarray | None = None
     pair_joint: np.ndarray | None = None
     pair_second: np.ndarray | None = None
+    cell_marginal_logits: np.ndarray | None = None
+    pair_completion_logits: np.ndarray | None = None
+    pair_proposal_score: np.ndarray | None = None
+    pair_joint_logits: np.ndarray | None = None
+    terminal_tactical_v1: np.ndarray | None = None
     regret_rank: np.ndarray | None = None
     metadata: dict[str, object] | None = None
 
@@ -277,9 +282,10 @@ def decode_global_graph_outputs(
     opp_rows = graph_inputs.get("opp_legal_qr")
     opp_width = int(opp_rows.shape[1]) if opp_rows is not None and opp_rows.ndim == 3 else 0
 
+    place_key = "policy_place" if "policy_place" in outputs else "cell_marginal_logits"
     place = _require_2d(
-        "policy_place",
-        sanitize_policy_logits(_require_output(outputs, "policy_place")),
+        place_key,
+        sanitize_policy_logits(_require_output(outputs, place_key)),
         legal_width,
     )
     if int(place.shape[0]) != batch:
@@ -315,26 +321,59 @@ def decode_global_graph_outputs(
         pair_first_np = _finite_numpy("policy_pair_first", pfirst_t)
 
     pair_joint = None
-    if "policy_pair_joint" in outputs:
+    v1_pair_joint_np = None
+    pair_joint_key = "policy_pair_joint" if "policy_pair_joint" in outputs else "pair_joint_logits"
+    if pair_joint_key in outputs:
         joint_t = _require_2d(
-            "policy_pair_joint",
-            sanitize_policy_logits(outputs["policy_pair_joint"]),
+            pair_joint_key,
+            sanitize_policy_logits(outputs[pair_joint_key]),
             pair_width,
         )
         if int(joint_t.shape[0]) != batch:
-            raise ValueError("policy_pair_joint batch dimension does not match graph inputs")
-        pair_joint = _finite_numpy("policy_pair_joint", joint_t)
+            raise ValueError(f"{pair_joint_key} batch dimension does not match graph inputs")
+        if pair_joint_key == "policy_pair_joint":
+            pair_joint = _finite_numpy("policy_pair_joint", joint_t)
+        else:
+            v1_pair_joint_np = _finite_numpy("pair_joint_logits", joint_t)
 
     pair_second = None
-    if "policy_pair_second" in outputs:
+    pair_completion_np = None
+    pair_second_key = "policy_pair_second" if "policy_pair_second" in outputs else "pair_completion_logits"
+    if pair_second_key in outputs:
         second_t = _require_2d(
-            "policy_pair_second",
-            sanitize_policy_logits(outputs["policy_pair_second"]),
+            pair_second_key,
+            sanitize_policy_logits(outputs[pair_second_key]),
             pair_width,
         )
         if int(second_t.shape[0]) != batch:
-            raise ValueError("policy_pair_second batch dimension does not match graph inputs")
-        pair_second = _finite_numpy("policy_pair_second", second_t)
+            raise ValueError(f"{pair_second_key} batch dimension does not match graph inputs")
+        if pair_second_key == "policy_pair_second":
+            pair_second = _finite_numpy("policy_pair_second", second_t)
+        else:
+            pair_completion_np = _finite_numpy("pair_completion_logits", second_t)
+
+    pair_proposal_np = None
+    if "pair_proposal_score" in outputs:
+        proposal_t = _require_2d(
+            "pair_proposal_score",
+            sanitize_policy_logits(outputs["pair_proposal_score"]),
+            pair_width,
+        )
+        if int(proposal_t.shape[0]) != batch:
+            raise ValueError("pair_proposal_score batch dimension does not match graph inputs")
+        pair_proposal_np = _finite_numpy("pair_proposal_score", proposal_t)
+
+    terminal_tactical_np = None
+    if "terminal_tactical_v1" in outputs:
+        terminal_t = torch.nan_to_num(
+            outputs["terminal_tactical_v1"].detach().float(),
+            nan=0.0,
+            posinf=80.0,
+            neginf=-80.0,
+        ).clamp_(-80.0, 80.0)
+        if terminal_t.ndim != 2 or int(terminal_t.shape[0]) != batch:
+            raise ValueError("terminal_tactical_v1 output must have shape (B, C)")
+        terminal_tactical_np = _finite_numpy("terminal_tactical_v1", terminal_t)
 
     regret = None
     if "regret_rank" in outputs:
@@ -358,9 +397,9 @@ def decode_global_graph_outputs(
         phase="any_position",
         source="global_graph_inference_adapter",
     )
-    row_tables = {"policy_place": legal_meta.to_dict()}
+    row_tables = {place_key: legal_meta.to_dict()}
     output_metadata = {
-        "policy_place": OutputMetadata("policy_place", "policy", row_table=legal_meta).to_dict(),
+        place_key: OutputMetadata(place_key, "policy", row_table=legal_meta).to_dict(),
         "value": OutputMetadata(
             "value",
             "value",
@@ -409,6 +448,46 @@ def decode_global_graph_outputs(
                 "policy",
                 row_table=pair_second_meta,
             ).to_dict()
+    if v1_pair_joint_np is not None or pair_completion_np is not None or pair_proposal_np is not None:
+        pair_rows, pair_active = _pair_rows_from_token_indices(
+            graph_inputs.get("token_qr"),
+            graph_inputs.get("pair_first_indices"),
+            graph_inputs.get("pair_second_indices"),
+            pair_width,
+        )
+        pair_meta = row_table_metadata(
+            "pair_joint",
+            pair_rows,
+            pair_active,
+            phase="first_placement_unordered",
+            source="global_graph_inference_adapter",
+        )
+        if v1_pair_joint_np is not None:
+            row_tables["pair_joint_logits"] = pair_meta.to_dict()
+            output_metadata["pair_joint_logits"] = OutputMetadata(
+                "pair_joint_logits",
+                "pair_policy",
+                row_table=pair_meta,
+            ).to_dict()
+        if pair_completion_np is not None:
+            row_tables["pair_completion_logits"] = pair_meta.to_dict()
+            output_metadata["pair_completion_logits"] = OutputMetadata(
+                "pair_completion_logits",
+                "pair_policy",
+                row_table=pair_meta,
+            ).to_dict()
+        if pair_proposal_np is not None:
+            row_tables["pair_proposal_score"] = pair_meta.to_dict()
+            output_metadata["pair_proposal_score"] = OutputMetadata(
+                "pair_proposal_score",
+                "pair_policy",
+                row_table=pair_meta,
+            ).to_dict()
+    if terminal_tactical_np is not None:
+        output_metadata["terminal_tactical_v1"] = OutputMetadata(
+            "terminal_tactical_v1",
+            "auxiliary",
+        ).to_dict()
 
     metadata = {
         "row_tables": row_tables,
@@ -423,6 +502,11 @@ def decode_global_graph_outputs(
         pair_first=pair_first_np,
         pair_joint=pair_joint,
         pair_second=pair_second,
+        cell_marginal_logits=_finite_numpy("cell_marginal_logits", place) if place_key == "cell_marginal_logits" else None,
+        pair_completion_logits=pair_completion_np,
+        pair_proposal_score=pair_proposal_np,
+        pair_joint_logits=v1_pair_joint_np,
+        terminal_tactical_v1=terminal_tactical_np,
         regret_rank=regret,
         metadata=metadata,
     )
@@ -488,6 +572,13 @@ def decode_graph_slot_response(
             "value": np.array(slot.res_value[row : row + 1], copy=True),
             "metadata": meta,
         }
+        result["cell_marginal_logits"] = np.array(result["policy_place"], copy=True)
+        meta["row_tables"]["cell_marginal_logits"] = legal_meta.to_dict()
+        meta["outputs"]["cell_marginal_logits"] = OutputMetadata(
+            "cell_marginal_logits",
+            "policy",
+            row_table=legal_meta,
+        ).to_dict()
         if head_flags & GRAPH_HEAD_OPP:
             result["opp_policy"] = np.array(slot.res_graph_opp_logits[opp_off : opp_off + opp_count], copy=True)
         if head_flags & GRAPH_HEAD_PAIR_FIRST:
@@ -522,6 +613,13 @@ def decode_graph_slot_response(
                 slot.res_graph_pair_logits[pair_off : pair_off + pair_count],
                 copy=True,
             )
+            result["pair_joint_logits"] = np.array(result["policy_pair_joint"], copy=True)
+            meta["row_tables"]["pair_joint_logits"] = pair_meta.to_dict()
+            meta["outputs"]["pair_joint_logits"] = OutputMetadata(
+                "pair_joint_logits",
+                "pair_policy",
+                row_table=pair_meta,
+            ).to_dict()
         if head_flags & GRAPH_HEAD_PAIR_SECOND:
             pair_meta = row_table_metadata(
                 "known_first_pair",
@@ -540,6 +638,13 @@ def decode_graph_slot_response(
                 slot.res_graph_pair_second_logits[pair_off : pair_off + pair_count],
                 copy=True,
             )
+            result["pair_completion_logits"] = np.array(result["policy_pair_second"], copy=True)
+            meta["row_tables"]["pair_completion_logits"] = pair_meta.to_dict()
+            meta["outputs"]["pair_completion_logits"] = OutputMetadata(
+                "pair_completion_logits",
+                "pair_policy",
+                row_table=pair_meta,
+            ).to_dict()
         if head_flags & GRAPH_HEAD_REGRET:
             result["regret_rank"] = np.array(
                 getattr(slot, "res_graph_regret_rank")[row : row + 1],

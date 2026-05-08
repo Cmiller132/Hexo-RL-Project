@@ -1,7 +1,7 @@
 use crate::protocol;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 use numpy::{ndarray, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 
@@ -10,6 +10,12 @@ use hexgame_core::encoding as encoder;
 use hexgame_core::mcts::MCTSEngine;
 use hexgame_core::rules::{GameError, Hex, HexGameState, HEX_DIRECTIONS, WIN_LENGTH};
 use hexgame_core::tactics::{tactical_status, TacticalStatus};
+use hexgame_core::v1::{self, LegalRowV1, PairRowTableV1, PairRowV1, TerminalTacticalSetV1};
+use hexgame_core::v1_pair_search::{
+    ProposalCorrectionModeV1, V1AppliedAction, V1InteriorReservoirTelemetry,
+    V1InteriorWideningResult, V1PairCandidate, V1PairSearchConfig, V1PairSearchEngine,
+    V1SelectedAction,
+};
 
 use std::time::Duration;
 
@@ -28,6 +34,401 @@ fn pair_vec_to_py(pairs: Vec<(Hex, Hex)>) -> Vec<((i32, i32), (i32, i32))> {
         .into_iter()
         .map(|(a, b)| (hex_to_tuple(a), hex_to_tuple(b)))
         .collect()
+}
+
+fn legal_rows_v1_to_py(rows: &[LegalRowV1]) -> Vec<(u32, i32, i32)> {
+    rows.iter()
+        .map(|row| (row.row_id, row.cell.q, row.cell.r))
+        .collect()
+}
+
+#[allow(clippy::type_complexity)]
+fn pair_rows_v1_to_py(rows: &[PairRowV1]) -> Vec<(u32, u32, u32, i32, i32, i32, i32, u64)> {
+    rows.iter()
+        .map(|row| {
+            (
+                row.row_id,
+                row.first_legal_row_id,
+                row.second_legal_row_id,
+                row.first.q,
+                row.first.r,
+                row.second.q,
+                row.second.r,
+                row.pair_key,
+            )
+        })
+        .collect()
+}
+
+fn legal_row_table_v1_to_py<'py>(
+    py: Python<'py>,
+    table: &v1::LegalRowTableV1,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    let legal_cells = table.rows.iter().map(|row| row.cell).collect::<Vec<_>>();
+    dict.set_item("schema_version", table.schema_version)?;
+    dict.set_item("schema_hash", table.schema_hash)?;
+    dict.set_item("table_hash", table.table_hash)?;
+    dict.set_item("phase", table.phase.as_str())?;
+    dict.set_item("query_phase", table.query_phase.as_str())?;
+    dict.set_item("current_player", table.current_player)?;
+    dict.set_item("placements_remaining", table.placements_remaining)?;
+    dict.set_item(
+        "current_placements_remaining",
+        table.current_placements_remaining,
+    )?;
+    dict.set_item("turn_start_move_count", table.turn_start_move_count)?;
+    dict.set_item("current_move_count", table.current_move_count)?;
+    dict.set_item("turn_start_state_hash", table.turn_start_state_hash)?;
+    dict.set_item("current_state_hash", table.current_state_hash)?;
+    dict.set_item("first_placement_row_id", table.first_placement_row_id)?;
+    dict.set_item("row_count", table.rows.len())?;
+    dict.set_item("row_width_bytes", protocol::V1_LEGAL_ROW_BYTES)?;
+    dict.set_item("rows", legal_rows_v1_to_py(&table.rows))?;
+    dict.set_item(
+        "rows_bytes",
+        PyBytes::new(py, &protocol::encode_v1_legal_rows(&table.rows)),
+    )?;
+    dict.set_item(
+        "legal_bytes",
+        PyBytes::new(py, &protocol::encode_legal_rows(&legal_cells)),
+    )?;
+    Ok(dict)
+}
+
+fn pair_row_table_v1_to_py<'py>(
+    py: Python<'py>,
+    table: &PairRowTableV1,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("schema_version", table.schema_version)?;
+    dict.set_item("schema_hash", table.schema_hash)?;
+    dict.set_item("table_hash", table.table_hash)?;
+    dict.set_item("legal_row_schema_version", table.legal_row_schema_version)?;
+    dict.set_item("legal_row_schema_hash", table.legal_row_schema_hash)?;
+    dict.set_item("legal_row_table_hash", table.legal_row_table_hash)?;
+    dict.set_item("phase", table.phase.as_str())?;
+    dict.set_item("row_count", table.rows.len())?;
+    dict.set_item("row_width_bytes", protocol::V1_PAIR_ROW_BYTES)?;
+    dict.set_item("rows", pair_rows_v1_to_py(&table.rows))?;
+    dict.set_item(
+        "rows_bytes",
+        PyBytes::new(py, &protocol::encode_v1_pair_rows(&table.rows)),
+    )?;
+    Ok(dict)
+}
+
+fn terminal_tactical_v1_to_py<'py>(
+    py: Python<'py>,
+    payload: TerminalTacticalSetV1,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("schema_version", payload.schema_version)?;
+    dict.set_item("schema_hash", payload.schema_hash)?;
+    dict.set_item("legal_row_table_hash", payload.legal_row_table_hash)?;
+    dict.set_item("pair_row_schema_version", payload.pair_row_schema_version)?;
+    dict.set_item("pair_row_schema_hash", payload.pair_row_schema_hash)?;
+    dict.set_item("phase", payload.phase.as_str())?;
+    dict.set_item("status", payload.status.as_str())?;
+    dict.set_item(
+        "winning_single_cells",
+        hex_vec_to_py(payload.winning_single_cells),
+    )?;
+    dict.set_item(
+        "hot_completion_pairs",
+        pair_rows_v1_to_py(&payload.hot_completion_pairs),
+    )?;
+    dict.set_item(
+        "terminal_equivalent_pairs",
+        pair_rows_v1_to_py(&payload.terminal_equivalent_pairs),
+    )?;
+    dict.set_item(
+        "opponent_win_requirements",
+        hex_vec_to_py(payload.opponent_win_requirements),
+    )?;
+    dict.set_item(
+        "hot_cover_pairs",
+        pair_rows_v1_to_py(&payload.hot_cover_pairs),
+    )?;
+    dict.set_item("impossible_to_cover", payload.impossible_to_cover)?;
+    Ok(dict)
+}
+
+fn decode_v1_correction_modes(codes: &[u8]) -> PyResult<Vec<ProposalCorrectionModeV1>> {
+    codes
+        .iter()
+        .enumerate()
+        .map(|(idx, &code)| {
+            ProposalCorrectionModeV1::from_code(code).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "correction_modes[{idx}] has invalid V1 code {code}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn selected_action_v1_to_py<'py>(
+    py: Python<'py>,
+    selected: &V1SelectedAction,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    match selected {
+        V1SelectedAction::Single {
+            cell,
+            reason,
+            root_generation,
+            legal_row_table_hash,
+        } => {
+            dict.set_item("action_kind", "single")?;
+            dict.set_item("cell", hex_to_tuple(*cell))?;
+            dict.set_item("reason", *reason)?;
+            dict.set_item("root_generation", *root_generation)?;
+            dict.set_item("legal_row_table_hash", *legal_row_table_hash)?;
+            dict.set_item("pair_key", Option::<u64>::None)?;
+        }
+        V1SelectedAction::Pair {
+            row,
+            root_generation,
+            legal_row_table_hash,
+        } => {
+            dict.set_item("action_kind", "pair")?;
+            dict.set_item("row_id", row.row_id)?;
+            dict.set_item("first_legal_row_id", row.first_legal_row_id)?;
+            dict.set_item("second_legal_row_id", row.second_legal_row_id)?;
+            dict.set_item("first", hex_to_tuple(row.first))?;
+            dict.set_item("second", hex_to_tuple(row.second))?;
+            dict.set_item("pair_key", row.pair_key)?;
+            dict.set_item("root_generation", *root_generation)?;
+            dict.set_item("legal_row_table_hash", *legal_row_table_hash)?;
+        }
+    }
+    Ok(dict)
+}
+
+fn applied_action_v1_to_py<'py>(
+    py: Python<'py>,
+    applied: V1AppliedAction,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("action_kind", applied.action_kind)?;
+    dict.set_item("placements_applied", applied.placements_applied)?;
+    dict.set_item("first", hex_to_tuple(applied.first))?;
+    dict.set_item("second", applied.second.map(hex_to_tuple))?;
+    dict.set_item("root_generation", applied.root_generation)?;
+    dict.set_item("legal_row_table_hash", applied.legal_row_table_hash)?;
+    dict.set_item("pair_key", applied.pair_key)?;
+    dict.set_item("terminal_after_first", applied.terminal_after_first)?;
+    Ok(dict)
+}
+
+fn candidate_rows_v1_to_py<'py>(
+    py: Python<'py>,
+    candidates: &[V1PairCandidate],
+) -> PyResult<Bound<'py, PyList>> {
+    let rows = PyList::empty(py);
+    for candidate in candidates {
+        let dict = PyDict::new(py);
+        dict.set_item("candidate_id", candidate.candidate_id)?;
+        dict.set_item("row_id", candidate.row.row_id)?;
+        dict.set_item("first_legal_row_id", candidate.row.first_legal_row_id)?;
+        dict.set_item("second_legal_row_id", candidate.row.second_legal_row_id)?;
+        dict.set_item("first", hex_to_tuple(candidate.row.first))?;
+        dict.set_item("second", hex_to_tuple(candidate.row.second))?;
+        dict.set_item("pair_key", candidate.row.pair_key)?;
+        dict.set_item("prior_logit", candidate.prior_logit)?;
+        dict.set_item("prior", candidate.prior)?;
+        dict.set_item("gumbel", candidate.gumbel)?;
+        dict.set_item("visit_count", candidate.visit_count)?;
+        dict.set_item("q_value", candidate.q_value())?;
+        dict.set_item("completed_q", candidate.completed_q)?;
+        dict.set_item("allocation", candidate.allocation)?;
+        dict.set_item("admitted", candidate.admitted)?;
+        dict.set_item("forced_exploration_flag", candidate.forced_exploration_flag)?;
+        dict.set_item("terminal_exact_flag", candidate.terminal_exact_flag)?;
+        dict.set_item(
+            "terminal_equivalence_flag",
+            candidate.terminal_equivalence_flag,
+        )?;
+        dict.set_item("target_support_flags", candidate.target_support_flags)?;
+        dict.set_item("correction_mode", candidate.correction_mode.as_str())?;
+        rows.append(dict)?;
+    }
+    Ok(rows)
+}
+
+fn replay_telemetry_v1_to_py<'py>(
+    py: Python<'py>,
+    engine: &V1PairSearchEngine,
+) -> PyResult<Bound<'py, PyDict>> {
+    let telemetry = engine.telemetry();
+    let candidates = engine.root_candidates();
+    let visit_sum: u32 = candidates
+        .iter()
+        .map(|candidate| candidate.visit_count)
+        .sum();
+    let improved_policy_target = candidates
+        .iter()
+        .map(|candidate| {
+            if visit_sum == 0 {
+                0.0
+            } else {
+                candidate.visit_count as f32 / visit_sum as f32
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "candidate_selector_version",
+        "rust_v1_pair_search_foundation",
+    )?;
+    dict.set_item("candidate_pairs", candidate_rows_v1_to_py(py, candidates)?)?;
+    dict.set_item("root_generation", telemetry.root_generation)?;
+    dict.set_item(
+        "phase",
+        telemetry
+            .phase
+            .map(|phase| phase.as_str())
+            .unwrap_or("unknown"),
+    )?;
+    dict.set_item("legal_row_table_hash", telemetry.legal_row_table_hash)?;
+    dict.set_item(
+        "legal_row_schema_version",
+        telemetry.legal_row_schema_version,
+    )?;
+    dict.set_item("pair_row_schema_version", telemetry.pair_row_schema_version)?;
+    dict.set_item("pair_row_schema_hash", telemetry.pair_row_schema_hash)?;
+    dict.set_item("legal_row_count", telemetry.legal_row_count)?;
+    dict.set_item("legal_pair_count", telemetry.legal_pair_count)?;
+    dict.set_item(
+        "supplied_candidate_count",
+        telemetry.supplied_candidate_count,
+    )?;
+    dict.set_item("admitted_pair_count", telemetry.admitted_pair_count)?;
+    dict.set_item("selected_pair_key", telemetry.selected_pair_key)?;
+    dict.set_item(
+        "selected_single",
+        telemetry.selected_single.map(hex_to_tuple),
+    )?;
+    dict.set_item("search_performed", telemetry.search_performed)?;
+    dict.set_item("hardcoded_action", telemetry.hardcoded_action)?;
+    dict.set_item("hardcoded_reason", telemetry.hardcoded_reason)?;
+    dict.set_item("root_gumbel_seed", telemetry.root_gumbel_seed)?;
+    dict.set_item("root_gumbel_rounds", telemetry.gumbel_rounds)?;
+    dict.set_item("simulation_count", telemetry.simulation_count)?;
+    dict.set_item(
+        "root_gumbel_values_or_admission_order",
+        candidates
+            .iter()
+            .filter(|candidate| candidate.admitted)
+            .map(|candidate| (candidate.candidate_id, candidate.gumbel))
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "root_simulation_allocation",
+        candidates
+            .iter()
+            .map(|candidate| candidate.allocation)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "visit_counts",
+        candidates
+            .iter()
+            .map(|candidate| candidate.visit_count)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "q_values",
+        candidates
+            .iter()
+            .map(|candidate| candidate.q_value())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "completed_q_values",
+        candidates
+            .iter()
+            .map(|candidate| candidate.completed_q)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item("improved_policy_target", improved_policy_target)?;
+    dict.set_item(
+        "forced_exploration_flags",
+        candidates
+            .iter()
+            .map(|candidate| candidate.forced_exploration_flag)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "target_support_flags",
+        candidates
+            .iter()
+            .map(|candidate| candidate.target_support_flags)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "terminal_equivalence_flags",
+        candidates
+            .iter()
+            .map(|candidate| candidate.terminal_equivalence_flag)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item("reservoir_build_count", telemetry.reservoir_build_count)?;
+    dict.set_item("scoring_pass_count", telemetry.scoring_pass_count)?;
+    dict.set_item(
+        "neural_calls_per_expanded_full_turn_node",
+        telemetry.neural_calls_per_expanded_full_turn_node,
+    )?;
+    dict.set_item("reservoir_refill_events", telemetry.reservoir_refill_events)?;
+    dict.set_item(
+        "interior_expanded_full_turn_nodes",
+        telemetry.interior_expanded_full_turn_nodes,
+    )?;
+    dict.set_item(
+        "interior_reservoir_build_count",
+        telemetry.interior_reservoir_build_count,
+    )?;
+    dict.set_item(
+        "interior_scoring_pass_count",
+        telemetry.interior_scoring_pass_count,
+    )?;
+    if let Some(selected) = engine.selected_action() {
+        dict.set_item("selected_action", selected_action_v1_to_py(py, selected)?)?;
+    } else {
+        dict.set_item("selected_action", Option::<u8>::None)?;
+    }
+    Ok(dict)
+}
+
+fn interior_telemetry_v1_to_py<'py>(
+    py: Python<'py>,
+    telemetry: V1InteriorReservoirTelemetry,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("node_key", telemetry.node_key)?;
+    dict.set_item("candidate_count", telemetry.candidate_count)?;
+    dict.set_item("revealed_count", telemetry.revealed_count)?;
+    dict.set_item("reservoir_build_count", telemetry.reservoir_build_count)?;
+    dict.set_item("scoring_pass_count", telemetry.scoring_pass_count)?;
+    dict.set_item("widening_events", telemetry.widening_events)?;
+    dict.set_item("reservoir_refill_events", telemetry.reservoir_refill_events)?;
+    Ok(dict)
+}
+
+fn interior_widening_v1_to_py<'py>(
+    py: Python<'py>,
+    result: V1InteriorWideningResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "telemetry",
+        interior_telemetry_v1_to_py(py, result.telemetry)?,
+    )?;
+    dict.set_item("revealed_rows", pair_rows_v1_to_py(&result.revealed_rows))?;
+    dict.set_item("puct_scores", result.puct_scores)?;
+    Ok(dict)
 }
 
 #[derive(Clone)]
@@ -505,6 +906,46 @@ impl PyHexGame {
         PyBytes::new(py, &buf)
     }
 
+    /// V1 full Rust-legal start-of-turn row table with schema and table hashes.
+    fn legal_row_table_v1<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let table = v1::legal_row_table_v1(&self.inner);
+        legal_row_table_v1_to_py(py, &table)
+    }
+
+    /// V1 canonical unordered all-pair row table for a normal two-placement turn.
+    fn pair_row_table_v1<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let legal_table = v1::legal_row_table_v1(&self.inner);
+        let pair_table = v1::pair_row_table_v1(&legal_table)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        pair_row_table_v1_to_py(py, &pair_table)
+    }
+
+    /// Canonicalize caller-supplied `(q1, r1, q2, r2)` V1 pair rows.
+    ///
+    /// Duplicate cells, illegal cells, reversed duplicates, and non-pair phases
+    /// are rejected instead of being silently repaired.
+    fn canonical_pair_rows_v1<'py>(
+        &self,
+        py: Python<'py>,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let qr = pair_qr.as_array();
+        let decoded = protocol::decode_pair_rows(qr, "pair_qr")?;
+        let pairs = decoded
+            .into_iter()
+            .map(|(q1, r1, q2, r2)| (Hex::new(q1, r1), Hex::new(q2, r2)))
+            .collect::<Vec<_>>();
+        let legal_table = v1::legal_row_table_v1(&self.inner);
+        let pair_table = v1::canonical_pair_rows_v1(&legal_table, &pairs)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        pair_row_table_v1_to_py(py, &pair_table)
+    }
+
+    /// V1 terminal tactical payload backed by Rust tactical status.
+    fn terminal_tactical_v1<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        terminal_tactical_v1_to_py(py, v1::terminal_tactical_set_v1(&self.inner))
+    }
+
     /// Board pieces as packed bytes: triples of little-endian `i32` `(q, r, player)`.
     ///
     /// Use `np.frombuffer(data, dtype=np.int32).reshape(-1, 3)` in Python.
@@ -770,6 +1211,193 @@ impl PyHexGame {
 ///
 /// The `classical_self_play` function generates bootstrap training data
 /// using the alpha-beta engine (no GPU required).
+
+#[pyclass(name = "V1PairSearchEngine")]
+pub struct PyV1PairSearchEngine {
+    inner: V1PairSearchEngine,
+}
+
+#[pymethods]
+impl PyV1PairSearchEngine {
+    #[new]
+    #[pyo3(signature = (game, num_simulations, c_puct=1.4, seed=1, max_root_admitted=None, min_root_admitted=1, prior_temperature=1.0, min_log_correction=-4.0, max_log_correction=4.0, alpha_pw=0.5, c_pw=2.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        game: &PyHexGame,
+        num_simulations: u32,
+        c_puct: f32,
+        seed: u64,
+        max_root_admitted: Option<usize>,
+        min_root_admitted: usize,
+        prior_temperature: f32,
+        min_log_correction: f32,
+        max_log_correction: f32,
+        alpha_pw: f32,
+        c_pw: f32,
+    ) -> Self {
+        let config = V1PairSearchConfig {
+            num_simulations,
+            c_puct,
+            seed,
+            min_root_admitted,
+            max_root_admitted,
+            prior_temperature,
+            min_log_correction,
+            max_log_correction,
+            alpha_pw,
+            c_pw,
+        };
+        Self {
+            inner: V1PairSearchEngine::new(game.inner.clone(), config),
+        }
+    }
+
+    fn init_root_v1<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let init = self.inner.init_root();
+        let dict = PyDict::new(py);
+        dict.set_item("root_generation", init.root_generation)?;
+        dict.set_item("legal_pair_count", init.legal_pair_count)?;
+        dict.set_item("phase", init.legal_table.phase.as_str())?;
+        dict.set_item(
+            "legal_row_table",
+            legal_row_table_v1_to_py(py, &init.legal_table)?,
+        )?;
+        dict.set_item(
+            "terminal_tactical",
+            terminal_tactical_v1_to_py(py, init.tactical)?,
+        )?;
+        Ok(dict)
+    }
+
+    fn admit_root_pairs<'py>(
+        &mut self,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        correction_weights: PyReadonlyArray1<'py, f32>,
+        correction_modes: PyReadonlyArray1<'py, u8>,
+        root_generation: u64,
+    ) -> PyResult<()> {
+        let qr = pair_qr.as_array();
+        let decoded = protocol::decode_pair_rows(qr, "pair_qr")?;
+        let pairs = decoded
+            .into_iter()
+            .map(|(q1, r1, q2, r2)| (Hex::new(q1, r1), Hex::new(q2, r2)))
+            .collect::<Vec<_>>();
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        let weights = correction_weights.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("correction_weights array must be contiguous")
+        })?;
+        let mode_codes = correction_modes.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("correction_modes array must be contiguous")
+        })?;
+        let modes = decode_v1_correction_modes(mode_codes)?;
+        self.inner
+            .admit_root_pairs(root_generation, &pairs, logits, weights, &modes)
+            .map_err(|err| PyValueError::new_err(err.to_string()))
+    }
+
+    fn run_root_search<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.inner
+            .run_root_search()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?
+            .as_ref()
+            .map(|selected| selected_action_v1_to_py(py, selected))
+            .transpose()
+    }
+
+    fn selected_action<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.inner
+            .selected_action()
+            .map(|selected| selected_action_v1_to_py(py, selected))
+            .transpose()
+    }
+
+    #[pyo3(signature = (root_generation, legal_row_table_hash, pair_key=None))]
+    fn apply_selected_action<'py>(
+        &mut self,
+        py: Python<'py>,
+        root_generation: u64,
+        legal_row_table_hash: u64,
+        pair_key: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let applied = self
+            .inner
+            .apply_selected_action(root_generation, legal_row_table_hash, pair_key)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        applied_action_v1_to_py(py, applied)
+    }
+
+    fn replay_telemetry<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        replay_telemetry_v1_to_py(py, &self.inner)
+    }
+
+    fn cache_interior_reservoir<'py>(
+        &mut self,
+        py: Python<'py>,
+        node_key: u64,
+        pair_qr: PyReadonlyArray2<'py, i32>,
+        pair_logits: PyReadonlyArray1<'py, f32>,
+        correction_weights: PyReadonlyArray1<'py, f32>,
+        correction_modes: PyReadonlyArray1<'py, u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let qr = pair_qr.as_array();
+        let decoded = protocol::decode_pair_rows(qr, "pair_qr")?;
+        let pairs = decoded
+            .into_iter()
+            .map(|(q1, r1, q2, r2)| (Hex::new(q1, r1), Hex::new(q2, r2)))
+            .collect::<Vec<_>>();
+        let logits = pair_logits
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("pair_logits array must be contiguous"))?;
+        let weights = correction_weights.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("correction_weights array must be contiguous")
+        })?;
+        let mode_codes = correction_modes.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("correction_modes array must be contiguous")
+        })?;
+        let modes = decode_v1_correction_modes(mode_codes)?;
+        let telemetry = self
+            .inner
+            .cache_interior_reservoir(node_key, &pairs, logits, weights, &modes)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        interior_telemetry_v1_to_py(py, telemetry)
+    }
+
+    fn widen_interior_reservoir<'py>(
+        &mut self,
+        py: Python<'py>,
+        node_key: u64,
+        parent_visits: u32,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let result = self
+            .inner
+            .widen_interior_reservoir(node_key, parent_visits)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        interior_widening_v1_to_py(py, result)
+    }
+
+    #[getter]
+    fn current_player(&self) -> u8 {
+        self.inner.game().current_player()
+    }
+
+    #[getter]
+    fn placements_remaining(&self) -> u8 {
+        self.inner.game().placements_remaining()
+    }
+
+    #[getter]
+    fn move_count(&self) -> u32 {
+        self.inner.game().move_count()
+    }
+
+    #[getter]
+    fn is_over(&self) -> bool {
+        self.inner.game().is_over()
+    }
+}
 
 #[pyclass(name = "MCTSEngine")]
 pub struct PyMCTSEngine {
@@ -1602,8 +2230,10 @@ fn classical_self_play(
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHexGame>()?;
+    m.add_class::<PyV1PairSearchEngine>()?;
     m.add_class::<PyMCTSEngine>()?;
     m.add("PyHexGame", m.getattr("HexGame")?)?;
+    m.add("PyV1PairSearchEngine", m.getattr("V1PairSearchEngine")?)?;
     m.add("PyMCTSEngine", m.getattr("MCTSEngine")?)?;
     m.add_function(wrap_pyfunction!(classical_self_play, m)?)?;
     m.add("FEATURE_COUNT", encoder::FEATURE_COUNT)?;
@@ -1612,5 +2242,36 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BOARD_SIZE", encoder::BOARD_SIZE)?;
     m.add("NUM_CHANNELS", encoder::NUM_CHANNELS)?;
     m.add("TENSOR_SIZE", encoder::TENSOR_SIZE)?;
+    m.add(
+        "LEGAL_ROW_SCHEMA_VERSION_V1",
+        v1::LEGAL_ROW_SCHEMA_VERSION_V1,
+    )?;
+    m.add("LEGAL_ROW_SCHEMA_HASH_V1", v1::LEGAL_ROW_SCHEMA_HASH_V1)?;
+    m.add("PAIR_ROW_SCHEMA_VERSION_V1", v1::PAIR_ROW_SCHEMA_VERSION_V1)?;
+    m.add("PAIR_ROW_SCHEMA_HASH_V1", v1::PAIR_ROW_SCHEMA_HASH_V1)?;
+    m.add(
+        "TERMINAL_TACTICAL_SCHEMA_VERSION_V1",
+        v1::TERMINAL_TACTICAL_SCHEMA_VERSION_V1,
+    )?;
+    m.add(
+        "TERMINAL_TACTICAL_SCHEMA_HASH_V1",
+        v1::TERMINAL_TACTICAL_SCHEMA_HASH_V1,
+    )?;
+    m.add(
+        "V1_CORRECTION_EXACT_IMPORTANCE",
+        ProposalCorrectionModeV1::ExactImportance.code(),
+    )?;
+    m.add(
+        "V1_CORRECTION_CLIPPED_PROPENSITY",
+        ProposalCorrectionModeV1::ClippedPropensity.code(),
+    )?;
+    m.add(
+        "V1_CORRECTION_UNCORRECTED_LOGGED",
+        ProposalCorrectionModeV1::UncorrectedLogged.code(),
+    )?;
+    m.add(
+        "V1_CORRECTION_TRAINING_FORBIDDEN",
+        ProposalCorrectionModeV1::TrainingForbidden.code(),
+    )?;
     Ok(())
 }

@@ -8,9 +8,10 @@ Each record represents one position from a self-play game:
   - player: u8 (which player generated this record — used for perspective flip)
 """
 
+import json
 import struct
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -19,9 +20,634 @@ NUM_CHANNELS = 13
 BOARD_SIZE = 33
 BOARD_AREA = 33 * 33  # 1089
 COMPACT_MAGIC_V2 = b"HXG2"
-COMPACT_VERSION_V2 = 9
+COMPACT_VERSION_V2 = 10
 COMPACT_VERSION_MIN = 2
 PolicyTargetV2 = List[Tuple[int, int, float]]
+
+V1_PAIR_SEARCH_SCHEMA_VERSION = 1
+V1_PAIR_SUPPORT_TYPES = frozenset(
+    {
+        "exhaustive_legal_pair_table",
+        "admitted_candidate_set_without_explicit_negatives",
+        "admitted_candidate_set_with_explicit_negatives",
+        "completed_q_candidate_posterior",
+    }
+)
+V1_PAIR_TARGET_SUPPORT_FLAGS = frozenset(
+    {
+        "admitted",
+        "explicit_negative",
+        "forced",
+        "sampled_negative",
+        "terminal_exact",
+        "terminal_equivalent",
+        "unsampled",
+    }
+)
+V1_BASE_SUPPORT_FLAGS = frozenset({"admitted", "explicit_negative", "unsampled"})
+V1_INCLUSION_KINDS = frozenset(
+    {
+        "stochastic_sample",
+        "deterministic_top_k",
+        "tactical_protected",
+        "structured_quota",
+        "diagnostic_canary",
+        "unknown",
+    }
+)
+V1_CORRECTION_MODES = frozenset(
+    {
+        "exact_importance",
+        "clipped_propensity",
+        "uncorrected_logged",
+        "training_forbidden",
+    }
+)
+
+PairCoord = Tuple[int, int]
+PairKey = Tuple[PairCoord, PairCoord]
+
+
+def _pair_coord(value: Any) -> PairCoord:
+    return (int(value[0]), int(value[1]))
+
+
+def _canonical_pair_key(first: Any, second: Any) -> PairKey:
+    a = _pair_coord(first)
+    b = _pair_coord(second)
+    if a == b:
+        raise ValueError(f"duplicate coordinates are illegal for V1 pair metadata: {a}")
+    return (a, b) if a <= b else (b, a)
+
+
+def _finite_optional(value: Optional[float], field_name: str) -> Optional[float]:
+    if value is None:
+        return None
+    out = float(value)
+    if not np.isfinite(out):
+        raise ValueError(f"{field_name} must be finite when provided")
+    return out
+
+
+def _string_tuple(values: Tuple[str, ...] | List[str]) -> Tuple[str, ...]:
+    return tuple(str(value) for value in values)
+
+
+@dataclass(frozen=True)
+class V1CandidateSourceContribution:
+    """Auditable source contribution for one V1 pair candidate."""
+
+    source_type: str
+    source_rank: Optional[int] = None
+    source_weight: Optional[float] = None
+    local_probability_or_score: Optional[float] = None
+    quota_id: Optional[str] = None
+    inclusion_kind: str = "unknown"
+    exact_inclusion_probability: Optional[float] = None
+    heuristic_propensity: Optional[float] = None
+    correction_mode: str = "training_forbidden"
+
+    def __post_init__(self) -> None:
+        if not str(self.source_type):
+            raise ValueError("V1 source_contribution.source_type is required")
+        if self.inclusion_kind not in V1_INCLUSION_KINDS:
+            raise ValueError(f"Unsupported V1 inclusion_kind: {self.inclusion_kind!r}")
+        if self.correction_mode not in V1_CORRECTION_MODES:
+            raise ValueError(f"Unsupported V1 correction_mode: {self.correction_mode!r}")
+        if self.source_rank is not None and int(self.source_rank) < 0:
+            raise ValueError("V1 source_rank cannot be negative")
+        object.__setattr__(self, "source_rank", None if self.source_rank is None else int(self.source_rank))
+        object.__setattr__(self, "source_weight", _finite_optional(self.source_weight, "source_weight"))
+        object.__setattr__(
+            self,
+            "local_probability_or_score",
+            _finite_optional(self.local_probability_or_score, "local_probability_or_score"),
+        )
+        object.__setattr__(
+            self,
+            "exact_inclusion_probability",
+            _finite_optional(self.exact_inclusion_probability, "exact_inclusion_probability"),
+        )
+        object.__setattr__(
+            self,
+            "heuristic_propensity",
+            _finite_optional(self.heuristic_propensity, "heuristic_propensity"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_type": self.source_type,
+            "source_rank": self.source_rank,
+            "source_weight": self.source_weight,
+            "local_probability_or_score": self.local_probability_or_score,
+            "quota_id": self.quota_id,
+            "inclusion_kind": self.inclusion_kind,
+            "exact_inclusion_probability": self.exact_inclusion_probability,
+            "heuristic_propensity": self.heuristic_propensity,
+            "correction_mode": self.correction_mode,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V1CandidateSourceContribution":
+        return cls(
+            source_type=str(data.get("source_type", "")),
+            source_rank=data.get("source_rank"),
+            source_weight=data.get("source_weight"),
+            local_probability_or_score=data.get("local_probability_or_score"),
+            quota_id=data.get("quota_id"),
+            inclusion_kind=str(data.get("inclusion_kind", "unknown")),
+            exact_inclusion_probability=data.get("exact_inclusion_probability"),
+            heuristic_propensity=data.get("heuristic_propensity"),
+            correction_mode=str(data.get("correction_mode", "training_forbidden")),
+        )
+
+
+@dataclass(frozen=True)
+class V1ProposalPropensityMetadata:
+    """Typed proposal logging used for sampled pair correction."""
+
+    proposal_policy: str
+    correction_mode: str
+    total_proposal_probability: Optional[float] = None
+    log_proposal_probability: Optional[float] = None
+    sampling_without_replacement: bool = False
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        if not str(self.proposal_policy):
+            raise ValueError("V1 proposal_propensity_metadata.proposal_policy is required")
+        if self.correction_mode not in V1_CORRECTION_MODES:
+            raise ValueError(f"Unsupported V1 proposal correction_mode: {self.correction_mode!r}")
+        prob = _finite_optional(self.total_proposal_probability, "total_proposal_probability")
+        if prob is not None and prob < 0.0:
+            raise ValueError("total_proposal_probability cannot be negative")
+        object.__setattr__(self, "total_proposal_probability", prob)
+        object.__setattr__(
+            self,
+            "log_proposal_probability",
+            _finite_optional(self.log_proposal_probability, "log_proposal_probability"),
+        )
+        object.__setattr__(self, "sampling_without_replacement", bool(self.sampling_without_replacement))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "proposal_policy": self.proposal_policy,
+            "correction_mode": self.correction_mode,
+            "total_proposal_probability": self.total_proposal_probability,
+            "log_proposal_probability": self.log_proposal_probability,
+            "sampling_without_replacement": self.sampling_without_replacement,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V1ProposalPropensityMetadata":
+        return cls(
+            proposal_policy=str(data.get("proposal_policy", "")),
+            correction_mode=str(data.get("correction_mode", "training_forbidden")),
+            total_proposal_probability=data.get("total_proposal_probability"),
+            log_proposal_probability=data.get("log_proposal_probability"),
+            sampling_without_replacement=bool(data.get("sampling_without_replacement", False)),
+            notes=str(data.get("notes", "")),
+        )
+
+
+@dataclass(frozen=True)
+class V1ProposalCorrectionParameters:
+    """Root/search correction parameters logged with V1 pair metadata."""
+
+    correction_mode: str
+    min_log: float
+    max_log: float
+    prior_temperature: float
+
+    def __post_init__(self) -> None:
+        if self.correction_mode not in V1_CORRECTION_MODES:
+            raise ValueError(f"Unsupported V1 correction_mode: {self.correction_mode!r}")
+        min_log = float(self.min_log)
+        max_log = float(self.max_log)
+        temp = float(self.prior_temperature)
+        if not np.isfinite(min_log) or not np.isfinite(max_log):
+            raise ValueError("V1 proposal correction log bounds must be finite")
+        if min_log > max_log:
+            raise ValueError("V1 proposal correction min_log cannot exceed max_log")
+        if not np.isfinite(temp) or temp <= 0.0:
+            raise ValueError("V1 proposal correction prior_temperature must be positive")
+        object.__setattr__(self, "min_log", min_log)
+        object.__setattr__(self, "max_log", max_log)
+        object.__setattr__(self, "prior_temperature", temp)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "correction_mode": self.correction_mode,
+            "min_log": self.min_log,
+            "max_log": self.max_log,
+            "prior_temperature": self.prior_temperature,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V1ProposalCorrectionParameters":
+        return cls(
+            correction_mode=str(data.get("correction_mode", "training_forbidden")),
+            min_log=float(data.get("min_log", 0.0)),
+            max_log=float(data.get("max_log", 0.0)),
+            prior_temperature=float(data.get("prior_temperature", 1.0)),
+        )
+
+
+@dataclass(frozen=True)
+class V1ReservoirRefillEvent:
+    """Telemetry for an explicitly allowed V1 candidate reservoir refill."""
+
+    node_id: str
+    reason: str
+    generation: int
+    requested_count: int
+    added_count: int
+
+    def __post_init__(self) -> None:
+        if not str(self.node_id):
+            raise ValueError("V1 reservoir_refill_events.node_id is required")
+        if not str(self.reason):
+            raise ValueError("V1 reservoir_refill_events.reason is required")
+        for field_name in ("generation", "requested_count", "added_count"):
+            value = int(getattr(self, field_name))
+            if value < 0:
+                raise ValueError(f"V1 reservoir refill {field_name} cannot be negative")
+            object.__setattr__(self, field_name, value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "reason": self.reason,
+            "generation": self.generation,
+            "requested_count": self.requested_count,
+            "added_count": self.added_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V1ReservoirRefillEvent":
+        return cls(
+            node_id=str(data.get("node_id", "")),
+            reason=str(data.get("reason", "")),
+            generation=int(data.get("generation", 0)),
+            requested_count=int(data.get("requested_count", 0)),
+            added_count=int(data.get("added_count", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class V1CandidatePair:
+    """One candidate/support row in the V1 sampled pair-action replay schema."""
+
+    candidate_id: str
+    pair_key: PairKey
+    first_legal_row_id: int
+    second_legal_row_id: int
+    row_table_schema_version: int
+    source_contributions: Tuple[V1CandidateSourceContribution, ...]
+    proposal_propensity_metadata: V1ProposalPropensityMetadata
+    forced_exploration_flag: bool
+    terminal_exact_flag: bool
+    terminal_equivalence_flag: bool
+    target_support_flags: Tuple[str, ...]
+    admission_generation: int
+    root_or_interior: str
+    candidate_selection_reason: str = ""
+
+    def __post_init__(self) -> None:
+        first, second = self.pair_key
+        object.__setattr__(self, "pair_key", _canonical_pair_key(first, second))
+        if not str(self.candidate_id):
+            raise ValueError("V1 candidate_pair.candidate_id is required")
+        if int(self.first_legal_row_id) < 0 or int(self.second_legal_row_id) < 0:
+            raise ValueError("V1 candidate legal row ids cannot be negative")
+        if int(self.first_legal_row_id) == int(self.second_legal_row_id):
+            raise ValueError("V1 candidate legal row ids must refer to distinct rows")
+        if int(self.row_table_schema_version) <= 0:
+            raise ValueError("V1 candidate row_table_schema_version must be positive")
+        if int(self.admission_generation) < 0:
+            raise ValueError("V1 candidate admission_generation cannot be negative")
+        if self.root_or_interior not in {"root", "interior"}:
+            raise ValueError("V1 candidate root_or_interior must be 'root' or 'interior'")
+        sources = tuple(
+            source
+            if isinstance(source, V1CandidateSourceContribution)
+            else V1CandidateSourceContribution.from_dict(source)
+            for source in self.source_contributions
+        )
+        if not sources:
+            raise ValueError("V1 candidate source_contributions are required")
+        proposal = (
+            self.proposal_propensity_metadata
+            if isinstance(self.proposal_propensity_metadata, V1ProposalPropensityMetadata)
+            else V1ProposalPropensityMetadata.from_dict(self.proposal_propensity_metadata)
+        )
+        flags = _string_tuple(self.target_support_flags)
+        unknown = set(flags) - V1_PAIR_TARGET_SUPPORT_FLAGS
+        if unknown:
+            raise ValueError(f"Unsupported V1 target_support_flags: {sorted(unknown)!r}")
+        base_flags = set(flags) & V1_BASE_SUPPORT_FLAGS
+        if len(base_flags) != 1:
+            raise ValueError(
+                "V1 target_support_flags must contain exactly one of "
+                "'admitted', 'explicit_negative', or 'unsampled'"
+            )
+        if "unsampled" in flags and "sampled_negative" in flags:
+            raise ValueError("V1 unsampled legal pairs cannot be marked sampled_negative")
+        if bool(self.forced_exploration_flag) != ("forced" in flags):
+            raise ValueError("V1 forced_exploration_flag must match the 'forced' target support flag")
+        if bool(self.terminal_exact_flag) != ("terminal_exact" in flags):
+            raise ValueError("V1 terminal_exact_flag must match the 'terminal_exact' target support flag")
+        if bool(self.terminal_equivalence_flag) != ("terminal_equivalent" in flags):
+            raise ValueError(
+                "V1 terminal_equivalence_flag must match the 'terminal_equivalent' target support flag"
+            )
+        object.__setattr__(self, "first_legal_row_id", int(self.first_legal_row_id))
+        object.__setattr__(self, "second_legal_row_id", int(self.second_legal_row_id))
+        object.__setattr__(self, "row_table_schema_version", int(self.row_table_schema_version))
+        object.__setattr__(self, "source_contributions", sources)
+        object.__setattr__(self, "proposal_propensity_metadata", proposal)
+        object.__setattr__(self, "forced_exploration_flag", bool(self.forced_exploration_flag))
+        object.__setattr__(self, "terminal_exact_flag", bool(self.terminal_exact_flag))
+        object.__setattr__(self, "terminal_equivalence_flag", bool(self.terminal_equivalence_flag))
+        object.__setattr__(self, "target_support_flags", flags)
+        object.__setattr__(self, "admission_generation", int(self.admission_generation))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "pair_key": [list(self.pair_key[0]), list(self.pair_key[1])],
+            "first_legal_row_id": self.first_legal_row_id,
+            "second_legal_row_id": self.second_legal_row_id,
+            "row_table_schema_version": self.row_table_schema_version,
+            "source_contributions": [source.to_dict() for source in self.source_contributions],
+            "proposal_propensity_metadata": self.proposal_propensity_metadata.to_dict(),
+            "forced_exploration_flag": self.forced_exploration_flag,
+            "terminal_exact_flag": self.terminal_exact_flag,
+            "terminal_equivalence_flag": self.terminal_equivalence_flag,
+            "target_support_flags": list(self.target_support_flags),
+            "admission_generation": self.admission_generation,
+            "root_or_interior": self.root_or_interior,
+            "candidate_selection_reason": self.candidate_selection_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V1CandidatePair":
+        pair_key = data.get("pair_key", [])
+        if len(pair_key) != 2:
+            raise ValueError("V1 candidate pair_key must contain two coordinates")
+        return cls(
+            candidate_id=str(data.get("candidate_id", "")),
+            pair_key=(_pair_coord(pair_key[0]), _pair_coord(pair_key[1])),
+            first_legal_row_id=int(data.get("first_legal_row_id", -1)),
+            second_legal_row_id=int(data.get("second_legal_row_id", -1)),
+            row_table_schema_version=int(data.get("row_table_schema_version", 0)),
+            source_contributions=tuple(
+                V1CandidateSourceContribution.from_dict(item)
+                for item in data.get("source_contributions", [])
+            ),
+            proposal_propensity_metadata=V1ProposalPropensityMetadata.from_dict(
+                data.get("proposal_propensity_metadata", {})
+            ),
+            forced_exploration_flag=bool(data.get("forced_exploration_flag", False)),
+            terminal_exact_flag=bool(data.get("terminal_exact_flag", False)),
+            terminal_equivalence_flag=bool(data.get("terminal_equivalence_flag", False)),
+            target_support_flags=tuple(data.get("target_support_flags", ())),
+            admission_generation=int(data.get("admission_generation", 0)),
+            root_or_interior=str(data.get("root_or_interior", "")),
+            candidate_selection_reason=str(data.get("candidate_selection_reason", "")),
+        )
+
+
+@dataclass(frozen=True)
+class V1SearchPairMetadata:
+    """Versioned V1 candidate-aware pair-search replay metadata.
+
+    This metadata is intentionally separate from legacy ``pair_policy_target_v2``.
+    Until V1 training consumers exist, records carrying this container must not
+    be treated as complete legacy pair-policy targets.
+    """
+
+    candidate_selector_version: str
+    support_type: str
+    legal_pair_count: int
+    legal_row_schema_version: int
+    pair_row_schema_version: int
+    candidate_pairs: Tuple[V1CandidatePair, ...]
+    proposal_correction_parameters: V1ProposalCorrectionParameters
+    root_gumbel_values: Tuple[float, ...]
+    root_admission_order: Tuple[int, ...]
+    root_simulation_allocation: Tuple[int, ...]
+    visit_counts: Tuple[int, ...]
+    q_values: Tuple[float, ...]
+    completed_q_values: Tuple[float, ...]
+    selected_pair: Optional[PairKey]
+    target_support_flags: Tuple[Tuple[str, ...], ...]
+    terminal_equivalence_flags: Tuple[bool, ...]
+    search_surprise_metrics: Dict[str, float] = field(default_factory=dict)
+    neural_calls_per_expanded_full_turn_node: Optional[float] = None
+    reservoir_refill_events: Tuple[V1ReservoirRefillEvent, ...] = ()
+    schema_version: int = V1_PAIR_SEARCH_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if int(self.schema_version) != V1_PAIR_SEARCH_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported V1 pair search schema_version {self.schema_version}")
+        if not str(self.candidate_selector_version):
+            raise ValueError("V1 candidate_selector_version is required")
+        if self.support_type not in V1_PAIR_SUPPORT_TYPES:
+            raise ValueError(f"Unsupported V1 support_type: {self.support_type!r}")
+        if int(self.legal_pair_count) < 0:
+            raise ValueError("V1 legal_pair_count cannot be negative")
+        if int(self.legal_row_schema_version) <= 0 or int(self.pair_row_schema_version) <= 0:
+            raise ValueError("V1 legal/pair schema versions must be positive")
+        candidates = tuple(
+            candidate
+            if isinstance(candidate, V1CandidatePair)
+            else V1CandidatePair.from_dict(candidate)
+            for candidate in self.candidate_pairs
+        )
+        if len(candidates) > int(self.legal_pair_count):
+            raise ValueError("V1 candidate_pairs cannot exceed legal_pair_count")
+        pair_keys = [candidate.pair_key for candidate in candidates]
+        if len(set(pair_keys)) != len(pair_keys):
+            raise ValueError("V1 candidate_pairs contain duplicate pair_key values")
+        selected = None if self.selected_pair is None else _canonical_pair_key(*self.selected_pair)
+        if selected is not None and selected not in set(pair_keys):
+            raise ValueError("V1 selected_pair must be present in candidate_pairs")
+        correction = (
+            self.proposal_correction_parameters
+            if isinstance(self.proposal_correction_parameters, V1ProposalCorrectionParameters)
+            else V1ProposalCorrectionParameters.from_dict(self.proposal_correction_parameters)
+        )
+        target_flags = tuple(_string_tuple(flags) for flags in self.target_support_flags)
+        terminal_flags = tuple(bool(flag) for flag in self.terminal_equivalence_flags)
+        arrays = {
+            "root_gumbel_values": tuple(float(v) for v in self.root_gumbel_values),
+            "root_admission_order": tuple(int(v) for v in self.root_admission_order),
+            "root_simulation_allocation": tuple(int(v) for v in self.root_simulation_allocation),
+            "visit_counts": tuple(int(v) for v in self.visit_counts),
+            "q_values": tuple(float(v) for v in self.q_values),
+            "completed_q_values": tuple(float(v) for v in self.completed_q_values),
+            "target_support_flags": target_flags,
+            "terminal_equivalence_flags": terminal_flags,
+        }
+        for name, values in arrays.items():
+            if len(values) != len(candidates):
+                raise ValueError(
+                    f"V1 {name} length {len(values)} must match candidate_pairs length {len(candidates)}"
+                )
+        for name in ("root_gumbel_values", "q_values", "completed_q_values"):
+            if any(not np.isfinite(value) for value in arrays[name]):
+                raise ValueError(f"V1 {name} must contain finite values")
+        for name in ("root_admission_order", "root_simulation_allocation", "visit_counts"):
+            if any(int(value) < 0 for value in arrays[name]):
+                raise ValueError(f"V1 {name} cannot contain negative values")
+        for idx, candidate in enumerate(candidates):
+            flags = target_flags[idx]
+            if flags != candidate.target_support_flags:
+                raise ValueError("V1 target_support_flags must mirror candidate target_support_flags")
+            if terminal_flags[idx] != candidate.terminal_equivalence_flag:
+                raise ValueError(
+                    "V1 terminal_equivalence_flags must mirror candidate terminal_equivalence_flag"
+                )
+            if (
+                "explicit_negative" in flags
+                and self.support_type != "admitted_candidate_set_with_explicit_negatives"
+            ):
+                raise ValueError("V1 explicit negatives require support_type with explicit negatives")
+            if "unsampled" in flags and "explicit_negative" in flags:
+                raise ValueError("V1 unsampled legal pairs cannot be explicit negatives")
+        surprise = {str(key): float(value) for key, value in self.search_surprise_metrics.items()}
+        if any(not np.isfinite(value) for value in surprise.values()):
+            raise ValueError("V1 search_surprise_metrics must be finite")
+        calls = _finite_optional(
+            self.neural_calls_per_expanded_full_turn_node,
+            "neural_calls_per_expanded_full_turn_node",
+        )
+        if calls is not None and calls < 0.0:
+            raise ValueError("V1 neural_calls_per_expanded_full_turn_node cannot be negative")
+        refills = tuple(
+            event
+            if isinstance(event, V1ReservoirRefillEvent)
+            else V1ReservoirRefillEvent.from_dict(event)
+            for event in self.reservoir_refill_events
+        )
+        object.__setattr__(self, "legal_pair_count", int(self.legal_pair_count))
+        object.__setattr__(self, "legal_row_schema_version", int(self.legal_row_schema_version))
+        object.__setattr__(self, "pair_row_schema_version", int(self.pair_row_schema_version))
+        object.__setattr__(self, "candidate_pairs", candidates)
+        object.__setattr__(self, "proposal_correction_parameters", correction)
+        object.__setattr__(self, "root_gumbel_values", arrays["root_gumbel_values"])
+        object.__setattr__(self, "root_admission_order", arrays["root_admission_order"])
+        object.__setattr__(self, "root_simulation_allocation", arrays["root_simulation_allocation"])
+        object.__setattr__(self, "visit_counts", arrays["visit_counts"])
+        object.__setattr__(self, "q_values", arrays["q_values"])
+        object.__setattr__(self, "completed_q_values", arrays["completed_q_values"])
+        object.__setattr__(self, "selected_pair", selected)
+        object.__setattr__(self, "target_support_flags", target_flags)
+        object.__setattr__(self, "terminal_equivalence_flags", terminal_flags)
+        object.__setattr__(self, "search_surprise_metrics", surprise)
+        object.__setattr__(self, "neural_calls_per_expanded_full_turn_node", calls)
+        object.__setattr__(self, "reservoir_refill_events", refills)
+        object.__setattr__(self, "schema_version", V1_PAIR_SEARCH_SCHEMA_VERSION)
+
+    def target_support_for_pair(self, pair: PairKey) -> Tuple[str, ...]:
+        key = _canonical_pair_key(*pair)
+        for idx, candidate in enumerate(self.candidate_pairs):
+            if candidate.pair_key == key:
+                return self.target_support_flags[idx]
+        return ()
+
+    def is_pair_explicit_negative(self, pair: PairKey) -> bool:
+        return "explicit_negative" in self.target_support_for_pair(pair)
+
+    def explicit_negative_pairs(self) -> Tuple[PairKey, ...]:
+        return tuple(
+            candidate.pair_key
+            for idx, candidate in enumerate(self.candidate_pairs)
+            if "explicit_negative" in self.target_support_flags[idx]
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "candidate_selector_version": self.candidate_selector_version,
+            "support_type": self.support_type,
+            "legal_pair_count": self.legal_pair_count,
+            "legal_row_schema_version": self.legal_row_schema_version,
+            "pair_row_schema_version": self.pair_row_schema_version,
+            "candidate_pairs": [candidate.to_dict() for candidate in self.candidate_pairs],
+            "proposal_correction_parameters": self.proposal_correction_parameters.to_dict(),
+            "root_gumbel_values": list(self.root_gumbel_values),
+            "root_admission_order": list(self.root_admission_order),
+            "root_simulation_allocation": list(self.root_simulation_allocation),
+            "visit_counts": list(self.visit_counts),
+            "q_values": list(self.q_values),
+            "completed_q_values": list(self.completed_q_values),
+            "selected_pair": None
+            if self.selected_pair is None
+            else [list(self.selected_pair[0]), list(self.selected_pair[1])],
+            "target_support_flags": [list(flags) for flags in self.target_support_flags],
+            "terminal_equivalence_flags": list(self.terminal_equivalence_flags),
+            "search_surprise_metrics": dict(self.search_surprise_metrics),
+            "neural_calls_per_expanded_full_turn_node": self.neural_calls_per_expanded_full_turn_node,
+            "reservoir_refill_events": [event.to_dict() for event in self.reservoir_refill_events],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V1SearchPairMetadata":
+        selected_raw = data.get("selected_pair")
+        selected_pair = None
+        if selected_raw is not None:
+            if len(selected_raw) != 2:
+                raise ValueError("V1 selected_pair must contain two coordinates")
+            selected_pair = (_pair_coord(selected_raw[0]), _pair_coord(selected_raw[1]))
+        return cls(
+            schema_version=int(data.get("schema_version", 0)),
+            candidate_selector_version=str(data.get("candidate_selector_version", "")),
+            support_type=str(data.get("support_type", "")),
+            legal_pair_count=int(data.get("legal_pair_count", -1)),
+            legal_row_schema_version=int(data.get("legal_row_schema_version", 0)),
+            pair_row_schema_version=int(data.get("pair_row_schema_version", 0)),
+            candidate_pairs=tuple(
+                V1CandidatePair.from_dict(item)
+                for item in data.get("candidate_pairs", [])
+            ),
+            proposal_correction_parameters=V1ProposalCorrectionParameters.from_dict(
+                data.get("proposal_correction_parameters", {})
+            ),
+            root_gumbel_values=tuple(data.get("root_gumbel_values", ())),
+            root_admission_order=tuple(data.get("root_admission_order", ())),
+            root_simulation_allocation=tuple(data.get("root_simulation_allocation", ())),
+            visit_counts=tuple(data.get("visit_counts", ())),
+            q_values=tuple(data.get("q_values", ())),
+            completed_q_values=tuple(data.get("completed_q_values", ())),
+            selected_pair=selected_pair,
+            target_support_flags=tuple(tuple(flags) for flags in data.get("target_support_flags", ())),
+            terminal_equivalence_flags=tuple(data.get("terminal_equivalence_flags", ())),
+            search_surprise_metrics=dict(data.get("search_surprise_metrics", {})),
+            neural_calls_per_expanded_full_turn_node=data.get("neural_calls_per_expanded_full_turn_node"),
+            reservoir_refill_events=tuple(
+                V1ReservoirRefillEvent.from_dict(item)
+                for item in data.get("reservoir_refill_events", ())
+            ),
+        )
+
+
+def v1_search_metadata_to_json_bytes(metadata: Optional[V1SearchPairMetadata]) -> bytes:
+    if metadata is None:
+        return b""
+    payload = json.dumps(metadata.to_dict(), separators=(",", ":"), sort_keys=True)
+    return payload.encode("utf-8")
+
+
+def v1_search_metadata_from_json_bytes(blob: bytes | None) -> Optional[V1SearchPairMetadata]:
+    if not blob:
+        return None
+    data = json.loads(blob.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("V1 pair search metadata payload must be a JSON object")
+    return V1SearchPairMetadata.from_dict(data)
 
 
 @dataclass
@@ -70,6 +696,7 @@ class PositionRecord:
     opp_policy_legal_v2: List[Tuple[int, int]] = field(default_factory=list)
     pair_policy_target_v2: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = field(default_factory=list)
     pair_policy_complete: bool = False
+    v1_search_metadata: Optional[V1SearchPairMetadata] = None
     target_policy_mass_outside_window: float = 0.0
     missing_target_policy_mass: float = 0.0
     candidate_recall_mcts_top1: float = 1.0
@@ -113,6 +740,22 @@ class PositionRecord:
     axis_label: int = -1
     moves_left: float = 0.0
     value_weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.v1_search_metadata is None:
+            return
+        metadata = (
+            self.v1_search_metadata
+            if isinstance(self.v1_search_metadata, V1SearchPairMetadata)
+            else V1SearchPairMetadata.from_dict(self.v1_search_metadata)
+        )
+        if self.pair_policy_target_v2:
+            raise ValueError(
+                "V1 pair search metadata must not be mixed with legacy pair_policy_target_v2 "
+                "until V1 pair training consumers are implemented"
+            )
+        self.v1_search_metadata = metadata
+        self.pair_policy_complete = False
 
     def to_value_target(self) -> float:
         """Compute the training value target for this position.
@@ -236,13 +879,13 @@ class GameRecord:
             parts.extend(struct.pack("<H", len(opp_legal_v2_entries)))
             for q, r in opp_legal_v2_entries:
                 parts.extend(struct.pack("<ii", int(q), int(r)))
-            pair_v2_entries = list(pos.pair_policy_target_v2)
+            pair_v2_entries = [] if pos.v1_search_metadata is not None else list(pos.pair_policy_target_v2)
             parts.extend(struct.pack("<H", len(pair_v2_entries)))
             for first, second, prob in pair_v2_entries:
                 q1, r1 = first
                 q2, r2 = second
                 parts.extend(struct.pack("<iiiif", int(q1), int(r1), int(q2), int(r2), float(prob)))
-            parts.extend(struct.pack("<B", int(bool(pos.pair_policy_complete))))
+            parts.extend(struct.pack("<B", int(bool(pos.pair_policy_complete and pos.v1_search_metadata is None))))
             parts.extend(struct.pack(
                 "<ffffffff",
                 float(pos.target_policy_mass_outside_window),
@@ -302,6 +945,10 @@ class GameRecord:
             ))
             for q, r in discovery_examples:
                 parts.extend(struct.pack("<ii", int(q), int(r)))
+
+            v1_metadata_blob = v1_search_metadata_to_json_bytes(pos.v1_search_metadata)
+            parts.extend(struct.pack("<I", len(v1_metadata_blob)))
+            parts.extend(v1_metadata_blob)
 
         return bytes(parts)
 
@@ -413,6 +1060,7 @@ class GameRecord:
             moves_left = 0.0
             opp_policy_weight = 0.0
             value_weight = 1.0
+            v1_search_metadata: Optional[V1SearchPairMetadata] = None
             if offset < len(data):
                 num_opp_entries = struct.unpack_from("<H", data, offset)[0]
                 offset += 2
@@ -535,6 +1183,13 @@ class GameRecord:
                         offset += struct.calcsize("<ii")
                         examples.append((int(q), int(r)))
                     candidate_critical_overflow_examples = tuple(examples)
+                if is_v2 and version >= 10:
+                    metadata_len = struct.unpack_from("<I", data, offset)[0]
+                    offset += 4
+                    if metadata_len:
+                        metadata_blob = data[offset:offset + metadata_len]
+                        offset += metadata_len
+                        v1_search_metadata = v1_search_metadata_from_json_bytes(metadata_blob)
 
             positions.append(PositionRecord(
                 move_history=move_history,
@@ -554,6 +1209,7 @@ class GameRecord:
                 opp_policy_legal_v2=opp_policy_legal_v2,
                 pair_policy_target_v2=pair_policy_v2,
                 pair_policy_complete=pair_policy_complete,
+                v1_search_metadata=v1_search_metadata,
                 target_policy_mass_outside_window=target_policy_mass_outside_window,
                 missing_target_policy_mass=missing_target_policy_mass,
                 candidate_recall_mcts_top1=candidate_recall_mcts_top1,

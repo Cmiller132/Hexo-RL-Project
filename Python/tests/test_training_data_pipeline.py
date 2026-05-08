@@ -31,12 +31,20 @@ from hexorl.selfplay.records import (
     GameRecord,
     PositionRecord,
     BOARD_SIZE,
+    NUM_CHANNELS,
+    V1CandidatePair,
+    V1CandidateSourceContribution,
+    V1ProposalCorrectionParameters,
+    V1ProposalPropensityMetadata,
+    V1ReservoirRefillEvent,
+    V1SearchPairMetadata,
     action_to_board_index,
     dense_policy_from_v2,
     pair_policy_v2_from_place_target,
     policy_v2_from_visits,
     sparsify_policy,
 )
+from hexorl.replay.training_batch import prepare_dense_training_batch
 from hexorl.train.losses import binned_value_loss, compute_losses, policy_loss, sparse_policy_loss
 from hexorl.train.loss_plan import LossContractError, build_loss_plan
 from hexorl.models.families.network import HexNet
@@ -54,6 +62,111 @@ def _compute_losses(predictions, targets, loss_weights, **kwargs):
 
 def _move(player: int, q: int, r: int) -> bytes:
     return struct.pack("<iii", player, q, r)
+
+
+def _v1_source(source_type: str = "direct_pair_retrieval") -> V1CandidateSourceContribution:
+    return V1CandidateSourceContribution(
+        source_type=source_type,
+        source_rank=0,
+        source_weight=1.0,
+        local_probability_or_score=0.5,
+        quota_id="fixture",
+        inclusion_kind="stochastic_sample",
+        exact_inclusion_probability=0.25,
+        heuristic_propensity=0.25,
+        correction_mode="exact_importance",
+    )
+
+
+def _v1_proposal() -> V1ProposalPropensityMetadata:
+    return V1ProposalPropensityMetadata(
+        proposal_policy="fixture_policy",
+        correction_mode="exact_importance",
+        total_proposal_probability=0.25,
+        log_proposal_probability=-1.38629436,
+        sampling_without_replacement=True,
+    )
+
+
+def _v1_candidate(
+    candidate_id: str,
+    first: tuple[int, int],
+    second: tuple[int, int],
+    flags: tuple[str, ...],
+    row: int,
+    *,
+    source_type: str = "direct_pair_retrieval",
+) -> V1CandidatePair:
+    return V1CandidatePair(
+        candidate_id=candidate_id,
+        pair_key=(first, second),
+        first_legal_row_id=row,
+        second_legal_row_id=row + 10,
+        row_table_schema_version=1,
+        source_contributions=(_v1_source(source_type),),
+        proposal_propensity_metadata=_v1_proposal(),
+        forced_exploration_flag="forced" in flags,
+        terminal_exact_flag="terminal_exact" in flags,
+        terminal_equivalence_flag="terminal_equivalent" in flags,
+        target_support_flags=flags,
+        admission_generation=row,
+        root_or_interior="root",
+        candidate_selection_reason="fixture",
+    )
+
+
+def _v1_metadata_fixture(
+    *,
+    support_type: str = "admitted_candidate_set_with_explicit_negatives",
+) -> V1SearchPairMetadata:
+    candidates = (
+        _v1_candidate("admitted", (1, 0), (0, 1), ("admitted",), 0),
+        _v1_candidate("explicit-negative", (2, 0), (0, 2), ("explicit_negative", "sampled_negative"), 1),
+        _v1_candidate("forced", (3, 0), (0, 3), ("admitted", "forced"), 2, source_type="blind_canary"),
+        _v1_candidate(
+            "terminal-equivalent",
+            (4, 0),
+            (0, 4),
+            ("admitted", "terminal_equivalent"),
+            3,
+            source_type="terminal_exact_v1",
+        ),
+        _v1_candidate("unsampled", (5, 0), (0, 5), ("unsampled",), 4, source_type="legal_pair_audit"),
+    )
+    return V1SearchPairMetadata(
+        candidate_selector_version="pair_candidate_selector_v1",
+        support_type=support_type,
+        legal_pair_count=15,
+        legal_row_schema_version=1,
+        pair_row_schema_version=1,
+        candidate_pairs=candidates,
+        proposal_correction_parameters=V1ProposalCorrectionParameters(
+            correction_mode="exact_importance",
+            min_log=-4.0,
+            max_log=4.0,
+            prior_temperature=1.25,
+        ),
+        root_gumbel_values=(0.4, 0.3, 0.2, 0.1, 0.0),
+        root_admission_order=(0, 1, 2, 3, 4),
+        root_simulation_allocation=(16, 4, 8, 8, 0),
+        visit_counts=(12, 0, 3, 4, 0),
+        q_values=(0.6, -0.2, 0.1, 0.9, 0.0),
+        completed_q_values=(0.65, -0.25, 0.15, 0.95, 0.0),
+        selected_pair=((1, 0), (0, 1)),
+        target_support_flags=tuple(candidate.target_support_flags for candidate in candidates),
+        terminal_equivalence_flags=tuple(candidate.terminal_equivalence_flag for candidate in candidates),
+        search_surprise_metrics={"search_surprise_kl": 0.125, "root_q_variance": 0.25},
+        neural_calls_per_expanded_full_turn_node=1.0,
+        reservoir_refill_events=(
+            V1ReservoirRefillEvent(
+                node_id="root",
+                reason="configured_refill",
+                generation=1,
+                requested_count=4,
+                added_count=2,
+            ),
+        ),
+    )
 
 
 class _FixedSymmetryRng:
@@ -579,6 +692,167 @@ def test_compact_record_v2_roundtrip_preserves_global_targets():
     assert out.positions[0].candidate_recall_winning_move == pytest.approx(1.0)
     assert out.positions[0].candidate_recall_forced_block == pytest.approx(0.75)
     assert out.positions[0].candidate_recall_two_placement_cover == pytest.approx(0.5)
+
+
+def test_compact_record_v9_without_v1_metadata_remains_loadable():
+    rec = PositionRecord(
+        move_history=b"",
+        policy_target={action_to_board_index(0, 0): 1.0},
+        root_value=0.25,
+        selected_action_value=0.5,
+        player=0,
+        outcome=1.0,
+        sparse_prior_stage=2,
+    )
+    game = GameRecord(positions=[rec], outcome=1.0, game_id=19)
+    data = bytearray(game.to_compact_bytes())
+    struct.pack_into("<H", data, 4, 9)
+    old_v9_data = bytes(data[:-4])
+
+    out = GameRecord.from_compact_bytes(old_v9_data)
+
+    assert out.game_id == 19
+    assert out.positions[0].v1_search_metadata is None
+    assert out.positions[0].policy_target[action_to_board_index(0, 0)] == pytest.approx(1.0)
+    assert out.positions[0].selected_action_value == pytest.approx(0.5)
+    assert out.positions[0].sparse_prior_stage == 2
+
+
+def test_v1_pair_search_metadata_roundtrips_through_compact_record_and_ring():
+    metadata = _v1_metadata_fixture()
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.25,
+        selected_action_value=0.5,
+        player=1,
+        outcome=-1.0,
+        v1_search_metadata=metadata,
+    )
+    game = GameRecord(positions=[rec], outcome=-1.0, game_id=20)
+
+    out = GameRecord.from_compact_bytes(game.to_compact_bytes())
+
+    loaded = out.positions[0].v1_search_metadata
+    assert loaded is not None
+    assert loaded.schema_version == 1
+    assert loaded.candidate_selector_version == "pair_candidate_selector_v1"
+    assert loaded.support_type == "admitted_candidate_set_with_explicit_negatives"
+    assert loaded.legal_pair_count == 15
+    assert loaded.legal_row_schema_version == 1
+    assert loaded.pair_row_schema_version == 1
+    assert loaded.root_gumbel_values == pytest.approx(metadata.root_gumbel_values)
+    assert loaded.root_admission_order == metadata.root_admission_order
+    assert loaded.root_simulation_allocation == metadata.root_simulation_allocation
+    assert loaded.visit_counts == metadata.visit_counts
+    assert loaded.q_values == pytest.approx(metadata.q_values)
+    assert loaded.completed_q_values == pytest.approx(metadata.completed_q_values)
+    assert loaded.selected_pair == ((0, 1), (1, 0))
+    assert loaded.target_support_flags[1] == ("explicit_negative", "sampled_negative")
+    assert loaded.terminal_equivalence_flags[3] is True
+    assert loaded.search_surprise_metrics["search_surprise_kl"] == pytest.approx(0.125)
+    assert loaded.neural_calls_per_expanded_full_turn_node == pytest.approx(1.0)
+    assert loaded.reservoir_refill_events[0].added_count == 2
+    assert out.positions[0].pair_policy_target_v2 == []
+    assert out.positions[0].pair_policy_complete is False
+
+    buffer = RingBuffer(capacity=2, max_policy_v2_entries=8)
+    buffer.append(out.positions[0])
+    buffered = buffer[0]
+
+    assert buffered is not None
+    assert buffered.v1_search_metadata is not None
+    assert buffered.v1_search_metadata.explicit_negative_pairs() == (((0, 2), (2, 0)),)
+    assert buffered.pair_policy_target_v2 == []
+    assert buffered.pair_policy_complete is False
+
+
+def test_v1_support_type_is_explicit_and_validated():
+    with pytest.raises(ValueError, match="support_type"):
+        _v1_metadata_fixture(support_type="")
+
+    with pytest.raises(ValueError, match="explicit negatives"):
+        _v1_metadata_fixture(support_type="admitted_candidate_set_without_explicit_negatives")
+
+
+def test_v1_unsampled_legal_pairs_are_not_implicit_negatives():
+    metadata = _v1_metadata_fixture()
+    unsampled_pair = metadata.candidate_pairs[4].pair_key
+    missing_pair = ((6, 0), (0, 6))
+
+    assert metadata.target_support_for_pair(unsampled_pair) == ("unsampled",)
+    assert metadata.is_pair_explicit_negative(unsampled_pair) is False
+    assert unsampled_pair not in metadata.explicit_negative_pairs()
+    assert metadata.target_support_for_pair(missing_pair) == ()
+    assert metadata.is_pair_explicit_negative(missing_pair) is False
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _v1_candidate(
+            "bad-unsampled-negative",
+            (7, 0),
+            (0, 7),
+            ("unsampled", "explicit_negative"),
+            5,
+        )
+
+
+def test_v1_metadata_rejects_legacy_pair_policy_target_mixing():
+    with pytest.raises(ValueError, match="legacy pair_policy_target_v2"):
+        PositionRecord(
+            move_history=_move(0, 0, 0),
+            policy_target={action_to_board_index(1, 0): 1.0},
+            root_value=0.0,
+            player=1,
+            outcome=1.0,
+            pair_policy_target_v2=[((1, 0), (0, 1), 1.0)],
+            pair_policy_complete=True,
+            v1_search_metadata=_v1_metadata_fixture(),
+        )
+
+
+def test_process_game_record_keeps_v1_metadata_out_of_legacy_pair_completeness():
+    rec = PositionRecord(
+        move_history=_move(0, 0, 0),
+        policy_target={action_to_board_index(1, 0): 1.0},
+        policy_target_v2=[(1, 0, 1.0)],
+        root_value=0.0,
+        selected_action_value=0.0,
+        player=1,
+        is_full_search=True,
+        v1_search_metadata=_v1_metadata_fixture(),
+    )
+    game = GameRecord(game_id="v1-no-legacy-complete", positions=[rec], outcome=1.0)
+
+    processed = process_game_record(game)
+
+    assert processed[0].v1_search_metadata is not None
+    assert processed[0].pair_policy_target_v2 == []
+    assert processed[0].pair_policy_complete is False
+
+
+def test_prepare_dense_training_batch_masks_legacy_pair_weight_for_v1_schema_marker():
+    tensors = np.zeros((2, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    policies = np.zeros((2, BOARD_SIZE * BOARD_SIZE), dtype=np.float32)
+    values = np.zeros(2, dtype=np.float32)
+
+    prepared = prepare_dense_training_batch(
+        tensors=tensors,
+        policies=policies,
+        values=values,
+        lookahead_list=[],
+        aux_targets={
+            "pair_policy_weight": np.ones(2, dtype=np.float32),
+            "v1_pair_schema_version": np.array([1, 0], dtype=np.int16),
+        },
+        lookahead_keys=[],
+        device=torch.device("cpu"),
+        channels_last=False,
+        train_policy_on_full_search_only=True,
+    )
+
+    assert prepared.targets["pair_policy_weight"].tolist() == pytest.approx([0.0, 1.0])
+    assert prepared.targets["v1_pair_legacy_pair_targets_masked"].tolist() == [True, False]
 
 
 def test_compact_record_preserves_missing_selected_action_as_invalid_regret_target():

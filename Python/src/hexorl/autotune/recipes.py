@@ -8,12 +8,24 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hexorl.config import Config
 from hexorl.config.schema import AUTOTUNE_PAIR_STRATEGY_MODES
+from hexorl.eval.v1_pair_scorecard import (
+    required_v1_pair_baselines,
+    required_v1_pair_metric_names,
+)
 from hexorl.models.registry import global_graph_architecture_ids, normalize_architecture_id
 
 
 RECIPE_SCHEMA_VERSION = 1
-PairMode = Literal["none", "root_pair_mcts", "full_pair_mcts"]
+PairMode = Literal["none", "root_pair_mcts", "full_pair_mcts", "sampled_joint_pair_v1"]
 _PAIR_HEADS = ("policy_pair_first", "policy_pair_joint", "policy_pair_second")
+_V1_PAIR_HEADS = (
+    "cell_marginal_logits",
+    "pair_completion_logits",
+    "pair_proposal_score",
+    "pair_joint_logits",
+    "value",
+    "terminal_tactical_v1",
+)
 
 
 class ModelRecipe(BaseModel):
@@ -182,6 +194,14 @@ class CandidateRecipe(BaseModel):
             "dirichlet_fraction": self.search.dirichlet_fraction,
             "dirichlet_alpha": self.search.dirichlet_alpha_scale,
         }
+        if self.pair_strategy.mode == "sampled_joint_pair_v1":
+            selfplay_update.update(
+                {
+                    "legal_row_mode": "full_rust_legal",
+                    "tactical_mode": "proposal_and_label",
+                    "constrain_threats": False,
+                }
+            )
         if self.runtime.selfplay_workers > 0:
             selfplay_update["num_workers"] = self.runtime.selfplay_workers
         if self.runtime.batch_size_per_worker > 0:
@@ -222,6 +242,16 @@ class CandidateRecipe(BaseModel):
         for head in _PAIR_HEADS:
             if head in self.model.output_heads:
                 loss_weights[head] = self.schedule.pair_loss_weight
+        if self.pair_strategy.mode == "sampled_joint_pair_v1":
+            loss_weights.update(
+                {
+                    "cell_marginal_logits": self.schedule.graph_loss_weight,
+                    "pair_completion_logits": self.schedule.pair_loss_weight,
+                    "pair_proposal_score": self.schedule.pair_loss_weight,
+                    "pair_joint_logits": self.schedule.graph_loss_weight,
+                    "terminal_tactical_v1": self.schedule.auxiliary_loss_weight,
+                }
+            )
         train["loss_weights"] = loss_weights
 
         return Config.model_validate(data)
@@ -233,12 +263,21 @@ def candidate_recipes_from_config(config: Config) -> tuple[CandidateRecipe, ...]
     recipes = []
     for entry in config.autotune.scout.candidate_plan:
         architecture_id, pair_mode = entry.split(":", 1)
+        metadata = {"source": "autotune.scout.candidate_plan", "plan_entry": entry}
+        if pair_mode == "sampled_joint_pair_v1":
+            metadata.update(
+                {
+                    "v1_pair_scorecard_schema": "v1_pair_scorecard:v1",
+                    "required_side_by_side_baselines": list(required_v1_pair_baselines()),
+                    "required_v1_pair_metrics": list(required_v1_pair_metric_names()),
+                }
+            )
         recipes.append(
             CandidateRecipe(
                 model=_model_recipe_for_architecture(architecture_id, pair_mode),
                 pair_strategy=_pair_strategy_for_mode(pair_mode),
                 runtime=_runtime_spec_for_architecture(architecture_id),
-                metadata={"source": "autotune.scout.candidate_plan", "plan_entry": entry},
+                metadata=metadata,
             )
         )
     ids = [recipe.candidate_id for recipe in recipes]
@@ -251,12 +290,20 @@ def _model_recipe_for_architecture(architecture_id: str, pair_mode: str) -> Mode
     architecture_id = normalize_architecture_id(architecture_id)
     output_heads = ["policy_place", "value"]
     head_bundle = "policy_value"
-    if pair_mode != "none":
+    if pair_mode == "sampled_joint_pair_v1":
+        output_heads = list(_V1_PAIR_HEADS)
+        head_bundle = "sampled_joint_pair_v1"
+    elif architecture_id == "global_pair_biaffine_0":
+        output_heads = ["cell_marginal_logits", "value"]
+        head_bundle = "v1_cell_value"
+    elif pair_mode != "none":
         output_heads.extend(_PAIR_HEADS)
         head_bundle = "pair_mcts"
     kwargs: dict[str, Any] = {}
     if architecture_id == "global_graph768_champion":
         kwargs.update({"graph_token_set": "graph768_champion", "graph_token_budget": 768, "graph_layers": 6})
+    elif architecture_id == "global_pair_biaffine_0":
+        kwargs.update({"graph_token_set": "graph512_turn_pair_prior", "graph_token_budget": 512, "graph_layers": 3})
     return ModelRecipe(
         architecture_id=architecture_id,
         head_bundle=head_bundle,
