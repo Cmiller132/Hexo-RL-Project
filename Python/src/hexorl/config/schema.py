@@ -76,6 +76,34 @@ class ModelConfig(BaseModel):
             ) from exc
         spec = architecture_spec(arch)
         self.architecture = arch
+        fields_set = set(self.model_fields_set)
+        if arch == "restnet":
+            if "blocks" not in fields_set:
+                self.blocks = 10
+            if "attention_heads" not in fields_set:
+                self.attention_heads = 4
+            if "attention_positions" not in fields_set:
+                self.attention_positions = [4, 7, 10]
+            if "relative_bias" not in fields_set:
+                self.relative_bias = True
+            if "heads" not in fields_set:
+                self.heads = ["policy", "value", "opp_policy"]
+            if self.blocks != 10:
+                raise ValueError("canonical restnet requires model.blocks = 10")
+            if self.attention_heads != 4:
+                raise ValueError("canonical restnet requires model.attention_heads = 4")
+            if list(self.attention_positions) != [4, 7, 10]:
+                raise ValueError(
+                    "canonical restnet requires model.attention_positions = [4, 7, 10]"
+                )
+            if self.relative_bias is not True:
+                raise ValueError("canonical restnet requires model.relative_bias = true")
+            if set(self.heads) != {"policy", "value", "opp_policy"} or len(self.heads) != 3:
+                raise ValueError("canonical restnet supports only policy, value, and opp_policy heads")
+            if self.sparse_policy or self.sparse_prior_stage != 0:
+                raise ValueError("canonical restnet does not support sparse policy heads")
+            if self.pair_strategy != "none" or self.pair_strategy_max_pairs != 0:
+                raise ValueError("canonical restnet requires model.pair_strategy='none'")
         if self.blocks <= 0:
             raise ValueError("model.blocks must be positive")
         if self.channels <= 0:
@@ -93,7 +121,7 @@ class ModelConfig(BaseModel):
             raise ValueError("model.dropout must be in [0, 1)")
         if not 0.0 <= self.attention_dropout < 1.0:
             raise ValueError("model.attention_dropout must be in [0, 1)")
-        if self.relative_bias:
+        if self.relative_bias and arch != "restnet":
             raise ValueError("model.relative_bias is reserved and must remain false")
         valid_graph_sets = {
             "graph256_cells",
@@ -135,7 +163,7 @@ class ModelConfig(BaseModel):
                 f"1..{self.blocks}; got {invalid_positions}"
             )
         if self.attention_positions and not spec.supports_attention_positions:
-            raise ValueError("model.attention_positions are only used by architecture='restnet'")
+            raise ValueError("model.attention_positions are only used by ResTNet dense architectures")
         return self
 
 

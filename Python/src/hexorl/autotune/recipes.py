@@ -173,6 +173,12 @@ class CandidateRecipe(BaseModel):
                 "pair_prior_mix": float(self.pair_strategy.pair_prior_mix) if pair_enabled else 0.0,
             }
         )
+        if self.model.architecture_id == "restnet":
+            model["blocks"] = 10
+            model["attention_heads"] = 4
+            model["attention_positions"] = [4, 7, 10]
+            model["relative_bias"] = True
+            model["heads"] = ["policy", "value", "opp_policy"]
 
         selfplay = data.setdefault("selfplay", {})
         selfplay_update = {
@@ -276,6 +282,8 @@ def _model_recipe_for_architecture(architecture_id: str, pair_mode: str) -> Mode
     architecture_id = normalize_architecture_id(architecture_id)
     spec = architecture_spec(architecture_id)
     output_heads = ["policy_place", "value"] if spec.global_graph else ["policy", "value"]
+    if architecture_id == "restnet":
+        output_heads = ["policy", "value", "opp_policy"]
     head_bundle = "policy_value"
     if pair_mode != "none":
         if not spec.global_graph:
@@ -287,6 +295,8 @@ def _model_recipe_for_architecture(architecture_id: str, pair_mode: str) -> Mode
         kwargs.update({"graph_token_set": "graph768_champion", "graph_token_budget": 768, "graph_layers": 6})
     elif architecture_id == "global_graph768_devwin_0":
         kwargs.update({"graph_token_set": "graph768_devwin", "graph_token_budget": 768, "graph_layers": 6})
+    elif architecture_id == "restnet":
+        kwargs.update({"blocks": 10, "attention_heads": 4})
     return ModelRecipe(
         architecture_id=architecture_id,
         head_bundle=head_bundle,

@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 from hexorl.autotune import CandidateArtifactPaths, CandidateArtifactWriter, CandidateRecipe, config_hash
 from hexorl.autotune.recipes import candidate_recipes_from_config
 from hexorl.config import Config
+from hexorl.models.registry import architecture_spec
 from hexorl.tuning.runtime_probe import (
     RuntimeCalibrationCache,
     RuntimeKnobs,
@@ -971,6 +972,14 @@ def _scout_epoch_budget_config(cfg: Config) -> Config:
     tuned.train.batches_per_epoch = min_train_batches
     if int(cfg.train.batches_per_epoch) != int(Config().train.batches_per_epoch):
         tuned.train.batches_per_epoch = max(min_train_batches, int(cfg.train.batches_per_epoch))
+    spec = architecture_spec(getattr(tuned.model, "architecture", "cnn"))
+    if spec.supports_attention_positions and getattr(tuned.model, "attention_positions", []):
+        original_samples = max(1, int(tuned.train.batch_size) * int(tuned.train.batches_per_epoch))
+        tuned.train.batch_size = min(int(tuned.train.batch_size), 64)
+        tuned.train.batches_per_epoch = max(
+            int(tuned.train.batches_per_epoch),
+            math.ceil(original_samples / max(1, int(tuned.train.batch_size))),
+        )
     return Config.model_validate(tuned.model_dump(mode="json"))
 
 

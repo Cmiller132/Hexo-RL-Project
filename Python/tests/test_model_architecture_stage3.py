@@ -271,7 +271,7 @@ def test_crop_pair_replay_masks_pair_head_when_target_mass_is_empty():
     assert aux["pair_candidate_missing_mass"][0] == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph_hybrid_0"])
+@pytest.mark.parametrize("architecture", ["cnn", "restnet_crop_scout", "graph_hybrid_0"])
 def test_dense_sparse_graph_hybrid_batches_train_through_trainer_adapter(architecture):
     pytest.importorskip("_engine")
     rec = PositionRecord(

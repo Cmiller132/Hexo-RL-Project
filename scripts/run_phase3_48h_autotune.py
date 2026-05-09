@@ -1011,7 +1011,7 @@ class Phase3Supervisor:
         # families at the CNN center rate can corrupt weights before the first
         # scorecard exists. Start them at the known-stable safety rail and let
         # the population exploit/explore upward only after finite metrics land.
-        if family.sparse_policy or family.graph or family.architecture == "restnet":
+        if family.sparse_policy or family.graph or family.architecture in {"restnet", "restnet_crop_scout"}:
             dynamic.lr = min(dynamic.lr, 3e-4)
         return dynamic
 
@@ -1058,6 +1058,15 @@ class Phase3Supervisor:
         cfg.model.sparse_prior_mix = 0.0 if family.global_graph else 0.25
         cfg.model.candidate_budget = recipe.candidate_budget if (family.sparse_policy or family.graph) else 256
         cfg.model.heads = self._heads_for_recipe(family, recipe)
+        if family.architecture == "restnet":
+            cfg.model.blocks = 10
+            cfg.model.attention_positions = [4, 7, 10]
+            cfg.model.attention_heads = 4
+            cfg.model.relative_bias = True
+            cfg.model.heads = ["policy", "value", "opp_policy"]
+            cfg.model.sparse_policy = False
+            cfg.model.sparse_prior_stage = 0
+            cfg.model.sparse_prior_mix = 0.0
         if family.global_graph:
             pair_strategy = str(getattr(recipe, "pair_strategy", "none")).lower()
             if pair_strategy != "none":
@@ -1090,7 +1099,7 @@ class Phase3Supervisor:
         cfg.train.lr_schedule = "constant"
         cfg.runtime.compile_inference = False
         cfg.runtime.compile_model = False
-        if self._low_memory_cuda_host() and (family.graph or family.sparse_policy or family.architecture == "restnet"):
+        if self._low_memory_cuda_host() and (family.graph or family.sparse_policy or family.architecture in {"restnet", "restnet_crop_scout"}):
             cfg.runtime.inference_start_timeout_s = max(float(cfg.runtime.inference_start_timeout_s), 90.0)
         self._apply_head_bundle_weights(cfg, recipe, dynamic)
         self._apply_dynamic_values(cfg, recipe, dynamic, family)
@@ -1112,7 +1121,7 @@ class Phase3Supervisor:
                 128,
             )
             cfg.inference.max_wait_us = max(int(cfg.inference.max_wait_us), 500)
-        if family.graph or family.sparse_policy or (family.architecture == "restnet" and not high_search_non_graph):
+        if family.graph or family.sparse_policy or (family.architecture in {"restnet", "restnet_crop_scout"} and not high_search_non_graph):
             if family.graph:
                 latency_scale = max(1.0, (recipe.graph_token_budget / 256.0) * max(recipe.graph_layers, 1))
                 if recipe.sparse_prior_stage > 0:
@@ -1564,7 +1573,7 @@ class Phase3Supervisor:
             worker_values = sorted(set(worker_values + [1, 2, 3, 4]))
             if self._low_memory_cuda_host():
                 base_workers = 1
-                if getattr(trial.family, "architecture", "") == "restnet":
+                if getattr(trial.family, "architecture", "") in {"restnet", "restnet_crop_scout"}:
                     worker_values = [1, 2, 3]
                 else:
                     worker_values = [1, 2, 3, 4]
@@ -2027,7 +2036,7 @@ class Phase3Supervisor:
         full_sims = max(1, int(requested))
         if not self._low_memory_cuda_host():
             return full_sims
-        if family.architecture == "restnet":
+        if family.architecture in {"restnet", "restnet_crop_scout"}:
             return min(full_sims, 512)
         if family.global_graph:
             return min(full_sims, LOW_MEMORY_GLOBAL_GRAPH_MAX_SIMS)
@@ -2037,7 +2046,7 @@ class Phase3Supervisor:
         batch_size = max(1, int(requested))
         if not self._low_memory_cuda_host():
             return batch_size
-        memory_hungry = bool(family.graph or family.sparse_policy or family.architecture == "restnet")
+        memory_hungry = bool(family.graph or family.sparse_policy or family.architecture in {"restnet", "restnet_crop_scout"})
         if memory_hungry:
             return min(batch_size, 128)
         return min(batch_size, 256)
@@ -2111,7 +2120,7 @@ class Phase3Supervisor:
         graph_available = any(f.graph and f.available for f in self.families)
         if self.host.cuda_available and self.host.cuda_memory_gb < 16.0 and self.host.physical_cpus <= 16:
             for family in self.families:
-                if family.architecture == "restnet" and family.sparse_policy:
+                if family.architecture in {"restnet", "restnet_crop_scout"} and family.sparse_policy:
                     reason = "host_guard:restnet_sparse_timeout_risk_on_12gb_16core"
                     self.blocked_families[family.name] = reason
                     object.__setattr__(family, "available", False)
@@ -2137,7 +2146,7 @@ class Phase3Supervisor:
         for family in self.families:
             if family.name in self.blocked_families:
                 continue
-            latency_sensitive = family.architecture == "restnet" or (graph_available and not family.graph)
+            latency_sensitive = family.architecture in {"restnet", "restnet_crop_scout"} or (graph_available and not family.graph)
             if not latency_sensitive:
                 continue
             rate = rates.get(family.name, 0.0)
@@ -2722,14 +2731,14 @@ class Phase3Supervisor:
             FamilySpec(
                 "best_restnet_33",
                 "ResTNet attention-inside-crop scout.",
-                "restnet",
+                "restnet_crop_scout",
                 attention_positions=(5, 10, 14),
             ),
             FamilySpec("candidate_policy_33", "CNN with candidate/action-keyed sparse policy scout.", "cnn", sparse_policy=True),
             FamilySpec(
                 "best_restnet_33_candidate_policy_33",
                 "ResTNet plus candidate/action-keyed sparse policy scout.",
-                "restnet",
+                "restnet_crop_scout",
                 sparse_policy=True,
                 attention_positions=(5, 10, 14),
             ),

@@ -185,7 +185,7 @@ def test_phase1_runner_can_enable_leaf_eval_for_xattn_and_include_restnet():
     assert [cfg.model.architecture for cfg in materialized] == ["global_xattn_0", "restnet"]
     assert materialized[0].model.heads == ["policy_place", "value"]
     assert materialized[0].model.global_graph_leaf_eval is True
-    assert materialized[1].model.heads == ["policy", "value"]
+    assert materialized[1].model.heads == ["policy", "value", "opp_policy"]
     assert materialized[1].model.global_graph_leaf_eval is False
 
 

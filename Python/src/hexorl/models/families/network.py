@@ -75,6 +75,129 @@ class GatedResBlock(nn.Module):
         return x + residual
 
 
+class PaperResBlock(nn.Module):
+    """AlphaZero-style residual block used by canonical ResTNet."""
+
+    def __init__(self, channels: int, dropout: float = 0.0):
+        super().__init__()
+        self.conv1 = HexConv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = HexConv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = self.dropout(self.bn2(self.conv2(x)))
+        return torch.relu(x + residual)
+
+
+class RelativePositionAttention2d(nn.Module):
+    """Multi-head self-attention with learned 2D relative position bias."""
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int,
+        height: int = BOARD_SIZE,
+        width: int = BOARD_SIZE,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if channels % heads != 0:
+            raise ValueError("channels must be divisible by attention heads")
+        self.channels = channels
+        self.heads = heads
+        self.head_dim = channels // heads
+        self.scale = self.head_dim ** -0.5
+        self.height = height
+        self.width = width
+        self.qkv = nn.Linear(channels, channels * 3)
+        self.proj = nn.Linear(channels, channels)
+        self.dropout = nn.Dropout(dropout)
+        table_size = (2 * height - 1) * (2 * width - 1)
+        self.relative_position_bias_table = nn.Parameter(torch.empty(table_size, heads))
+
+        q = torch.arange(height)
+        r = torch.arange(width)
+        coords = torch.stack(torch.meshgrid(q, r, indexing="ij"))
+        coords_flat = coords.flatten(1)
+        rel = coords_flat[:, :, None] - coords_flat[:, None, :]
+        rel[0] += height - 1
+        rel[1] += width - 1
+        rel[0] *= 2 * width - 1
+        self.register_buffer(
+            "relative_position_index",
+            (rel[0] + rel[1]).to(dtype=torch.long),
+            persistent=False,
+        )
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def forward(self, x: torch.Tensor, *, need_weights: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        b, n, c = x.shape
+        expected_tokens = self.height * self.width
+        if n != expected_tokens:
+            raise ValueError(f"relative attention expects {expected_tokens} tokens, got {n}")
+        qkv = self.qkv(x).reshape(b, n, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        score = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        bias = self.relative_position_bias_table[self.relative_position_index.reshape(-1)]
+        bias = bias.reshape(n, n, self.heads).permute(2, 0, 1).to(device=x.device, dtype=score.dtype)
+        score = score + bias.unsqueeze(0)
+        attn = torch.softmax(score, dim=-1)
+        attn = self.dropout(attn)
+        y = torch.matmul(attn, v).transpose(1, 2).reshape(b, n, c)
+        weights = attn.detach() if need_weights else None
+        return self.proj(y), weights
+
+
+class PaperSpatialTransformerBlock(nn.Module):
+    """ResTNet Transformer block over one token per board cell."""
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 4,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+    ):
+        super().__init__()
+        hidden = max(channels, int(math.ceil(channels * mlp_ratio)))
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = RelativePositionAttention2d(
+            channels,
+            heads,
+            height=BOARD_SIZE,
+            width=BOARD_SIZE,
+            dropout=attention_dropout,
+        )
+        self.drop1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(channels)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, channels),
+            nn.Dropout(dropout),
+        )
+        self.capture_attention = False
+        self.last_attention_map: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if h != BOARD_SIZE or w != BOARD_SIZE:
+            raise ValueError(f"PaperSpatialTransformerBlock expects {BOARD_SIZE}x{BOARD_SIZE}, got {h}x{w}")
+        tokens = x.flatten(2).transpose(1, 2).contiguous()
+        attn_out, weights = self.attn(self.norm1(tokens), need_weights=self.capture_attention)
+        if self.capture_attention:
+            self.last_attention_map = weights
+        tokens = tokens + self.drop1(attn_out)
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(b, c, h, w).contiguous()
+
+
 class SpatialTransformerBlock(nn.Module):
     """PreNorm spatial attention block over the 33x33 crop."""
 
@@ -541,6 +664,9 @@ class HexNet(nn.Module):
         moves_left  — (B, 1) moves-left scalar (softplus)
     """
 
+    RESTNET_SEQUENCE = "RRRTRRTRRT"
+    RESTNET_ATTENTION_POSITIONS = (4, 7, 10)
+
     def __init__(
         self,
         channels: int = 128,
@@ -566,6 +692,7 @@ class HexNet(nn.Module):
         self.n_bins = n_bins
         self.architecture = architecture.lower()
         self.attention_positions = sorted(set(attention_positions or []))
+        self.restnet_sequence = self.RESTNET_SEQUENCE if self.architecture == "restnet" else ""
         self.sparse_policy_enabled = bool(sparse_policy)
         self.candidate_feature_dim = candidate_feature_dim
         self.graph_token_set = graph_token_set.lower()
@@ -597,9 +724,35 @@ class HexNet(nn.Module):
                 dropout=dropout,
                 attention_dropout=attention_dropout,
             )
+        elif self.architecture == "restnet":
+            if blocks != len(self.RESTNET_SEQUENCE):
+                raise ValueError(f"canonical restnet requires {len(self.RESTNET_SEQUENCE)} blocks")
+            if attention_heads != 4:
+                raise ValueError("canonical restnet requires 4 attention heads")
+            if tuple(self.attention_positions) != self.RESTNET_ATTENTION_POSITIONS:
+                raise ValueError(
+                    "canonical restnet requires attention_positions=[4, 7, 10]"
+                )
+            if not relative_bias:
+                raise ValueError("canonical restnet requires relative_bias=True")
+            for symbol in self.RESTNET_SEQUENCE:
+                if symbol == "R":
+                    self.res_blocks.append(PaperResBlock(channels, dropout=dropout))
+                elif symbol == "T":
+                    self.res_blocks.append(
+                        PaperSpatialTransformerBlock(
+                            channels,
+                            heads=attention_heads,
+                            mlp_ratio=attention_mlp_ratio,
+                            dropout=dropout,
+                            attention_dropout=attention_dropout,
+                        )
+                    )
+                else:
+                    raise ValueError(f"unknown ResTNet block symbol {symbol!r}")
         else:
             for idx in range(1, blocks + 1):
-                if self.architecture == "restnet" and idx in attention_set:
+                if self.architecture == "restnet_crop_scout" and idx in attention_set:
                     self.res_blocks.append(
                         SpatialTransformerBlock(
                             channels,
@@ -689,6 +842,20 @@ class HexNet(nn.Module):
         if self.graph_encoder is not None:
             x = self.graph_encoder(x, raw)
         return x
+
+    def set_attention_capture(self, enabled: bool = True) -> None:
+        for block in self.res_blocks:
+            if isinstance(block, PaperSpatialTransformerBlock):
+                block.capture_attention = bool(enabled)
+                if not enabled:
+                    block.last_attention_map = None
+
+    def attention_maps(self) -> list[torch.Tensor]:
+        return [
+            block.last_attention_map
+            for block in self.res_blocks
+            if isinstance(block, PaperSpatialTransformerBlock) and block.last_attention_map is not None
+        ]
 
     def forward(
         self,

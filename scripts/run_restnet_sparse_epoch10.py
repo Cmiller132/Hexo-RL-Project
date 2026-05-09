@@ -42,7 +42,7 @@ def configure_experiment(cfg: Config, args: argparse.Namespace) -> Config:
     cfg.run.output_dir = str(args.output_dir)
     cfg.run.log_level = "INFO"
 
-    cfg.model.architecture = "restnet"
+    cfg.model.architecture = "restnet_crop_scout"
     cfg.model.attention_positions = [
         int(part.strip()) for part in args.attention.split(",") if part.strip()
     ]

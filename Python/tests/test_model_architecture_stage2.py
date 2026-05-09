@@ -21,6 +21,7 @@ def test_stage2_registry_resolves_all_current_architectures_and_alias_decision()
     assert {
         "cnn",
         "restnet",
+        "restnet_crop_scout",
         "graph_hybrid_0",
         "global_graph_option1",
         "global_xattn_0",
@@ -48,6 +49,11 @@ def test_stage2_registry_resolves_all_current_architectures_and_alias_decision()
         "global_graph768_champion",
         "global_graph768_devwin_0",
     }
+    restnet = architecture_spec("restnet")
+    assert restnet.default_outputs == ("policy", "value", "opp_policy")
+    assert restnet.pair_capabilities == ()
+    assert restnet.crop_pair_capable is False
+    assert architecture_spec("restnet_crop_scout").supports_attention_positions is True
     assert deprecated_aliases()["graph"].target is None
     assert deprecated_aliases()["graph"].runtime_supported is False
     with pytest.raises(ValueError, match="architecture alias 'graph' is not a runtime architecture"):
@@ -156,7 +162,7 @@ def test_stage2_dynamic_lookahead_family_expands_from_buffer_horizons():
 
 @pytest.mark.parametrize(
     "architecture",
-    ["cnn", "restnet", "graph_hybrid_0", "global_xattn_0"],
+    ["cnn", "restnet", "restnet_crop_scout", "graph_hybrid_0", "global_xattn_0"],
 )
 def test_stage2_assembly_attaches_resolved_metadata_for_current_bundles(architecture):
     model_cfg = {
@@ -165,9 +171,18 @@ def test_stage2_assembly_attaches_resolved_metadata_for_current_bundles(architec
         "blocks": 1,
         "heads": ["policy", "value"],
     }
-    if architecture in {"restnet", "graph_hybrid_0"} or is_global_graph_architecture(architecture):
+    if architecture in {"restnet", "restnet_crop_scout", "graph_hybrid_0"} or is_global_graph_architecture(architecture):
         model_cfg["attention_heads"] = 4
     if architecture == "restnet":
+        model_cfg.update(
+            {
+                "blocks": 10,
+                "heads": ["policy", "value", "opp_policy"],
+                "attention_positions": [4, 7, 10],
+                "relative_bias": True,
+            }
+        )
+    if architecture == "restnet_crop_scout":
         model_cfg["attention_positions"] = [1]
     if architecture == "graph_hybrid_0":
         model_cfg.update(

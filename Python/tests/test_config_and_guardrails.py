@@ -18,7 +18,12 @@ from hexorl.train.ema import ModelEMA
 from hexorl.train.loss_plan import build_loss_plan
 from hexorl.train.losses import compute_losses
 from hexorl.models.assembly import build_model_from_config
-from hexorl.models.families.network import HexConv2d, GatedResBlock
+from hexorl.models.families.network import (
+    GatedResBlock,
+    HexConv2d,
+    PaperResBlock,
+    PaperSpatialTransformerBlock,
+)
 from hexorl.models.loading import restore_model_weights
 
 
@@ -243,8 +248,33 @@ def test_restnet_config_validation_and_forward_shapes():
         {
             "model": {
                 "channels": 16,
-                "blocks": 3,
                 "architecture": "restnet",
+            },
+            "inference": {"fp16": False},
+        }
+    )
+    assert cfg.model.blocks == 10
+    assert cfg.model.attention_positions == [4, 7, 10]
+    assert cfg.model.attention_heads == 4
+    assert cfg.model.relative_bias is True
+    assert cfg.model.heads == ["policy", "value", "opp_policy"]
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    out = model(torch.zeros(2, 13, 33, 33))
+    assert out["policy"].shape == (2, 1089)
+    assert out["value"].shape == (2, 65)
+    assert out["opp_policy"].shape == (2, 1089)
+    assert getattr(model, "restnet_sequence") == "RRRTRRTRRT"
+    assert [type(block) for block in model.res_blocks].count(PaperResBlock) == 7
+    assert [type(block) for block in model.res_blocks].count(PaperSpatialTransformerBlock) == 3
+
+
+def test_restnet_crop_scout_preserves_configurable_attention_positions():
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "channels": 16,
+                "blocks": 3,
+                "architecture": "restnet_crop_scout",
                 "attention_positions": [2],
                 "attention_heads": 4,
                 "heads": ["policy", "value"],
@@ -256,6 +286,34 @@ def test_restnet_config_validation_and_forward_shapes():
     out = model(torch.zeros(2, 13, 33, 33))
     assert out["policy"].shape == (2, 1089)
     assert out["value"].shape == (2, 65)
+
+
+def test_restnet_relative_bias_and_attention_capture_are_active():
+    cfg = Config.model_validate(
+        {"model": {"architecture": "restnet", "channels": 8}, "inference": {"fp16": False}}
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    transformer = next(block for block in model.res_blocks if isinstance(block, PaperSpatialTransformerBlock))
+    assert transformer.attn.relative_position_bias_table.requires_grad
+    assert torch.count_nonzero(transformer.attn.relative_position_bias_table.detach()) > 0
+
+    x = torch.randn(1, 8, 33, 33)
+    transformer.eval()
+    with torch.no_grad():
+        with_bias = transformer(x)
+        saved = transformer.attn.relative_position_bias_table.detach().clone()
+        transformer.attn.relative_position_bias_table.zero_()
+        without_bias = transformer(x)
+        transformer.attn.relative_position_bias_table.copy_(saved)
+    assert not torch.allclose(with_bias, without_bias)
+
+    model.set_attention_capture(True)
+    _ = model(torch.zeros(1, 13, 33, 33))
+    maps = model.attention_maps()
+    assert len(maps) == 3
+    assert maps[0].shape == (1, 4, 1089, 1089)
+    model.set_attention_capture(False)
+    assert model.attention_maps() == []
 
 
 def test_graph_config_validation_and_action_keyed_forward_shapes():
@@ -361,7 +419,7 @@ def test_hex_conv_masks_are_reapplied_after_loading_state_dict():
         assert torch.count_nonzero(conv.weight[:, :, 2, 2]) == 0
 
 
-@pytest.mark.parametrize("architecture", ["cnn", "restnet", "graph_hybrid_0"])
+@pytest.mark.parametrize("architecture", ["cnn", "restnet_crop_scout", "graph_hybrid_0"])
 def test_trunks_use_hex_conv_for_architecture_names(architecture):
     cfg = Config.model_validate(
         {
@@ -644,8 +702,27 @@ def test_restnet_config_rejects_invalid_attention_position():
             {
                 "model": {
                     "blocks": 2,
-                    "architecture": "restnet",
+                    "architecture": "restnet_crop_scout",
                     "attention_positions": [3],
+                }
+            }
+        )
+
+
+def test_canonical_restnet_rejects_noncanonical_or_pair_sparse_configuration():
+    with pytest.raises(ValueError, match="blocks = 10"):
+        Config.model_validate({"model": {"architecture": "restnet", "blocks": 9}})
+    with pytest.raises(ValueError, match="attention_positions"):
+        Config.model_validate({"model": {"architecture": "restnet", "attention_positions": [5, 10, 14]}})
+    with pytest.raises(ValueError, match="only policy, value, and opp_policy"):
+        Config.model_validate({"model": {"architecture": "restnet", "heads": ["policy", "value"]}})
+    with pytest.raises(ValueError, match="pair_strategy='none'"):
+        Config.model_validate(
+            {
+                "model": {
+                    "architecture": "restnet",
+                    "pair_strategy": "root_pair_mcts",
+                    "pair_strategy_max_pairs": 32,
                 }
             }
         )
@@ -689,7 +766,9 @@ def test_cnn_config_does_not_require_attention_head_divisibility():
 
 def test_config_rejects_reserved_or_invalid_attention_options():
     with pytest.raises(ValueError, match="relative_bias"):
-        Config.model_validate({"model": {"architecture": "restnet", "relative_bias": True}})
+        Config.model_validate({"model": {"architecture": "cnn", "relative_bias": True}})
+    cfg = Config.model_validate({"model": {"architecture": "restnet", "relative_bias": True}})
+    assert cfg.model.relative_bias is True
     with pytest.raises(ValueError, match="dropout"):
         Config.model_validate({"model": {"dropout": 1.0}})
     with pytest.raises(ValueError, match="attention_dropout"):

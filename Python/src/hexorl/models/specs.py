@@ -251,6 +251,7 @@ GLOBAL_OPTIONAL_OUTPUTS = (
 DENSE_LOSS_DEFAULTS = {
     "policy": 1.0,
     "value": 1.5,
+    "opp_policy": 0.15,
     "sparse_policy": 0.25,
     "pair_policy": 0.05,
 }
@@ -280,6 +281,9 @@ def dense_spec(
     replay_sparse_diagnostics: bool = False,
     requires_attention_head_divisibility: bool = False,
     supports_attention_positions: bool = False,
+    default_outputs: tuple[str, ...] = ("policy", "value"),
+    pair_capabilities: tuple[str, ...] = ("crop_pair_policy",),
+    crop_pair_capable: bool = True,
 ) -> ArchitectureSpec:
     contracts = output_contracts_for(("policy", "value", *DENSE_OPTIONAL_OUTPUTS))
     contracts["opp_policy"] = OutputContract(
@@ -294,16 +298,16 @@ def dense_spec(
         family_id=family_id,
         recipe_id=recipe_id,
         description=description,
-        default_outputs=("policy", "value"),
+        default_outputs=default_outputs,
         supported_optional_outputs=DENSE_OPTIONAL_OUTPUTS,
         selfplay_required_outputs=("policy", "value"),
         training_adapter_id="crop:v1",
         inference_adapter_id="crop:v1",
         policy_provider_id="dense_board:v1",
-        pair_capabilities=("crop_pair_policy",),
+        pair_capabilities=pair_capabilities,
         row_families=("dense_board", "candidate", "pair_joint"),
         sparse_policy_capable=sparse_policy_capable,
-        crop_pair_capable=True,
+        crop_pair_capable=crop_pair_capable,
         replay_sparse_diagnostics=replay_sparse_diagnostics,
         requires_attention_head_divisibility=requires_attention_head_divisibility,
         supports_attention_positions=supports_attention_positions,

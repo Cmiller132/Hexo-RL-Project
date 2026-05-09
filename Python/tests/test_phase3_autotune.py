@@ -437,7 +437,7 @@ def test_low_memory_restnet_recommended_recipe_caps_train_batch():
     family = module.FamilySpec(
         name="best_restnet_33",
         description="restnet",
-        architecture="restnet",
+        architecture="restnet_crop_scout",
         attention_positions=(5, 10, 14),
         available=True,
     )
@@ -461,7 +461,7 @@ def test_low_memory_static_recipe_caps_memory_hungry_bohb_batch():
     restnet = module.FamilySpec(
         name="best_restnet_33",
         description="restnet",
-        architecture="restnet",
+        architecture="restnet_crop_scout",
         attention_positions=(5, 10, 14),
         available=True,
     )
@@ -758,7 +758,7 @@ def test_static_candidates_are_family_balanced(tmp_path):
         module.FamilySpec(
             name="best_restnet_33",
             description="restnet",
-            architecture="restnet",
+            architecture="restnet_crop_scout",
             attention_positions=(5, 10, 14),
             available=True,
         ),
@@ -806,7 +806,7 @@ def test_static_candidates_stay_balanced_with_global_graph_families(tmp_path):
         module.FamilySpec(
             "best_restnet_33",
             "restnet",
-            "restnet",
+            "restnet_crop_scout",
             attention_positions=(5, 10, 14),
             available=True,
         ),

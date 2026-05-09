@@ -520,6 +520,38 @@ def test_scout_epoch_budget_respects_explicit_train_batch_override(tmp_path):
     ]
 
 
+def test_scout_epoch_budget_caps_restnet_attention_batch_and_preserves_samples(tmp_path):
+    cfg = Config()
+    cfg.autotune.scout.min_generated_selfplay_positions_per_epoch = 5000
+    cfg.train.batch_size = 256
+    cfg.train.batches_per_epoch = 32
+    candidate = _candidate("restnet")
+    runner = ConfigRecordingRunner()
+
+    Phase1OptunaScoutController(
+        runs_root=tmp_path / "runs",
+        run_id="restnet_budget",
+        base_config=cfg,
+        candidates=(candidate,),
+        runner=runner,
+        min_epochs=1,
+        quantum_epochs=1,
+    ).run(max_quanta=1)
+
+    written = json.loads(
+        (
+            tmp_path
+            / "runs"
+            / "restnet_budget"
+            / "candidates"
+            / candidate.candidate_id
+            / "full_config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert written["train"]["batch_size"] == 64
+    assert written["train"]["batches_per_epoch"] == 128
+
+
 def test_runtime_probe_speed_quarantine_stops_candidate_but_not_scout(tmp_path):
     candidates = (_candidate("global_xattn_0"), _candidate("global_line_window_0"))
     runner = RecordingRunner()
