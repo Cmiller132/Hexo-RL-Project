@@ -86,6 +86,13 @@ _SPECS: dict[str, ArchitectureSpec] = {
         description="Scaled global graph champion recipe.",
         relation_required=True,
     ),
+    "global_graph768_devwin_0": global_graph_spec(
+        "global_graph768_devwin_0",
+        family_id="scaled_development_window_graph",
+        recipe_id="global_graph",
+        description="Scaled global graph with development-window Window6 encoding.",
+        relation_required=True,
+    ),
 }
 
 _ALIASES: dict[str, AliasDecision] = {

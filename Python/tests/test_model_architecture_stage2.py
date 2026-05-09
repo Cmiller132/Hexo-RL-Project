@@ -29,6 +29,7 @@ def test_stage2_registry_resolves_all_current_architectures_and_alias_decision()
         "global_graph_full_0",
         "global_hybrid_action_0",
         "global_graph768_champion",
+        "global_graph768_devwin_0",
     } <= ids
     assert set(global_graph_architecture_ids()) == {
         "global_graph_option1",
@@ -38,12 +39,14 @@ def test_stage2_registry_resolves_all_current_architectures_and_alias_decision()
         "global_graph_full_0",
         "global_hybrid_action_0",
         "global_graph768_champion",
+        "global_graph768_devwin_0",
     }
     assert set(relation_required_architecture_ids()) == {
         "global_graph_option1",
         "global_line_window_0",
         "global_graph_full_0",
         "global_graph768_champion",
+        "global_graph768_devwin_0",
     }
     assert deprecated_aliases()["graph"].target is None
     assert deprecated_aliases()["graph"].runtime_supported is False

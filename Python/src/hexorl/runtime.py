@@ -158,6 +158,8 @@ def dataloader_worker_count(
     if cfg.runtime.dataloader_workers is not None:
         return max(0, cfg.runtime.dataloader_workers)
     if host.system == "windows":
+        if is_global_graph and host.cuda_available:
+            return min(4, max(2, host.physical_cpus // 4))
         return 0
     if is_global_graph and host.cuda_available:
         return min(8, max(2, host.physical_cpus - 4))

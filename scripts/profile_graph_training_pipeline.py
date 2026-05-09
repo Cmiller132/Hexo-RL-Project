@@ -14,11 +14,12 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader
 
-from hexorl.buffer.ring import RingBuffer
+from hexorl.buffer.ring import ReplaySnapshot, RingBuffer
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.dashboard.replay import encode_tensor_for_history
 from hexorl.graph.batch import current_turn_state, legal_moves_for_stones
 from hexorl.selfplay.records import PositionRecord
+from hexorl.train.trainer import shutdown_dataloader_workers
 
 
 def _history(moves: list[tuple[int, int, int]]) -> bytes:
@@ -99,18 +100,19 @@ def _make_synthetic_records(games: int, plies: int) -> list[PositionRecord]:
     return records
 
 
-def _make_dataset(buffer: RingBuffer, *, batch_size: int) -> ReplayDataset:
+def _make_dataset(args: argparse.Namespace, buffer: RingBuffer | ReplaySnapshot, *, batch_size: int) -> ReplayDataset:
     return ReplayDataset(
         buffer,
         batch_size=batch_size,
         include_sparse_policy=True,
         include_pair_policy=True,
         include_graph_policy=True,
-        candidate_budget=256,
-        graph_context_tokens=512,
-        graph_legal_rows=256,
-        max_game_turns=500,
-        graph_cache_size=256,
+        candidate_budget=args.candidate_budget,
+        graph_context_tokens=args.graph_context_tokens,
+        graph_legal_rows=args.candidate_budget,
+        max_game_turns=args.max_game_turns,
+        graph_token_set=args.graph_token_set,
+        graph_cache_size=args.graph_cache_size,
         lookahead_horizons=[4, 12, 36],
     )
 
@@ -143,34 +145,71 @@ def run_synthetic(args: argparse.Namespace) -> None:
                 prefetch_factor=args.prefetch_factor,
                 worker_init_fn=_worker_init,
             )
-        dataset = _make_dataset(replay, batch_size=args.batch_size)
+        dataset_buffer = ReplaySnapshot.from_buffer(replay) if workers > 0 else replay
+        dataset = _make_dataset(args, dataset_buffer, batch_size=args.batch_size)
         loader = DataLoader(dataset, batch_size=None, num_workers=workers, pin_memory=False, **kwargs)
-        iterator = iter(loader)
-        warm_started = time.perf_counter()
-        next(iterator)
-        warm_s = time.perf_counter() - warm_started
-        waits: list[float] = []
-        loader_samples: list[float] = []
-        for _ in range(args.batches):
-            started = time.perf_counter()
-            batch = next(iterator)
-            waits.append(time.perf_counter() - started)
-            aux = batch[4]
-            timings = aux.get("_loader_timings", {}) if isinstance(aux, dict) else {}
-            loader_samples.append(float(timings.get("graph_loader_sample_s", 0.0)))
-        if hasattr(iterator, "_shutdown_workers"):
-            iterator._shutdown_workers()  # type: ignore[attr-defined]
-        print(
-            "workers={workers} warm_s={warm:.3f} avg_wait_s={avg:.3f} "
-            "median_wait_s={median:.3f} p90_wait_s={p90:.3f} avg_loader_sample_s={sample:.3f}".format(
-                workers=workers,
-                warm=warm_s,
-                avg=statistics.mean(waits),
-                median=statistics.median(waits),
-                p90=sorted(waits)[max(0, int(len(waits) * 0.9) - 1)],
-                sample=statistics.mean(loader_samples),
+        iterator = None
+        try:
+            iterator = iter(loader)
+            warm_started = time.perf_counter()
+            next(iterator)
+            warm_s = time.perf_counter() - warm_started
+            waits: list[float] = []
+            loader_samples: list[float] = []
+            component_sums: dict[str, float] = {}
+            for _ in range(args.batches):
+                started = time.perf_counter()
+                batch = next(iterator)
+                waits.append(time.perf_counter() - started)
+                aux = batch[4]
+                timings = aux.get("_loader_timings", {}) if isinstance(aux, dict) else {}
+                loader_samples.append(float(timings.get("graph_loader_sample_s", 0.0)))
+                for key, value in timings.items():
+                    if str(key).startswith("graph_loader_graph_") or str(key) in {
+                        "graph_loader_candidate_s",
+                        "graph_loader_policy_overlay_s",
+                        "graph_loader_collate_s",
+                    }:
+                        component_sums[str(key)] = component_sums.get(str(key), 0.0) + float(value)
+            print(
+                "workers={workers} warm_s={warm:.3f} avg_wait_s={avg:.3f} "
+                "median_wait_s={median:.3f} p90_wait_s={p90:.3f} avg_loader_sample_s={sample:.3f}".format(
+                    workers=workers,
+                    warm=warm_s,
+                    avg=statistics.mean(waits),
+                    median=statistics.median(waits),
+                    p90=sorted(waits)[max(0, int(len(waits) * 0.9) - 1)],
+                    sample=statistics.mean(loader_samples),
+                )
             )
-        )
+            if component_sums:
+                top_components = sorted(
+                    ((key, value) for key, value in component_sums.items() if key.endswith("_s")),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:12]
+                print(
+                    "components_per_batch="
+                    + " ".join(
+                        f"{key}={value / max(1, len(waits)):.3f}s"
+                        for key, value in top_components
+                    )
+                )
+                count_components = sorted(
+                    (key, value) for key, value in component_sums.items() if not key.endswith("_s")
+                )
+                if count_components:
+                    print(
+                        "component_counts_per_batch="
+                        + " ".join(
+                            f"{key}={value / max(1, len(waits)):.1f}"
+                            for key, value in count_components
+                        )
+                    )
+        finally:
+            if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+                iterator._shutdown_workers()  # type: ignore[attr-defined]
+            shutdown_dataloader_workers(loader)
 
 
 def run_existing(args: argparse.Namespace) -> None:
@@ -226,6 +265,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", default="0,2,4,8,12")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--candidate-budget", type=int, default=512)
+    parser.add_argument("--graph-context-tokens", type=int, default=256)
+    parser.add_argument("--graph-token-set", default="graph256_cells")
+    parser.add_argument("--graph-cache-size", type=int, default=256)
+    parser.add_argument("--max-game-turns", type=int, default=768)
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--games", type=int, default=12)
     parser.add_argument("--plies", type=int, default=36)

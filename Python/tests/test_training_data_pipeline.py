@@ -1035,7 +1035,10 @@ def test_graph_replay_emits_collated_graph_targets_for_training():
     _tensors, _policies, _values, _lookahead, aux = next(iter(dataset))
 
     assert "token_features" in aux
-    assert "relation_bias" in aux
+    assert "relation_sparse_src" in aux
+    assert "relation_sparse_dst" in aux
+    assert "relation_bias" not in aux
+    assert "relation_type" not in aux
     assert "policy_target" in aux
     assert "_graph_batches" not in aux
     assert aux["policy_target"].sum(axis=1).tolist() == pytest.approx([1.0, 1.0])

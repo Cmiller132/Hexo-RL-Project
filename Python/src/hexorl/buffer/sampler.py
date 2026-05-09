@@ -37,7 +37,7 @@ from hexorl.action_contract.tactical_oracle import (
 from hexorl.graph.batch import (
     GraphBatch,
     build_graph_batch_from_history,
-    collate_graph_batches,
+    collate_graph_training_targets,
     graph_batch_with_policy_targets,
     graph_batch_with_reference_pair_rows,
 )
@@ -313,6 +313,7 @@ class ReplayDataset(_IterableDataset):
         include_graph_policy: bool = False,
         candidate_budget: int = 256,
         max_game_turns: int = 256,
+        graph_token_set: str = "graph256_cells",
         graph_context_tokens: int | None = None,
         graph_legal_rows: int | None = None,
         graph_cache_size: int = 256,
@@ -334,6 +335,7 @@ class ReplayDataset(_IterableDataset):
         self.regret_fraction = max(0.0, min(1.0, regret_fraction))
         self.regret_temperature = regret_temperature
         self.max_game_turns = max(1, int(max_game_turns))
+        self.graph_token_set = str(graph_token_set or "graph256_cells").lower()
         self.graph_context_tokens = (
             max(1, int(graph_context_tokens))
             if graph_context_tokens is not None and int(graph_context_tokens) > 0
@@ -345,7 +347,7 @@ class ReplayDataset(_IterableDataset):
             else None
         )
         self._graph_base_cache: OrderedDict[
-            tuple[bytes, int | None, int | None, tuple[tuple[int, int], ...]],
+            tuple[bytes, str, int | None, int | None, tuple[tuple[int, int], ...]],
             GraphBatch,
         ] = OrderedDict()
         self._graph_base_cache_max = max(0, int(graph_cache_size))
@@ -761,6 +763,7 @@ class ReplayDataset(_IterableDataset):
                 graph_base = self._graph_base_for_history(
                     sample_history,
                     required_legal_rows=required_graph_legal_rows,
+                    timings=loader_timings,
                 )
                 loader_timings["graph_loader_graph_base_s"] = (
                     loader_timings.get("graph_loader_graph_base_s", 0.0)
@@ -835,41 +838,19 @@ class ReplayDataset(_IterableDataset):
 
         if self.include_graph_policy:
             collate_started = time.perf_counter()
-            graph_batch = collate_graph_batches(graph_batches)
+            graph_targets = collate_graph_training_targets(graph_batches)
             loader_timings["graph_loader_collate_s"] = (
                 loader_timings.get("graph_loader_collate_s", 0.0)
                 + time.perf_counter()
                 - collate_started
             )
-            aux_targets.update({
-                "token_features": graph_batch.token_features,
-                "token_type": graph_batch.token_type,
-                "token_qr": graph_batch.token_qr,
-                "token_mask": graph_batch.token_mask,
-                "legal_token_indices": graph_batch.legal_token_indices,
-                "legal_qr": graph_batch.legal_qr,
-                "legal_mask": graph_batch.legal_mask,
-                "pair_token_indices": graph_batch.pair_token_indices,
-                "pair_first_indices": graph_batch.pair_first_indices,
-                "pair_second_indices": graph_batch.pair_second_indices,
-                "relation_type": graph_batch.relation_type,
-                "relation_bias": graph_batch.relation_bias,
-                "policy_target": graph_batch.policy_target,
-                "legal_token_quality_target": graph_batch.policy_target,
-                "opp_legal_qr": graph_batch.opp_legal_qr,
-                "opp_legal_mask": graph_batch.opp_legal_mask,
-                "opp_policy_target": graph_batch.opp_policy_target,
-                "pair_first_policy_target": graph_batch.pair_first_policy_target,
-                "pair_policy_target": graph_batch.pair_policy_target,
-                "pair_second_policy_target": graph_batch.pair_second_policy_target,
-                "tactical_target": graph_batch.tactical_target,
-                "placements_remaining": graph_batch.placements_remaining_by_sample,
-            })
+            aux_targets.update(graph_targets)
             first = aux_targets["pair_first_indices"]
             second = aux_targets["pair_second_indices"]
             pair_row_mask = (first >= 0) & (second >= 0) & (first != second)
-            known_first = graph_batch.placements_remaining_by_sample == 1
-            unordered_first = graph_batch.placements_remaining_by_sample >= 2
+            placements_remaining = np.asarray(aux_targets["placements_remaining"], dtype=np.int64)
+            known_first = placements_remaining == 1
+            unordered_first = placements_remaining >= 2
             aux_targets["pair_row_mask"] = pair_row_mask
             aux_targets["pair_first_unordered"] = unordered_first
             aux_targets["pair_second_known_first"] = known_first
@@ -887,13 +868,18 @@ class ReplayDataset(_IterableDataset):
         history: bytes,
         *,
         required_legal_rows: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
+        timings: dict[str, float] | None = None,
     ) -> GraphBatch:
         required_key = tuple(sorted({(int(q), int(r)) for q, r in required_legal_rows}))
-        key = (history, self.graph_context_tokens, self.graph_legal_rows, required_key)
+        key = (history, self.graph_token_set, self.graph_context_tokens, self.graph_legal_rows, required_key)
         cached = self._graph_base_cache.get(key)
         if cached is not None:
             self._graph_base_cache.move_to_end(key)
+            if timings is not None:
+                timings["graph_loader_graph_cache_hits"] = timings.get("graph_loader_graph_cache_hits", 0.0) + 1.0
             return cached
+        if timings is not None:
+            timings["graph_loader_graph_cache_misses"] = timings.get("graph_loader_graph_cache_misses", 0.0) + 1.0
         graph = build_graph_batch_from_history(
             history,
             radius=8,
@@ -901,6 +887,9 @@ class ReplayDataset(_IterableDataset):
             max_context_tokens=self.graph_context_tokens,
             max_legal_rows=self.graph_legal_rows,
             required_legal_rows=required_key,
+            graph_token_set=self.graph_token_set,
+            timings=timings,
+            timing_prefix="graph_loader_graph_",
         )
         if self._graph_base_cache_max > 0:
             self._graph_base_cache[key] = graph

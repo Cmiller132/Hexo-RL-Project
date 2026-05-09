@@ -158,6 +158,7 @@ class NoisyModelPlayer:
                 "candidate_budget",
                 default=256,
             ),
+            graph_token_set=str(getattr(self._unwrapped_model, "graph_token_set", "graph256_cells")),
         )
         graph = collate_graph_batches([graph])
         legal = np.asarray(graph.legal_qr[0], dtype=np.int32)

@@ -174,7 +174,7 @@ class GlobalHexGraphNet(nn.Module):
         block_count = max(1, int(layers))
         if architecture == "global_xattn_0":
             block_count = max(1, min(block_count, 2))
-        elif architecture == "global_graph768_champion":
+        elif architecture in {"global_graph768_champion", "global_graph768_devwin_0"}:
             block_count = max(block_count, 6)
         self.blocks = nn.ModuleList([GraphBlock(channels, heads, dropout=dropout) for _ in range(block_count)])
         self.legal_cross_attention = LegalContextCrossAttention(channels, heads, dropout=dropout)

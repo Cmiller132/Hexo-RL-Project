@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from hexorl.buffer.ring import RingBuffer, replay_feature_flags
+from hexorl.buffer.ring import ReplaySnapshot, RingBuffer, replay_feature_flags
 from hexorl.buffer.sampler import ReplayDataset
 from hexorl.buffer.targets import process_game_record
 from hexorl.config import Config
@@ -75,7 +75,7 @@ def _uses_pair_policy_targets(cfg: Config) -> bool:
 
 def _make_training_dataset(
     cfg: Config,
-    replay: RingBuffer,
+    replay: RingBuffer | ReplaySnapshot,
     *,
     resolved_outputs: set[str] | None = None,
     is_global_graph: bool | None = None,
@@ -104,8 +104,10 @@ def _make_training_dataset(
         include_pair_policy=_uses_pair_policy_targets(cfg),
         include_graph_policy=graph_model,
         candidate_budget=int(getattr(cfg.model, "candidate_budget", 256)),
+        graph_token_set=str(getattr(cfg.model, "graph_token_set", "graph256_cells")),
         graph_context_tokens=int(getattr(cfg.model, "graph_token_budget", 512)),
         graph_legal_rows=int(getattr(cfg.model, "candidate_budget", 256)),
+        graph_cache_size=int(getattr(cfg.runtime, "graph_cache_size", 256) or 256),
         max_game_turns=int(getattr(cfg.selfplay, "max_game_moves", 256)),
     )
 
@@ -129,10 +131,24 @@ def _make_training_dataloader(
         if worker_count is None
         else max(0, int(worker_count))
     )
+    snapshot_build_s = 0.0
+    snapshot_records = 0
+    dataset_replay: RingBuffer | ReplaySnapshot = replay
+    if graph_model and workers > 0 and isinstance(replay, RingBuffer):
+        snapshot_started = time.perf_counter()
+        dataset_replay = ReplaySnapshot.from_buffer(replay)
+        snapshot_build_s = time.perf_counter() - snapshot_started
+        snapshot_records = len(dataset_replay)
+    configured_pin_memory = getattr(cfg.runtime, "dataloader_pin_memory", None)
+    effective_pin_memory = (
+        torch.cuda.is_available()
+        if pin_memory is None and configured_pin_memory is None
+        else bool(configured_pin_memory if pin_memory is None else pin_memory)
+    )
     kwargs: dict[str, Any] = {
         "batch_size": None,
         "num_workers": workers,
-        "pin_memory": torch.cuda.is_available() if pin_memory is None else bool(pin_memory),
+        "pin_memory": effective_pin_memory,
         "persistent_workers": workers > 0,
     }
     if workers > 0:
@@ -144,16 +160,19 @@ def _make_training_dataloader(
             _training_dataloader_worker_init,
             torch_threads=max(1, int(getattr(cfg.runtime, "graph_worker_torch_threads", 1) or 1)),
         )
-    return DataLoader(
+    dataloader = DataLoader(
         _make_training_dataset(
             cfg,
-            replay,
+            dataset_replay,
             resolved_outputs=resolved_outputs,
             is_global_graph=graph_model,
             worker_count=workers,
         ),
         **kwargs,
     )
+    setattr(dataloader, "graph_snapshot_build_s", float(snapshot_build_s))
+    setattr(dataloader, "graph_snapshot_records", float(snapshot_records))
+    return dataloader
 
 
 @dataclass

@@ -60,6 +60,7 @@ class ModelConfig(BaseModel):
     pair_prior_mix: float = 0.35
     pair_strategy: str = "none"
     pair_strategy_max_pairs: int = 0
+    global_graph_leaf_eval: bool = False
 
     @model_validator(mode="after")
     def validate_model_config(self) -> "ModelConfig":
@@ -101,6 +102,7 @@ class ModelConfig(BaseModel):
             "graph512_turn",
             "graph512_turn_pair_prior",
             "graph768_champion",
+            "graph768_devwin",
         }
         self.graph_token_set = self.graph_token_set.lower()
         if self.graph_token_set not in valid_graph_sets:
@@ -541,7 +543,10 @@ class RuntimeConfig(BaseModel):
     dataloader_workers: int | None = None
     graph_dataloader_workers: int | None = None
     dataloader_prefetch_factor: int = 2
+    dataloader_pin_memory: bool | None = None
     graph_worker_torch_threads: int = 1
+    graph_relation_rebuild_threads: int = 0
+    graph_cache_size: int = 256
     selfplay_workers: int | None = None
     selfplay_cpu_reserve: int = 4
     channels_last: bool = True

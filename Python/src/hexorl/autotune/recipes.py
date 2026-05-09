@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hexorl.config import Config
 from hexorl.config.schema import AUTOTUNE_PAIR_STRATEGY_MODES
-from hexorl.models.registry import global_graph_architecture_ids, normalize_architecture_id
+from hexorl.models.registry import architecture_ids, architecture_spec, normalize_architecture_id
 
 
 RECIPE_SCHEMA_VERSION = 1
@@ -29,6 +29,7 @@ class ModelRecipe(BaseModel):
     graph_token_budget: int = 256
     graph_layers: int = 1
     candidate_budget: int = 256
+    global_graph_leaf_eval: bool = False
     head_bundle: str = "policy_value"
     output_contract: str = "global_legal:v1"
     output_heads: list[str] = Field(default_factory=lambda: ["policy_place", "value"])
@@ -36,8 +37,8 @@ class ModelRecipe(BaseModel):
     @model_validator(mode="after")
     def validate_model_recipe(self) -> "ModelRecipe":
         self.architecture_id = normalize_architecture_id(self.architecture_id)
-        if self.architecture_id not in set(global_graph_architecture_ids()):
-            raise ValueError("ModelRecipe.architecture_id must be a global graph architecture")
+        if self.architecture_id not in set(architecture_ids()):
+            raise ValueError("ModelRecipe.architecture_id must be a registered architecture")
         if self.channels <= 0:
             raise ValueError("ModelRecipe.channels must be positive")
         if self.blocks <= 0:
@@ -150,6 +151,7 @@ class CandidateRecipe(BaseModel):
 
         data = base_config.model_copy(deep=True).model_dump(mode="json")
         model = data.setdefault("model", {})
+        spec = architecture_spec(self.model.architecture_id)
         pair_enabled = self.pair_strategy.mode != "none"
         model.update(
             {
@@ -161,6 +163,7 @@ class CandidateRecipe(BaseModel):
                 "graph_token_budget": self.model.graph_token_budget,
                 "graph_layers": self.model.graph_layers,
                 "candidate_budget": self.model.candidate_budget,
+                "global_graph_leaf_eval": bool(self.model.global_graph_leaf_eval and spec.global_graph),
                 "sparse_policy": False,
                 "sparse_prior_stage": 0,
                 "sparse_prior_mix": 0.0,
@@ -271,14 +274,19 @@ def candidate_recipes_from_plan_entries(
 
 def _model_recipe_for_architecture(architecture_id: str, pair_mode: str) -> ModelRecipe:
     architecture_id = normalize_architecture_id(architecture_id)
-    output_heads = ["policy_place", "value"]
+    spec = architecture_spec(architecture_id)
+    output_heads = ["policy_place", "value"] if spec.global_graph else ["policy", "value"]
     head_bundle = "policy_value"
     if pair_mode != "none":
+        if not spec.global_graph:
+            raise ValueError("pair strategy modes are only supported for global graph scout candidates")
         output_heads.extend(_PAIR_HEADS)
         head_bundle = "pair_mcts"
     kwargs: dict[str, Any] = {}
     if architecture_id == "global_graph768_champion":
         kwargs.update({"graph_token_set": "graph768_champion", "graph_token_budget": 768, "graph_layers": 6})
+    elif architecture_id == "global_graph768_devwin_0":
+        kwargs.update({"graph_token_set": "graph768_devwin", "graph_token_budget": 768, "graph_layers": 6})
     return ModelRecipe(
         architecture_id=architecture_id,
         head_bundle=head_bundle,
@@ -294,13 +302,13 @@ def _pair_strategy_for_mode(pair_mode: str) -> PairStrategySpec:
 
 
 def _runtime_spec_for_architecture(architecture_id: str) -> RuntimeSpec:
-    if normalize_architecture_id(architecture_id) == "global_graph768_champion":
+    if normalize_architecture_id(architecture_id) in {"global_graph768_champion", "global_graph768_devwin_0"}:
         return RuntimeSpec(
-            inference_fp16=False,
-            graph_microbatch_size=1,
+            inference_fp16=True,
+            graph_microbatch_size=0,
             graph_microbatch_autotune_max_size=4,
             graph_microbatch_memory_headroom=0.60,
-            memory_safety_envelope="graph768_conservative_fp32_microbatch1",
+            memory_safety_envelope="graph768_fp16_autotune4",
         )
     return RuntimeSpec()
 

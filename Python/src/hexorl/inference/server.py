@@ -299,6 +299,15 @@ class InferenceServer:
                 ready_workers = graph_request
 
             build_t0 = time.monotonic()
+            if self._global_graph_mode and not self._is_graph_request(ready_workers):
+                modes = [
+                    int(getattr(self._queue.get_slot(worker_id), "req_mode", np.array([0], dtype=np.uint8))[0])
+                    for worker_id in ready_workers
+                ]
+                raise RuntimeError(
+                    "global graph inference server received dense IPC requests; "
+                    f"workers={ready_workers}, req_modes={modes}"
+                )
             if self._is_graph_request(ready_workers):
                 graph_inputs, graph_row_sources, total_count = self._build_graph_inputs(ready_workers)
                 batch_tensor = None

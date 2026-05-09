@@ -46,8 +46,9 @@ def test_linux_cuda_global_graph_defaults_to_7950x_safe_worker_count():
     assert dataloader_worker_count(_graph_cfg(), _host(physical=5, logical=10)) == 2
 
 
-def test_windows_keeps_dataloader_workers_disabled_by_default():
-    assert dataloader_worker_count(_graph_cfg(), _host(system="windows")) == 0
+def test_windows_cuda_global_graph_defaults_to_snapshot_worker_count():
+    assert dataloader_worker_count(_graph_cfg(), _host(system="windows")) == 4
+    assert dataloader_worker_count(_graph_cfg(), _host(system="windows", physical=4, logical=8)) == 2
 
 
 def test_explicit_dataloader_worker_overrides_win():
@@ -62,6 +63,7 @@ def test_explicit_dataloader_worker_overrides_win():
 def test_non_graph_models_keep_default_workers_disabled_on_linux_cuda():
     cfg = Config.model_validate({"model": {"architecture": "cnn"}, "inference": {"fp16": False}})
     assert dataloader_worker_count(cfg, _host(), global_graph_model=False) == 0
+    assert dataloader_worker_count(cfg, _host(system="windows"), global_graph_model=False) == 0
 
 
 def test_graph_worker_thread_config_is_validated():
@@ -284,3 +286,33 @@ def test_run_epoch_retries_single_process_on_dataloader_worker_failure(monkeypat
     assert result.train_stats["epoch"] == 1.0
     assert 2 in shutdown_events
     assert 0 in shutdown_events
+
+
+def test_graph_training_dataloader_snapshots_ring_for_process_workers(monkeypatch):
+    from hexorl.buffer.ring import ReplaySnapshot, RingBuffer
+    from hexorl.epoch.pipeline import _make_bootstrap_game_records, _make_training_dataloader
+
+    cfg = _graph_cfg(graph_dataloader_workers=2)
+    cfg.train.batch_size = 1
+    cfg.selfplay.max_game_moves = 8
+    replay = RingBuffer(capacity=8, max_policy_entries=4, max_policy_v2_entries=4)
+    replay.extend(_make_bootstrap_game_records(cfg, 1)[0].positions[:2])
+    seen = {}
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            self.dataset = dataset
+            self.num_workers = int(kwargs.get("num_workers", 0))
+            self.prefetch_factor = int(kwargs.get("prefetch_factor", 0) or 0)
+            seen["buffer_type"] = type(dataset.buffer)
+            seen["snapshot_len"] = len(dataset.buffer)
+
+    monkeypatch.setattr(epoch_pipeline, "DataLoader", FakeDataLoader)
+
+    loader = _make_training_dataloader(cfg, replay, is_global_graph=True, worker_count=2)
+
+    assert loader.num_workers == 2
+    assert seen["buffer_type"] is ReplaySnapshot
+    assert seen["snapshot_len"] == len(replay)
+    assert loader.graph_snapshot_records == float(len(replay))
+    assert loader.graph_snapshot_build_s >= 0.0

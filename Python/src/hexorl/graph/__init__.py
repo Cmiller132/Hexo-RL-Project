@@ -2,6 +2,7 @@
 
 from .batch import (
     GRAPH_SCHEMA_VERSION,
+    GRAPH_FEATURE_DEVELOPMENT_SCORE,
     GraphBatch,
     GraphTokenType,
     RelationType,
@@ -16,6 +17,7 @@ from .batch import (
 
 __all__ = [
     "GRAPH_SCHEMA_VERSION",
+    "GRAPH_FEATURE_DEVELOPMENT_SCORE",
     "GraphBatch",
     "GraphTokenType",
     "RelationType",

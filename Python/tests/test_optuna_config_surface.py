@@ -1,5 +1,6 @@
 import hashlib
 import json
+from argparse import Namespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from hexorl.autotune import (
     write_candidate_artifacts,
 )
 from hexorl.config import Config
+from scripts.run_phase1_optuna_scout import _base_config_from_args, _candidates_from_args
 
 
 def test_autotune_config_defaults_match_scout_plan():
@@ -99,8 +101,8 @@ def test_initial_scout_recipes_have_deterministic_candidate_ids():
     champion = next(recipe for recipe in recipes if recipe.model.architecture_id == "global_graph768_champion")
     assert champion.model.graph_token_budget == 768
     assert champion.pair_strategy.mode == "none"
-    assert champion.runtime.inference_fp16 is False
-    assert champion.runtime.graph_microbatch_size == 1
+    assert champion.runtime.inference_fp16 is True
+    assert champion.runtime.graph_microbatch_size == 0
     assert champion.runtime.graph_microbatch_autotune_max_size == 4
     assert champion.runtime.graph_microbatch_memory_headroom == pytest.approx(0.60)
 
@@ -129,6 +131,62 @@ def test_explicit_scout_plan_builds_ordered_subset_without_mutating_config():
     assert cfg.model.architecture == "global_pair_twostage_0"
     assert cfg.model.pair_strategy == "root_pair_mcts"
     assert cfg.selfplay.mcts_simulations == 512
+
+
+def test_phase1_runner_candidate_budget_override_materializes_candidates():
+    args = Namespace(
+        max_game_moves=None,
+        phase1_mcts_simulations=None,
+        phase1_states_per_epoch=None,
+        phase1_train_batches_per_epoch=None,
+        phase1_candidate_budget=512,
+        phase1_global_graph_leaf_eval=False,
+        phase1_graph_dataloader_workers=2,
+        phase1_dataloader_prefetch_factor=3,
+        phase1_graph_cache_size=384,
+        phase1_graph_relation_rebuild_threads=None,
+        phase1_disable_dataloader_pin_memory=False,
+        phase1_inference_start_timeout_s=None,
+        candidate_plan=["global_xattn_0:none", "global_graph768_devwin_0:none"],
+    )
+    base = _base_config_from_args(args)
+    candidates = _candidates_from_args(base, args)
+
+    assert base.model.candidate_budget == 512
+    assert base.runtime.graph_dataloader_workers == 2
+    assert base.runtime.dataloader_prefetch_factor == 3
+    assert base.runtime.graph_cache_size == 384
+    assert [candidate.model.candidate_budget for candidate in candidates] == [512, 512]
+    materialized = [candidate.materialize_config(base) for candidate in candidates]
+    assert [cfg.model.candidate_budget for cfg in materialized] == [512, 512]
+    assert [cfg.runtime.graph_dataloader_workers for cfg in materialized] == [2, 2]
+
+
+def test_phase1_runner_can_enable_leaf_eval_for_xattn_and_include_restnet():
+    args = Namespace(
+        max_game_moves=None,
+        phase1_mcts_simulations=None,
+        phase1_states_per_epoch=None,
+        phase1_train_batches_per_epoch=None,
+        phase1_candidate_budget=256,
+        phase1_global_graph_leaf_eval=True,
+        phase1_graph_dataloader_workers=None,
+        phase1_dataloader_prefetch_factor=None,
+        phase1_graph_cache_size=None,
+        phase1_graph_relation_rebuild_threads=None,
+        phase1_disable_dataloader_pin_memory=False,
+        phase1_inference_start_timeout_s=None,
+        candidate_plan=["global_xattn_0:none", "restnet:none"],
+    )
+    base = _base_config_from_args(args)
+    candidates = _candidates_from_args(base, args)
+    materialized = [candidate.materialize_config(base) for candidate in candidates]
+
+    assert [cfg.model.architecture for cfg in materialized] == ["global_xattn_0", "restnet"]
+    assert materialized[0].model.heads == ["policy_place", "value"]
+    assert materialized[0].model.global_graph_leaf_eval is True
+    assert materialized[1].model.heads == ["policy", "value"]
+    assert materialized[1].model.global_graph_leaf_eval is False
 
 
 @pytest.mark.parametrize(
@@ -173,7 +231,7 @@ def test_candidate_recipe_materializes_valid_config_without_mutating_base():
     assert Config.model_validate(cfg.model_dump(mode="json")).model.architecture == "global_xattn_0"
 
 
-def test_graph768_champion_materializes_conservative_training_runtime():
+def test_graph768_champion_materializes_autotuned_training_runtime():
     recipe = next(
         recipe
         for recipe in candidate_recipes_from_config(Config())
@@ -185,10 +243,24 @@ def test_graph768_champion_materializes_conservative_training_runtime():
     assert cfg.model.architecture == "global_graph768_champion"
     assert cfg.model.graph_token_budget == 768
     assert cfg.model.graph_layers == 6
-    assert cfg.inference.fp16 is False
-    assert cfg.train.graph_microbatch_size == 1
+    assert cfg.inference.fp16 is True
+    assert cfg.train.graph_microbatch_size == 0
     assert cfg.train.graph_microbatch_autotune_max_size == 4
     assert cfg.train.graph_microbatch_memory_headroom == pytest.approx(0.60)
+
+
+def test_graph768_devwin_materializes_development_window_token_set():
+    recipe = candidate_recipes_from_plan_entries(["global_graph768_devwin_0:none"])[0]
+
+    cfg = recipe.materialize_config(Config())
+
+    assert recipe.candidate_id == "global_graph768_devwin_0__none__v1"
+    assert cfg.model.architecture == "global_graph768_devwin_0"
+    assert cfg.model.graph_token_set == "graph768_devwin"
+    assert cfg.model.graph_token_budget == 768
+    assert cfg.model.graph_layers == 6
+    assert cfg.inference.fp16 is True
+    assert cfg.train.graph_microbatch_size == 0
 
 
 @pytest.mark.parametrize("mode", ["root_pair_mcts", "full_pair_mcts"])

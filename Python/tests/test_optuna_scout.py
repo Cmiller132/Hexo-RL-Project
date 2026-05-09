@@ -215,6 +215,45 @@ def test_resume_continues_existing_stable_candidate_trials(tmp_path):
     assert final_summary.completed is True
 
 
+def test_resume_allows_appending_candidate_plan_suffix(tmp_path):
+    initial = (
+        _candidate("global_xattn_0"),
+        _candidate("global_line_window_0"),
+    )
+    first = Phase1OptunaScoutController(
+        runs_root=tmp_path / "runs",
+        run_id="append",
+        candidates=initial,
+        runner=RecordingRunner(),
+        min_epochs=1,
+        quantum_epochs=1,
+    )
+    first_study = first.create_or_resume_study()
+    assert len(first_study.get_trials(deepcopy=False)) == 2
+
+    expanded = initial + (_candidate("global_graph768_devwin_0"),)
+    runner = RecordingRunner()
+    controller = Phase1OptunaScoutController(
+        runs_root=tmp_path / "runs",
+        run_id="append",
+        candidates=expanded,
+        runner=runner,
+        min_epochs=1,
+        quantum_epochs=1,
+    )
+
+    study = controller.create_or_resume_study()
+    assert study.user_attrs["candidate_plan"] == [candidate.candidate_id for candidate in expanded]
+    assert {trial.user_attrs["candidate_id"] for trial in study.get_trials(deepcopy=False)} == {
+        candidate.candidate_id for candidate in expanded
+    }
+
+    summary = controller.run()
+
+    assert summary.completed is True
+    assert runner.epochs == [(candidate.candidate_id, 1) for candidate in expanded]
+
+
 def test_hard_failure_quarantines_candidate_and_scout_continues(tmp_path):
     candidates = (
         _candidate("global_xattn_0"),
@@ -344,6 +383,10 @@ def test_epoch_scout_runner_advances_real_epoch_api_with_candidate_artifacts(tmp
                 "pair_policy_weight_mean": 0.25 * epoch,
                 "batches_per_sec": 2.0 * epoch,
                 "graph_peak_cuda_allocated_mb": 100.0 * epoch,
+                "dataloader_wait_s": 1.5 * epoch,
+                "graph_loader_workers": 2.0,
+                "graph_loader_graph_base_s": 4.0 * epoch,
+                "graph_snapshot_records": 100.0 * epoch,
                 "graph_microbatch_oom_retries": 0.0,
                 "graph_microbatch_nonfinite_retries": 0.0,
             },
@@ -389,6 +432,10 @@ def test_epoch_scout_runner_advances_real_epoch_api_with_candidate_artifacts(tmp
     assert result.scorecards[-1]["component_metrics"]["pair_policy_weight_mean"] == pytest.approx(0.5)
     assert result.scorecards[-1]["component_metrics"]["batches_per_sec"] == pytest.approx(4.0)
     assert result.scorecards[-1]["component_metrics"]["graph_peak_cuda_allocated_mb"] == pytest.approx(200.0)
+    assert result.scorecards[-1]["component_metrics"]["dataloader_wait_s"] == pytest.approx(3.0)
+    assert result.scorecards[-1]["component_metrics"]["graph_loader_workers"] == pytest.approx(2.0)
+    assert result.scorecards[-1]["component_metrics"]["graph_loader_graph_base_s"] == pytest.approx(8.0)
+    assert result.scorecards[-1]["component_metrics"]["graph_snapshot_records"] == pytest.approx(200.0)
     assert result.scorecards[-1]["component_metrics"]["avg_candidate_recall_mcts_top1"] == pytest.approx(1.0)
     assert result.scorecards[-1]["component_metrics"]["pair_prior_hit_frac"] == pytest.approx(0.0)
     assert result.scorecards[-1]["component_metrics"]["pair_fallback_prior_use"] == pytest.approx(0.0)

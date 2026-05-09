@@ -315,6 +315,9 @@ class EpochScoutEpochRunner:
                     scorecards[-1]["component_metrics"],
                 )
             )
+            scorecards[-1]["component_metrics"].update(
+                _train_runtime_component_metrics(result.train_stats)
+            )
             events.append(
                 {
                     "event": "epoch_runner_completed",
@@ -431,7 +434,30 @@ class Phase1OptunaScoutController:
         existing_hash = study.user_attrs.get("candidate_plan_hash")
         if existing_hash is not None:
             if existing_hash != plan_hash:
-                raise RuntimeError("resumed Optuna study has a different Phase 1 candidate plan")
+                existing_plan = tuple(str(item) for item in study.user_attrs.get("candidate_plan", ()))
+                current_plan = tuple(self._candidate_ids)
+                if not existing_plan or current_plan[: len(existing_plan)] != existing_plan:
+                    raise RuntimeError("resumed Optuna study has a different Phase 1 candidate plan")
+                existing_trials = self._candidate_trials(study)
+                for index, candidate in enumerate(self.candidates):
+                    if candidate.candidate_id in existing_trials:
+                        continue
+                    cfg = self._configs[candidate.candidate_id]
+                    paths = self.writer.paths_for(candidate.candidate_id)
+                    study.enqueue_trial(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "candidate_index": index,
+                            "architecture_id": candidate.model.architecture_id,
+                            "pair_strategy": candidate.pair_strategy.mode,
+                        },
+                        user_attrs=self._initial_user_attrs(candidate, cfg, paths),
+                        skip_if_exists=True,
+                    )
+                study.set_user_attr("candidate_plan_hash", plan_hash)
+                study.set_user_attr("candidate_plan", list(self._candidate_ids))
+                self._validate_one_trial_per_candidate(study)
+                return
             self._validate_one_trial_per_candidate(study)
             return
 
@@ -750,16 +776,7 @@ class Phase1OptunaScoutController:
         trial = self._candidate_trials(study)[candidate.candidate_id]
         if trial.state == TrialState.WAITING:
             active = study.ask()
-            fixed_candidate = active.suggest_categorical("candidate_id", self._candidate_ids)
-            active.suggest_int("candidate_index", 0, len(self._candidate_ids) - 1)
-            active.suggest_categorical(
-                "architecture_id",
-                sorted({recipe.model.architecture_id for recipe in self.candidates}),
-            )
-            active.suggest_categorical(
-                "pair_strategy",
-                sorted({recipe.pair_strategy.mode for recipe in self.candidates}),
-            )
+            fixed_candidate = str(active.user_attrs.get("candidate_id", ""))
             if fixed_candidate != candidate.candidate_id:
                 raise RuntimeError(
                     "Optuna queued trial order no longer matches the Phase 1 round-robin candidate plan"
@@ -981,6 +998,42 @@ def _train_stat_float(train_stats: dict[str, Any] | None, *keys: str) -> float:
         if math.isfinite(result):
             return result
     return 0.0
+
+
+def _train_runtime_component_metrics(train_stats: dict[str, Any] | None) -> dict[str, float]:
+    """Expose runtime bottleneck fields in Phase 1 scorecards and dashboards."""
+    if not train_stats:
+        return {}
+    prefixes = (
+        "dataloader_",
+        "graph_loader_",
+        "graph_snapshot_",
+        "graph_prepare_",
+        "graph_phase_",
+        "graph_row_",
+        "graph_to_device_",
+        "graph_forward_",
+        "graph_loss_",
+        "graph_backward_",
+        "graph_optimizer_",
+        "graph_microbatch_",
+        "graph_bottleneck_",
+    )
+    exact = {
+        "elapsed_s",
+        "batches",
+        "batches_per_sec",
+        "graph_peak_cuda_allocated_mb",
+        "graph_peak_cuda_reserved_mb",
+    }
+    metrics: dict[str, float] = {}
+    for key, value in train_stats.items():
+        if key in exact or any(str(key).startswith(prefix) for prefix in prefixes):
+            try:
+                metrics[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return metrics
 
 
 def _value_effective_samples(cfg: Config, train_stats: dict[str, Any] | None) -> float:

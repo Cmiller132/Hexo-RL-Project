@@ -31,7 +31,7 @@ from hexorl.action_contract.tactical_oracle import (
 )
 from hexorl.inference.client import InferenceClient
 from hexorl.graph.batch import GraphBatch, GraphIPCCapacityError, build_graph_batch_from_history
-from hexorl.models.registry import is_global_graph_architecture, resolve_model_spec
+from hexorl.models.registry import resolve_model_spec
 from hexorl.search.engine_adapter import EngineAdapter
 from hexorl.search.pair_strategy import (
     PAIR_STRATEGY_FULL_PAIR_MCTS,
@@ -1036,9 +1036,7 @@ class SelfPlayWorker:
         self.sparse_prior_mix = float(getattr(cfg.model, "sparse_prior_mix", 0.25))
         self.sparse_policy_enabled = bool(getattr(cfg.model, "sparse_policy", False))
         resolved_model = resolve_model_spec(cfg)
-        self.global_graph_enabled = is_global_graph_architecture(
-            getattr(cfg.model, "architecture", "")
-        )
+        self.global_graph_enabled = bool(resolved_model.global_graph)
         self.opp_policy_enabled = "opp_policy" in set(resolved_model.outputs)
         self.global_graph_leaf_eval = bool(getattr(cfg.model, "global_graph_leaf_eval", False))
         if self.global_graph_enabled:
@@ -1061,6 +1059,8 @@ class SelfPlayWorker:
             int(getattr(cfg.model, "candidate_budget", 256)),
             int(sp.policy_target_top_k),
         )
+        self.graph_token_set = str(getattr(cfg.model, "graph_token_set", "graph256_cells")).lower()
+        self.graph_context_tokens = max(1, int(getattr(cfg.model, "graph_token_budget", self.candidate_budget)))
         self.mcts_child_limit = self.candidate_budget if self.global_graph_enabled else None
         self.rgsc = RGSCRestartService(
             beta=float(getattr(sp, "rgsc_beta", 0.0)),
@@ -1307,7 +1307,8 @@ class SelfPlayWorker:
                             include_pair_rows=False,
                             include_opp_policy_rows=self.opp_policy_enabled,
                             max_legal_rows=self.candidate_budget,
-                            max_context_tokens=self.candidate_budget,
+                            max_context_tokens=self.graph_context_tokens,
+                            graph_token_set=self.graph_token_set,
                         )
                         graph_out = client.submit_graph(graph_batch)
                         raw_graph_legal = np.asarray(graph_out["metadata"]["legal_qr"], dtype=np.int32)
@@ -1727,7 +1728,8 @@ class SelfPlayWorker:
                                     include_pair_rows=False,
                                     include_opp_policy_rows=self.opp_policy_enabled,
                                     max_legal_rows=self.candidate_budget,
-                                    max_context_tokens=self.candidate_budget,
+                                    max_context_tokens=self.graph_context_tokens,
+                                    graph_token_set=self.graph_token_set,
                                 )
                                 graph_batches.append(graph_batch)
                                 leaf_histories.append(bytes(leaf_history_bytes))
@@ -2015,7 +2017,8 @@ class SelfPlayWorker:
                                 include_pair_rows=False,
                                 include_opp_policy_rows=self.opp_policy_enabled,
                                 max_legal_rows=self.candidate_budget,
-                                max_context_tokens=self.candidate_budget,
+                                max_context_tokens=self.graph_context_tokens,
+                                graph_token_set=self.graph_token_set,
                             )
                             out = client.submit_graph(graph)
                             regret_rank = float(np.asarray(out.get("regret_rank", [0.0]), dtype=np.float32)[0])

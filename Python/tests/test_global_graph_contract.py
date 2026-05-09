@@ -24,6 +24,7 @@ from hexorl.graph import (
 )
 from hexorl.graph.batch import (
     GRAPH_FEATURE_DIM,
+    GRAPH_FEATURE_DEVELOPMENT_SCORE,
     GRAPH_FEATURE_LEGAL_WINDOW_COUNT,
     GRAPH_FEATURE_NEAREST_OPPONENT,
     GRAPH_FEATURE_NEAREST_OWN,
@@ -32,6 +33,7 @@ from hexorl.graph.batch import (
     GRAPH_FEATURE_WINDOW_OWNER_RELATIVE,
     GRAPH_FEATURE_WINDOW_STONE_COUNT,
     GraphIPCCapacityError,
+    collate_graph_training_targets,
     dense_relations_from_sparse_edges,
     graph_capacity_report,
     sparse_relation_edges_from_batch,
@@ -385,6 +387,40 @@ def test_global_graph_features_expose_minimal_token_family_fields():
     assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_STONE_COUNT] > 0.0)
     assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_EMPTY_COUNT] > 0.0)
     assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_WINDOW_AXIS] > 0.0)
+
+
+def test_graph768_devwin_exposes_development_window_features_and_relations():
+    history = _hist((0, 0, 0), (1, 1, 0), (1, 0, 1), (0, -1, 0), (0, -2, 0))
+
+    graph = build_graph_batch_from_history(
+        history,
+        max_context_tokens=96,
+        graph_token_set="graph768_devwin",
+    )
+
+    legal_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.LEGAL))
+    window_rows = np.flatnonzero(graph.token_type == int(GraphTokenType.WINDOW6))
+    relation_ids = set(int(x) for x in graph.relation_type.reshape(-1).tolist())
+
+    assert legal_rows.size > 0
+    assert window_rows.size > 0
+    assert np.any(graph.token_features[legal_rows, GRAPH_FEATURE_DEVELOPMENT_SCORE] > 0.0)
+    assert np.any(graph.token_features[window_rows, GRAPH_FEATURE_DEVELOPMENT_SCORE] > 0.0)
+    assert any(
+        int(relation) in relation_ids
+        for relation in (
+            RelationType.WINDOW6_SLOT_0,
+            RelationType.WINDOW6_SLOT_1,
+            RelationType.WINDOW6_SLOT_2,
+            RelationType.WINDOW6_SLOT_3,
+            RelationType.WINDOW6_SLOT_4,
+            RelationType.WINDOW6_SLOT_5,
+        )
+    )
+    assert {
+        int(RelationType.WINDOW6_SHARED_LEGAL),
+        int(RelationType.WINDOW6_SHARED_MULTI_LEGAL),
+    } & relation_ids
 
 
 def test_global_graph_capacity_report_fails_without_dropping_rows():
@@ -902,8 +938,11 @@ def test_graph_dataset_collation_matches_worker_loader_collation():
         "legal_mask",
         "pair_first_indices",
         "pair_second_indices",
-        "relation_type",
-        "relation_bias",
+        "relation_sparse_row",
+        "relation_sparse_src",
+        "relation_sparse_dst",
+        "relation_sparse_type",
+        "relation_sparse_bias",
         "policy_target",
         "opp_legal_qr",
         "opp_legal_mask",
@@ -914,8 +953,62 @@ def test_graph_dataset_collation_matches_worker_loader_collation():
         "placements_remaining",
     ):
         assert np.array_equal(np.asarray(collated_aux[key]), np.asarray(expected_aux[key]))
+    assert "relation_type" not in collated_aux
+    assert "relation_bias" not in collated_aux
     assert "_loader_timings" in collated_aux
     assert collated_aux["_loader_timings"]["graph_loader_collate_s"] >= 0.0
+
+
+def test_global_graph_training_accepts_sparse_relation_targets():
+    graphs = [
+        _build_graph_batch_from_history(
+            b"",
+            policy_target=[(0, 0, 1.0)],
+            include_pair_rows=False,
+        )
+        for _ in range(3)
+    ]
+    cfg = Config.model_validate(
+        {
+            "model": {
+                "architecture": "global_xattn_0",
+                "channels": 16,
+                "attention_heads": 4,
+                "graph_layers": 1,
+                "heads": ["policy_place", "value"],
+            },
+            "train": {
+                "batches_per_epoch": 1,
+                "graph_microbatch_size": 2,
+                "loss_weights": {
+                    "policy": 1.0,
+                    "policy_place": 1.0,
+                    "value": 1.0,
+                },
+            },
+            "runtime": {"graph_relation_rebuild_threads": 2},
+            "inference": {"fp16": False},
+        }
+    )
+    model = build_model_from_config(cfg, device=torch.device("cpu"))
+    aux = collate_graph_training_targets(graphs)
+    aux["policy_weight"] = torch.ones(3)
+    batch = (
+        torch.zeros(3, 13, 33, 33),
+        torch.zeros(3, 1089),
+        torch.zeros(3),
+        [torch.zeros(3), torch.zeros(3), torch.zeros(3)],
+        aux,
+    )
+    trainer = Trainer(model, cfg, dataloader=[], device=torch.device("cpu"))
+
+    losses = trainer._train_step(batch, 0)
+
+    assert np.isfinite(losses["total"])
+    assert losses["graph_microbatch_size"] == 2.0
+    assert losses["graph_relation_rebuild_s"] >= 0.0
+    assert losses["graph_relation_sparse_edges"] >= 0.0
+    assert losses["graph_relation_rebuild_workers"] == 2.0
 
 
 def test_graph_microbatch_autotune_rejects_memory_heavy_candidates(monkeypatch):

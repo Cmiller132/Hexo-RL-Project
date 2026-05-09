@@ -1,4 +1,4 @@
-"""Hexo-RL: AlphaZero/KataGo-style training pipeline for the game Hexo."""
+"""Local Python startup guards for Hexo development commands."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import platform
 
 
 def _seed_windows_platform_cache() -> None:
-    """Avoid WMI stalls during early torch imports on overloaded Windows hosts."""
     if os.name != "nt" or getattr(platform, "_uname_cache", None) is not None:
         return
     uname_result = getattr(platform, "uname_result", None)
@@ -26,5 +25,3 @@ def _seed_windows_platform_cache() -> None:
 
 
 _seed_windows_platform_cache()
-
-__version__ = "0.2.0"

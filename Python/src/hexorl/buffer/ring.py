@@ -9,7 +9,7 @@ of wide dense target tables.
 from __future__ import annotations
 
 import threading
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -894,3 +894,118 @@ class RingBuffer:
             [(self._tail + i) % self.capacity for i in range(self._size)],
             dtype=np.int64,
         )
+
+
+class ReplaySnapshot:
+    """Picklable replay view for process-backed DataLoader workers.
+
+    ``RingBuffer`` intentionally owns a lock and preallocated capacity-sized
+    arrays, which makes it the right mutable runtime store but a poor object to
+    send through Windows multiprocessing. A snapshot keeps only active
+    ``PositionRecord`` rows for one training epoch, preserving sampling
+    semantics without serializing the whole ring capacity.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[PositionRecord],
+        *,
+        capacity: int | None = None,
+        max_game_id: int | None = None,
+        stats: dict | None = None,
+    ) -> None:
+        self._records = tuple(records)
+        self.capacity = int(capacity if capacity is not None else len(self._records))
+        self._max_game_id = (
+            int(max_game_id)
+            if max_game_id is not None
+            else max((int(getattr(record, "game_id", 0) or 0) for record in self._records), default=0)
+        )
+        self._stats = dict(stats or {})
+        self._game_ids = np.asarray(
+            [max(0, int(getattr(record, "game_id", 0) or 0)) for record in self._records],
+            dtype=np.int64,
+        )
+        self._is_full = np.asarray(
+            [bool(getattr(record, "is_full_search", True)) for record in self._records],
+            dtype=np.bool_,
+        )
+        self._regret_rank = np.asarray(
+            [float(getattr(record, "regret_rank", 0.0) or 0.0) for record in self._records],
+            dtype=np.float64,
+        )
+        self._regret_weights = np.asarray(
+            [float(getattr(record, "regret_weight", 0.0) or 0.0) for record in self._records],
+            dtype=np.float64,
+        )
+
+    @classmethod
+    def from_buffer(cls, buffer: RingBuffer) -> "ReplaySnapshot":
+        return cls(
+            buffer.records(),
+            capacity=buffer.capacity,
+            max_game_id=buffer.max_game_id,
+            stats=buffer.stats,
+        )
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    @property
+    def max_game_id(self) -> int:
+        return self._max_game_id
+
+    @property
+    def stats(self) -> dict:
+        stats = dict(self._stats)
+        stats.setdefault("size", len(self._records))
+        stats.setdefault("capacity", self.capacity)
+        stats.setdefault("max_game_id", self._max_game_id)
+        return stats
+
+    def records(self) -> List[PositionRecord]:
+        return list(self._records)
+
+    def sample_indices(
+        self,
+        n: int,
+        recency_decay: Optional[float] = None,
+        pcr_weight: float = 0.25,
+    ) -> np.ndarray:
+        if n <= 0 or not self._records:
+            return np.array([], dtype=np.int64)
+        decay = float(recency_decay if recency_decay is not None else 0.99)
+        indices = np.arange(len(self._records), dtype=np.int64)
+        game_age = np.maximum(self._max_game_id - self._game_ids, 0)
+        recency_w = np.power(decay, game_age, dtype=np.float64)
+        quality_w = np.where(self._is_full, 4.0, float(pcr_weight))
+        weights = recency_w * quality_w
+        total = float(weights.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            return np.array([], dtype=np.int64)
+        logical = np.random.choice(len(indices), size=int(n), p=weights / total, replace=True)
+        return indices[logical].astype(np.int64)
+
+    def sample_regret_indices(self, n: int, temperature: float = 0.1) -> np.ndarray:
+        if n <= 0 or not self._records:
+            return np.array([], dtype=np.int64)
+        weights = np.zeros(len(self._records), dtype=np.float64)
+        active = self._regret_weights > 0.0
+        weights[active] = np.maximum(self._regret_rank[active], 1e-8)
+        inv_temp = 1.0 / max(float(temperature), 1e-6)
+        weights = weights ** inv_temp
+        total = float(weights.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            return self.sample_indices(n)
+        indices = np.arange(len(self._records), dtype=np.int64)
+        logical = np.random.choice(len(indices), size=int(n), p=weights / total, replace=True)
+        return indices[logical].astype(np.int64)
+
+    def get_batch(self, indices: np.ndarray) -> List[PositionRecord]:
+        records: list[PositionRecord] = []
+        size = len(self._records)
+        for idx in indices:
+            row = int(idx)
+            if 0 <= row < size:
+                records.append(self._records[row])
+        return records

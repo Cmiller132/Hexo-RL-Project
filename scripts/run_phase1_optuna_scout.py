@@ -51,6 +51,52 @@ def main() -> int:
         default=None,
         help="Override train.batches_per_epoch for Phase 1 scout epochs.",
     )
+    parser.add_argument(
+        "--phase1-candidate-budget",
+        type=int,
+        default=None,
+        help="Override model.candidate_budget for Phase 1 legal/action rows.",
+    )
+    parser.add_argument(
+        "--phase1-global-graph-leaf-eval",
+        action="store_true",
+        help="Enable global graph model evaluation at MCTS leaves instead of root-only neutral rollouts.",
+    )
+    parser.add_argument(
+        "--phase1-graph-dataloader-workers",
+        type=int,
+        default=None,
+        help="Override runtime.graph_dataloader_workers for graph training.",
+    )
+    parser.add_argument(
+        "--phase1-dataloader-prefetch-factor",
+        type=int,
+        default=None,
+        help="Override runtime.dataloader_prefetch_factor for training DataLoaders.",
+    )
+    parser.add_argument(
+        "--phase1-graph-cache-size",
+        type=int,
+        default=None,
+        help="Override runtime.graph_cache_size for per-worker graph-base caches.",
+    )
+    parser.add_argument(
+        "--phase1-graph-relation-rebuild-threads",
+        type=int,
+        default=None,
+        help="Override runtime.graph_relation_rebuild_threads for sparse-to-dense training relation rebuilds.",
+    )
+    parser.add_argument(
+        "--phase1-disable-dataloader-pin-memory",
+        action="store_true",
+        help="Disable CUDA DataLoader pin_memory for large graph batches.",
+    )
+    parser.add_argument(
+        "--phase1-inference-start-timeout-s",
+        type=float,
+        default=None,
+        help="Override runtime.inference_start_timeout_s for slower WSL/CUDA process startup.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Use deterministic smoke runner.")
     parser.add_argument("--production", action="store_true", help="Run real self-play/training epoch quanta.")
     parser.add_argument(
@@ -115,6 +161,36 @@ def _base_config_from_args(args: argparse.Namespace) -> Config:
         if int(args.phase1_train_batches_per_epoch) <= 0:
             raise SystemExit("--phase1-train-batches-per-epoch must be positive")
         data["train"]["batches_per_epoch"] = int(args.phase1_train_batches_per_epoch)
+    if args.phase1_candidate_budget is not None:
+        if int(args.phase1_candidate_budget) <= 0:
+            raise SystemExit("--phase1-candidate-budget must be positive")
+        data["model"]["candidate_budget"] = int(args.phase1_candidate_budget)
+    if bool(getattr(args, "phase1_global_graph_leaf_eval", False)):
+        data["model"]["global_graph_leaf_eval"] = True
+    if args.phase1_graph_dataloader_workers is not None:
+        if int(args.phase1_graph_dataloader_workers) < 0:
+            raise SystemExit("--phase1-graph-dataloader-workers must be non-negative")
+        data["runtime"]["graph_dataloader_workers"] = int(args.phase1_graph_dataloader_workers)
+    if args.phase1_dataloader_prefetch_factor is not None:
+        if int(args.phase1_dataloader_prefetch_factor) <= 0:
+            raise SystemExit("--phase1-dataloader-prefetch-factor must be positive")
+        data["runtime"]["dataloader_prefetch_factor"] = int(args.phase1_dataloader_prefetch_factor)
+    if args.phase1_graph_cache_size is not None:
+        if int(args.phase1_graph_cache_size) < 0:
+            raise SystemExit("--phase1-graph-cache-size must be non-negative")
+        data["runtime"]["graph_cache_size"] = int(args.phase1_graph_cache_size)
+    graph_relation_rebuild_threads = getattr(args, "phase1_graph_relation_rebuild_threads", None)
+    if graph_relation_rebuild_threads is not None:
+        if int(graph_relation_rebuild_threads) < 0:
+            raise SystemExit("--phase1-graph-relation-rebuild-threads must be non-negative")
+        data["runtime"]["graph_relation_rebuild_threads"] = int(graph_relation_rebuild_threads)
+    if bool(getattr(args, "phase1_disable_dataloader_pin_memory", False)):
+        data["runtime"]["dataloader_pin_memory"] = False
+    inference_start_timeout_s = getattr(args, "phase1_inference_start_timeout_s", None)
+    if inference_start_timeout_s is not None:
+        if float(inference_start_timeout_s) <= 0.0:
+            raise SystemExit("--phase1-inference-start-timeout-s must be positive")
+        data["runtime"]["inference_start_timeout_s"] = float(inference_start_timeout_s)
     return Config.model_validate(data)
 
 
@@ -127,22 +203,38 @@ def _candidates_from_args(base_config: Config, args: argparse.Namespace):
         if args.candidate_plan
         else candidate_recipes_from_config(base_config)
     )
-    if args.phase1_mcts_simulations is None:
+    phase1_global_graph_leaf_eval = bool(getattr(args, "phase1_global_graph_leaf_eval", False))
+    if (
+        args.phase1_mcts_simulations is None
+        and args.phase1_candidate_budget is None
+        and not phase1_global_graph_leaf_eval
+    ):
         return candidates
-    full_sims = int(args.phase1_mcts_simulations)
-    return tuple(
-        candidate.model_copy(
-            update={
-                "search": candidate.search.model_copy(
-                    update={
-                        "full_mcts_simulations": full_sims,
-                        "pcr_low_sims": min(int(candidate.search.pcr_low_sims), max(1, full_sims - 32)),
-                    }
-                )
-            }
-        )
-        for candidate in candidates
+    full_sims = int(args.phase1_mcts_simulations) if args.phase1_mcts_simulations is not None else None
+    candidate_budget = (
+        int(args.phase1_candidate_budget)
+        if args.phase1_candidate_budget is not None
+        else None
     )
+    updated = []
+    for candidate in candidates:
+        update = {}
+        if full_sims is not None:
+            update["search"] = candidate.search.model_copy(
+                update={
+                    "full_mcts_simulations": full_sims,
+                    "pcr_low_sims": min(int(candidate.search.pcr_low_sims), max(1, full_sims - 32)),
+                }
+            )
+        model_update = {}
+        if candidate_budget is not None:
+            model_update["candidate_budget"] = candidate_budget
+        if phase1_global_graph_leaf_eval:
+            model_update["global_graph_leaf_eval"] = True
+        if model_update:
+            update["model"] = candidate.model.model_copy(update=model_update)
+        updated.append(candidate.model_copy(update=update))
+    return tuple(updated)
 
 
 if __name__ == "__main__":

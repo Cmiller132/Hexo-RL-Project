@@ -7,11 +7,12 @@ every legal action row, and rebuilds graph data after any D6 transform.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from enum import IntEnum
 import struct
 import time
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -26,7 +27,7 @@ from hexorl.graph.capacity import (
 )
 
 
-GRAPH_SCHEMA_VERSION = 3
+GRAPH_SCHEMA_VERSION = 4
 GRAPH_FEATURE_DIM = 12
 GRAPH_FEATURE_PLACEMENTS_REMAINING = 0
 GRAPH_FEATURE_CURRENT_PLAYER = 1
@@ -39,9 +40,22 @@ GRAPH_FEATURE_WINDOW_STONE_COUNT = 7
 GRAPH_FEATURE_WINDOW_EMPTY_COUNT = 8
 GRAPH_FEATURE_WINDOW_AXIS = 9
 GRAPH_FEATURE_LEGAL_WINDOW_COUNT = 10
-RELATION_SCHEMA_VERSION = 2
+GRAPH_FEATURE_DEVELOPMENT_SCORE = 11
+RELATION_SCHEMA_VERSION = 3
 HEX_DIRECTIONS: tuple[tuple[int, int], ...] = ((1, 0), (0, 1), (1, -1))
 WIN_LENGTH = 6
+GRAPH_TOKEN_SETS = frozenset(
+    {
+        "graph256_cells",
+        "graph384_windows",
+        "graph512_cover",
+        "graph512_turn",
+        "graph512_turn_pair_prior",
+        "graph768_champion",
+        "graph768_devwin",
+    }
+)
+DEVELOPMENT_WINDOW_TOKEN_SET = "graph768_devwin"
 
 
 class GraphTokenType(IntEnum):
@@ -65,6 +79,14 @@ class RelationType(IntEnum):
     RECENT_MOVE_RELATION = 15
     FIRST_SECOND_PAIR_RELATION = 16
     D6_ORBIT_RELATION = 17
+    WINDOW6_SLOT_0 = 18
+    WINDOW6_SLOT_1 = 19
+    WINDOW6_SLOT_2 = 20
+    WINDOW6_SLOT_3 = 21
+    WINDOW6_SLOT_4 = 22
+    WINDOW6_SLOT_5 = 23
+    WINDOW6_SHARED_LEGAL = 24
+    WINDOW6_SHARED_MULTI_LEGAL = 25
 
 
 SPARSE_IPC_DERIVED_RELATION_TYPES = frozenset(
@@ -74,6 +96,15 @@ SPARSE_IPC_DERIVED_RELATION_TYPES = frozenset(
         int(RelationType.SAME_LINE),
         int(RelationType.DISTANCE_BUCKET),
         int(RelationType.DIRECTION_BUCKET),
+    }
+)
+SPARSE_RELATION_TARGET_KEYS = frozenset(
+    {
+        "relation_sparse_row",
+        "relation_sparse_src",
+        "relation_sparse_dst",
+        "relation_sparse_type",
+        "relation_sparse_bias",
     }
 )
 
@@ -307,6 +338,76 @@ def dense_relations_from_sparse_edges(
     return relation_type, relation_bias
 
 
+def dense_relations_from_sparse_training_targets(
+    targets: Mapping[str, object],
+    *,
+    relation_workers: int = 1,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Rebuild dense relation tensors for one already-sliced training batch.
+
+    DataLoader workers carry relation overlays as row-tagged sparse edges. The
+    full dense relation matrices are reconstructed only for the microbatch that
+    is about to run through the model, keeping large tensors out of worker IPC.
+    """
+    token_features = _as_numpy_array(targets["token_features"], dtype=np.float32)
+    token_type = _as_numpy_array(targets["token_type"], dtype=np.int64)
+    token_qr = _as_numpy_array(targets["token_qr"], dtype=np.int64)
+    token_mask = _as_numpy_array(targets["token_mask"], dtype=np.bool_)
+    if token_features.ndim != 3:
+        raise ValueError("token_features must have shape (B,T,F) for sparse relation rebuild")
+    batch_size, max_tokens = int(token_features.shape[0]), int(token_features.shape[1])
+    relation_row = _as_numpy_array(targets["relation_sparse_row"], dtype=np.int64).reshape(-1)
+    relation_src = _as_numpy_array(targets["relation_sparse_src"], dtype=np.int64).reshape(-1)
+    relation_dst = _as_numpy_array(targets["relation_sparse_dst"], dtype=np.int64).reshape(-1)
+    relation_type = _as_numpy_array(targets["relation_sparse_type"], dtype=np.int16).reshape(-1)
+    relation_bias = _as_numpy_array(targets["relation_sparse_bias"], dtype=np.float32).reshape(-1)
+    if not (
+        relation_row.shape
+        == relation_src.shape
+        == relation_dst.shape
+        == relation_type.shape
+        == relation_bias.shape
+    ):
+        raise ValueError("sparse training relation arrays must have matching lengths")
+
+    dense_type = np.zeros((batch_size, max_tokens, max_tokens), dtype=np.int16)
+    dense_bias = np.zeros((batch_size, 1, max_tokens, max_tokens), dtype=np.float32)
+    edge_indices_by_row = [np.flatnonzero(relation_row == row) for row in range(batch_size)]
+
+    def rebuild_row(row: int) -> tuple[int, int, np.ndarray, np.ndarray]:
+        token_count = int(np.asarray(token_mask[row], dtype=np.bool_).sum())
+        edge_idx = edge_indices_by_row[row]
+        row_type, row_bias = dense_relations_from_sparse_edges(
+            token_features[row, :token_count],
+            token_type[row, :token_count],
+            token_qr[row, :token_count],
+            relation_src[edge_idx],
+            relation_dst[edge_idx],
+            relation_type[edge_idx],
+            relation_bias[edge_idx],
+        )
+        return row, token_count, row_type, row_bias
+
+    worker_count = max(1, int(relation_workers or 1))
+    worker_count = min(worker_count, max(batch_size, 1))
+    if worker_count > 1 and batch_size > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            rows = list(executor.map(rebuild_row, range(batch_size)))
+    else:
+        rows = [rebuild_row(row) for row in range(batch_size)]
+
+    for row, token_count, row_type, row_bias in rows:
+        dense_type[row, :token_count, :token_count] = row_type
+        dense_bias[row, :, :token_count, :token_count] = row_bias
+    return dense_type, dense_bias, int(relation_row.shape[0])
+
+
+def _as_numpy_array(value: object, dtype=None) -> np.ndarray:
+    if hasattr(value, "detach") and callable(getattr(value, "detach")):
+        value = value.detach().cpu().numpy()  # type: ignore[union-attr]
+    return np.asarray(value, dtype=dtype)
+
+
 def hex_distance(a: tuple[int, int], b: tuple[int, int] = (0, 0)) -> int:
     dq = int(a[0]) - int(b[0])
     dr = int(a[1]) - int(b[1])
@@ -471,6 +572,102 @@ def _active_windows(stones: dict[tuple[int, int], int], legal: Sequence[tuple[in
     return out
 
 
+@dataclass(frozen=True)
+class _WindowDevelopmentStats:
+    score: float
+    legal_continuations: int
+    shared_legal_continuations: int
+
+
+def _normalize_graph_token_set(graph_token_set: str | None) -> str:
+    token_set = str(graph_token_set or "graph256_cells").strip().lower()
+    if token_set not in GRAPH_TOKEN_SETS:
+        raise ValueError(f"graph_token_set must be one of {sorted(GRAPH_TOKEN_SETS)}")
+    return token_set
+
+
+def _window_development_stats(
+    *,
+    windows: Sequence[tuple[int, tuple[int, int], int, int, Sequence[tuple[int, int]]]],
+    stones: dict[tuple[int, int], int],
+    legal: Sequence[tuple[int, int]],
+    current_player: int,
+) -> tuple[dict[tuple[int, tuple[int, int]], _WindowDevelopmentStats], dict[tuple[int, int], int]]:
+    legal_set = {(int(q), int(r)) for q, r in legal}
+    window_legals: dict[tuple[int, tuple[int, int]], tuple[tuple[int, int], ...]] = {}
+    cell_windows: dict[tuple[int, int], list[tuple[int, tuple[int, int]]]] = {}
+    for axis, start, own, opp, _empties in windows:
+        key = (int(axis), (int(start[0]), int(start[1])))
+        cells = _window_cells(key[1], key[0])
+        legal_cells = tuple(cell for cell in cells if cell in legal_set)
+        window_legals[key] = legal_cells
+        for cell in legal_cells:
+            cell_windows.setdefault(cell, []).append(key)
+
+    stats: dict[tuple[int, tuple[int, int]], _WindowDevelopmentStats] = {}
+    legal_dev_count: dict[tuple[int, int], int] = {}
+    for axis, start, own, opp, _empties in windows:
+        key = (int(axis), (int(start[0]), int(start[1])))
+        cells = _window_cells(key[1], key[0])
+        current_count = int(own) if int(current_player) == 0 else int(opp)
+        opponent_count = int(opp) if int(current_player) == 0 else int(own)
+        owner_count = current_count if current_count > 0 else opponent_count
+        legal_cells = window_legals.get(key, ())
+        legal_count = len(legal_cells)
+        shared_count = sum(1 for cell in legal_cells if len(cell_windows.get(cell, ())) > 1)
+        stone_slots = [idx for idx, cell in enumerate(cells) if cell in stones]
+        if stone_slots:
+            span = max(stone_slots) - min(stone_slots) + 1
+            gap_count = sum(1 for idx in range(min(stone_slots), max(stone_slots) + 1) if cells[idx] not in stones)
+        else:
+            span = 0
+            gap_count = 0
+        longest_run = 0
+        run = 0
+        for cell in cells:
+            if cell in stones:
+                run += 1
+                longest_run = max(longest_run, run)
+            else:
+                run = 0
+        if owner_count <= 0 or legal_count <= 0:
+            score = 0.0
+        else:
+            stone_quality = {
+                1: 0.35,
+                2: 0.75,
+                3: 1.0,
+                4: 0.80,
+                5: 0.20,
+                6: 0.0,
+            }.get(min(owner_count, WIN_LENGTH), 0.0)
+            continuation_quality = min(legal_count, 4) / 4.0
+            gap_quality = min(gap_count, 3) / 3.0
+            shared_quality = min(shared_count, 3) / 3.0
+            spread_quality = min(span, WIN_LENGTH) / float(WIN_LENGTH)
+            direct_run_penalty = 0.75 if longest_run >= 4 else 1.0
+            single_continuation_penalty = 0.65 if legal_count == 1 else 1.0
+            near_terminal_penalty = 0.35 if owner_count >= 5 else 1.0
+            score = (
+                0.30 * stone_quality
+                + 0.20 * continuation_quality
+                + 0.20 * gap_quality
+                + 0.20 * shared_quality
+                + 0.10 * spread_quality
+            )
+            score *= direct_run_penalty * single_continuation_penalty * near_terminal_penalty
+            score = max(0.0, min(1.0, score))
+        stats[key] = _WindowDevelopmentStats(
+            score=float(score),
+            legal_continuations=int(legal_count),
+            shared_legal_continuations=int(shared_count),
+        )
+        if score > 0.0:
+            for cell in legal_cells:
+                legal_dev_count[cell] = legal_dev_count.get(cell, 0) + 1
+    return stats, legal_dev_count
+
+
 def _features(
     token_type: GraphTokenType,
     *,
@@ -485,6 +682,7 @@ def _features(
     nearest_opp: int = 64,
     window_empty_count: int = 0,
     legal_window_count: int = 0,
+    development_score: float = 0.0,
 ) -> np.ndarray:
     out = np.zeros(GRAPH_FEATURE_DIM, dtype=np.float32)
     out[GRAPH_FEATURE_PLACEMENTS_REMAINING] = float(placements_remaining) / 2.0
@@ -506,7 +704,13 @@ def _features(
         out[GRAPH_FEATURE_WINDOW_AXIS] = float(axis + 1) / 4.0
     if token_type == GraphTokenType.LEGAL:
         out[GRAPH_FEATURE_LEGAL_WINDOW_COUNT] = min(legal_window_count, 16) / 16.0
+    out[GRAPH_FEATURE_DEVELOPMENT_SCORE] = max(0.0, min(1.0, float(development_score)))
     return out
+
+
+def _add_timing(timings: dict[str, float] | None, key: str, started: float) -> None:
+    if timings is not None:
+        timings[key] = timings.get(key, 0.0) + time.perf_counter() - started
 
 
 def build_graph_batch_from_history(
@@ -527,19 +731,28 @@ def build_graph_batch_from_history(
     max_legal_rows: int | None = None,
     max_context_tokens: int | None = None,
     required_legal_rows: Sequence[tuple[int, int]] = (),
+    graph_token_set: str | None = None,
+    timings: dict[str, float] | None = None,
+    timing_prefix: str = "graph_build_",
 ) -> GraphBatch:
+    token_set = _normalize_graph_token_set(graph_token_set)
+    development_windows = token_set == DEVELOPMENT_WINDOW_TOKEN_SET
     if int(radius) != 8:
         raise ValueError("global graph legal rows must preserve all Rust-legal moves; radius must be 8")
     if materialize_pair_context_tokens:
         raise ValueError("PAIR_ACTION context tokens were removed from the minimal global graph schema")
+    parse_started = time.perf_counter()
     moves = parse_history(history)
     stones = {(q, r): player for player, q, r in moves}
     current_player, placements_remaining = current_turn_state(moves)
+    _add_timing(timings, f"{timing_prefix}parse_s", parse_started)
+    engine_started = time.perf_counter()
     legal, current_player, placements_remaining = _engine_state_from_history(
         history,
         radius=radius,
         constrain_threats=bool(constrain_threats) and legal_moves is None,
     )
+    _add_timing(timings, f"{timing_prefix}engine_s", engine_started)
     if legal_moves is not None:
         occupied_rows = [
             (int(qr[0]), int(qr[1]))
@@ -549,17 +762,20 @@ def build_graph_batch_from_history(
         if occupied_rows:
             raise ValueError(f"legal_moves contains occupied cells: {occupied_rows[:8]}")
         legal = _unique_qr(legal_moves)
+    oracle_started = time.perf_counter()
     oracle = scan_tactical_oracle_from_history(
         history,
         legal,
         near_radius=8,
     )
+    _add_timing(timings, f"{timing_prefix}oracle_s", oracle_started)
     win_now_cells = {(int(q), int(r)) for q, r in getattr(oracle, "win_now_cells", ())}
     forced_cells = {(int(q), int(r)) for q, r in getattr(oracle, "forced_block_cells", ())}
     open_four_cells = {(int(q), int(r)) for q, r in getattr(oracle, "open_four_cells", ())}
     open_five_cells = {(int(q), int(r)) for q, r in getattr(oracle, "open_five_cells", ())}
     cover_cells = {(int(q), int(r)) for q, r in getattr(oracle, "cover_cells", ())}
     context_budget = int(max_context_tokens) if max_context_tokens is not None and int(max_context_tokens) > 0 else None
+    legal_rank_started = time.perf_counter()
     if max_legal_rows is not None and int(max_legal_rows) > 0 and len(legal) > int(max_legal_rows):
         legal_set = set(legal)
         required_legal = {
@@ -612,9 +828,25 @@ def build_graph_batch_from_history(
         )
         selected_set = set(selected)
         legal = [qr for qr in legal if qr in selected_set]
+    _add_timing(timings, f"{timing_prefix}legal_rank_s", legal_rank_started)
     legal_index = {qr: i for i, qr in enumerate(legal)}
+    windows_started = time.perf_counter()
     windows = _active_windows(stones, legal)
+    _add_timing(timings, f"{timing_prefix}active_windows_s", windows_started)
+    dev_stats_started = time.perf_counter()
+    window_development_stats, development_window_count_by_cell = (
+        _window_development_stats(
+            windows=windows,
+            stones=stones,
+            legal=legal,
+            current_player=current_player,
+        )
+        if development_windows
+        else ({}, {})
+    )
+    _add_timing(timings, f"{timing_prefix}dev_stats_s", dev_stats_started)
 
+    token_started = time.perf_counter()
     token_features: list[np.ndarray] = []
     token_type: list[int] = []
     token_qr: list[tuple[int, int]] = []
@@ -696,6 +928,9 @@ def build_graph_batch_from_history(
     def add(tt: GraphTokenType, qr: tuple[int, int], **kwargs) -> int:
         idx = len(token_type)
         nearest_own, nearest_opp, _nearest_any = nearest_distances(qr)
+        development_score = float(kwargs.pop("development_score", 0.0))
+        if tt == GraphTokenType.LEGAL and development_windows:
+            development_score = min(development_window_count_by_cell.get(qr, 0), 16) / 16.0
         token_type.append(int(tt))
         token_qr.append(qr)
         token_axis.append(int(kwargs.get("axis", -1)))
@@ -708,6 +943,7 @@ def build_graph_batch_from_history(
                 nearest_own=nearest_own,
                 nearest_opp=nearest_opp,
                 legal_window_count=legal_window_count_by_cell.get(qr, 0),
+                development_score=development_score,
                 **kwargs,
             )
         )
@@ -734,7 +970,27 @@ def build_graph_batch_from_history(
     for qr in legal:
         legal_token_indices.append(add(GraphTokenType.LEGAL, qr))
 
-    if window_limit is not None and len(windows) > window_limit:
+    if window_limit is not None and len(windows) > window_limit and development_windows:
+        def window_rank(row: tuple[int, tuple[int, int], int, int, tuple[tuple[int, int], ...]]) -> tuple[float, int, int, int, int, int]:
+            axis, start, own, opp, _empties = row
+            key = (int(axis), (int(start[0]), int(start[1])))
+            cells = _window_cells(start, axis)
+            center = cells[WIN_LENGTH // 2]
+            stats = window_development_stats.get(key, _WindowDevelopmentStats(0.0, 0, 0))
+            owner_count = max(int(own), int(opp))
+            near_terminal = 1 if owner_count >= 5 else 0
+            isolated = 1 if stats.shared_legal_continuations == 0 else 0
+            return (
+                -float(stats.score),
+                near_terminal,
+                isolated,
+                -int(stats.legal_continuations),
+                hex_distance(center),
+                int(start[0]) * 4096 + int(start[1]),
+            )
+
+        windows = sorted(windows, key=window_rank)[:window_limit]
+    elif window_limit is not None and len(windows) > window_limit:
         important_cells = win_now_cells | forced_cells | open_four_cells | open_five_cells | cover_cells
 
         def window_rank(row: tuple[int, tuple[int, int], int, int, tuple[tuple[int, int], ...]]) -> tuple[int, int, int, int, int, int]:
@@ -761,6 +1017,14 @@ def build_graph_batch_from_history(
             count_a=own,
             count_b=opp,
             window_empty_count=len(empties),
+            development_score=(
+                window_development_stats.get(
+                    (int(axis), (int(start[0]), int(start[1]))),
+                    _WindowDevelopmentStats(0.0, 0, 0),
+                ).score
+                if development_windows
+                else 0.0
+            ),
         )
         memberships[idx] = set(_window_cells(start, axis))
 
@@ -814,7 +1078,9 @@ def build_graph_batch_from_history(
             pair_token_indices.append(-1)
             pair_first_indices.append(first_token)
             pair_second_indices.append(legal_token_indices[b_idx])
+    _add_timing(timings, f"{timing_prefix}tokens_s", token_started)
 
+    relation_started = time.perf_counter()
     relation_type, relation_bias = _build_relations(
         token_type,
         token_qr,
@@ -824,8 +1090,11 @@ def build_graph_batch_from_history(
         pair_token_indices,
         pair_first_indices,
         pair_second_indices,
+        development_windows=development_windows,
     )
+    _add_timing(timings, f"{timing_prefix}relations_s", relation_started)
 
+    targets_started = time.perf_counter()
     policy = _target_for_legal(legal, policy_target, label="policy_target")
     if not include_opp_policy_rows:
         if opp_policy_target:
@@ -871,6 +1140,7 @@ def build_graph_batch_from_history(
         else np.zeros_like(pair_target, dtype=np.float32)
     )
     tactical_target = _tactical_target_from_oracle(oracle)
+    _add_timing(timings, f"{timing_prefix}targets_s", targets_started)
 
     return GraphBatch(
         token_features=np.asarray(token_features, dtype=np.float32),
@@ -1281,6 +1551,8 @@ def _build_relations(
     pair_token_indices: Sequence[int],
     pair_first_indices: Sequence[int],
     pair_second_indices: Sequence[int],
+    *,
+    development_windows: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     n = len(token_type)
     token_type_arr = np.asarray(token_type, dtype=np.int64)
@@ -1415,6 +1687,105 @@ def _build_relations(
         first = pair_first_arr[valid_pair_refs]
         second = pair_second_arr[valid_pair_refs]
         assign_edges(first, second, RelationType.FIRST_SECOND_PAIR_RELATION, symmetric=True)
+
+    if development_windows and window_tokens.size:
+        legal_sets_by_window: dict[int, set[int]] = {}
+        slot_relation_values = np.asarray(
+            [
+                int(RelationType.WINDOW6_SLOT_0),
+                int(RelationType.WINDOW6_SLOT_1),
+                int(RelationType.WINDOW6_SLOT_2),
+                int(RelationType.WINDOW6_SLOT_3),
+                int(RelationType.WINDOW6_SLOT_4),
+                int(RelationType.WINDOW6_SLOT_5),
+            ],
+            dtype=np.int16,
+        )
+        member_mask = stone_mask | legal_token_mask
+        slot_edge_sources: dict[int, list[int]] = {
+            int(relation_value): [] for relation_value in slot_relation_values.tolist()
+        }
+        slot_edge_targets: dict[int, list[int]] = {
+            int(relation_value): [] for relation_value in slot_relation_values.tolist()
+        }
+        for window in window_tokens.tolist():
+            axis = int(token_axis_arr[int(window)])
+            if axis < 0 or axis >= len(HEX_DIRECTIONS):
+                continue
+            dq_axis, dr_axis = HEX_DIRECTIONS[axis]
+            center_q = int(token_qr_arr[int(window), 0])
+            center_r = int(token_qr_arr[int(window), 1])
+            start = (
+                center_q - dq_axis * (WIN_LENGTH // 2),
+                center_r - dr_axis * (WIN_LENGTH // 2),
+            )
+            legal_rows_for_window: set[int] = set()
+            for slot, cell in enumerate(_window_cells(start, axis)):
+                rows = token_rows_by_cell_key.get(int(cell_key(cell)), ())
+                if not rows:
+                    continue
+                rows_arr = np.asarray(
+                    [row for row in rows if member_mask[int(row)]],
+                    dtype=np.int64,
+                )
+                if rows_arr.size == 0:
+                    continue
+                relation_value = int(slot_relation_values[slot])
+                slot_edge_sources[relation_value].extend([int(window)] * int(rows_arr.size))
+                slot_edge_targets[relation_value].extend(int(row) for row in rows_arr.tolist())
+                legal_rows_for_window.update(int(row) for row in rows_arr.tolist() if legal_token_mask[int(row)])
+            legal_sets_by_window[int(window)] = legal_rows_for_window
+        for relation_value in slot_relation_values.tolist():
+            relation_int = int(relation_value)
+            sources = slot_edge_sources.get(relation_int, ())
+            targets = slot_edge_targets.get(relation_int, ())
+            if sources:
+                assign_edges(
+                    np.asarray(sources, dtype=np.int64),
+                    np.asarray(targets, dtype=np.int64),
+                    RelationType(relation_int),
+                    symmetric=True,
+                )
+        if len(legal_sets_by_window) > 1:
+            windows = sorted(legal_sets_by_window)
+            shared_edge_sources: dict[int, list[int]] = {
+                int(RelationType.WINDOW6_SHARED_LEGAL): [],
+                int(RelationType.WINDOW6_SHARED_MULTI_LEGAL): [],
+            }
+            shared_edge_targets: dict[int, list[int]] = {
+                int(RelationType.WINDOW6_SHARED_LEGAL): [],
+                int(RelationType.WINDOW6_SHARED_MULTI_LEGAL): [],
+            }
+            for idx, left in enumerate(windows):
+                left_set = legal_sets_by_window[left]
+                if not left_set:
+                    continue
+                for right in windows[idx + 1 :]:
+                    shared = len(left_set & legal_sets_by_window[right])
+                    if shared <= 0:
+                        continue
+                    relation = (
+                        RelationType.WINDOW6_SHARED_MULTI_LEGAL
+                        if shared >= 2
+                        else RelationType.WINDOW6_SHARED_LEGAL
+                    )
+                    relation_int = int(relation)
+                    shared_edge_sources[relation_int].append(int(left))
+                    shared_edge_targets[relation_int].append(int(right))
+            for relation in (
+                RelationType.WINDOW6_SHARED_LEGAL,
+                RelationType.WINDOW6_SHARED_MULTI_LEGAL,
+            ):
+                relation_int = int(relation)
+                sources = shared_edge_sources.get(relation_int, ())
+                targets = shared_edge_targets.get(relation_int, ())
+                if sources:
+                    assign_edges(
+                        np.asarray(sources, dtype=np.int64),
+                        np.asarray(targets, dtype=np.int64),
+                        relation,
+                        symmetric=True,
+                    )
 
     if window_tokens.size:
         window_member_rows = membership_token_matrix(window_tokens)
@@ -1567,3 +1938,133 @@ def collate_graph_batches(
             time.perf_counter() - started
         )
     return collated
+
+
+def collate_graph_training_targets(
+    batches: Sequence[GraphBatch],
+    *,
+    timings: dict[str, float] | None = None,
+) -> dict[str, object]:
+    """Collate graph training targets without dense relation matrices.
+
+    Dense ``B x T x T`` relation tensors are the largest part of graph768
+    batches. Keeping relation overlays sparse until trainer microbatching
+    removes that payload from DataLoader worker memory and shared-memory IPC.
+    """
+    started = time.perf_counter()
+    if not batches:
+        raise ValueError("cannot collate an empty graph batch list")
+    max_t = max(b.token_features.shape[0] for b in batches)
+    max_a = max(b.legal_qr.shape[0] for b in batches)
+    max_o = max(b.opp_legal_qr.shape[0] for b in batches)
+    max_p = max(b.pair_token_indices.shape[0] for b in batches)
+    bsz = len(batches)
+
+    def pad(shape, dtype, fill=0):
+        return np.full(shape, fill, dtype=dtype)
+
+    token_features = pad((bsz, max_t, GRAPH_FEATURE_DIM), np.float32)
+    token_type = pad((bsz, max_t), np.int64)
+    token_qr = pad((bsz, max_t, 2), np.int32)
+    token_mask = pad((bsz, max_t), np.bool_)
+    legal_token_indices = pad((bsz, max_a), np.int64, -1)
+    legal_qr = pad((bsz, max_a, 2), np.int32)
+    legal_mask = pad((bsz, max_a), np.bool_)
+    policy_target = pad((bsz, max_a), np.float32)
+    opp_legal_qr = pad((bsz, max_o, 2), np.int32)
+    opp_legal_mask = pad((bsz, max_o), np.bool_)
+    opp_policy_target = pad((bsz, max_o), np.float32)
+    pair_first_policy_target = pad((bsz, max_a), np.float32)
+    pair_token_indices = pad((bsz, max_p), np.int64, -1)
+    pair_first_indices = pad((bsz, max_p), np.int64, -1)
+    pair_second_indices = pad((bsz, max_p), np.int64, -1)
+    pair_policy_target = pad((bsz, max_p), np.float32)
+    pair_second_policy_target = pad((bsz, max_p), np.float32)
+    tactical_target = pad((bsz, 4), np.float32)
+    placements_remaining_by_sample = np.zeros(bsz, dtype=np.int64)
+
+    relation_rows: list[np.ndarray] = []
+    relation_srcs: list[np.ndarray] = []
+    relation_dsts: list[np.ndarray] = []
+    relation_types: list[np.ndarray] = []
+    relation_biases: list[np.ndarray] = []
+
+    for row, batch in enumerate(batches):
+        t = batch.token_features.shape[0]
+        a = batch.legal_qr.shape[0]
+        o = batch.opp_legal_qr.shape[0]
+        p = batch.pair_token_indices.shape[0]
+        token_features[row, :t] = batch.token_features
+        token_type[row, :t] = batch.token_type
+        token_qr[row, :t] = batch.token_qr
+        token_mask[row, :t] = True
+        legal_token_indices[row, :a] = batch.legal_token_indices
+        legal_qr[row, :a] = batch.legal_qr
+        legal_mask[row, :a] = True
+        policy_target[row, :a] = batch.policy_target
+        opp_legal_qr[row, :o] = batch.opp_legal_qr
+        opp_legal_mask[row, :o] = True
+        opp_policy_target[row, :o] = batch.opp_policy_target
+        pair_first_policy_target[row, :a] = batch.pair_first_policy_target
+        pair_token_indices[row, :p] = batch.pair_token_indices
+        pair_first_indices[row, :p] = batch.pair_first_indices
+        pair_second_indices[row, :p] = batch.pair_second_indices
+        pair_policy_target[row, :p] = batch.pair_policy_target
+        pair_second_policy_target[row, :p] = batch.pair_second_policy_target
+        tactical_target[row] = batch.tactical_target
+        placements_remaining_by_sample[row] = int(batch.placements_remaining)
+
+        src, dst, edge_type, edge_bias = sparse_relation_edges_from_batch(batch)
+        if src.size:
+            relation_rows.append(np.full(src.shape, row, dtype=np.int32))
+            relation_srcs.append(src.astype(np.int32, copy=False))
+            relation_dsts.append(dst.astype(np.int32, copy=False))
+            relation_types.append(edge_type.astype(np.int16, copy=False))
+            relation_biases.append(edge_bias.astype(np.float32, copy=False))
+
+    if relation_rows:
+        relation_sparse_row = np.concatenate(relation_rows).astype(np.int32, copy=False)
+        relation_sparse_src = np.concatenate(relation_srcs).astype(np.int32, copy=False)
+        relation_sparse_dst = np.concatenate(relation_dsts).astype(np.int32, copy=False)
+        relation_sparse_type = np.concatenate(relation_types).astype(np.int16, copy=False)
+        relation_sparse_bias = np.concatenate(relation_biases).astype(np.float32, copy=False)
+    else:
+        relation_sparse_row = np.zeros(0, dtype=np.int32)
+        relation_sparse_src = np.zeros(0, dtype=np.int32)
+        relation_sparse_dst = np.zeros(0, dtype=np.int32)
+        relation_sparse_type = np.zeros(0, dtype=np.int16)
+        relation_sparse_bias = np.zeros(0, dtype=np.float32)
+
+    targets: dict[str, object] = {
+        "token_features": token_features,
+        "token_type": token_type,
+        "token_qr": token_qr,
+        "token_mask": token_mask,
+        "legal_token_indices": legal_token_indices,
+        "legal_qr": legal_qr,
+        "legal_mask": legal_mask,
+        "pair_token_indices": pair_token_indices,
+        "pair_first_indices": pair_first_indices,
+        "pair_second_indices": pair_second_indices,
+        "relation_sparse_row": relation_sparse_row,
+        "relation_sparse_src": relation_sparse_src,
+        "relation_sparse_dst": relation_sparse_dst,
+        "relation_sparse_type": relation_sparse_type,
+        "relation_sparse_bias": relation_sparse_bias,
+        "policy_target": policy_target,
+        "legal_token_quality_target": policy_target,
+        "opp_legal_qr": opp_legal_qr,
+        "opp_legal_mask": opp_legal_mask,
+        "opp_policy_target": opp_policy_target,
+        "pair_first_policy_target": pair_first_policy_target,
+        "pair_policy_target": pair_policy_target,
+        "pair_second_policy_target": pair_second_policy_target,
+        "tactical_target": tactical_target,
+        "placements_remaining": placements_remaining_by_sample,
+        "_relation_sparse_edges": int(relation_sparse_row.shape[0]),
+    }
+    if timings is not None:
+        timings["graph_collate_s"] = timings.get("graph_collate_s", 0.0) + (
+            time.perf_counter() - started
+        )
+    return targets

@@ -56,6 +56,7 @@ def build_model_family(
         )
         model.graph_context_tokens = int(getattr(model_cfg, "graph_token_budget", 256))
         model.graph_legal_rows = int(getattr(model_cfg, "candidate_budget", 256))
+        model.graph_token_set = str(getattr(model_cfg, "graph_token_set", "graph256_cells")).lower()
     else:
         model = HexNet(
             channels=model_cfg.channels,
