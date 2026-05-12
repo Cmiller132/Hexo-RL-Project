@@ -183,6 +183,16 @@ class SelfPlayConfig(BaseModel):
     dirichlet_fraction: float = 0.25
     pcr_low_sim_prob: float = 0.75
     pcr_low_sims: int = 192
+    classical_seed_plies: int = 0
+    classical_seed_time_ms: int = 10
+    classical_seed_max_depth: int = 3
+    classical_seed_near_radius: int = 2
+    classical_root_prior_mix: float = 0.0
+    classical_root_prior_time_ms: int = 10
+    classical_root_prior_max_depth: int = 3
+    classical_root_prior_near_radius: int = 2
+    tactical_target_mix: float = 0.0
+    open_four_target_mix: float = 0.0
     policy_target_top_k: int = 64
     train_policy_on_full_search_only: bool = True
     near_radius: int = 8
@@ -585,6 +595,7 @@ class RuntimeConfig(BaseModel):
     compile_mode: str = "reduce-overhead"
     train_memory_fraction: float = 0.62
     inference_start_timeout_s: float = 30.0
+    inference_response_timeout_ms: float = 30000.0
 
 
 Config.model_rebuild()

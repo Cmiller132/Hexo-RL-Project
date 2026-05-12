@@ -100,6 +100,87 @@ def _sample_root_dirichlet_noise(
     return np.full(n, 1.0 / float(n), dtype=np.float32)
 
 
+def _unique_cells(cells) -> list[tuple[int, int]]:
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for q, r in cells:
+        cell = (int(q), int(r))
+        if cell not in seen:
+            seen.add(cell)
+            out.append(cell)
+    return out
+
+
+def _mix_policy_v2_with_cells(
+    policy_v2: list[tuple[int, int, float]],
+    cells: list[tuple[int, int]],
+    mix: float,
+    *,
+    top_k: int,
+    offset_q: int,
+    offset_r: int,
+) -> list[tuple[int, int, float]]:
+    cells = [
+        cell
+        for cell in _unique_cells(cells)
+        if action_to_board_index(cell[0], cell[1], offset_q, offset_r) >= 0
+    ]
+    mix_value = min(max(float(mix), 0.0), 0.95)
+    if not cells or mix_value <= 0.0:
+        return policy_v2
+    weights: dict[tuple[int, int], float] = {}
+    keep = max(0.0, 1.0 - mix_value)
+    for q, r, prob in policy_v2:
+        if float(prob) > 0.0:
+            cell = (int(q), int(r))
+            weights[cell] = weights.get(cell, 0.0) + keep * float(prob)
+    add = mix_value / float(len(cells))
+    for cell in cells:
+        weights[cell] = weights.get(cell, 0.0) + add
+    items = sorted(weights.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+    items = items[: max(1, int(top_k))]
+    total = sum(prob for _cell, prob in items)
+    if total <= 0.0:
+        return policy_v2
+    return [(q, r, float(prob / total)) for (q, r), prob in items]
+
+
+def _shape_policy_v2_with_oracle(
+    policy_v2: list[tuple[int, int, float]],
+    oracle,
+    *,
+    tactical_mix: float,
+    open_four_mix: float,
+    top_k: int,
+    offset_q: int,
+    offset_r: int,
+) -> list[tuple[int, int, float]]:
+    shaped = policy_v2
+    tactical_cells = _unique_cells(
+        list(getattr(oracle, "win_now_cells", ()))
+        + list(getattr(oracle, "forced_block_cells", ()))
+        + list(getattr(oracle, "open_five_cells", ()))
+        + list(getattr(oracle, "cover_cells", ()))
+    )
+    shaped = _mix_policy_v2_with_cells(
+        shaped,
+        tactical_cells,
+        tactical_mix,
+        top_k=top_k,
+        offset_q=offset_q,
+        offset_r=offset_r,
+    )
+    shaped = _mix_policy_v2_with_cells(
+        shaped,
+        list(getattr(oracle, "open_four_cells", ())),
+        open_four_mix,
+        top_k=top_k,
+        offset_q=offset_q,
+        offset_r=offset_r,
+    )
+    return shaped
+
+
 def _align_global_logits_to_rust_legal(
     graph_legal: np.ndarray,
     rust_legal: np.ndarray,
@@ -1029,6 +1110,19 @@ class SelfPlayWorker:
         self.temperature_schedule = sp.temperature_schedule
         self.pcr_low_sim_prob = sp.pcr_low_sim_prob
         self.pcr_low_sims = sp.pcr_low_sims
+        self.classical_seed_plies = max(0, int(getattr(sp, "classical_seed_plies", 0) or 0))
+        self.classical_seed_time_ms = max(1, int(getattr(sp, "classical_seed_time_ms", 10) or 10))
+        self.classical_seed_max_depth = max(1, int(getattr(sp, "classical_seed_max_depth", 3) or 3))
+        self.classical_seed_near_radius = max(1, int(getattr(sp, "classical_seed_near_radius", 2) or 2))
+        self.classical_root_prior_mix = min(
+            max(float(getattr(sp, "classical_root_prior_mix", 0.0) or 0.0), 0.0),
+            0.95,
+        )
+        self.classical_root_prior_time_ms = max(1, int(getattr(sp, "classical_root_prior_time_ms", 10) or 10))
+        self.classical_root_prior_max_depth = max(1, int(getattr(sp, "classical_root_prior_max_depth", 3) or 3))
+        self.classical_root_prior_near_radius = max(1, int(getattr(sp, "classical_root_prior_near_radius", 2) or 2))
+        self.tactical_target_mix = min(max(float(getattr(sp, "tactical_target_mix", 0.0) or 0.0), 0.0), 0.95)
+        self.open_four_target_mix = min(max(float(getattr(sp, "open_four_target_mix", 0.0) or 0.0), 0.0), 0.95)
         self.policy_target_top_k = sp.policy_target_top_k
         self.dirichlet_alpha = sp.dirichlet_alpha
         self.dirichlet_fraction = sp.dirichlet_fraction
@@ -1153,7 +1247,7 @@ class SelfPlayWorker:
             worker_id=self.worker_id,
             num_workers=self.num_workers,
             max_batch_size=self.max_batch,
-            timeout_ms=30000,
+            timeout_ms=float(getattr(self.cfg.runtime, "inference_response_timeout_ms", 30000.0)),
         )
 
         try:
@@ -1233,6 +1327,117 @@ class SelfPlayWorker:
             if client is not None:
                 client.disconnect()
 
+    def _apply_classical_seed_opening(
+        self,
+        engine,
+        positions: List[PositionRecord],
+        move_history: bytearray,
+        *,
+        game_id: int,
+        move_idx: int,
+        game_seed: int,
+    ):
+        if not HAS_ENGINE or self.classical_seed_plies <= 0:
+            return engine, move_idx, "unknown"
+        game = getattr(engine, "_game", None)
+        if game is None:
+            return engine, move_idx, "unknown"
+
+        terminal_reason = "unknown"
+        for _seed_idx in range(self.classical_seed_plies):
+            if move_idx >= self.max_game_moves:
+                terminal_reason = "max_game_moves"
+                break
+            if bool(getattr(game, "is_over", False)):
+                terminal_reason = "win"
+                break
+            try:
+                player = int(game.current_player)
+                _tensor_3d, offset_q, offset_r, legal_bytes = game.encode_board_and_legal(
+                    self.near_radius,
+                    self.constrain_threats,
+                )
+                legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                if legal.shape[0] <= 0:
+                    terminal_reason = "no_root"
+                    break
+                q, r, score, _depth, _nodes = game.classical_search(
+                    time_ms=self.classical_seed_time_ms,
+                    max_depth=self.classical_seed_max_depth,
+                    near_radius=self.classical_seed_near_radius,
+                    noise_level=0.0,
+                )
+                q, r = int(q), int(r)
+                if not any(int(lq) == q and int(lr) == r for lq, lr in legal):
+                    logger.warning(
+                        "Worker %s: classical seed move (%s,%s) was not legal at turn %s",
+                        self.worker_id,
+                        q,
+                        r,
+                        move_idx,
+                    )
+                    break
+                policy_v2 = [(q, r, 1.0)]
+                policy, outside_mass = dense_policy_from_v2(
+                    policy_v2,
+                    int(offset_q),
+                    int(offset_r),
+                    top_k=self.policy_target_top_k,
+                )
+                value_hint = float(np.tanh(float(score) / 600.0))
+                positions.append(
+                    PositionRecord(
+                        move_history=bytes(move_history),
+                        policy_target=policy,
+                        policy_target_v2=policy_v2,
+                        target_policy_mass_outside_window=outside_mass,
+                        root_value=value_hint,
+                        selected_action_value=value_hint,
+                        player=player,
+                        game_id=game_id,
+                        is_full_search=True,
+                        turn_index=move_idx,
+                    )
+                )
+                move_history.extend(player.to_bytes(4, "little", signed=True))
+                move_history.extend(q.to_bytes(4, "little", signed=True))
+                move_history.extend(r.to_bytes(4, "little", signed=True))
+                move_idx += 1
+                _use_pcr, next_sims = self._search_mode_for_turn(game_seed, move_idx)
+                engine.re_root(q, r, next_sims)
+                game = getattr(engine, "_game", game)
+            except Exception as exc:
+                logger.warning(
+                    "Worker %s: classical seed opening stopped at turn %s: %s",
+                    self.worker_id,
+                    move_idx,
+                    exc,
+                )
+                break
+        return engine, move_idx, terminal_reason
+
+    def _classical_root_prior(self, engine, legal) -> tuple[np.ndarray, np.ndarray]:
+        if not HAS_ENGINE or self.classical_root_prior_mix <= 0.0:
+            return np.zeros((0, 2), dtype=np.int32), np.zeros(0, dtype=np.float32)
+        game = getattr(engine, "_game", None)
+        if game is None:
+            return np.zeros((0, 2), dtype=np.int32), np.zeros(0, dtype=np.float32)
+        try:
+            q, r, _score, _depth, _nodes = game.classical_search(
+                time_ms=self.classical_root_prior_time_ms,
+                max_depth=self.classical_root_prior_max_depth,
+                near_radius=self.classical_root_prior_near_radius,
+                noise_level=0.0,
+            )
+            q, r = int(q), int(r)
+            legal_set = {(int(lq), int(lr)) for lq, lr in np.asarray(legal, dtype=np.int32).reshape(-1, 2)}
+            if (q, r) not in legal_set:
+                return np.zeros((0, 2), dtype=np.int32), np.zeros(0, dtype=np.float32)
+            return np.asarray([(q, r)], dtype=np.int32), np.asarray([10.0], dtype=np.float32)
+        except Exception as exc:
+            logger.debug("Worker %s: classical root prior skipped: %s", self.worker_id, exc)
+            return np.zeros((0, 2), dtype=np.int32), np.zeros(0, dtype=np.float32)
+
     def _play_one_game(
         self, client: Optional[InferenceClient]
     ) -> Optional[GameRecord]:
@@ -1273,6 +1478,35 @@ class SelfPlayWorker:
         move_history = bytearray(rgsc_restart.move_history if rgsc_restart and rgsc_restart.used else b"")
         move_idx = int(rgsc_restart.move_count) if rgsc_restart and rgsc_restart.used else 0
         terminal_reason = "unknown"
+        if move_idx == 0 and self.classical_seed_plies > 0:
+            seed_result = self._apply_classical_seed_opening(
+                engine,
+                positions,
+                move_history,
+                game_id=game_id,
+                move_idx=move_idx,
+                game_seed=game_seed,
+            )
+            engine, move_idx, terminal_reason = seed_result
+            if terminal_reason == "win":
+                full_history = bytes(move_history)
+                record = GameRecord(
+                    positions=positions,
+                    outcome=(
+                        1.0
+                        if engine.winner == 0
+                        else -1.0
+                        if engine.winner == 1
+                        else 0.0
+                    ),
+                    game_id=game_id,
+                    game_length=len(positions),
+                    final_move_history=full_history,
+                    truncated=False,
+                    terminal_reason=terminal_reason,
+                )
+                record.assign_outcomes()
+                return record
 
         while True:
             if move_idx >= self.max_game_moves:
@@ -1600,9 +1834,25 @@ class SelfPlayWorker:
                                 float(v[0]),
                                 context="dense root inference",
                             )
-                            engine.expand_root(
-                                p, root_value, offset_q, offset_r, legal_bytes, root_generation
-                            )
+                            legal = np.frombuffer(legal_bytes, dtype=np.int32).reshape(-1, 2)
+                            prior_qr, prior_logits = self._classical_root_prior(engine, legal)
+                            if prior_qr.shape[0] > 0:
+                                engine.expand_root_with_sparse_priors(
+                                    p,
+                                    root_value,
+                                    offset_q,
+                                    offset_r,
+                                    legal_bytes,
+                                    root_generation,
+                                    prior_qr,
+                                    prior_logits,
+                                    1,
+                                    self.classical_root_prior_mix,
+                                )
+                            else:
+                                engine.expand_root(
+                                    p, root_value, offset_q, offset_r, legal_bytes, root_generation
+                                )
                 except Exception as exc:
                     self._emit_graph_ipc_overflow(
                         exc,
@@ -2068,19 +2318,11 @@ class SelfPlayWorker:
 
             # Preserve global action identity first, then project to the legacy
             # 33x33 crop target. This keeps outside-window MCTS mass measurable.
-            policy_v2 = policy_v2_from_visits(
+            raw_policy_v2 = policy_v2_from_visits(
                 moves_q,
                 moves_r,
                 visits,
             )
-            policy, outside_mass = dense_policy_from_v2(
-                policy_v2,
-                offset_q,
-                offset_r,
-                top_k=self.policy_target_top_k,
-            )
-            target_mass = sum(prob for _q, _r, prob in policy_v2)
-            missing_mass = max(0.0, 1.0 - target_mass) if policy_v2 else 1.0
             winning_moves, forced_blocks, cover_cells = _critical_actions_from_root_tensor(
                 tensor_3d,
                 legal_root,
@@ -2093,9 +2335,26 @@ class SelfPlayWorker:
                 offset_q=int(offset_q),
                 offset_r=int(offset_r),
             )
+            policy_v2 = _shape_policy_v2_with_oracle(
+                raw_policy_v2,
+                oracle,
+                tactical_mix=self.tactical_target_mix,
+                open_four_mix=self.open_four_target_mix,
+                top_k=self.policy_target_top_k,
+                offset_q=int(offset_q),
+                offset_r=int(offset_r),
+            )
+            policy, outside_mass = dense_policy_from_v2(
+                policy_v2,
+                offset_q,
+                offset_r,
+                top_k=self.policy_target_top_k,
+            )
+            target_mass = sum(prob for _q, _r, prob in policy_v2)
+            missing_mass = max(0.0, 1.0 - target_mass) if policy_v2 else 1.0
             candidate_probe = build_candidate_batch(
                 legal_root.tolist(),
-                policy_v2,
+                raw_policy_v2,
                 offset_q=int(offset_q),
                 offset_r=int(offset_r),
                 budget=self.candidate_budget,

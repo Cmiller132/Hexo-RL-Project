@@ -317,6 +317,25 @@ class Trainer:
                     weight_float = weight_tensor.float()
                     result[f"{weight_key}_mean"] = float(weight_float.mean().detach().cpu())
                     result[f"{weight_key}_zero_frac"] = float((weight_float <= 0).float().mean().detach().cpu())
+        if "policy" in targets:
+            with torch.no_grad():
+                policy_target = targets["policy"].float()
+                policy_mass = policy_target.abs().reshape(policy_target.shape[0], -1).sum(dim=1)
+                policy_weight = targets.get("policy_weight")
+                active = torch.ones_like(policy_mass, dtype=torch.bool)
+                if policy_weight is not None:
+                    active &= policy_weight.to(device=policy_mass.device).float() > 0
+                result["policy_target_mass_mean"] = float(policy_mass.mean().detach().cpu())
+                result["policy_target_mass_zero_frac"] = float((policy_mass <= 0).float().mean().detach().cpu())
+                result["policy_target_active_zero_mass_frac"] = float(
+                    (active & (policy_mass <= 0)).float().mean().detach().cpu()
+                )
+                valid = policy_mass > 0
+                if torch.any(valid):
+                    norm_target = policy_target[valid] / policy_mass[valid].unsqueeze(1).clamp(min=1e-6)
+                    entropy = -(norm_target.clamp(min=1e-12) * norm_target.clamp(min=1e-12).log()).sum(dim=1)
+                    result["policy_target_entropy_mean"] = float(entropy.mean().detach().cpu())
+                    result["policy_target_top_mass_mean"] = float(norm_target.max(dim=1).values.mean().detach().cpu())
         if "policy" in predictions and "policy" in targets:
             with torch.no_grad():
                 policy_probs = torch.softmax(predictions["policy"], dim=-1)

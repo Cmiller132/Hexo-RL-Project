@@ -41,7 +41,13 @@ def prepare_dense_training_batch(
     }
     _attach_lookahead_targets(targets, lookahead_keys, lookahead_list, device)
     _attach_aux_targets(targets, aux_targets, device)
-    _ensure_sample_weights(targets, "policy_weight", targets["policy"], train_policy_on_full_search_only)
+    _ensure_sample_weights(
+        targets,
+        "policy_weight",
+        targets["policy"],
+        train_policy_on_full_search_only,
+        require_positive_mass=True,
+    )
     _ensure_sample_weights(targets, "value_weight", targets["value"], True)
     _ensure_sample_weights(targets, "sparse_policy_weight", targets["value"], True)
     _ensure_sample_weights(targets, "pair_policy_weight", targets["value"], True)
@@ -77,7 +83,13 @@ def prepare_global_graph_training_batch(
         timings["graph_phase_targets_s"] = timings.get("graph_phase_targets_s", 0.0) + (
             time.perf_counter() - phase_started
         )
-    _ensure_sample_weights(targets, "policy_weight", targets["value"], train_policy_on_full_search_only)
+    _ensure_sample_weights(
+        targets,
+        "policy_weight",
+        targets.get("policy_target", targets["value"]),
+        train_policy_on_full_search_only,
+        require_positive_mass="policy_target" in targets,
+    )
     _ensure_sample_weights(targets, "value_weight", targets["value"], True)
     _ensure_sample_weights(targets, "pair_policy_weight", targets["value"], True)
     _ensure_sample_weights(targets, "opp_policy_weight", targets["value"], True, default=0.0)
@@ -205,11 +217,25 @@ def _ensure_sample_weights(
     train_on_existing: bool,
     *,
     default: float = 1.0,
+    require_positive_mass: bool = False,
 ) -> None:
     ref = _to_device(reference, reference.device if isinstance(reference, torch.Tensor) else torch.device("cpu"))
     batch_size = int(ref.shape[0])
     if key not in targets or not train_on_existing:
         targets[key] = torch.full((batch_size,), float(default), device=ref.device, dtype=torch.float32)
+    elif isinstance(targets[key], torch.Tensor):
+        targets[key] = targets[key].to(device=ref.device, dtype=torch.float32)
+    if require_positive_mass:
+        mass = _sample_target_mass(ref)
+        valid = (mass > 0).to(device=ref.device, dtype=torch.float32)
+        targets[key] = _to_device(targets[key], ref.device, dtype=torch.float32) * valid
+
+
+def _sample_target_mass(target: torch.Tensor) -> torch.Tensor:
+    values = target.float().abs()
+    if values.ndim <= 1:
+        return values
+    return values.reshape(values.shape[0], -1).sum(dim=1)
 
 
 def _to_device(value, device: torch.device, dtype: torch.dtype | None = None) -> torch.Tensor:

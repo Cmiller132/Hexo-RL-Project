@@ -147,6 +147,10 @@ def test_phase1_runner_candidate_budget_override_materializes_candidates():
         phase1_graph_relation_rebuild_threads=None,
         phase1_disable_dataloader_pin_memory=False,
         phase1_inference_start_timeout_s=None,
+        phase1_inference_response_timeout_ms=180000.0,
+        phase1_compile_model=True,
+        phase1_compile_inference=True,
+        phase1_compile_mode="reduce-overhead",
         candidate_plan=["global_xattn_0:none", "global_graph768_devwin_0:none"],
     )
     base = _base_config_from_args(args)
@@ -156,6 +160,10 @@ def test_phase1_runner_candidate_budget_override_materializes_candidates():
     assert base.runtime.graph_dataloader_workers == 2
     assert base.runtime.dataloader_prefetch_factor == 3
     assert base.runtime.graph_cache_size == 384
+    assert base.runtime.compile_model is True
+    assert base.runtime.compile_inference is True
+    assert base.runtime.compile_mode == "reduce-overhead"
+    assert base.runtime.inference_response_timeout_ms == 180000.0
     assert [candidate.model.candidate_budget for candidate in candidates] == [512, 512]
     materialized = [candidate.materialize_config(base) for candidate in candidates]
     assert [cfg.model.candidate_budget for cfg in materialized] == [512, 512]
@@ -176,6 +184,10 @@ def test_phase1_runner_can_enable_leaf_eval_for_xattn_and_include_restnet():
         phase1_graph_relation_rebuild_threads=None,
         phase1_disable_dataloader_pin_memory=False,
         phase1_inference_start_timeout_s=None,
+        phase1_inference_response_timeout_ms=None,
+        phase1_compile_model=False,
+        phase1_compile_inference=False,
+        phase1_compile_mode=None,
         candidate_plan=["global_xattn_0:none", "restnet:none"],
     )
     base = _base_config_from_args(args)

@@ -14,6 +14,7 @@ from hexorl.tuning.optuna_scout import (
     Phase1OptunaScoutController,
     ScoutHardFailure,
     ScoutQuantumResult,
+    _resume_config_change_is_operational,
 )
 from hexorl.tuning.runtime_probe import RuntimeKnobs
 
@@ -548,8 +549,24 @@ def test_scout_epoch_budget_caps_restnet_attention_batch_and_preserves_samples(t
             / "full_config.json"
         ).read_text(encoding="utf-8")
     )
-    assert written["train"]["batch_size"] == 64
-    assert written["train"]["batches_per_epoch"] == 128
+    assert written["train"]["batch_size"] == 128
+    assert written["train"]["batches_per_epoch"] == 64
+
+
+def test_resume_allows_compile_and_batch_packaging_changes_only():
+    before = Config().model_dump(mode="json")
+    after = Config().model_dump(mode="json")
+    after["runtime"]["compile_model"] = True
+    after["runtime"]["compile_inference"] = True
+    after["runtime"]["compile_mode"] = "reduce-overhead"
+    after["runtime"]["inference_response_timeout_ms"] = 180000.0
+    after["train"]["batch_size"] = 128
+    after["train"]["batches_per_epoch"] = 64
+
+    assert _resume_config_change_is_operational(before, after)
+
+    after["model"]["channels"] = 256
+    assert not _resume_config_change_is_operational(before, after)
 
 
 def test_runtime_probe_speed_quarantine_stops_candidate_but_not_scout(tmp_path):

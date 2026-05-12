@@ -141,9 +141,20 @@ class RelativePositionAttention2d(nn.Module):
             raise ValueError(f"relative attention expects {expected_tokens} tokens, got {n}")
         qkv = self.qkv(x).reshape(b, n, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        score = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         bias = self.relative_position_bias_table[self.relative_position_index.reshape(-1)]
-        bias = bias.reshape(n, n, self.heads).permute(2, 0, 1).to(device=x.device, dtype=score.dtype)
+        bias = bias.reshape(n, n, self.heads).permute(2, 0, 1).to(device=x.device, dtype=q.dtype)
+        if not need_weights:
+            y = F.scaled_dot_product_attention(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                attn_mask=bias.unsqueeze(0).contiguous(),
+                dropout_p=float(self.dropout.p) if self.training else 0.0,
+                is_causal=False,
+            )
+            y = y.transpose(1, 2).reshape(b, n, c)
+            return self.proj(y), None
+        score = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         score = score + bias.unsqueeze(0)
         attn = torch.softmax(score, dim=-1)
         attn = self.dropout(attn)

@@ -500,8 +500,14 @@ class Phase1OptunaScoutController:
             attrs = self._initial_user_attrs(candidate, cfg, paths)
             existing_hash = trial.user_attrs.get("config_hash")
             next_hash = attrs["config_hash"]
+            allowed_resume_update = False
             if existing_hash is not None and existing_hash != next_hash:
-                if _completed_epochs(trial) > 0 or trial.user_attrs.get("latest_checkpoint_path"):
+                has_lineage = _completed_epochs(trial) > 0 or trial.user_attrs.get("latest_checkpoint_path")
+                allowed_resume_update = _resume_config_change_is_operational(
+                    trial.user_attrs.get("full_config"),
+                    attrs.get("full_config"),
+                )
+                if has_lineage and not allowed_resume_update:
                     raise RuntimeError(
                         f"resumed candidate config hash changed for {candidate.candidate_id} "
                         "after checkpoint lineage exists"
@@ -512,8 +518,13 @@ class Phase1OptunaScoutController:
                     key in {"config_hash", "full_config"}
                     and existing_hash is not None
                     and existing_hash != next_hash
-                    and _completed_epochs(trial) == 0
-                    and not trial.user_attrs.get("latest_checkpoint_path")
+                    and (
+                        allowed_resume_update
+                        or (
+                            _completed_epochs(trial) == 0
+                            and not trial.user_attrs.get("latest_checkpoint_path")
+                        )
+                    )
                 )
                 if should_update:
                     self._set_trial_user_attr(study, trial, key, value)
@@ -975,7 +986,7 @@ def _scout_epoch_budget_config(cfg: Config) -> Config:
     spec = architecture_spec(getattr(tuned.model, "architecture", "cnn"))
     if spec.supports_attention_positions and getattr(tuned.model, "attention_positions", []):
         original_samples = max(1, int(tuned.train.batch_size) * int(tuned.train.batches_per_epoch))
-        tuned.train.batch_size = min(int(tuned.train.batch_size), 64)
+        tuned.train.batch_size = min(int(tuned.train.batch_size), 128)
         tuned.train.batches_per_epoch = max(
             int(tuned.train.batches_per_epoch),
             math.ceil(original_samples / max(1, int(tuned.train.batch_size))),
@@ -1043,6 +1054,39 @@ def _train_runtime_component_metrics(train_stats: dict[str, Any] | None) -> dict
             except (TypeError, ValueError):
                 continue
     return metrics
+
+
+_OPERATIONAL_RESUME_CONFIG_PATHS = frozenset(
+    {
+        ("runtime", "compile_model"),
+        ("runtime", "compile_inference"),
+        ("runtime", "compile_mode"),
+        ("runtime", "inference_response_timeout_ms"),
+        ("runtime", "selfplay_workers"),
+        ("selfplay", "num_workers"),
+        ("train", "batch_size"),
+        ("train", "batches_per_epoch"),
+    }
+)
+
+
+def _resume_config_change_is_operational(existing: Any, updated: Any) -> bool:
+    """Return whether a resumed config diff is safe for checkpoint lineage."""
+
+    if not isinstance(existing, dict) or not isinstance(updated, dict):
+        return False
+    return _changed_config_paths(existing, updated) <= _OPERATIONAL_RESUME_CONFIG_PATHS
+
+
+def _changed_config_paths(left: Any, right: Any, prefix: tuple[str, ...] = ()) -> set[tuple[str, ...]]:
+    if isinstance(left, dict) and isinstance(right, dict):
+        paths: set[tuple[str, ...]] = set()
+        for key in set(left) | set(right):
+            paths.update(_changed_config_paths(left.get(key), right.get(key), (*prefix, str(key))))
+        return paths
+    if left != right:
+        return {prefix}
+    return set()
 
 
 def _value_effective_samples(cfg: Config, train_stats: dict[str, Any] | None) -> float:

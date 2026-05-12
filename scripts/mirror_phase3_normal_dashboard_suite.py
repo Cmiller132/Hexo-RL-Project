@@ -34,6 +34,8 @@ def _same_file_stat(src: Path, dst: Path) -> bool:
         return False
     src_stat = src.stat()
     dst_stat = dst.stat()
+    if src.suffix == ".pt" and src_stat.st_size > 0:
+        return src_stat.st_size == dst_stat.st_size
     return src_stat.st_size == dst_stat.st_size and src_stat.st_mtime_ns == dst_stat.st_mtime_ns
 
 
@@ -47,10 +49,19 @@ def _copy_file_if_changed(src: Path, dst: Path) -> str:
     if _same_file_stat(src, dst):
         return "unchanged"
     dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
     try:
-        shutil.copy2(src, dst)
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
         return "copied"
     except OSError as exc:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         if src.suffix == ".sqlite3":
             try:
                 return _copy_sqlite_snapshot(src, dst)

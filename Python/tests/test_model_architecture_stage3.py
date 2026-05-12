@@ -242,6 +242,38 @@ def test_training_adapter_rejects_target_namespace_overwrite():
         )
 
 
+def test_dense_adapter_masks_zero_mass_policy_rows_when_training_all_policy():
+    prepared = prepare_dense_training_batch(
+        tensors=torch.zeros(2, 13, 33, 33),
+        policies=torch.tensor([[0.0, 0.0], [0.25, 0.75]]),
+        values=torch.zeros(2),
+        lookahead_list=[],
+        aux_targets={},
+        lookahead_keys=[],
+        device=torch.device("cpu"),
+        channels_last=False,
+        train_policy_on_full_search_only=False,
+    )
+
+    assert prepared.targets["policy_weight"].tolist() == [0.0, 1.0]
+
+
+def test_dense_adapter_existing_policy_weight_cannot_activate_zero_mass_target():
+    prepared = prepare_dense_training_batch(
+        tensors=torch.zeros(2, 13, 33, 33),
+        policies=torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
+        values=torch.zeros(2),
+        lookahead_list=[],
+        aux_targets={"policy_weight": torch.ones(2)},
+        lookahead_keys=[],
+        device=torch.device("cpu"),
+        channels_last=False,
+        train_policy_on_full_search_only=True,
+    )
+
+    assert prepared.targets["policy_weight"].tolist() == [0.0, 1.0]
+
+
 def test_crop_pair_replay_masks_pair_head_when_target_mass_is_empty():
     pytest.importorskip("_engine")
     rec = PositionRecord(

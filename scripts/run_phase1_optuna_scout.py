@@ -58,6 +58,12 @@ def main() -> int:
         help="Override model.candidate_budget for Phase 1 legal/action rows.",
     )
     parser.add_argument(
+        "--phase1-selfplay-workers",
+        type=int,
+        default=None,
+        help="Override selfplay.num_workers for Phase 1 self-play.",
+    )
+    parser.add_argument(
         "--phase1-global-graph-leaf-eval",
         action="store_true",
         help="Enable global graph model evaluation at MCTS leaves instead of root-only neutral rollouts.",
@@ -96,6 +102,27 @@ def main() -> int:
         type=float,
         default=None,
         help="Override runtime.inference_start_timeout_s for slower WSL/CUDA process startup.",
+    )
+    parser.add_argument(
+        "--phase1-inference-response-timeout-ms",
+        type=float,
+        default=None,
+        help="Override worker inference response timeout for slow first torch.compile batches.",
+    )
+    parser.add_argument(
+        "--phase1-compile-model",
+        action="store_true",
+        help="Enable torch.compile for Phase 1 training models.",
+    )
+    parser.add_argument(
+        "--phase1-compile-inference",
+        action="store_true",
+        help="Enable torch.compile for Phase 1 inference-server models.",
+    )
+    parser.add_argument(
+        "--phase1-compile-mode",
+        default=None,
+        help="Override runtime.compile_mode when Phase 1 torch.compile is enabled.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Use deterministic smoke runner.")
     parser.add_argument("--production", action="store_true", help="Run real self-play/training epoch quanta.")
@@ -165,6 +192,11 @@ def _base_config_from_args(args: argparse.Namespace) -> Config:
         if int(args.phase1_candidate_budget) <= 0:
             raise SystemExit("--phase1-candidate-budget must be positive")
         data["model"]["candidate_budget"] = int(args.phase1_candidate_budget)
+    if args.phase1_selfplay_workers is not None:
+        if int(args.phase1_selfplay_workers) <= 0:
+            raise SystemExit("--phase1-selfplay-workers must be positive")
+        data["runtime"]["selfplay_workers"] = int(args.phase1_selfplay_workers)
+        data["selfplay"]["num_workers"] = int(args.phase1_selfplay_workers)
     if bool(getattr(args, "phase1_global_graph_leaf_eval", False)):
         data["model"]["global_graph_leaf_eval"] = True
     if args.phase1_graph_dataloader_workers is not None:
@@ -191,6 +223,18 @@ def _base_config_from_args(args: argparse.Namespace) -> Config:
         if float(inference_start_timeout_s) <= 0.0:
             raise SystemExit("--phase1-inference-start-timeout-s must be positive")
         data["runtime"]["inference_start_timeout_s"] = float(inference_start_timeout_s)
+    inference_response_timeout_ms = getattr(args, "phase1_inference_response_timeout_ms", None)
+    if inference_response_timeout_ms is not None:
+        if float(inference_response_timeout_ms) <= 0.0:
+            raise SystemExit("--phase1-inference-response-timeout-ms must be positive")
+        data["runtime"]["inference_response_timeout_ms"] = float(inference_response_timeout_ms)
+    if bool(getattr(args, "phase1_compile_model", False)):
+        data["runtime"]["compile_model"] = True
+    if bool(getattr(args, "phase1_compile_inference", False)):
+        data["runtime"]["compile_inference"] = True
+    compile_mode = getattr(args, "phase1_compile_mode", None)
+    if compile_mode is not None:
+        data["runtime"]["compile_mode"] = str(compile_mode)
     return Config.model_validate(data)
 
 

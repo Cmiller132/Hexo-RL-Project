@@ -229,9 +229,16 @@ class InferenceServer:
             compile_inference = getattr(self.cfg.runtime, "compile_model", False)
         if self._device.type == "cuda" and compile_inference:
             try:
+                try:
+                    import torch._inductor.config as inductor_config
+
+                    inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+                except Exception:
+                    pass
                 self._model = torch.compile(
                     self._model,
                     mode=getattr(self.cfg.runtime, "compile_mode", "reduce-overhead"),
+                    dynamic=True,
                 )
             except Exception as exc:
                 print(f"[inference-server] torch.compile disabled: {exc}", flush=True)
